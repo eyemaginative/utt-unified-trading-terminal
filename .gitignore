@@ -1,13 +1,16 @@
 ﻿# Secrets / local config
 .env
 .env.*
+!.env.example
+!.env.sample
+
 *.pem
 *.key
 **/secrets.*
-**/*secret*
-**/*apikey*
-**/*api_key*
-**/*token*
+**/*secret*.env
+**/*apikey*.env
+**/*api_key*.env
+**/*token*.env
 
 # Python
 __pycache__/
@@ -17,7 +20,10 @@ venv/
 .envrc
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 *.log
+logs/
 
 # Node / React
 node_modules/
@@ -34,11 +40,21 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local DB / runtime artifacts (adjust if you actually want to version these)
+# Frontend assets (local-only)
+frontend/src/assets/*
+!frontend/src/assets/.gitkeep
+!frontend/src/assets/utt-banner.jpg
+
+# Local DB / runtime artifacts
 *.sqlite
 *.sqlite3
-backend/*.db
-backend/app/*.db
+backend/data/*.db
+backend/data/*.db-wal
+backend/data/*.db-shm
 
 # Coverage
 coverage/
+
+# Local temp / exports
+tmp/
+*.tmp

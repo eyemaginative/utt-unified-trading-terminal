@@ -58,3 +58,11 @@ coverage/
 # Local temp / exports
 tmp/
 *.tmp
+
+# Key material / generated secrets
+backend/keys/*
+!backend/keys/.gitkeep
+*.b64.txt
+*_private_key*
+*_public_key*
+gen_robinhood_keys.py

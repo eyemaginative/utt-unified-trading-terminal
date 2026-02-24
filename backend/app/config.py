@@ -9,7 +9,7 @@ import os
 # config.py lives at: backend/app/config.py
 # We want env_file to reliably point to backend/.env regardless of where uvicorn is launched from.
 _BACKEND_DIR = Path(__file__).resolve().parents[1]  # .../backend
-_ENV_PATH = _BACKEND_DIR / ".env"
+_DEFAULT_ENV_PATH = _BACKEND_DIR / ".env"
 
 
 def _hydrate_os_environ_from_env_file(env_path: Path) -> None:
@@ -57,8 +57,20 @@ def _hydrate_os_environ_from_env_file(env_path: Path) -> None:
         return
 
 
-# Hydrate os.environ early so os.getenv() in other modules sees backend/.env.
-_hydrate_os_environ_from_env_file(_ENV_PATH)
+# 1) First pass: hydrate from default backend/.env so UTT_ENV_PATH can be discovered.
+_hydrate_os_environ_from_env_file(_DEFAULT_ENV_PATH)
+
+# 2) Compute selected env path (supports absolute paths or paths relative to backend/.)
+_raw_env_override = (os.getenv("UTT_ENV_PATH") or "").strip()
+if _raw_env_override:
+    p = Path(_raw_env_override)
+    _ENV_PATH = p if p.is_absolute() else (_BACKEND_DIR / p)
+else:
+    _ENV_PATH = _DEFAULT_ENV_PATH
+
+# 3) Second pass: hydrate from selected env file (no-op if same).
+if _ENV_PATH != _DEFAULT_ENV_PATH:
+    _hydrate_os_environ_from_env_file(_ENV_PATH)
 
 
 def _is_valid_b64_nonempty(s: Optional[str]) -> bool:

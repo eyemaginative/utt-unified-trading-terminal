@@ -66,3 +66,7 @@ backend/keys/*
 *_private_key*
 *_public_key*
 gen_robinhood_keys.py
+
+# allow committing keygen tool script (no secrets)
+!backend/keys/tools/
+!backend/keys/tools/gen_robinhood_keys.py

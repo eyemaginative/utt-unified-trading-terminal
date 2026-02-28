@@ -1985,7 +1985,11 @@ class CryptoComExchangeAdapter(ExchangeAdapter):
 
         hist_rows: List[Dict[str, Any]] = []
         scan_all = self._env_bool("CRYPTOCOM_ORDER_HISTORY_SCAN_ALL", False)
+        min_rows = clamp_int(os.getenv("CRYPTOCOM_ORDER_HISTORY_MIN_ROWS", "0"), 0, 5000)
         scanned_insts: List[str] = []
+        tried_insts = 0
+        calls = 0
+        added_rows = 0
         trades_fallback_used = 0
         trades_fallback_max = clamp_int(os.getenv("CRYPTOCOM_TRADES_FALLBACK_MAX_INSTRUMENTS_PER_REFRESH", "5"), 0, 500)
 
@@ -2043,7 +2047,7 @@ class CryptoComExchangeAdapter(ExchangeAdapter):
             # Fallback: per-instrument history.
             # If we couldn't obtain any history rows from unfiltered history or unfiltered trades,
             # try per-instrument history using hint instruments (open orders + recent cache + optional env list).
-            if not hist_rows:
+            if (not hist_rows) or (min_rows > 0 and len(hist_rows) < min_rows):
                 scan_batch = int(self._env_int("CRYPTOCOM_ORDER_HISTORY_SCAN_BATCH", 50))
                 max_insts_per_refresh = int(self._env_int("CRYPTOCOM_ORDER_HISTORY_MAX_INSTRUMENTS_PER_REFRESH", 80))
                 max_calls = int(self._env_int("CRYPTOCOM_ORDER_HISTORY_MAX_CALLS_PER_REFRESH", 50))
@@ -2079,8 +2083,9 @@ class CryptoComExchangeAdapter(ExchangeAdapter):
                 for k in env_list:
                     hint_set.add(k)
 
-                # If we have no hints and scan_all is enabled, round-robin through the full instrument list in batches.
-                if scan_all and not hint_set:
+                # If scan_all is enabled, we can extend the hint set by round-robin'ing through the full instrument list
+                # in batches. This is useful when open/recent hints don't cover the instrument that has the missing fills.
+                if scan_all:
                     try:
                         all_defs = self._get_instruments()
                         all_names = [self._inst_id(d) for d in (all_defs or [])]
@@ -2092,12 +2097,16 @@ class CryptoComExchangeAdapter(ExchangeAdapter):
                         start_idx = int(self._history_scan_cursor) % len(all_names)
                         ordered_scan: List[str] = []
                         for i in range(len(all_names)):
-                            ordered_scan.append(all_names[(start_idx + i) % len(all_names)])
-                            if len(ordered_scan) >= max_insts_per_refresh:
+                            cand = all_names[(start_idx + i) % len(all_names)]
+                            if cand and cand not in hint_set:
+                                ordered_scan.append(cand)
+                            if len(ordered_scan) + len(hint_set) >= max_insts_per_refresh:
                                 break
-                        self._history_scan_cursor = (start_idx + len(ordered_scan)) % len(all_names)
-                        hint_set.update(ordered_scan)
-                        scanned_insts = ordered_scan[:]
+                        if ordered_scan:
+                            self._history_scan_cursor = (start_idx + len(ordered_scan)) % len(all_names)
+                            hint_set.update(ordered_scan)
+                            scanned_insts = ordered_scan[:]
+
 
                 # Deterministic ordering: open instruments first, then recent, then env list, then the rest alpha.
                 ordered_hints: List[str] = []
@@ -2116,32 +2125,44 @@ class CryptoComExchangeAdapter(ExchangeAdapter):
 
                 ordered_hints = ordered_hints[:max_insts_per_refresh]
 
-                calls = 0
                 for inst_key in ordered_hints:
                     if calls >= max_calls:
                         break
-                    # Correct signature. The old positional call here broke per-instrument history recovery.
-                    rows = self._get_order_history_cached(
-                        inst_key,
-                        lookback_ms=lookback_ms,
-                        limit=hist_limit,
-                        bypass_cache=bypass_cache,
-                    )
+                    tried_insts += 1
+                    try:
+                        # Correct signature. The old positional call here broke per-instrument history recovery.
+                        rows = self._get_order_history_cached(
+                            inst_key,
+                            lookback_ms=lookback_ms,
+                            limit=hist_limit,
+                            bypass_cache=bypass_cache,
+                        )
+                    except Exception as e:
+                        if debug:
+                            logger.warning("Crypto.com per-instrument get-order-history failed for %s: %s", inst_key, e)
+                        rows = []
                     calls += 1
                     if rows:
                         hist_rows.extend(rows)
+                        added_rows += len(rows)
+                        if min_rows > 0 and len(hist_rows) >= min_rows:
+                            break
 
             if self._env_bool("CRYPTOCOM_DEBUG_ORDERS", False):
                 try:
                     logger.info(
-                        "Crypto.com fetch_orders debug: include_history=%s require_inst=%s bypass_cache=%s open_insts=%d hist_rows=%d scan_all=%s scanned=%d lookback_ms=%s limit=%s",
+                        "Crypto.com fetch_orders debug: include_history=%s require_inst=%s bypass_cache=%s open_insts=%d hist_rows=%d min_rows=%d scan_all=%s scanned=%d tried_insts=%d calls=%d added_rows=%d lookback_ms=%s limit=%s",
                         bool(include_history),
                         bool(require_inst),
                         bool(bypass_cache),
                         len(insts),
                         len(hist_rows),
-                        bool(self._env_bool("CRYPTOCOM_ORDER_HISTORY_SCAN_ALL", True)),
+                        int(min_rows),
+                        bool(scan_all),
                         len(scanned_insts),
+                        int(tried_insts),
+                        int(calls),
+                        int(added_rows),
                         int(lookback_ms),
                         int(hist_limit),
                     )

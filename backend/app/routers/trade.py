@@ -1,5 +1,7 @@
 # app/routers/trade.py
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -9,10 +11,11 @@ from ..config import settings
 from ..schemas import OrderCreate, OrderOut
 from ..services.orders import create_order, cancel_by_ref
 
+# Auth moved to app/routers/auth.py (kept backwards-compatible behavior).
+from .auth import require_auth
+
 
 router = APIRouter(prefix="/api/trade", tags=["trade"])
-
-
 def _effective_dry_run() -> bool:
     # Mirror services/orders.py policy:
     # live routing is only allowed when DRY_RUN=false AND ARMED=true
@@ -44,7 +47,7 @@ def _enabled_live_venues() -> set[str]:
 
 
 @router.post("/order", response_model=OrderOut)
-def post_trade_order(req: OrderCreate, db: Session = Depends(get_db)):
+def post_trade_order(req: OrderCreate, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     """
     UI endpoint (OrderTicketWidget.jsx) calls POST /api/trade/order.
 
@@ -96,7 +99,7 @@ class CancelRequest(BaseModel):
 
 
 @router.post("/cancel")
-def post_trade_cancel(req: CancelRequest, db: Session = Depends(get_db)):
+def post_trade_cancel(req: CancelRequest, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     """
     UI endpoint (All Orders table Cancel button) calls POST /api/trade/cancel.
 

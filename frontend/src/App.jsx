@@ -1,6 +1,6 @@
 // frontend/src/App.jsx
 // App.jsx
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   API_BASE,
   refreshBalances,
@@ -40,6 +40,36 @@ import TerminalTablesWidget from "./TerminalTablesWidget";
 import useAppState from "./app/useAppState";
 import WindowManager from "./app/WindowManager";
 import AppHeader from "./components/AppHeader";
+// ErrorBoundary: prevents "gray screen" by surfacing runtime errors in UI.
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null, info: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    this.setState({ info });
+    // Also log to console for devtools.
+    // eslint-disable-next-line no-console
+    console.error("AppErrorBoundary caught error:", error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      const msg = this.state.error ? String(this.state.error?.message || this.state.error) : "Unknown error";
+      return (
+        <div style={{ padding: 16, fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto" }}>
+          <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>UTT UI crashed</div>
+          <div style={{ opacity: 0.85, marginBottom: 12 }}>Open DevTools Console for full stack trace.</div>
+          <pre style={{ whiteSpace: "pre-wrap", background: "rgba(255,255,255,0.06)", padding: 12, borderRadius: 8 }}>{msg}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 
 // --- URL routing (no react-router-dom) ---
 // Routes:
@@ -1010,7 +1040,7 @@ export default function App() {
     const valueLooksThemeRelated = (v) => {
       const s = canonThemeStr(v);
       return (
-        (s.includes("midnight") && s.includes("blue")) ||
+              (s.includes("midnight") && s.includes("blue")) ||
         s.includes("graphite") ||
         s.includes("oled") ||
         s.includes("trueblack") ||
@@ -1219,13 +1249,60 @@ export default function App() {
   const [venuesRaw, setVenuesRaw] = useState([]);
   const [venuesLoaded, setVenuesLoaded] = useState(false);
 
+  // UI-local venue enable/disable overrides (persisted in localStorage).
+  // These override the backend registry's `enabled` flag for the frontend only.
+  const LS_VENUE_OVERRIDES_KEY = "utt_venue_overrides_v1";
+  const [venueOverrides, setVenueOverrides] = useState(() => {
+    try {
+      const raw = localStorage.getItem(LS_VENUE_OVERRIDES_KEY);
+      if (!raw) return {};
+      const obj = JSON.parse(raw);
+      return obj && typeof obj === "object" ? obj : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const setVenueOverride = useCallback((venueId, enabled) => {
+    const k = String(venueId || "").trim().toLowerCase();
+    if (!k) return;
+    setVenueOverrides((prev) => {
+      const next = { ...(prev && typeof prev === "object" ? prev : {}) };
+      next[k] = !!enabled;
+      try {
+        localStorage.setItem(LS_VENUE_OVERRIDES_KEY, JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
   const [supportedVenues, setSupportedVenues] = useState(() => [...DEFAULT_SUPPORTED_VENUES]);
   const [loadingSupportedVenues, setLoadingSupportedVenues] = useState(false);
 
   const venuesEnabled = useMemo(() => {
     const raw = Array.isArray(venuesRaw) ? venuesRaw : [];
-    return raw.filter((v) => v?.enabled !== false);
-  }, [venuesRaw]);
+
+    const getId = (row) =>
+      String(row?.venue ?? row?.id ?? row?.slug ?? row?.key ?? row?.code ?? row?.name ?? "")
+        .trim()
+        .toLowerCase();
+
+    const isEnabled = (row) => {
+      const id = getId(row);
+      if (id && Object.prototype.hasOwnProperty.call(venueOverrides || {}, id)) return !!venueOverrides[id];
+      return row?.enabled !== false;
+    };
+
+    return raw.filter((v) => isEnabled(v));
+  }, [venuesRaw, venueOverrides]);
+
+  // Venue selector should only show *currently enabled* venues (after UI-local overrides),
+  // while the Manage popup can still list all venues (enabled + disabled).
+  const supportedVenuesForSelector = useMemo(() => {
+    return normalizeVenueList(venuesEnabled);
+  }, [venuesEnabled]);
 
   const tradingVenues = useMemo(() => venuesEnabled.filter((v) => !!v?.supports?.trading), [venuesEnabled]);
   const orderbookVenues = useMemo(() => venuesEnabled.filter((v) => !!v?.supports?.orderbook), [venuesEnabled]);
@@ -1259,7 +1336,34 @@ export default function App() {
         setVenuesRaw(raw);
         setVenuesLoaded(true);
 
-        const enabled = raw.filter((v) => v?.enabled !== false);
+        const getId = (row) =>
+
+
+          String(row?.venue ?? row?.id ?? row?.slug ?? row?.key ?? row?.code ?? row?.name ?? "")
+
+
+            .trim()
+
+
+            .toLowerCase();
+
+
+        const isEnabled = (row) => {
+
+
+          const id = getId(row);
+
+
+          if (id && Object.prototype.hasOwnProperty.call(venueOverrides || {}, id)) return !!venueOverrides[id];
+
+
+          return row?.enabled !== false;
+
+
+        };
+
+
+        const enabled = raw.filter((v) => isEnabled(v));
         const enabledIds = normalizeVenueList(enabled);
 
         const merged = normalizeVenueList([...(DEFAULT_SUPPORTED_VENUES || []), ...(ARB_VENUES || []), ...(enabledIds || [])]);
@@ -1275,6 +1379,28 @@ export default function App() {
     return () => {
       alive = false;
     };
+
+  // When UI venue overrides change, recompute supportedVenues without refetching the registry.
+  useEffect(() => {
+    if (!venuesLoaded) return;
+
+    const raw = Array.isArray(venuesRaw) ? venuesRaw : [];
+    const getId = (row) =>
+      String(row?.venue ?? row?.id ?? row?.slug ?? row?.key ?? row?.code ?? row?.name ?? "")
+        .trim()
+        .toLowerCase();
+    const isEnabled = (row) => {
+      const id = getId(row);
+      if (id && Object.prototype.hasOwnProperty.call(venueOverrides || {}, id)) return !!venueOverrides[id];
+      return row?.enabled !== false;
+    };
+
+    const enabled = raw.filter((v) => isEnabled(v));
+    const enabledIds = normalizeVenueList(enabled);
+    const merged = normalizeVenueList([...(DEFAULT_SUPPORTED_VENUES || []), ...(ARB_VENUES || []), ...(enabledIds || [])]);
+    if (merged.length > 0) setSupportedVenues(merged);
+  }, [venueOverrides, venuesRaw, venuesLoaded]);
+
   }, []);
 
   function getVenueLabelFromRegistry(value) {
@@ -3116,7 +3242,8 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
   );
 
   return (
-    <div ref={appContainerRef} style={styles.page}>
+    <AppErrorBoundary>
+      <div ref={appContainerRef} style={styles.page}>
       <div style={styles.container}>
         <div style={styles.appRow}>
           <AppHeader
@@ -3128,7 +3255,10 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
             venuesLoaded={venuesLoaded}
             venue={venue}
             setVenue={setVenueFromHeader}
-            supportedVenues={supportedVenues}
+            supportedVenues={supportedVenuesForSelector}
+            venuesRaw={venuesRaw}
+            venueOverrides={venueOverrides}
+            setVenueOverride={setVenueOverride}
             ALL_VENUES_VALUE={ALL_VENUES_VALUE}
             labelVenueOption={labelVenueOption}
             dryRunKnown={dryRunKnown}
@@ -3424,5 +3554,6 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
         }}
       />
     </div>
+    </AppErrorBoundary>
   );
 }

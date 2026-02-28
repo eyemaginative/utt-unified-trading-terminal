@@ -26,6 +26,7 @@ from .routers.venue_orders import router as venue_orders_router
 from .routers.all_orders import router as all_orders_router
 from .routers.order_views import router as order_views_router
 from .routers.trade import router as trade_router
+from .routers.auth import router as auth_router
 from .routers.venues import router as venues_router
 from .routers import scanners
 from .routers.market_intel import router as market_intel_router
@@ -104,6 +105,7 @@ def create_app() -> FastAPI:
     app.include_router(venue_orders_router)
     app.include_router(all_orders_router)
     app.include_router(order_views_router)
+    app.include_router(auth_router)
     app.include_router(trade_router)
     app.include_router(venues_router)
     app.include_router(scanners.router)

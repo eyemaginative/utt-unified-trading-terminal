@@ -4,6 +4,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { getOrderRules } from "./lib/api";
 import { expandExponential } from "./lib/format";
 
+// Auth (local token) — used to gate funds actions.
+const UTT_AUTH_TOKEN_KEY = 'utt_auth_token_v1';
+function getAuthToken() {
+  try { return localStorage.getItem(UTT_AUTH_TOKEN_KEY) || ''; } catch { return ''; }
+}
+
+
 const LS_OT_BOX = "utt_ot_box_v2";
 const LS_OT_LOCK = "utt_ot_lock_v2";
 
@@ -83,6 +90,11 @@ export default function OrderTicketWidget({
   limitPrice: limitPriceProp,
   setLimitPrice: setLimitPriceProp,
 }) {
+  // Optional toast emitter (some app shells inject this; keep safe/no-op if absent)
+  const onToast = (typeof window !== "undefined" && (window.__uttOnToast || window.uttOnToast))
+    ? (window.__uttOnToast || window.uttOnToast)
+    : undefined;
+
   const [side, setSide] = useState("buy");
 
   const [qtyLocal, setQtyLocal] = useState("");
@@ -169,10 +181,23 @@ export default function OrderTicketWidget({
   const dragStateRef = useRef(null);
   const resizeStateRef = useRef(null);
 
-  function getGutterBounds() {
-    const vw = HAS_WINDOW ? window.innerWidth : 1200;
-    const vh = HAS_WINDOW ? window.innerHeight : 800;
+  // NOTE: Use the same coordinate-space model as OrderBookWidget.
+  // We store and clamp x/y in *page* coords (visualViewport offsets applied), because
+  // Brave vertical tabs / docked DevTools shift visualViewport and can otherwise cause
+  // x to be permanently clamped to a boundary (making horizontal drag feel "stuck").
+  function getViewport() {
+    const vv = typeof window !== "undefined" ? window.visualViewport : null;
+    const vw = Math.round(vv?.width ?? window.innerWidth);
+    const vh = Math.round(vv?.height ?? window.innerHeight);
+    const ox = Math.round(vv?.offsetLeft ?? 0);
+    const oy = Math.round(vv?.offsetTop ?? 0);
+    return { vw, vh, ox, oy };
+  }
 
+  function getGutterBounds() {
+    const { vw, vh, ox, oy } = getViewport();
+
+    // If we have an app container, treat its right edge as the gutter split.
     const el = appContainerRef?.current;
     const rect = el?.getBoundingClientRect?.();
 
@@ -180,29 +205,38 @@ export default function OrderTicketWidget({
 
     if (!rect) {
       return {
-        minX: margin,
-        maxX: vw - margin,
-        minY: margin,
-        maxY: vh - margin,
-        gutterLeft: margin,
-        gutterWidth: vw - margin * 2,
+        minX: ox + margin,
+        maxX: ox + vw - margin,
+        minY: oy + margin,
+        maxY: oy + vh - margin,
+        gutterLeft: ox + margin,
+        gutterWidth: Math.max(0, vw - margin * 2),
+        vw,
+        vh,
+        ox,
+        oy,
       };
     }
 
-    const containerRight = rect.right;
+    // rect.* are relative to the current visual viewport; convert to absolute page coords.
+    const containerRight = ox + rect.right;
     const gutterLeft = Math.ceil(containerRight + margin);
-    const gutterWidth = vw - gutterLeft - margin;
+    const gutterWidth = Math.max(0, Math.floor((ox + vw) - gutterLeft - margin));
 
     return {
       minX: gutterLeft,
-      maxX: vw - margin,
-      minY: margin,
-      maxY: vh - margin,
+      maxX: ox + vw - margin,
+      minY: oy + margin,
+      maxY: oy + vh - margin,
       gutterLeft,
       gutterWidth,
-      containerRight,
+      vw,
+      vh,
+      ox,
+      oy,
     };
   }
+
 
   function clamp(n, lo, hi) {
     if (!Number.isFinite(n)) return lo;
@@ -226,8 +260,38 @@ export default function OrderTicketWidget({
 
       if (canGutter) {
         setBox((prev) => {
+          // b.vw/vh are visualViewport dimensions; b.ox/oy are offsets (page coords).
+          const vwAbs = (Number.isFinite(b.ox) ? b.ox : 0) + (Number.isFinite(b.vw) ? b.vw : (HAS_WINDOW ? window.innerWidth : 1200));
+          const vhAbs = (Number.isFinite(b.oy) ? b.oy : 0) + (Number.isFinite(b.vh) ? b.vh : (HAS_WINDOW ? window.innerHeight : 800));
           const w = clamp(prev.w || DEFAULT_W, MIN_W, Math.min(MAX_W, b.gutterWidth));
-          const h = clamp(prev.h || DEFAULT_H, MIN_H, Math.min(MAX_H, (HAS_WINDOW ? window.innerHeight : 800)));
+          const h = clamp(prev.h || DEFAULT_H, MIN_H, Math.min(MAX_H, b.maxY - b.minY));
+
+          if (lockedRef.current) {
+            const curX = Number.isFinite(prev.x) ? prev.x : b.minX;
+            const curY = Number.isFinite(prev.y) ? prev.y : b.minY;
+
+            const left = Number.isFinite(prev.left) ? prev.left : (curX - b.minX);
+            const top = Number.isFinite(prev.top) ? prev.top : (curY - b.minY);
+            const right = Number.isFinite(prev.right) ? prev.right : (vwAbs - (curX + w));
+            const bottom = Number.isFinite(prev.bottom) ? prev.bottom : (vhAbs - (curY + h));
+
+            const anchorX = prev.anchorX === "right" || prev.anchorX === "left"
+              ? prev.anchorX
+              : (left <= right ? "left" : "right");
+            const anchorY = prev.anchorY === "bottom" || prev.anchorY === "top"
+              ? prev.anchorY
+              : (top <= bottom ? "top" : "bottom");
+
+            const rawX = anchorX === "right" ? (vwAbs - w - right) : (b.minX + left);
+            const rawY = anchorY === "bottom" ? (vhAbs - h - bottom) : (b.minY + top);
+
+            const x = clamp(rawX, b.minX, b.maxX - w);
+            const y = clamp(rawY, b.minY, b.maxY - h);
+            const clamped = clampBox({ x, y, w, h });
+            // Preserve lock metadata so we don't "re-decide" anchors on overlay/resize.
+            return { ...prev, ...clamped, left, top, right, bottom, anchorX, anchorY };
+          }
+
           const x = clamp(prev.x ?? b.minX, b.minX, b.maxX - w);
           const y = clamp(prev.y ?? b.maxY - h, b.minY, b.maxY - h);
           return clampBox({ x, y, w, h });
@@ -279,10 +343,8 @@ export default function OrderTicketWidget({
     e.stopPropagation();
 
     const start = { ...box };
-    const startRight = start.x + start.w;
-    const startBottom = start.y + start.h;
-
-    resizeStateRef.current = { startX: e.clientX, startY: e.clientY, startBox: start, startRight, startBottom };
+    // Resize from bottom-right corner (keep x/y fixed; change w/h).
+    resizeStateRef.current = { startX: e.clientX, startY: e.clientY, startBox: start };
 
     const onMove = (ev) => {
       const st = resizeStateRef.current;
@@ -291,15 +353,15 @@ export default function OrderTicketWidget({
       const dx = ev.clientX - st.startX;
       const dy = ev.clientY - st.startY;
 
-      const rawW = st.startBox.w - dx;
-      const rawH = st.startBox.h - dy;
+      const rawW = st.startBox.w + dx;
+      const rawH = st.startBox.h + dy;
 
       const b = getGutterBounds();
       const w = clamp(rawW, MIN_W, Math.min(MAX_W, b.maxX - b.minX));
       const h = clamp(rawH, MIN_H, Math.min(MAX_H, b.maxY - b.minY));
 
-      const x = st.startRight - w;
-      const y = st.startBottom - h;
+      const x = st.startBox.x;
+      const y = st.startBox.y;
 
       setBox(clampBox({ x, y, w, h }));
     };
@@ -1483,9 +1545,27 @@ export default function OrderTicketWidget({
   }
 
   async function submitLimitOrder() {
-    if (!canSubmit) return;
+  const tok = getAuthToken();
 
-    setSubmitting(true);
+  // Never silently no-op.
+  // If something changed after the confirm modal opened, surface why.
+  if (!canSubmit) {
+    const reason =
+      preTrade?.message ||
+      (preTrade?.status ? String(preTrade.status) : "") ||
+      "Order is not currently submittable — check Qty/Price and venue rules.";
+    onToast?.({ kind: "warn", msg: reason });
+    openSubmitResultModal("error", reason, "Order Not Submitted");
+    return;
+  }
+
+  // Do not silently no-op when logged out.
+  // Attempt the request without Authorization so we always get a network response (401/403).
+  if (!tok) {
+    onToast?.({ kind: "warn", msg: "Login required to place orders." });
+  }
+
+  setSubmitting(true);
     setSubmitError(null);
     setSubmitOk(null);
 
@@ -1505,9 +1585,15 @@ export default function OrderTicketWidget({
         client_order_id: clientOid ? String(clientOid).trim() : undefined,
       };
 
-      const r = await fetch(`${apiBase}/api/trade/order`, {
+      const headers = { "Content-Type": "application/json" };
+      if (tok) headers.Authorization = `Bearer ${tok}`;
+
+      const base = String(apiBase || "").replace(/\/+$/, "");
+      const url = `${base}/api/trade/order`;
+
+      const r = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify(payload),
       });
 
@@ -1562,7 +1648,12 @@ export default function OrderTicketWidget({
       return;
     }
     setShowConfirm(false);
-    submitLimitOrder();
+    // Surface immediate feedback and never allow a silent no-op.
+    openSubmitResultModal("info", "Submitting…", "Submitting");
+    void submitLimitOrder().catch((e) => {
+      const msg = e?.message || String(e);
+      openSubmitResultModal("error", msg, "Order Submit Failed");
+    });
   }
 
   // Defensive: if styles is missing, do not crash the entire UI.
@@ -1749,13 +1840,18 @@ export default function OrderTicketWidget({
                 setBox((prev) => {
                   const vw = window.innerWidth;
                   const vh = window.innerHeight;
+                  const b = getGutterBounds();
                   const w = prev.w || DEFAULT_W;
                   const h = prev.h || DEFAULT_H;
-                  const x = prev.x ?? 0;
-                  const y = prev.y ?? 0;
+                  const x = Number.isFinite(prev.x) ? prev.x : b.minX;
+                  const y = Number.isFinite(prev.y) ? prev.y : b.minY;
+                  const left = x - b.minX;
+                  const top = y - b.minY;
                   const right = vw - (x + w);
                   const bottom = vh - (y + h);
-                  return { ...prev, right, bottom };
+                  const anchorX = left <= right ? "left" : "right";
+                  const anchorY = top <= bottom ? "top" : "bottom";
+                  return { ...prev, left, top, right, bottom, anchorX, anchorY };
                 });
               }
             }} />

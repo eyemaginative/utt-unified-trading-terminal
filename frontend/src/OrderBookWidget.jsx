@@ -252,12 +252,19 @@ export default function OrderBookWidget({
     cooldownPowRef.current = 0;
   }, [obSymbol]);
 
+  const isSolJupVenue = useMemo(() => {
+    return String(effectiveVenue || "").toLowerCase().trim() === "solana_jupiter";
+  }, [effectiveVenue]);
+
   // Reset gating when venue changes
   useEffect(() => {
     pairNotFoundRef.current = false;
     cooldownUntilRef.current = 0;
     cooldownPowRef.current = 0;
-  }, [effectiveVenue]);
+
+    // Prevent Solana/Jupiter decimals from leaking into other venues' size formatting.
+    if (!isSolJupVenue) setSizeDecimals(null);
+  }, [effectiveVenue, isSolJupVenue]);
 
 
   const lockedRef = useRef(locked);
@@ -273,42 +280,59 @@ export default function OrderBookWidget({
 
   const venueLabel = hideVenueNames ? "••••" : String(effectiveVenue || "");
 
-  function getGutterBounds() {
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+  function getViewport() {
+  const vv = typeof window !== "undefined" ? window.visualViewport : null;
+  const vw = Math.round(vv?.width ?? window.innerWidth);
+  const vh = Math.round(vv?.height ?? window.innerHeight);
+  const ox = Math.round(vv?.offsetLeft ?? 0);
+  const oy = Math.round(vv?.offsetTop ?? 0);
+  return { vw, vh, ox, oy };
+}
 
-    const el = appContainerRef?.current;
-    const rect = el?.getBoundingClientRect?.();
+function getGutterBounds() {
+  const { vw, vh, ox, oy } = getViewport();
 
-    const margin = 0;
+  const el = appContainerRef?.current;
+  const rect = el?.getBoundingClientRect?.();
 
-    if (!rect) {
-      return {
-        minX: margin,
-        maxX: vw - margin,
-        minY: margin,
-        maxY: vh - margin,
-        gutterLeft: margin,
-        gutterWidth: vw - margin * 2,
-      };
-    }
+  const margin = 0;
 
-    const containerRight = rect.right;
-    const gutterLeft = Math.ceil(containerRight + margin);
-    const gutterWidth = vw - gutterLeft - margin;
-
+  if (!rect) {
     return {
-      minX: gutterLeft,
-      maxX: vw - margin,
-      minY: margin,
-      maxY: vh - margin,
-      gutterLeft,
-      gutterWidth,
-      containerRight,
+      minX: ox + margin,
+      maxX: ox + vw - margin,
+      minY: oy + margin,
+      maxY: oy + vh - margin,
+      gutterLeft: ox + margin,
+      gutterWidth: vw - margin * 2,
+      vw,
+      vh,
+      ox,
+      oy,
     };
   }
 
-  function clampBox(next) {
+  // rect.* are relative to the current visual viewport; convert to absolute page coords via (ox, oy)
+  const containerRight = ox + rect.right;
+
+  const gutterLeft = Math.ceil(containerRight + margin);
+  const gutterWidth = Math.max(0, Math.floor((ox + vw) - gutterLeft - margin));
+
+  return {
+    minX: gutterLeft,
+    maxX: ox + vw - margin,
+    minY: oy + margin,
+    maxY: oy + vh - margin,
+    gutterLeft,
+    gutterWidth,
+    vw,
+    vh,
+    ox,
+    oy,
+  };
+}
+
+function clampBox(next) {
     const b = getGutterBounds();
     const w = clamp(next.w, MIN_W, Math.min(MAX_W, b.maxX - b.minX));
     const h = clamp(next.h, MIN_H, Math.min(MAX_H, b.maxY - b.minY));
@@ -325,30 +349,30 @@ export default function OrderBookWidget({
 
       if (canGutter) {
         setBox((prev) => {
-          // When locked, keep the widget visually anchored to the viewport edges
-          // (DevTools open/close changes window.innerWidth/Height, which would otherwise shove it).
+          // When locked, keep the widget anchored to the *same* side(s) of the gutter/viewport.
+          // This prevents a temporary viewport reduction (DevTools, vertical tabs) from
+          // permanently shoving the widget to a different docking edge.
           if (lockedRef.current) {
-            const vw = window.innerWidth;
-            const vh = window.innerHeight;
+
             const w = clamp(prev.w || DEFAULT_W, MIN_W, MAX_W);
+
             const h = clamp(prev.h || DEFAULT_H, MIN_H, MAX_H);
 
-            const prevX = prev.x ?? b.minX;
-            const prevY = prev.y ?? 0;
+          
 
-            const right =
-              Number.isFinite(prev.right) ? prev.right : vw - (prevX + w);
-            const bottom =
-              Number.isFinite(prev.bottom) ? prev.bottom : vh - (prevY + h);
+            const curX = Number.isFinite(prev.x) ? prev.x : b.minX;
 
-            const x = clamp(vw - w - right, b.minX, b.maxX - w);
-            const y = clamp(vh - h - bottom, b.minY, b.maxY - h);
+            const curY = Number.isFinite(prev.y) ? prev.y : b.minY;
 
-            // Preserve w/h; only update x/y and anchors.
-            return { ...prev, x, y, w, h, right, bottom };
+          
+
+            // Freeze locked position (do not clamp/re-anchor under overlays).
+
+            return { ...prev, x: curX, y: curY, w, h };
+
           }
 
-          // Unlocked: keep within gutter bounds and allow size clamp to gutter width/viewport height.
+// Unlocked: keep within gutter bounds and allow size clamp to gutter width/viewport height.
           const w = clamp(prev.w || DEFAULT_W, MIN_W, Math.min(MAX_W, b.gutterWidth));
           const h = clamp(prev.h || DEFAULT_H, MIN_H, Math.min(MAX_H, window.innerHeight));
           const x = clamp(prev.x ?? b.minX, b.minX, b.maxX - w);
@@ -475,7 +499,8 @@ export default function OrderBookWidget({
   function fmtSizeCell(sz) {
     const v = Number(sz);
     if (!Number.isFinite(v)) return "—";
-    if (Number.isFinite(Number(sizeDecimals))) {
+    // IMPORTANT: sizeDecimals is a Solana/Jupiter-only hint. Never apply it to CEX venues.
+    if (isSolJupVenue && Number.isFinite(Number(sizeDecimals))) {
       const d = clamp(Number(sizeDecimals), 0, 18);
       return v.toFixed(d);
     }
@@ -895,11 +920,16 @@ export default function OrderBookWidget({
                   const vh = window.innerHeight;
                   const w = prev.w || DEFAULT_W;
                   const h = prev.h || DEFAULT_H;
-                  const x = prev.x ?? 0;
-                  const y = prev.y ?? 0;
+                  const b = getGutterBounds();
+                  const x = Number.isFinite(prev.x) ? prev.x : b.minX;
+                  const y = Number.isFinite(prev.y) ? prev.y : b.minY;
+                  const left = x - b.minX;
+                  const top = y - b.minY;
                   const right = vw - (x + w);
                   const bottom = vh - (y + h);
-                  return { ...prev, right, bottom };
+                  const anchorX = left <= right ? "left" : "right";
+                  const anchorY = top <= bottom ? "top" : "bottom";
+                  return { ...prev, left, top, right, bottom, anchorX, anchorY };
                 });
               }
             }} />

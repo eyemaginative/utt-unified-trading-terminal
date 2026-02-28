@@ -18,6 +18,28 @@ import { sharedFetchJSON } from "../lib/sharedFetch";
  * This makes AppHeader + TradingViewChartWidget match the Tables theme precisely.
  */
 
+  const donateSmallBtnStyle = {
+display: "inline-flex",
+alignItems: "center",
+gap: 8,
+padding: "7px 10px",
+borderRadius: 10,
+background: "var(--utt-hdr-btn-bg, rgba(255,255,255,0.04))",
+border: "1px solid var(--utt-hdr-btn-border, rgba(255,255,255,0.12))",
+color: "var(--utt-hdr-fg, #e8eef8)",
+cursor: "pointer",
+fontSize: 12,
+fontWeight: 800,
+userSelect: "none",
+whiteSpace: "nowrap",
+  };
+
+  const donatePrimaryBtnStyle = {
+...donateSmallBtnStyle,
+border: "1px solid color-mix(in srgb, var(--utt-hdr-link, #9ad) 45%, var(--utt-hdr-btn-border, rgba(255,255,255,0.12)))",
+background: "color-mix(in srgb, var(--utt-hdr-link, #9ad) 12%, var(--utt-hdr-btn-bg, rgba(255,255,255,0.04)))",
+  };
+
 const LS_THEME_KEY = "utt_tables_theme_v1";
 const LS_THEME_CUSTOM_KEY = "utt_tables_theme_custom_v1";
 
@@ -29,6 +51,10 @@ const BANNER_RECOMMENDED_H = 200;
 
 // Donate (read-only config; only "hide addresses" is user-local)
 const LS_DONATE_HIDE_ADDRS_KEY = "utt_donate_hide_addrs_v1";
+
+// Optional auth UI (local-only unless wired to backend)
+const LS_AUTH_TOKEN_KEY = "utt_auth_token_v1";
+const LS_AUTH_USER_KEY = "utt_auth_user_v1";
 
 // IMPORTANT: This is the immutable donation config for your official build.
 // Users cannot edit this in-app (no localStorage for addresses).
@@ -311,6 +337,42 @@ function writeDonateHideAddrsToStorage(v) {
   }
 }
 
+
+function readAuthTokenFromStorage() {
+  try {
+    const raw = localStorage.getItem(LS_AUTH_TOKEN_KEY);
+    const t = String(raw || "").trim();
+    return t ? t : "";
+  } catch {
+    return "";
+  }
+}
+
+function readAuthUserFromStorage() {
+  try {
+    const raw = localStorage.getItem(LS_AUTH_USER_KEY);
+    const u = String(raw || "").trim();
+    return u ? u : "";
+  } catch {
+    return "";
+  }
+}
+
+function writeAuthToStorage(token, userLabel) {
+  try {
+    if (token) localStorage.setItem(LS_AUTH_TOKEN_KEY, String(token));
+    else localStorage.removeItem(LS_AUTH_TOKEN_KEY);
+  } catch {
+    // ignore
+  }
+  try {
+    if (userLabel) localStorage.setItem(LS_AUTH_USER_KEY, String(userLabel));
+    else localStorage.removeItem(LS_AUTH_USER_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 function CameraIcon({ size = 14 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false" style={{ display: "block" }}>
@@ -335,6 +397,36 @@ function UploadIcon({ size = 14 }) {
   );
 }
 
+
+function LockIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false" style={{ display: "block" }}>
+      <path
+        d="M7.5 11V8.5A4.5 4.5 0 0 1 12 4a4.5 4.5 0 0 1 4.5 4.5V11"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M6.5 11h11A2 2 0 0 1 19.5 13v5.5A2 2 0 0 1 17.5 20.5h-11A2 2 0 0 1 4.5 18.5V13A2 2 0 0 1 6.5 11Z"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function UserIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false" style={{ display: "block" }}>
+      <path d="M12 12.5a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M4.5 20a7.5 7.5 0 0 1 15 0" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function DonateIcon({ size = 14 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false" style={{ display: "block" }}>
@@ -347,6 +439,75 @@ function DonateIcon({ size = 14 }) {
     </svg>
   );
 }
+
+
+function BuyIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false" style={{ display: "block" }}>
+      <path d="M6 7h15l-2 8H8L6 7Z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M6 7 5 4H2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M9 20a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M18 20a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+
+function BuyUtttIcon({ size = 16 }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+      focusable="false"
+      style={{ display: "block" }}
+    >
+      <defs>
+        <linearGradient id="uttGradBuyBtn" x1="0" y1="0" x2="24" y2="0">
+          <stop offset="0" stopColor="#4ef0ff" />
+          <stop offset="0.45" stopColor="#5f7cff" />
+          <stop offset="1" stopColor="#b45cff" />
+        </linearGradient>
+      </defs>
+
+      {/* horns */}
+      <path
+        d="M6 7c1.8 0 3.2 1 4 2.2C10.8 8 12.2 7 14 7c1.6 0 3 .7 4 1.8"
+        stroke="url(#uttGradBuyBtn)"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        opacity="0.95"
+      />
+
+      {/* head/body hint */}
+      <path
+        d="M9.5 20c-1.8-1.3-3-3.3-3-5.7 0-2.9 1.8-5.2 4.4-6
+           0.7 1.5 1.8 2.2 3.1 2.2s2.4-0.7 3.1-2.2
+           2.4 2.1 2.4 5c0 2.4-1.2 4.4-3 5.7"
+        stroke="url(#uttGradBuyBtn)"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        opacity="0.9"
+      />
+
+      {/* upward arrow */}
+      <path
+        d="M13.5 17.5l4-4m0 0h-3m3 0v3"
+        stroke="url(#uttGradBuyBtn)"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+
 
 function ToolChip({
   title,
@@ -596,6 +757,9 @@ export default function AppHeader({
   venue,
   setVenue,
   supportedVenues,
+  venuesRaw,
+  venueOverrides,
+  setVenueOverride,
   ALL_VENUES_VALUE,
   labelVenueOption,
 
@@ -690,6 +854,72 @@ addDexAccount,
 
   const donateBtnRef = useRef(null);
   const donatePopRef = useRef(null);
+  // Auth UI (optional; local-only unless backend is wired)
+  const [authOpen, setAuthOpen] = useState(false);
+  const [authToken, setAuthToken] = useState(() => (typeof window === "undefined" ? "" : readAuthTokenFromStorage()));
+  const [authUser, setAuthUser] = useState(() => (typeof window === "undefined" ? "" : readAuthUserFromStorage()));
+  const [authMsg, setAuthMsg] = useState("");
+  const [authForm, setAuthForm] = useState({ user: "", pass: "", otp: "" });
+  const clearAuthSensitive = () => setAuthForm((s) => ({ ...s, pass: "", otp: "" }));
+  const submitAuth = async () => {
+    setAuthMsg("");
+    const u = String(authForm.user || "").trim();
+    const p = String(authForm.pass || "");
+    const otp = String(authForm.otp || "").trim();
+    if (!u || !p) {
+      setAuthMsg("Missing username/email or password.");
+      return;
+    }
+
+    // Optional backend wiring: POST /api/auth/login { username, password, totp }
+    // If you don't have this endpoint yet, you'll see a clear message.
+    const base = tgTrimApiBase(API_BASE);
+    const url = `${base}/api/auth/login`;
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: u, password: p, totp: otp || null }),
+      });
+
+      const ct = String(r.headers.get("content-type") || "");
+      const data = ct.includes("application/json") ? await r.json() : { detail: await r.text() };
+      if (!r.ok) {
+        const msg = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail || data);
+        setAuthMsg(msg || `Login failed (${r.status})`);
+        return;
+      }
+
+      const token = String(data?.token || data?.access_token || "").trim();
+      const label = String(data?.user || data?.username || u).trim();
+      if (!token) {
+        setAuthMsg("Login endpoint returned no token (expected token/access_token).");
+        return;
+      }
+
+      writeAuthToStorage(token, label);
+      setAuthToken(token);
+      setAuthUser(label);
+      clearAuthSensitive();
+      setAuthOpen(false);
+      setAuthMsg("");
+    } catch (e) {
+      setAuthMsg("Auth not configured yet (missing /api/auth/login) or network error.");
+    }
+  };
+
+  const [buyUtttMsg, setBuyUtttMsg] = useState("");
+  const [buyHover, setBuyHover] = useState(false);
+  const [buyDown, setBuyDown] = useState(false);
+
+  const authBtnRef = useRef(null);
+  const authPopRef = useRef(null);
+
+  // Venue enable/disable manager (UI-local overrides)
+  const [venueMgrOpen, setVenueMgrOpen] = useState(false);
+  const venueMgrBtnRef = useRef(null);
+  const venueMgrPopRef = useRef(null);
+
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -832,9 +1062,11 @@ addDexAccount,
     gap: 8,
     padding: "6px 10px",
     borderRadius: 10,
-    background: "color-mix(in srgb, var(--utt-hdr-bg, #0f1114) 72%, transparent)",
+    background: "color-mix(in srgb, var(--utt-hdr-bg, #0f1114) 88%, transparent)",
     border: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.12))",
-    backdropFilter: "blur(6px)",
+    backdropFilter: "blur(10px)",
+    WebkitBackdropFilter: "blur(10px)",
+    boxShadow: "0 12px 28px rgba(0,0,0,0.55)",
   };
 
   const bannerCtlRowStyle = {
@@ -901,6 +1133,177 @@ addDexAccount,
     letterSpacing: 0.3,
   };
 
+
+  const authBtnStyle = {
+    ...donateBtnStyle,
+    background: "var(--utt-hdr-btn-bg, rgba(255,255,255,0.04))",
+    border: "1px solid var(--utt-hdr-btn-border, rgba(255,255,255,0.12))",
+    fontWeight: 800,
+    letterSpacing: 0.2,
+  };
+
+
+  
+const buyUtttBtnStyle = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 8,
+  height: 34, // keep consistent with existing header buttons
+  padding: "0 12px",
+  borderRadius: 10,
+  cursor: "pointer",
+  userSelect: "none",
+  fontWeight: 800,
+  letterSpacing: 0.6,
+  textTransform: "uppercase",
+  fontSize: 12,
+  lineHeight: "34px",
+  whiteSpace: "nowrap",
+
+  border: "1px solid transparent",
+  background:
+    "linear-gradient(#0b0d10, #0b0d10) padding-box," +
+    "linear-gradient(90deg, #4ef0ff 0%, #5f7cff 45%, #b45cff 100%) border-box",
+
+  color: "var(--utt-hdr-fg, #e8eef8)",
+  boxShadow: "0 0 0 1px rgba(78,240,255,0.10) inset, 0 8px 18px rgba(0,0,0,0.55)",
+};
+
+const buyUtttBtnHoverStyle = {
+  filter: "brightness(1.07)",
+  boxShadow:
+    "0 0 0 1px rgba(78,240,255,0.20) inset," +
+    "0 10px 22px rgba(0,0,0,0.60)," +
+    "0 0 16px rgba(78,240,255,0.15)",
+};
+
+const buyUtttBtnActiveStyle = {
+  transform: "translateY(1px)",
+  filter: "brightness(1.03)",
+};
+
+
+
+  // ---------------------------
+  // Auth (Login) popover: FIXED positioning under the Login button + viewport clamp
+  // (matches Donate popover behavior and avoids transparency/blur)
+  // ---------------------------
+  const AUTH_MARGIN = 10;
+  const AUTH_GAP = 10;
+  const AUTH_MAX_W = 420;
+
+  const [authPos, setAuthPos] = useState(null); // { x, y, w }
+
+  const computeAuthWidth = () => {
+    const vw = Math.max(320, window.innerWidth || 0);
+    const w = Math.min(AUTH_MAX_W, Math.floor(vw * 0.92));
+    return Math.max(320, w);
+  };
+
+  const clampAuthPos = (x, y, w) => {
+    const vw = Math.max(320, window.innerWidth || 0);
+    const vh = Math.max(320, window.innerHeight || 0);
+
+    const ww = Math.min(Math.max(320, w || computeAuthWidth()), vw - AUTH_MARGIN * 2);
+    const maxX = Math.max(AUTH_MARGIN, vw - ww - AUTH_MARGIN);
+
+    // clamp Y so the header remains reachable (we don't know panel height precisely)
+    const maxY = Math.max(AUTH_MARGIN, vh - 80);
+
+    const cx = clamp(x, AUTH_MARGIN, maxX);
+    const cy = clamp(y, AUTH_MARGIN, maxY);
+
+    return { x: cx, y: cy, w: ww };
+  };
+
+  const placeAuthNearButton = () => {
+    const btn = authBtnRef.current;
+    if (!btn) return;
+
+    const rect = btn.getBoundingClientRect();
+    const w = computeAuthWidth();
+
+    const desiredX = rect.right - w;
+    const desiredY = rect.bottom + AUTH_GAP;
+
+    setAuthPos(clampAuthPos(desiredX, desiredY, w));
+  };
+
+  useEffect(() => {
+    if (!authOpen) return;
+
+    // On open: place it under the Login button
+    placeAuthNearButton();
+
+    // Clamp on resize
+    const onResize = () => {
+      setAuthPos((p) => {
+        const w = computeAuthWidth();
+        if (!p) return clampAuthPos(AUTH_MARGIN, 120, w);
+        return clampAuthPos(p.x, p.y, Math.min(p.w || w, w));
+      });
+    };
+
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authOpen]);
+
+  const authPanelStyle = {
+    position: "fixed",
+    left: authPos?.x ?? AUTH_MARGIN,
+    top: authPos?.y ?? 120,
+    zIndex: 20000,
+    width: authPos?.w ?? 360,
+    maxWidth: "92vw",
+
+    color: "var(--utt-hdr-fg, #e8eef8)",
+
+    // fully opaque (match Donate popover behavior)
+    backgroundColor: "var(--utt-hdr-ctl-bg, #0b0d10)",
+    border: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.12))",
+    borderRadius: 14,
+    boxShadow: "var(--utt-hdr-shadow, 0 10px 24px rgba(0,0,0,0.35))",
+    overflow: "hidden",
+    opacity: 1,
+  };
+
+  const authPanelHeaderStyle = {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    padding: "10px 12px",
+    borderBottom: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.10))",
+  };
+
+  const authPanelBodyStyle = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    padding: 12,
+  };
+
+  const authInputStyle = {
+    width: "100%",
+    padding: "8px 10px",
+    borderRadius: 10,
+    border: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.12))",
+    background: "rgba(0,0,0,0.25)",
+    color: "var(--utt-hdr-fg, #e8eef8)",
+    outline: "none",
+    fontSize: 12,
+  };
+
+  const authRowStyle = { display: "flex", gap: 10, alignItems: "center" };
+  const authPrimaryBtnStyle = {
+    ...donatePrimaryBtnStyle,
+    width: "100%",
+    justifyContent: "center",
+  };
+  const authSecondaryBtnStyle = { ...donateSmallBtnStyle };
+
+
   // ---------------------------
   // Donate popover: FIXED positioning + viewport clamp (prevents header clipping)
   // ---------------------------
@@ -963,6 +1366,75 @@ addDexAccount,
     return () => window.removeEventListener("resize", onResize);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [donateOpen]);
+
+  // ---------------------------
+  // Venues Manager popover: FIXED positioning near the Manage button + viewport clamp
+  // ---------------------------
+  const VENUE_MGR_MARGIN = 10;
+  const VENUE_MGR_GAP = 10;
+  const VENUE_MGR_MAX_W = 420;
+
+  const [venueMgrPos, setVenueMgrPos] = useState(null); // { x, y, w }
+
+  const computeVenueMgrWidth = () => {
+    const vw = Math.max(320, window.innerWidth || 0);
+    const w = Math.min(VENUE_MGR_MAX_W, Math.floor(vw * 0.92));
+    return Math.max(300, w);
+  };
+
+  const clampVenueMgrPos = (x, y, w) => {
+    const vw = Math.max(320, window.innerWidth || 0);
+    const vh = Math.max(320, window.innerHeight || 0);
+
+    const ww = Math.min(Math.max(300, w || computeVenueMgrWidth()), vw - VENUE_MGR_MARGIN * 2);
+    const maxX = Math.max(VENUE_MGR_MARGIN, vw - ww - VENUE_MGR_MARGIN);
+
+    const maxY = Math.max(VENUE_MGR_MARGIN, vh - 80);
+    const cx = clamp(x, VENUE_MGR_MARGIN, maxX);
+    const cy = clamp(y, VENUE_MGR_MARGIN, maxY);
+
+    return { x: cx, y: cy, w: ww };
+  };
+
+  const placeVenueMgrNearButton = () => {
+    const btn = venueMgrBtnRef.current;
+    if (!btn) return;
+
+    const rect = btn.getBoundingClientRect();
+    const w = computeVenueMgrWidth();
+
+    const desiredX = rect.left; // open beside the Manage button
+    const desiredY = rect.bottom + VENUE_MGR_GAP;
+
+    setVenueMgrPos(clampVenueMgrPos(desiredX, desiredY, w));
+  };
+
+  useEffect(() => {
+    if (!venueMgrOpen) return;
+
+    // On open: place it under the Manage button
+    placeVenueMgrNearButton();
+
+    const onResize = () => {
+      setVenueMgrPos((p) => {
+        const w = computeVenueMgrWidth();
+        if (!p) return clampVenueMgrPos(VENUE_MGR_MARGIN, 120, w);
+        return clampVenueMgrPos(p.x, p.y, Math.min(p.w || w, w));
+      });
+    };
+
+    // Track scroll too (fixed popover stays put relative to viewport, but button may move if user scrolls)
+    const onScroll = () => placeVenueMgrNearButton();
+
+    window.addEventListener("resize", onResize);
+    window.addEventListener("scroll", onScroll, true);
+
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [venueMgrOpen]);
 
   // FIX: donate popover should be fully opaque + scrollable body
   // Guard against accidental transparent theme values:
@@ -1057,28 +1529,6 @@ addDexAccount,
     padding: "8px 10px",
     fontSize: 12,
     outline: "none",
-  };
-
-  const donateSmallBtnStyle = {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 8,
-    padding: "7px 10px",
-    borderRadius: 10,
-    background: "var(--utt-hdr-btn-bg, rgba(255,255,255,0.04))",
-    border: "1px solid var(--utt-hdr-btn-border, rgba(255,255,255,0.12))",
-    color: "var(--utt-hdr-fg, #e8eef8)",
-    cursor: "pointer",
-    fontSize: 12,
-    fontWeight: 800,
-    userSelect: "none",
-    whiteSpace: "nowrap",
-  };
-
-  const donatePrimaryBtnStyle = {
-    ...donateSmallBtnStyle,
-    border: "1px solid color-mix(in srgb, var(--utt-hdr-link, #9ad) 45%, var(--utt-hdr-btn-border, rgba(255,255,255,0.12)))",
-    background: "color-mix(in srgb, var(--utt-hdr-link, #9ad) 12%, var(--utt-hdr-btn-bg, rgba(255,255,255,0.04)))",
   };
 
   const openBannerPicker = () => {
@@ -1183,6 +1633,54 @@ addDexAccount,
 
   // FIX: stabilize enabled venues (sorting prevents dependency churn)
   const enabledVenuesForScanners = useMemo(() => (supportedVenues || []).map((v) => normalizeVenue(v)).filter(Boolean).sort(), [supportedVenues]);
+
+  // Venue manager list: show all venues from the registry (including disabled) plus any known supportedVenues.
+  const venueMgrRows = useMemo(() => {
+    const byId = new Map();
+
+    const addRow = (idRaw, row) => {
+      const id = normalizeVenue(idRaw);
+      if (!id) return;
+      if (!byId.has(id)) byId.set(id, { id, row: row && typeof row === "object" ? row : null });
+      else if (row && typeof row === "object") byId.set(id, { id, row });
+    };
+
+    for (const r of Array.isArray(venuesRaw) ? venuesRaw : []) {
+      const id = normalizeVenue(r?.venue ?? r?.id ?? r?.slug ?? r?.key ?? r?.code ?? r?.name ?? "");
+      addRow(id, r);
+    }
+    for (const v of Array.isArray(supportedVenues) ? supportedVenues : []) addRow(v, null);
+
+    const rows = Array.from(byId.values());
+
+    const getLabel = (id, row) => {
+      const label =
+        row?.display_name ??
+        row?.displayName ??
+        row?.label ??
+        row?.title ??
+        row?.name ??
+        row?.venue ??
+        row?.id ??
+        "";
+      return String(label || "").trim() || (typeof labelVenueOption === "function" ? labelVenueOption(id) : id);
+    };
+
+    const isEnabled = (id, row) => {
+      const k = normalizeVenue(id);
+      if (k && venueOverrides && Object.prototype.hasOwnProperty.call(venueOverrides, k)) return !!venueOverrides[k];
+      return row?.enabled !== false;
+    };
+
+    return rows
+      .map(({ id, row }) => ({
+        id,
+        label: getLabel(id, row),
+        enabled: isEnabled(id, row),
+        backendEnabled: row?.enabled !== false,
+      }))
+      .sort((a, b) => String(a.label).localeCompare(String(b.label)));
+  }, [venuesRaw, supportedVenues, venueOverrides, labelVenueOption]);
 
   const tg = useMemo(() => {
     const found = (toolWindows || []).find((w) => isTopGainersTool(w));
@@ -1443,6 +1941,35 @@ addDexAccount,
       document.removeEventListener("mousedown", onDown, true);
       document.removeEventListener("keydown", onKey, true);
     };
+  // Venue manager popover behavior (close on outside click / ESC)
+  useEffect(() => {
+    if (!venueMgrOpen) return;
+
+    const onDown = (e) => {
+      const btn = venueMgrBtnRef.current;
+      const pop = venueMgrPopRef.current;
+      const t = e?.target;
+      if (!t) return;
+      if (btn && btn.contains(t)) return;
+      if (pop && pop.contains(t)) return;
+      setVenueMgrOpen(false);
+    };
+
+    const onKey = (e) => {
+      if (!e) return;
+      if (String(e.key || "").toLowerCase() === "escape") {
+        setVenueMgrOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("mousedown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+  }, [venueMgrOpen]);
+
   }, [donateOpen]);
 
   const copyText = async (txt) => {
@@ -1667,9 +2194,73 @@ addDexAccount,
           </div>
 
           {!!bannerMsg && <div style={bannerWarnStyle}>{bannerMsg}</div>}
+          {!!buyUtttMsg && <div style={bannerWarnStyle}>{buyUtttMsg}</div>}
 
           {/* Donate button lives under the banner upload controls */}
-          <div style={{ position: "relative", alignSelf: "flex-end" }}>
+          <div style={{ position: "relative", alignSelf: "flex-end", display: "flex", alignItems: "center", gap: 10 }}>
+            <button
+              ref={authBtnRef}
+              type="button"
+              style={authBtnStyle}
+              onClick={() => {
+                if (authToken) {
+                  // local logout (and optionally call backend if present)
+                  writeAuthToStorage("", "");
+                  setAuthToken("");
+                  setAuthUser("");
+                  clearAuthSensitive();
+                  setAuthMsg("");
+                  setAuthOpen(false);
+                  return;
+                }
+                setAuthOpen((v) => {
+                  const next = !v;
+                  if (next) {
+                    clearAuthSensitive();
+                    // place under button after render
+                    setTimeout(() => placeAuthNearButton(), 0);
+                  }
+                  return next;
+                });
+                setAuthMsg("");
+              }}
+              title={authToken ? "Logout (local)" : "Login"}
+              aria-label={authToken ? "Logout" : "Login"}
+            >
+              {authToken ? <UserIcon size={14} /> : <LockIcon size={14} />}
+              <span>{authToken ? "LOGOUT" : "LOGIN"}</span>
+            </button>
+
+            
+
+
+
+            <button
+              type="button"
+              style={{
+                ...buyUtttBtnStyle,
+                ...(buyHover ? buyUtttBtnHoverStyle : null),
+                ...(buyDown ? buyUtttBtnActiveStyle : null),
+              }}
+              onMouseEnter={() => setBuyHover(true)}
+              onMouseLeave={() => {
+                setBuyHover(false);
+                setBuyDown(false);
+              }}
+              onMouseDown={() => setBuyDown(true)}
+              onMouseUp={() => setBuyDown(false)}
+              onClick={() => {
+                setBuyUtttMsg("Buy UTTT is coming soon (Solana swap wiring next). ");
+                // auto-clear to avoid permanent banner growth
+                window.clearTimeout(window.__utt_buy_msg_to);
+                window.__utt_buy_msg_to = window.setTimeout(() => setBuyUtttMsg(""), 4000);
+              }}
+              title="Buy UTTT (coming soon)"
+              aria-label="Buy UTTT"
+            >
+              <BuyUtttIcon size={14} />
+              <span>BUY UTTT</span>
+            </button>
             <button
               ref={donateBtnRef}
               type="button"
@@ -1690,8 +2281,90 @@ addDexAccount,
               <span>DONATE</span>
             </button>
           </div>
+
         </div>
       </div>
+
+      {authOpen && !authToken && (
+        <div ref={authPopRef} style={authPanelStyle}>
+          <div style={authPanelHeaderStyle}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+              <div style={{ fontWeight: 900, fontSize: 13, lineHeight: 1.1 }}>Sign in</div>
+              <div style={{ fontSize: 11, opacity: 0.75, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                Password + 2FA UI (wire backend when ready)
+              </div>
+            </div>
+
+            <button
+              type="button"
+              style={authSecondaryBtnStyle}
+              onClick={() => {
+                setAuthOpen(false);
+                clearAuthSensitive();
+                setAuthMsg("");
+              }}
+              title="Close"
+            >
+              Close
+            </button>
+          </div>
+
+          <div style={authPanelBodyStyle}>
+            {!!authMsg && <div style={{ fontSize: 12, opacity: 0.9, color: "var(--utt-hdr-warn, var(--utt-warn, #f7b955))" }}>{authMsg}</div>}
+
+            <input
+              style={authInputStyle}
+              placeholder="Username / email"
+              value={authForm.user}
+              onChange={(e) => setAuthForm((s) => ({ ...s, user: e.target.value }))}
+              autoComplete="username"
+            />
+
+            <input
+              style={authInputStyle}
+              placeholder="Password"
+              type="password"
+              value={authForm.pass}
+              onChange={(e) => setAuthForm((s) => ({ ...s, pass: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  submitAuth();
+                }
+              }}
+              autoComplete="current-password"
+            />
+
+            <div style={authRowStyle}>
+              <input
+                style={{ ...authInputStyle, flex: 1 }}
+                placeholder="2FA code (optional)"
+                value={authForm.otp}
+                onChange={(e) => setAuthForm((s) => ({ ...s, otp: e.target.value.replace(/[^0-9]/g, "").slice(0, 8) }))}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    submitAuth();
+                  }
+                }}
+                inputMode="numeric"
+              />
+            </div>
+
+            <button
+              type="button"
+              style={authPrimaryBtnStyle}
+              onClick={submitAuth}
+            >
+              Sign in
+            </button>
+
+            <div style={{ fontSize: 11, opacity: 0.7, lineHeight: 1.25 }}>
+              This UI is inert unless you implement <code>/api/auth/login</code>. It does not change any existing venue behavior.
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* FIXED popover (outside of banner stack) so it cannot be clipped */}
       {donateOpen && (
@@ -1788,6 +2461,107 @@ addDexAccount,
         </div>
       )}
 
+      {venueMgrOpen && (
+        <div
+          ref={venueMgrPopRef}
+          style={{
+            position: "fixed",
+            left: venueMgrPos?.x ?? 10,
+            top: venueMgrPos?.y ?? 80,
+            zIndex: 50,
+            width: venueMgrPos?.w ?? 360,
+            maxWidth: "calc(100vw - 24px)",
+            border: "1px solid var(--utt-border-1, rgba(255,255,255,0.14))",
+            background: "var(--utt-surface-2, #151515)",
+            borderRadius: 12,
+            padding: 10,
+            boxShadow: "var(--utt-shadow, 0 10px 24px rgba(0,0,0,0.40))",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
+            <div style={{ fontWeight: 900, fontSize: 13 }}>Venues</div>
+            <button type="button" style={{ ...headerStyles.button, padding: "6px 8px" }} onClick={() => setVenueMgrOpen(false)}>
+              Close
+            </button>
+          </div>
+
+          <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
+            These toggles are a <b>UI-local override</b> (stored in your browser). Backend env stays unchanged.
+          </div>
+
+          <div style={{ maxHeight: 340, overflow: "auto", paddingRight: 6 }}>
+            {(venueMgrRows || []).map((r) => {
+              const disabledByBackend = r.backendEnabled === false && (venueOverrides == null || !Object.prototype.hasOwnProperty.call(venueOverrides, r.id));
+              const checked = !!r.enabled;
+
+              return (
+                <label
+                  key={r.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 10,
+                    padding: "6px 6px",
+                    borderRadius: 10,
+                    cursor: "pointer",
+                    border: "1px solid transparent",
+                  }}
+                  title={disabledByBackend ? "Disabled by backend registry (env). Enabling here is a UI override." : ""}
+                >
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <div style={{ fontSize: 12, fontWeight: 850 }}>{r.label}</div>
+                    <div style={{ fontSize: 11, opacity: 0.65 }}>{r.id}</div>
+                  </div>
+
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(e) => {
+                      const next = !!e.target.checked;
+                      if (typeof setVenueOverride === "function") setVenueOverride(r.id, next);
+                      if (!next && normalizeVenue(venue) === normalizeVenue(r.id)) {
+                        try {
+                          setVenue(ALL_VENUES_VALUE);
+                        } catch {
+                          // ignore
+                        }
+                      }
+                    }}
+                  />
+                </label>
+              );
+            })}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginTop: 10, justifyContent: "flex-end" }}>
+            <button
+              type="button"
+              style={{ ...headerStyles.button, padding: "6px 8px" }}
+              onClick={() => {
+                try {
+                  localStorage.removeItem("utt_venue_overrides_v1");
+                } catch {
+                  // ignore
+                }
+                try {
+                  if (typeof setVenueOverride === "function") {
+                    // best-effort: clear by forcing a reload; App.jsx will re-init overrides state on reload.
+                    window.location.reload();
+                  }
+                } catch {
+                  // ignore
+                }
+              }}
+              title="Clear local overrides (reloads the page)"
+            >
+              Reset overrides
+            </button>
+          </div>
+        </div>
+      )}
+
+
       <div style={headerStyles.toolbar}>
         <div style={headerStyles.pill}>
           <span>Venue</span>
@@ -1799,6 +2573,19 @@ addDexAccount,
               </option>
             ))}
           </select>
+          <button
+            ref={venueMgrBtnRef}
+            type="button"
+            style={{ ...headerStyles.button, padding: "6px 8px" }}
+            onClick={() => {
+              const next = !venueMgrOpen;
+              setVenueMgrOpen(next);
+              if (next) setTimeout(() => placeVenueMgrNearButton(), 0);
+            }}
+            title="Enable/disable venues (local UI override)"
+          >
+            Manage
+          </button>
         </div>
 
         <div style={headerStyles.pill} title="Trading safety: DRY_RUN is process-level; ARMED is runtime toggle.">

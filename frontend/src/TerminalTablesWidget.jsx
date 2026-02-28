@@ -3,6 +3,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { fmtQty, fmtPrice, fmtMoney, fmtFee, fmtBal, fmtNum } from "./lib/format";
 
+// Auth (local token) — used to gate funds actions.
+const UTT_AUTH_TOKEN_KEY = 'utt_auth_token_v1';
+function getAuthToken() {
+  try { return localStorage.getItem(UTT_AUTH_TOKEN_KEY) || ''; } catch { return ''; }
+}
+
+
 const LS_KEY = "utt_all_orders_columns_v1";
 // One-time migration flag: ensure new All Orders columns are injected into existing custom layouts.
 const LS_AO_COLS_MIG_V2 = "utt_all_orders_columns_mig_v2_tax_netaftertax_v1";
@@ -2287,6 +2294,11 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   }
 
   async function postCancelRefresh(venueMaybe) {
+  const tok = getAuthToken();
+  if (!tok) {
+    toast?.warning?.('Login required to cancel orders.');
+    return;
+  }
     // Immediate refresh
     await runRefreshBalances(venueMaybe);
 

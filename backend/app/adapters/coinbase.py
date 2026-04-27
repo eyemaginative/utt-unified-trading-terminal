@@ -879,6 +879,32 @@ class CoinbaseAdapter(ExchangeAdapter):
                 or os.getenv("COINBASE_CDP_API_PRIVATE_KEY_PATH")
             )
 
+
+
+        # DB-vault fallback (Profile → API Keys)
+        if (not key_name) or (not pem):
+            try:
+                if scope_s == "transfers":
+                    vc = getattr(settings, "coinbase_transfers_private_creds", None)
+                else:
+                    vc = getattr(settings, "coinbase_trade_private_creds", None)
+
+                if callable(vc):
+                    v = vc()
+                    vk = vs = None
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        vk, vs = v[0], v[1]
+                    elif isinstance(v, dict):
+                        vk = v.get("api_key") or v.get("key_name") or v.get("key")
+                        vs = v.get("api_secret") or v.get("secret") or v.get("pem")
+                    if (not key_name) and vk is not None:
+                        key_name = str(vk).strip()
+                    if (not pem) and vs is not None:
+                        pem = str(vs).strip()
+            except Exception:
+                pass
+
+
         key_name = (key_name or "").strip()
         pem = (pem or "").strip()
 

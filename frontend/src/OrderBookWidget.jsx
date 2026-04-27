@@ -6,6 +6,7 @@ const LS_OB_LOCK = "utt_ob_lock_v2";
 // persist auto refresh + interval
 const LS_OB_AUTO = "utt_ob_auto_v1";
 const LS_OB_SEC = "utt_ob_sec_v1";
+const LS_OB_SOL_ROUTER = "utt_ob_sol_router_v1";
 
 function safeNum(v) {
   const n = Number(v);
@@ -96,11 +97,11 @@ function formatOrderBookError(rawMsg, venueLabel) {
     const err = String(detailObj.error || "").toLowerCase();
     if (err === "unknown_symbol") {
       const sym = String(detailObj.symbol || "").trim() || "(unknown)";
-      return `Unknown token symbol ${sym} on ${venue} — use mint:<ADDRESS> in the pair (e.g. mint:<UTTT_MINT>-SOL) or set UTT_SOLANA_MINTS_JSON override`;
+      return `Token “${sym}” isn’t in your Token Registry for ${venue}. Add it in Tokens → Token/Symbol Registry (Solana) (preferred), or use mint:<ADDRESS> in the pair (e.g. mint:<UTTT_MINT>-SOL).`;
     }
     if (err === "symbol_ambiguous") {
       const sym = String(detailObj.symbol || "").trim() || "(unknown)";
-      return `Ambiguous token symbol ${sym} on ${venue} — use mint:<ADDRESS> in the pair or set UTT_SOLANA_MINTS_JSON override`;
+      return `Token symbol “${sym}” maps to multiple mints on ${venue}. Pick the right one by adding the token in Tokens → Token/Symbol Registry (Solana), or use mint:<ADDRESS> in the pair.`;
     }
     if (err === "missing_decimals") {
       const sym = String(detailObj.symbol || "").trim() || "(unknown)";
@@ -171,6 +172,12 @@ export default function OrderBookWidget({
   const [sizeDecimals, setSizeDecimals] = useState(null);
   const [priceIncrement, setPriceIncrement] = useState(null);
 
+  // Separate display precision from click/ticket precision:
+  // - display: keep compact/readable (cap 8)
+  // - click/ticket: preserve up to 9 decimals for low-priced USDC pairs
+  const ORDERBOOK_PRICE_DISPLAY_CAP = 8;
+  const ORDERBOOK_PRICE_CLICK_CAP = 9;
+
   // Defaults:
   // - Auto refresh: ON
   // - Interval: 30 seconds
@@ -186,6 +193,15 @@ export default function OrderBookWidget({
     if (n === null) return 30;
     return Math.max(1, Math.min(300, Math.floor(n)));
   });
+  const [obSolanaRouterMode, setObSolanaRouterMode] = useState(() => {
+    try {
+      const v = String(localStorage.getItem(LS_OB_SOL_ROUTER) || "auto").toLowerCase().trim();
+      return v === "ultra" || v === "jupiter" || v === "raydium" || v === "metis" ? v : "auto";
+    } catch {
+      return "auto";
+    }
+  });
+  const [obActiveRouter, setObActiveRouter] = useState(null);
 
   const inFlightRef = useRef(false);
   const abortRef = useRef(null);
@@ -197,7 +213,10 @@ export default function OrderBookWidget({
   const cooldownUntilRef = useRef(0);
   const cooldownPowRef = useRef(0);
 
-  const [inlineMode, setInlineMode] = useState(false);
+  const [inlineMode, setInlineMode] = useState(true);
+
+  // Right-rail tile containment mode: keep this widget fully contained inside the App rail tile.
+  const forceTileMode = true;
 
   const DEFAULT_W = 460;
   const DEFAULT_H = 520;
@@ -243,6 +262,14 @@ export default function OrderBookWidget({
     localStorage.setItem(LS_OB_SEC, String(Math.floor(n)));
   }, [obAutoSeconds]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_OB_SOL_ROUTER, String(obSolanaRouterMode || "auto"));
+    } catch {
+      // ignore
+    }
+  }, [obSolanaRouterMode]);
+
   // Keep draft in sync when parent sets obSymbol (e.g. from clicks elsewhere)
   useEffect(() => {
     setSymbolDraft(String(obSymbol || ""));
@@ -261,10 +288,19 @@ export default function OrderBookWidget({
     pairNotFoundRef.current = false;
     cooldownUntilRef.current = 0;
     cooldownPowRef.current = 0;
+    setObActiveRouter(null);
 
     // Prevent Solana/Jupiter decimals from leaking into other venues' size formatting.
     if (!isSolJupVenue) setSizeDecimals(null);
   }, [effectiveVenue, isSolJupVenue]);
+
+  useEffect(() => {
+    if (!isSolJupVenue) return;
+    pairNotFoundRef.current = false;
+    cooldownUntilRef.current = 0;
+    cooldownPowRef.current = 0;
+    setObActiveRouter(null);
+  }, [obSolanaRouterMode, isSolJupVenue]);
 
 
   const lockedRef = useRef(locked);
@@ -342,6 +378,11 @@ function clampBox(next) {
   }
 
   useEffect(() => {
+    if (forceTileMode) {
+      setInlineMode(true);
+      return;
+    }
+
     const recompute = () => {
       const b = getGutterBounds();
       const canGutter = Number.isFinite(b.gutterWidth) ? b.gutterWidth >= MIN_W + 4 : false;
@@ -386,7 +427,7 @@ function clampBox(next) {
     window.addEventListener("resize", recompute);
     return () => window.removeEventListener("resize", recompute);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [forceTileMode]);
 
   useEffect(() => {
     if (inlineMode) return;
@@ -487,7 +528,7 @@ function clampBox(next) {
     if (np === null) return "—";
 
     if (Number.isFinite(Number(priceDecimals))) {
-      const d = clamp(Number(priceDecimals), 0, 18);
+      const d = clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_DISPLAY_CAP);
       return Number(np).toFixed(d);
     }
 
@@ -543,15 +584,45 @@ function clampBox(next) {
             const forceQ = opts.force ? "&force=true" : "";
 
       const isSolJup = v === "solana_jupiter";
+      const isSolRay = v === "solana_raydium";
+      const routerModeRaw = isSolJup ? String(obSolanaRouterMode || "auto").toLowerCase().trim() : "auto";
+      const routerMode = routerModeRaw === "metis" ? "jupiter" : routerModeRaw;
+      const ultraUrl = `${apiBase}/api/solana_dex/jupiter/ultra_orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
+        String(depth)
+      )}${forceQ}&_ts=${Date.now()}`;
+      const jupUrl = `${apiBase}/api/solana_dex/jupiter/orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
+        String(depth)
+      )}${forceQ}&_ts=${Date.now()}`;
+      const rayUrl = `${apiBase}/api/solana_dex/raydium/orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
+        String(depth)
+      )}${forceQ}&_ts=${Date.now()}`;
       const url = isSolJup
-        ? `${apiBase}/api/solana_dex/jupiter/orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
-            String(depth)
-          )}${forceQ}&_ts=${Date.now()}`
-        : `${apiBase}/api/market/orderbook?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
-            sym
-          )}&depth=${encodeURIComponent(String(depth))}${forceQ}&_ts=${Date.now()}`;
+        ? (routerMode === "raydium" ? rayUrl : (routerMode === "jupiter" ? jupUrl : (routerMode === "ultra" ? ultraUrl : ultraUrl)))
+        : isSolRay
+          ? rayUrl
+          : `${apiBase}/api/market/orderbook?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
+              sym
+            )}&depth=${encodeURIComponent(String(depth))}${forceQ}&_ts=${Date.now()}`;
 
-      const r = await fetch(url, { signal: ac.signal });
+      const shouldFallbackToRaydium = (txt) => {
+        const low = String(txt || "").toLowerCase();
+        return isSolJup && (
+          low.includes("token_not_tradable") ||
+          low.includes("not tradable") ||
+          low.includes("no_quote_levels") ||
+          low.includes("no routable jupiter quotes") ||
+          low.includes("jupiter_quote_http_error") ||
+          low.includes("jupiter_ultra_order_http_error") ||
+          low.includes("failed to get quotes") ||
+          low.includes("jupiterultra")
+        );
+      };
+
+      let r = await fetch(url, { signal: ac.signal });
+      let usedVenue = v;
+      let usedRouter = isSolJup
+        ? (routerMode === "raydium" ? "raydium" : (routerMode === "jupiter" ? "jupiter" : "ultra"))
+        : (isSolRay ? "raydium" : v || null);
 
       // handle 429 explicitly (cooldown)
       if (r.status === 429) {
@@ -559,6 +630,33 @@ function clampBox(next) {
         const backoffMs = Math.min(300000, 15000 * Math.pow(2, cooldownPowRef.current)); // 15s, 30s, 60s... up to 5m
         cooldownUntilRef.current = Date.now() + backoffMs;
 
+        const txt = await r.text().catch(() => "");
+        throw new Error(txt || `HTTP 429 Too Many Requests`);
+      }
+
+      if (!r.ok && isSolJup) {
+        const txt = await r.text().catch(() => "");
+        if (routerMode === "auto") {
+          if (usedRouter === "ultra" && shouldFallbackToRaydium(txt)) {
+            r = await fetch(rayUrl, { signal: ac.signal });
+            usedVenue = "solana_raydium";
+            usedRouter = "raydium";
+          } else {
+            throw new Error(txt || `HTTP ${r.status}`);
+          }
+        } else if (routerMode !== "jupiter" && routerMode !== "ultra" && shouldFallbackToRaydium(txt)) {
+          r = await fetch(rayUrl, { signal: ac.signal });
+          usedVenue = "solana_raydium";
+          usedRouter = "raydium";
+        } else {
+          throw new Error(txt || `HTTP ${r.status}`);
+        }
+      }
+
+      if (r.status === 429) {
+        cooldownPowRef.current = clamp((cooldownPowRef.current || 0) + 1, 0, 6);
+        const backoffMs = Math.min(300000, 15000 * Math.pow(2, cooldownPowRef.current));
+        cooldownUntilRef.current = Date.now() + backoffMs;
         const txt = await r.text().catch(() => "");
         throw new Error(txt || `HTTP 429 Too Many Requests`);
       }
@@ -573,11 +671,39 @@ function clampBox(next) {
       cooldownUntilRef.current = 0;
 
       const data = await r.json();
+      const responseRouter = String(data?.router || "").toLowerCase().trim();
+      if (usedRouter === "ultra") {
+        setObActiveRouter("ultra");
+      } else if (responseRouter === "ultra" || responseRouter === "jupiter" || responseRouter === "metis" || responseRouter === "raydium") {
+        setObActiveRouter(responseRouter);
+      } else {
+        setObActiveRouter(usedRouter);
+      }
 
       // DEX-only formatting hints (opt-in by venue)
-      if (isSolJup) {
-        const pd = Number(data?.priceDecimals);
-        if (Number.isFinite(pd)) setPriceDecimals(pd);
+      if (isSolJup || usedVenue === "solana_raydium" || isSolRay) {
+        const inferLevelDecimals = (levels) => {
+          try {
+            let best = 0;
+            for (const lvl of Array.isArray(levels) ? levels : []) {
+              const px = Number(lvl?.price);
+              if (!Number.isFinite(px) || px <= 0) continue;
+              const s = px.toFixed(12).replace(/0+$/g, "").replace(/\.$/g, "");
+              const i = s.indexOf(".");
+              const d = i >= 0 ? (s.length - i - 1) : 0;
+              if (d > best) best = d;
+            }
+            return Math.min(Math.max(best, 0), ORDERBOOK_PRICE_CLICK_CAP);
+          } catch {
+            return 0;
+          }
+        };
+
+        const pdApi = Number(data?.priceDecimals);
+        const pdLevels = inferLevelDecimals([...(data?.asks || []), ...(data?.bids || [])]);
+        const pd = Math.max(Number.isFinite(pdApi) ? pdApi : 0, pdLevels);
+        if (Number.isFinite(pd) && pd > 0) setPriceDecimals(clamp(pd, 0, ORDERBOOK_PRICE_CLICK_CAP));
+
         const sd = Number(data?.sizeDecimals);
         if (Number.isFinite(sd)) setSizeDecimals(sd);
       }
@@ -596,6 +722,7 @@ function clampBox(next) {
       setObAsks([]);
       setObBids([]);
 
+      setObActiveRouter(null);
       const raw = e?.message || "Failed to load order book";
       const pretty = formatOrderBookError(raw, venueLabel || effectiveVenue);
       setObError(pretty);
@@ -654,7 +781,7 @@ function clampBox(next) {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [obAutoRefresh, obAutoSeconds, effectiveVenue, obSymbol, obDepth, apiBase]);
+  }, [obAutoRefresh, obAutoSeconds, effectiveVenue, obSymbol, obDepth, apiBase, obSolanaRouterMode]);
 
   function onDragMouseDown(e) {
     if (inlineMode || locked) return;
@@ -724,9 +851,19 @@ function clampBox(next) {
   function handlePickPrice(px) {
     // Normalize clicked price when rules are known; otherwise pass through.
     const outPx = normPriceByRules(px);
-    if (typeof onPickPrice === "function" && outPx !== null && Number.isFinite(Number(outPx))) {
-      onPickPrice(Number(outPx));
-    }
+    if (typeof onPickPrice !== "function") return;
+
+    const n = Number(outPx);
+    if (!Number.isFinite(n)) return;
+
+    // Preserve decimals for venues where order rules may be unknown.
+    // Some ticket implementations format clicked prices using "known" decimals
+    // (which may default to 0), causing whole-number rounding.
+    const d = Number.isFinite(Number(priceDecimals)) ? clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_CLICK_CAP) : null;
+    const pxStr = d !== null ? n.toFixed(clamp(d, 0, 18)) : String(outPx);
+
+    // Back-compat: keep numeric first arg; pass string + context as optional extras.
+    onPickPrice(n, pxStr, { priceDecimals: d, priceIncrement });
   }
 
   function handlePickQty(q) {
@@ -737,20 +874,28 @@ function clampBox(next) {
   const asksView = asksSorted.slice(0, depthN);
   const bidsView = bidsSorted.slice(0, depthN);
 
-  const BOTTOM_SPACER = 12;
+  const BOTTOM_SPACER = 0;
   const SHELL_PAD = 8;
-  const SHELL_PAD_BOTTOM = 16;
+  const SHELL_PAD_BOTTOM = 10;
 
   const obShellStyle = inlineMode
     ? {
         ...styles.orderBookDock,
         width: "100%",
         maxWidth: "100%",
-        resize: "vertical",
+        height: "100%",
+        maxHeight: "100%",
+        resize: "none",
         overflow: "hidden",
         marginTop: 0,
         padding: SHELL_PAD,
         paddingBottom: SHELL_PAD_BOTTOM,
+        display: "flex",
+        flexDirection: "column",
+        flex: "1 1 auto",
+        minHeight: 0,
+        minWidth: 0,
+        boxSizing: "border-box",
       }
     : {
         ...styles.orderBookDock,
@@ -760,10 +905,21 @@ function clampBox(next) {
         overflow: "hidden",
         padding: SHELL_PAD,
         paddingBottom: SHELL_PAD_BOTTOM,
+        display: "flex",
+        flexDirection: "column",
+        minHeight: 0,
+        boxSizing: "border-box",
       };
 
   const fixedWrapperStyle = inlineMode
-    ? { marginTop: 0 }
+    ? {
+        width: "100%",
+        height: "100%",
+        minHeight: 0,
+        minWidth: 0,
+        display: "flex",
+        flexDirection: "column",
+      }
     : { position: "fixed", left: box.x, top: box.y, zIndex: 60, userSelect: "none" };
 
   const approxChrome = 145;
@@ -774,27 +930,60 @@ function clampBox(next) {
   const BID = { border: "rgba(224, 79, 79, 0.55)", bg: "rgba(224, 79, 79, 0.06)" };
   const OB_TEXT = "#ffffff";
 
-  const BIDS_INNER_PAD_BOTTOM = 10;
+  const BIDS_INNER_PAD_BOTTOM = 0;
 
   const asksWrapStyle = {
     ...styles.obTableWrap,
-    maxHeight: half,
+    maxHeight: "none",
+    height: "100%",
+    minHeight: 0,
     marginTop: 3,
     border: `1px solid ${ASK.border}`,
     background: ASK.bg,
     borderRadius: 10,
     boxSizing: "border-box",
+    overflow: "auto",
+    flex: "1 1 0",
   };
 
   const bidsWrapStyle = {
     ...styles.obTableWrap,
-    maxHeight: half,
+    maxHeight: "none",
+    height: "100%",
+    minHeight: 0,
     marginTop: 3,
     border: `1px solid ${BID.border}`,
     background: BID.bg,
     borderRadius: 10,
     paddingBottom: BIDS_INNER_PAD_BOTTOM,
     boxSizing: "border-box",
+    overflow: "auto",
+    flex: "1 1 0",
+  };
+
+  const obBodyWrapStyle = {
+    display: "flex",
+    flexDirection: "column",
+    flex: "1 1 auto",
+    minHeight: 0,
+    overflow: "hidden",
+  };
+
+  const obDepthStackStyle = {
+    display: "grid",
+    gridTemplateRows: "minmax(0, 1fr) minmax(0, 1fr)",
+    gap: 6,
+    flex: "1 1 auto",
+    minHeight: 0,
+    overflow: "hidden",
+    paddingBottom: 0,
+  };
+
+  const obDepthPaneStyle = {
+    display: "flex",
+    flexDirection: "column",
+    minHeight: 0,
+    overflow: "hidden",
   };
 
   const GAP = 6;
@@ -820,6 +1009,16 @@ function clampBox(next) {
     borderRadius: 10,
     ...extra,
   });
+  const darkSelectStyle = {
+    ...styles.select,
+    minWidth: 110,
+    padding: "4px 6px",
+    background: "#101010",
+    backgroundColor: "#101010",
+    color: "#eaeaea",
+    border: "1px solid rgba(255,255,255,0.14)",
+  };
+  const darkOptionStyle = { backgroundColor: "#101010", color: "#eaeaea" };
 
   const thCompact = { ...styles.obTh, padding: "6px 8px", fontSize: 12, color: OB_TEXT };
   const tdCompact = { ...styles.obTd, padding: "6px 8px", fontSize: 12, color: OB_TEXT };
@@ -870,6 +1069,25 @@ function clampBox(next) {
           <h3 style={{ ...styles.widgetTitle, fontSize: 16, lineHeight: "18px" }}>Order Book</h3>
           <span style={{ ...styles.widgetSub, fontSize: 11 }}>
             Venue used: <b>{venueLabel || "—"}</b>
+            {isSolJupVenue ? (
+              <>
+                {" "}• API router: <b>{
+                  obActiveRouter
+                    ? (String(obActiveRouter) === "ultra"
+                        ? "Jupiter Ultra"
+                        : (String(obActiveRouter) === "jupiter" || String(obActiveRouter) === "metis")
+                            ? "Jupiter Metis"
+                            : String(obActiveRouter).replace(/^./, (m) => m.toUpperCase()))
+                    : (String(obSolanaRouterMode || "auto") === "auto"
+                        ? "Auto"
+                        : (String(obSolanaRouterMode || "auto") === "ultra"
+                            ? "Jupiter Ultra"
+                            : ((String(obSolanaRouterMode || "auto") === "jupiter" || String(obSolanaRouterMode || "auto") === "metis")
+                                ? "Jupiter Metis"
+                                : String(obSolanaRouterMode || "auto").replace(/^./, (m) => m.toUpperCase()))))
+                }</b>
+              </>
+            ) : null}
           </span>
         </div>
 
@@ -899,13 +1117,23 @@ function clampBox(next) {
             />
           </div>
 
-          <button
-            style={{ ...btnCompact(), ...(obLoading ? styles.buttonDisabled : {}) }}
-            disabled={obLoading}
-            onClick={() => commitSymbolAndRefresh(true)}
-          >
-            {obLoading ? "Loading…" : "Refresh"}
-          </button>
+          {isSolJupVenue ? (
+            <div style={pillCompact()}>
+              <span>Router</span>
+              <select
+                style={{ ...darkSelectStyle, minWidth: 100 }}
+                value={obSolanaRouterMode}
+                onChange={(e) => setObSolanaRouterMode(e.target.value)}
+                title="Order book quote source"
+              >
+                <option value="auto" style={darkOptionStyle}>Auto</option>
+                <option value="ultra" style={darkOptionStyle}>Jupiter Ultra</option>
+                <option value="jupiter" style={darkOptionStyle}>Jupiter Metis</option>
+                <option value="raydium" style={darkOptionStyle}>Raydium</option>
+              </select>
+            </div>
+          ) : null}
+
         </div>
 
         <div style={{ ...rowStyle, marginTop: 6 }}>
@@ -954,89 +1182,105 @@ function clampBox(next) {
             />
             <span style={styles.muted}>sec</span>
           </div>
+
+          <button
+            style={{ ...btnCompact(), ...(obLoading ? styles.buttonDisabled : {}) }}
+            disabled={obLoading}
+            onClick={() => commitSymbolAndRefresh(true)}
+          >
+            {obLoading ? "Loading…" : "Refresh"}
+          </button>
         </div>
 
         {obError && <div style={{ ...styles.codeError, marginTop: 6, padding: 8 }}>{obError}</div>}
 
-        <div style={asksTitleStyle}>Asks</div>
-        <div ref={asksWrapRef} style={asksWrapStyle}>
-          <table style={styles.obInnerTable}>
-            <thead>
-              <tr>
-                <th style={asksTh}>Price</th>
-                <th style={asksTh}>Size</th>
-              </tr>
-            </thead>
-            <tbody>
-              {asksView.map((x, idx) => (
-                <tr key={`a-${idx}`}>
-                  <td
-                    style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
-                    title="Click to set ticket Limit price"
-                    onClick={() => handlePickPrice(x.price)}
-                  >
-                    {fmtPriceCell(x.price)}
-                  </td>
-                  <td
-                    style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
-                    title="Click to set ticket Qty"
-                    onClick={() => handlePickQty(x.size)}
-                  >
-                    {fmtSizeCell(x.size)}
-                  </td>
-                </tr>
-              ))}
-              {asksView.length === 0 && (
-                <tr>
-                  <td style={tdCompact} colSpan={2}>
-                    <span style={styles.muted}>No asks loaded.</span>
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+        <div style={obBodyWrapStyle}>
+          <div style={obDepthStackStyle}>
+            <div style={obDepthPaneStyle}>
+              <div style={asksTitleStyle}>Asks</div>
+              <div ref={asksWrapRef} style={asksWrapStyle}>
+                <table style={styles.obInnerTable}>
+                  <thead>
+                    <tr>
+                      <th style={asksTh}>Price</th>
+                      <th style={asksTh}>Size</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {asksView.map((x, idx) => (
+                      <tr key={`a-${idx}`}>
+                        <td
+                          style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
+                          title="Click to set ticket Limit price"
+                          onClick={() => handlePickPrice(x.price)}
+                        >
+                          {fmtPriceCell(x.price)}
+                        </td>
+                        <td
+                          style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
+                          title="Click to set ticket Qty"
+                          onClick={() => handlePickQty(x.size)}
+                        >
+                          {fmtSizeCell(x.size)}
+                        </td>
+                      </tr>
+                    ))}
+                    {asksView.length === 0 && (
+                      <tr>
+                        <td style={tdCompact} colSpan={2}>
+                          <span style={styles.muted}>No asks loaded.</span>
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
 
-        <div style={bidsTitleStyle}>Bids</div>
-        <div ref={bidsWrapRef} style={bidsWrapStyle}>
-          <table style={styles.obInnerTable}>
-            <thead>
-              <tr>
-                <th style={bidsTh}>Price</th>
-                <th style={bidsTh}>Size</th>
-              </tr>
-            </thead>
-            <tbody>
-              {bidsView.map((x, idx) => (
-                <tr key={`b-${idx}`}>
-                  <td
-                    style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
-                    title="Click to set ticket Limit price"
-                    onClick={() => handlePickPrice(x.price)}
-                  >
-                    {fmtPriceCell(x.price)}
-                  </td>
-                  <td
-                    style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
-                    title="Click to set ticket Qty"
-                    onClick={() => handlePickQty(x.size)}
-                  >
-                    {fmtSizeCell(x.size)}
-                  </td>
-                </tr>
-              ))}
-              {bidsView.length === 0 && (
-                <tr>
-                  <td style={tdCompact} colSpan={2}>
-                    <span style={styles.muted}>No bids loaded.</span>
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+            <div style={obDepthPaneStyle}>
+              <div style={bidsTitleStyle}>Bids</div>
+              <div ref={bidsWrapRef} style={bidsWrapStyle}>
+                <table style={styles.obInnerTable}>
+                  <thead>
+                    <tr>
+                      <th style={bidsTh}>Price</th>
+                      <th style={bidsTh}>Size</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bidsView.map((x, idx) => (
+                      <tr key={`b-${idx}`}>
+                        <td
+                          style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
+                          title="Click to set ticket Limit price"
+                          onClick={() => handlePickPrice(x.price)}
+                        >
+                          {fmtPriceCell(x.price)}
+                        </td>
+                        <td
+                          style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
+                          title="Click to set ticket Qty"
+                          onClick={() => handlePickQty(x.size)}
+                        >
+                          {fmtSizeCell(x.size)}
+                        </td>
+                      </tr>
+                    ))}
+                    {bidsView.length === 0 && (
+                      <tr>
+                        <td style={tdCompact} colSpan={2}>
+                          <span style={styles.muted}>No bids loaded.</span>
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
 
-        <div style={{ height: 12 }} />
+          <div style={{ height: BOTTOM_SPACER, flex: "0 0 auto" }} />
+        </div>
 
         {!inlineMode && (
           <div

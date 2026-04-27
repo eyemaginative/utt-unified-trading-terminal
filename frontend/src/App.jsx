@@ -1,6 +1,6 @@
 // frontend/src/App.jsx
 // App.jsx
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   API_BASE,
   refreshBalances,
@@ -101,11 +101,16 @@ import VolumeWindow from "./features/scanners/VolumeWindow";
 
 import LedgerWindow from "./features/basis/LedgerWindow";
 import WalletAddressesWindow from "./features/wallets/WalletAddressesWindow";
+import TokenRegistryWindow from "./features/registry/TokenRegistryWindow";
 // Fallback base styling (global). Header gets its own overrides driven by the Tables theme bus.
 // NOTE: Most surfaces now reference CSS vars so App shell can follow Tables theme (without fully re-theming every widget yet).
 const fallbackStyles = {
   page: {
+    height: "100vh",
     minHeight: "100vh",
+    overflow: "hidden",
+    display: "flex",
+    flexDirection: "column",
     background: "var(--utt-page-bg, #111)",
     color: "var(--utt-page-fg, #eee)",
     fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif",
@@ -126,7 +131,7 @@ const fallbackStyles = {
   },
   toolbar: {
     display: "flex",
-    gap: 10,
+    gap: 12,
     rowGap: 8,
     alignItems: "center",
     flexWrap: "wrap",
@@ -274,6 +279,37 @@ const fallbackStyles = {
   },
 };
 
+const workspaceShellStyles = {
+  outer: {
+    width: "100%",
+    padding: "0 10px 14px",
+  },
+  inner: {
+    width: "100%",
+    maxWidth: 1600,
+    margin: "0 auto",
+    display: "grid",
+    gap: 12,
+    alignItems: "start",
+  },
+  main: {
+    minWidth: 0,
+    display: "grid",
+    gap: 12,
+    alignItems: "start",
+  },
+  rail: {
+    minWidth: 0,
+    display: "grid",
+    gap: 12,
+    alignItems: "start",
+    alignSelf: "start",
+  },
+  panel: {
+    minWidth: 0,
+  },
+};
+
 const ALL_VENUES_VALUE = "ALL";
 
 // NOTE: This list is used for *core trading/balances polling* fallback.
@@ -284,6 +320,14 @@ const DEFAULT_SUPPORTED_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "
 const ARB_VENUES = ["coinbase", "kraken", "gemini", "robinhood", "dex_trade"];
 
 const LS_VISIBLE_WIDGETS = "utt_visible_widgets_v1";
+const LS_RIGHT_RAIL_SPLIT = "utt_right_rail_split_v1";
+const LS_RIGHT_RAIL_WIDTH = "utt_right_rail_width_v1";
+const LS_RIGHT_RAIL_TOP_PX = "utt_right_rail_top_px_v1";
+const LS_RIGHT_RAIL_RESIZE_LOCK = "utt_right_rail_resize_lock_v1"; // legacy shared lock key
+const LS_RIGHT_RAIL_WIDTH_LOCK = "utt_right_rail_width_lock_v1";
+const LS_RIGHT_RAIL_SPLIT_LOCK = "utt_right_rail_split_lock_v1";
+const LS_RIGHT_RAIL_BOTTOM_PX = "utt_right_rail_bottom_px_v1";
+const LS_RIGHT_RAIL_BOTTOM_LOCK = "utt_right_rail_bottom_lock_v1";
 const DEFAULT_VISIBLE = {
   chart: true,
   tables: true,
@@ -910,6 +954,16 @@ export default function App() {
 
   const appContainerRef = useRef(null);
   const headerRef = useRef(null);
+  const headerShellRef = useRef(null);
+  const workspaceViewportRef = useRef(null);
+  const mainViewportRef = useRef(null);
+  const tablesPaneRef = useRef(null);
+  const tablesLockBoundsRef = useRef(null);
+  const railShellRef = useRef(null);
+  const [tablesPaneReservedHeight, setTablesPaneReservedHeight] = useState(520);
+  const tablesPaneReserveFreezeUntilRef = useRef(0);
+  const [workspaceViewportHeight, setWorkspaceViewportHeight] = useState(null);
+  const [workspaceViewportTop, setWorkspaceViewportTop] = useState(null);
 
   const [themeKey, setThemeKey] = useState(() => detectThemeNameFromLocalStorage());
 
@@ -917,6 +971,52 @@ export default function App() {
     applyHeaderThemeVars(headerRef.current, themeKey);
     applyShellThemeVars(appContainerRef.current, themeKey);
   }, [themeKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    let raf = 0;
+    let ro = null;
+
+    const measure = () => {
+      cancelAnimationFrame(raf);
+      raf = window.requestAnimationFrame(() => {
+        const host = workspaceViewportRef.current;
+        if (!host) return;
+        const rect = host.getBoundingClientRect();
+        const nextTop = Math.max(0, Math.floor(rect.top));
+        const next = Math.max(320, Math.floor(window.innerHeight - rect.top - 8));
+        setWorkspaceViewportTop((prev) => (prev === nextTop ? prev : nextTop));
+        setWorkspaceViewportHeight((prev) => (prev === next ? prev : next));
+      });
+    };
+
+    measure();
+
+    try {
+      if (typeof ResizeObserver !== "undefined") {
+        ro = new ResizeObserver(() => measure());
+        if (headerShellRef.current) ro.observe(headerShellRef.current);
+        if (appContainerRef.current) ro.observe(appContainerRef.current);
+      }
+    } catch {
+      ro = null;
+    }
+
+    window.addEventListener("resize", measure);
+    window.addEventListener("orientationchange", measure);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      try {
+        if (ro) ro.disconnect();
+      } catch {
+        // ignore
+      }
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("orientationchange", measure);
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1145,6 +1245,7 @@ export default function App() {
       volume: "volume",
       walletAddresses: "wallet_addresses",
       deposits: "deposits",
+      tokenRegistry: "token_registry",
     }),
     []
   );
@@ -1193,6 +1294,14 @@ export default function App() {
       width: 980,
       height: 620,
       z: 12,
+      payload: { focusSeq: 0 },
+    },
+    {
+      id: TOOL_IDS.tokenRegistry,
+      title: "Tokens",
+      open: false,
+      width: 980,
+      height: 620,
       payload: { focusSeq: 0 },
     },
     {
@@ -1379,6 +1488,7 @@ export default function App() {
     return () => {
       alive = false;
     };
+  }, []);
 
   // When UI venue overrides change, recompute supportedVenues without refetching the registry.
   useEffect(() => {
@@ -1400,8 +1510,6 @@ export default function App() {
     const merged = normalizeVenueList([...(DEFAULT_SUPPORTED_VENUES || []), ...(ARB_VENUES || []), ...(enabledIds || [])]);
     if (merged.length > 0) setSupportedVenues(merged);
   }, [venueOverrides, venuesRaw, venuesLoaded]);
-
-  }, []);
 
   function getVenueLabelFromRegistry(value) {
     const v = String(value || "").trim().toLowerCase();
@@ -1523,6 +1631,8 @@ export default function App() {
   useEffect(() => { venuesLoadedRef.current = venuesLoaded; }, [venuesLoaded]);
   useEffect(() => { venueRef.current = venue; }, [venue]);
   useEffect(() => { marketInputRef.current = marketInput; }, [marketInput]);
+
+  const suppressAllOrdersReloadOnceRef = useRef(false);
 
   function setUrlForMarket(nextVenue, nextSymbol, { replace = false } = {}) {
     const v = normalizeVenue(nextVenue);
@@ -1659,7 +1769,777 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem(LS_VISIBLE_WIDGETS, JSON.stringify(visible));
-  }, [visible]);
+  }, [visible, workspaceViewportHeight]);
+
+  useLayoutEffect(() => {
+    const host = tablesPaneRef.current;
+    if (!host || typeof ResizeObserver === "undefined") return undefined;
+
+    let raf = 0;
+    const measure = () => {
+      try {
+        const first = host.firstElementChild;
+        const rect = first?.getBoundingClientRect?.() || host.getBoundingClientRect?.();
+        const next = Math.max(380, Math.round(rect?.height || host.offsetHeight || 0));
+        if (Number.isFinite(next) && next > 0) {
+          setTablesPaneReservedHeight((prev) => {
+            const freezeActive = Date.now() < Number(tablesPaneReserveFreezeUntilRef.current || 0);
+            const target = freezeActive ? Math.max(prev, next) : next;
+            return Math.abs(prev - target) > 2 ? target : prev;
+          });
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    measure();
+    const ro = new ResizeObserver(() => {
+      try { cancelAnimationFrame(raf); } catch {}
+      raf = window.requestAnimationFrame(measure);
+    });
+    ro.observe(host);
+    if (host.firstElementChild) ro.observe(host.firstElementChild);
+
+    return () => {
+      try { cancelAnimationFrame(raf); } catch {}
+      try { ro.disconnect(); } catch {}
+    };
+  }, [visible?.tables, tab, workspaceViewportHeight]);
+
+  const [railSplit, setRailSplit] = useState(() => {
+    const saved = readNumLS(LS_RIGHT_RAIL_SPLIT, 0.44);
+    return Math.max(0.28, Math.min(0.72, saved));
+  });
+  const [railWidth, setRailWidth] = useState(() => {
+    const saved = readNumLS(LS_RIGHT_RAIL_WIDTH, 680);
+    return Math.max(640, Math.min(960, saved));
+  });
+  const [railTopPxStored, setRailTopPxStored] = useState(() => {
+    const saved = readNumLS(LS_RIGHT_RAIL_TOP_PX, 360);
+    return Math.max(180, Math.min(900, saved));
+  });
+  const legacyRailResizeLocked = readBoolLS(LS_RIGHT_RAIL_RESIZE_LOCK, false);
+  const [railWidthLocked, setRailWidthLocked] = useState(() => readBoolLS(LS_RIGHT_RAIL_WIDTH_LOCK, legacyRailResizeLocked));
+  const [railSplitLocked, setRailSplitLocked] = useState(() => readBoolLS(LS_RIGHT_RAIL_SPLIT_LOCK, legacyRailResizeLocked));
+  const [railBottomPxStored, setRailBottomPxStored] = useState(() => {
+    const saved = readNumLS(LS_RIGHT_RAIL_BOTTOM_PX, 360);
+    return Math.max(220, Math.min(2400, saved));
+  });
+  const [railBottomLocked, setRailBottomLocked] = useState(() => readBoolLS(LS_RIGHT_RAIL_BOTTOM_LOCK, false));
+  const railViewportRef = useRef(null);
+  const railDragRef = useRef(null);
+  const tablesLockScrollTopRef = useRef(null);
+  const tablesLockGuardRafRef = useRef(0);
+  const tablesLockGuardTimersRef = useRef([]);
+  const tablesLockGuardScrollHandlerRef = useRef(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_RIGHT_RAIL_SPLIT, String(railSplit));
+    } catch {
+      // ignore
+    }
+  }, [railSplit]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_RIGHT_RAIL_WIDTH, String(railWidth));
+    } catch {
+      // ignore
+    }
+  }, [railWidth]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_RIGHT_RAIL_TOP_PX, String(railTopPxStored));
+    } catch {
+      // ignore
+    }
+  }, [railTopPxStored]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_RIGHT_RAIL_BOTTOM_PX, String(railBottomPxStored));
+    } catch {
+      // ignore
+    }
+  }, [railBottomPxStored]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_RIGHT_RAIL_WIDTH_LOCK, JSON.stringify(!!railWidthLocked));
+    } catch {
+      // ignore
+    }
+  }, [railWidthLocked]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_RIGHT_RAIL_SPLIT_LOCK, JSON.stringify(!!railSplitLocked));
+      localStorage.setItem(LS_RIGHT_RAIL_RESIZE_LOCK, JSON.stringify(!!(railWidthLocked && railSplitLocked)));
+    } catch {
+      // ignore
+    }
+  }, [railWidthLocked, railSplitLocked]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_RIGHT_RAIL_BOTTOM_LOCK, JSON.stringify(!!railBottomLocked));
+    } catch {
+      // ignore
+    }
+  }, [railBottomLocked]);
+
+  useLayoutEffect(() => {
+    const host = railViewportRef.current;
+    if (!host) return undefined;
+
+    let raf1 = 0;
+    let raf2 = 0;
+    let t1 = 0;
+    let t2 = 0;
+
+    const reset = () => {
+      try {
+        host.scrollTop = 0;
+        host.scrollLeft = 0;
+      } catch {
+        // ignore
+      }
+    };
+
+    reset();
+    raf1 = window.requestAnimationFrame(() => {
+      reset();
+      raf2 = window.requestAnimationFrame(() => reset());
+    });
+    t1 = window.setTimeout(reset, 60);
+    t2 = window.setTimeout(reset, 180);
+
+    return () => {
+      try { window.cancelAnimationFrame(raf1); } catch {}
+      try { window.cancelAnimationFrame(raf2); } catch {}
+      try { window.clearTimeout(t1); } catch {}
+      try { window.clearTimeout(t2); } catch {}
+    };
+  }, [workspaceViewportHeight, workspaceViewportTop, visible?.orderBook, visible?.orderTicket, railWidth]);
+
+  const onRailSplitterPointerDown = useCallback((e) => {
+    if (railSplitLocked) return;
+    if (e?.target?.closest?.("[data-utt-rail-split-lock]")) return;
+    const btn = typeof e?.button === "number" ? e.button : 0;
+    if (btn !== 0) return;
+    const shell = railShellRef.current;
+    if (!shell) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const splitBarPx = 56;
+    const minTopPx = 80;
+    const minBottomPx = 16;
+    const pointerId = typeof e?.pointerId === "number" ? e.pointerId : null;
+    const pointerTarget = e?.currentTarget || null;
+
+    const calcNext = (clientY) => {
+      const rect = shell.getBoundingClientRect();
+      const usable = Math.max(360, (shell.clientHeight || rect.height || 0) - splitBarPx - 8);
+      const raw = Math.round(clientY - rect.top - 4);
+      return Math.max(minTopPx, Math.min(usable - minBottomPx, raw));
+    };
+
+    const onMove = (ev) => {
+      if (pointerId !== null && ev?.pointerId !== pointerId) return;
+      const nextPx = calcNext(ev.clientY);
+      setRailTopPxStored(nextPx);
+      const rect = shell.getBoundingClientRect();
+      const usable = Math.max(360, (shell.clientHeight || rect.height || 0) - splitBarPx - 8);
+      setRailSplit(Math.max(0.10, Math.min(0.95, usable > 0 ? nextPx / usable : railSplit)));
+    };
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      try {
+        if (pointerId !== null) pointerTarget?.releasePointerCapture?.(pointerId);
+      } catch {}
+      try { document.body.style.cursor = ""; } catch {}
+      try { document.body.style.userSelect = ""; } catch {}
+    };
+
+    const onUp = (ev) => {
+      if (pointerId !== null && ev?.pointerId !== pointerId) return;
+      cleanup();
+    };
+
+    try {
+      if (pointerId !== null) pointerTarget?.setPointerCapture?.(pointerId);
+    } catch {}
+
+    onMove(e);
+
+    try { document.body.style.cursor = "row-resize"; } catch {}
+    try { document.body.style.userSelect = "none"; } catch {}
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }, [railSplit, railSplitLocked]);
+
+  const clearTablesLockScrollGuard = useCallback(() => {
+    try {
+      if (tablesLockGuardRafRef.current) window.cancelAnimationFrame(tablesLockGuardRafRef.current);
+    } catch {}
+    tablesLockGuardRafRef.current = 0;
+    try {
+      for (const t of tablesLockGuardTimersRef.current || []) window.clearTimeout(t);
+    } catch {}
+    tablesLockGuardTimersRef.current = [];
+    try {
+      const host = mainViewportRef.current;
+      const handler = tablesLockGuardScrollHandlerRef.current;
+      if (host && handler) host.removeEventListener("scroll", handler);
+    } catch {}
+    tablesLockGuardScrollHandlerRef.current = null;
+    tablesLockScrollTopRef.current = null;
+  }, []);
+
+  const restoreTablesLockScroll = useCallback((scrollTopIn) => {
+    const host = mainViewportRef.current;
+    const scrollTop = Number(scrollTopIn);
+    if (!host || !Number.isFinite(scrollTop)) return;
+    if (Math.abs((host.scrollTop || 0) - scrollTop) <= 1) return;
+    try { host.scrollTop = scrollTop; } catch {}
+  }, []);
+
+  const armTablesLockScrollGuard = useCallback(() => {
+    const host = mainViewportRef.current;
+    if (!host) return;
+
+    tablesPaneReserveFreezeUntilRef.current = Date.now() + 1800;
+    try {
+      const pane = tablesPaneRef.current;
+      const first = pane?.firstElementChild;
+      const rect = first?.getBoundingClientRect?.() || pane?.getBoundingClientRect?.();
+      const snap = Math.max(380, Math.round(rect?.height || pane?.offsetHeight || 0));
+      if (Number.isFinite(snap) && snap > 0) {
+        setTablesPaneReservedHeight((prev) => Math.max(prev, snap));
+      }
+    } catch {
+      // ignore
+    }
+
+    const savedScrollTop = Number(host.scrollTop || 0);
+    tablesLockScrollTopRef.current = savedScrollTop;
+    clearTablesLockScrollGuard();
+
+    const restore = () => restoreTablesLockScroll(savedScrollTop);
+
+    const onScroll = () => restore();
+    tablesLockGuardScrollHandlerRef.current = onScroll;
+    try { host.addEventListener("scroll", onScroll, { passive: true }); } catch {}
+
+    restore();
+    tablesLockGuardRafRef.current = window.requestAnimationFrame(() => {
+      restore();
+      tablesLockGuardRafRef.current = window.requestAnimationFrame(() => {
+        restore();
+        tablesLockGuardRafRef.current = window.requestAnimationFrame(restore);
+      });
+    });
+
+    const timers = [0, 16, 40, 80, 140, 220, 320, 500, 800, 1200].map((ms) => window.setTimeout(restore, ms));
+    tablesLockGuardTimersRef.current = timers;
+  }, [clearTablesLockScrollGuard, restoreTablesLockScroll]);
+
+  useEffect(() => () => {
+    clearTablesLockScrollGuard();
+  }, [clearTablesLockScrollGuard]);
+
+  function isTablesLockInteractionTarget(target) {
+    if (typeof Element === "undefined" || !(target instanceof Element)) return false;
+
+    const candidates = [
+      target,
+      target.closest('label'),
+      target.closest('button'),
+      target.closest('input'),
+      target.closest('[role="checkbox"]'),
+      target.closest('[title]'),
+      target.closest('[aria-label]'),
+    ].filter(Boolean);
+
+    for (const node of candidates) {
+      const parts = [
+        node.getAttribute?.('title') || '',
+        node.getAttribute?.('aria-label') || '',
+        node.textContent || '',
+      ];
+      const hay = parts.join(' ').toLowerCase();
+      if (hay.includes('lock')) return true;
+    }
+
+    const lockishCheckbox = target.closest('input[type="checkbox"]');
+    if (lockishCheckbox) {
+      const labelText = lockishCheckbox.closest('label')?.textContent || lockishCheckbox.parentElement?.textContent || '';
+      if (String(labelText).toLowerCase().includes('lock')) return true;
+    }
+
+    return false;
+  }
+
+  const onRailResizePointerDown = useCallback((e) => {
+    if (railWidthLocked) return;
+    const btn = typeof e?.button === "number" ? e.button : 0;
+    if (btn !== 0) return;
+    const host = railShellRef.current;
+    if (!host) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const startX = e.clientX;
+    const startWidth = host.getBoundingClientRect().width || railWidth;
+    const pointerId = typeof e?.pointerId === "number" ? e.pointerId : null;
+    const pointerTarget = e?.currentTarget || null;
+
+    const onMove = (ev) => {
+      if (pointerId !== null && ev?.pointerId !== pointerId) return;
+      const dx = startX - ev.clientX;
+      const next = startWidth + dx;
+      setRailWidth(Math.max(460, Math.min(980, Math.round(next))));
+    };
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      try {
+        if (pointerId !== null) pointerTarget?.releasePointerCapture?.(pointerId);
+      } catch {}
+      try { document.body.style.cursor = ""; } catch {}
+      try { document.body.style.userSelect = ""; } catch {}
+    };
+
+    const onUp = (ev) => {
+      if (pointerId !== null && ev?.pointerId !== pointerId) return;
+      cleanup();
+    };
+
+    try {
+      if (pointerId !== null) pointerTarget?.setPointerCapture?.(pointerId);
+    } catch {}
+
+    onMove(e);
+
+    try { document.body.style.cursor = "col-resize"; } catch {}
+    try { document.body.style.userSelect = "none"; } catch {}
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }, [railWidth, railWidthLocked]);
+
+  const onRailBottomSplitterPointerDown = useCallback((e) => {
+    if (railBottomLocked) return;
+    if (e?.target?.closest?.("[data-utt-rail-bottom-lock]")) return;
+    const btn = typeof e?.button === "number" ? e.button : 0;
+    if (btn !== 0) return;
+    const shell = railShellRef.current;
+    if (!shell) return;
+    if (!visible?.orderTicket) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const showOrderBook = !!visible?.orderBook;
+    const splitBarPx = showOrderBook ? 24 : 0;
+    const tailSplitterPx = 24;
+    const minBottomTilePx = 220;
+
+    const calcVisibleBottomMin = () => {
+      const rect = shell.getBoundingClientRect();
+      const laneHeightNow = Math.max(480, shell.clientHeight || rect.height || 0);
+      const laneBodyVisiblePx = Math.max(460, laneHeightNow - splitBarPx - tailSplitterPx);
+
+      if (!showOrderBook) return Math.max(minBottomTilePx, laneBodyVisiblePx);
+
+      const rawTop = Number.isFinite(Number(railTopPxStored)) ? Number(railTopPxStored) : laneBodyVisiblePx * railSplit;
+      const topNow = Math.max(80, Math.min(laneBodyVisiblePx - 16, Math.round(rawTop)));
+      return Math.max(minBottomTilePx, laneBodyVisiblePx - topNow);
+    };
+
+    const startY = e.clientY;
+    const startHeight = Math.max(calcVisibleBottomMin(), Number(railBottomPxStored) || 0);
+    const pointerId = typeof e?.pointerId === "number" ? e.pointerId : null;
+    const pointerTarget = e?.currentTarget || null;
+
+    const onMove = (ev) => {
+      if (pointerId !== null && ev?.pointerId !== pointerId) return;
+      const dy = ev.clientY - startY;
+      const minNow = calcVisibleBottomMin();
+      const next = Math.max(minNow, Math.min(3200, Math.round(startHeight + dy)));
+      setRailBottomPxStored(next);
+    };
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      try {
+        if (pointerId !== null) pointerTarget?.releasePointerCapture?.(pointerId);
+      } catch {}
+      try { document.body.style.cursor = ""; } catch {}
+      try { document.body.style.userSelect = ""; } catch {}
+    };
+
+    const onUp = (ev) => {
+      if (pointerId !== null && ev?.pointerId !== pointerId) return;
+      cleanup();
+    };
+
+    try {
+      if (pointerId !== null) pointerTarget?.setPointerCapture?.(pointerId);
+    } catch {}
+
+    onMove(e);
+
+    try { document.body.style.cursor = "row-resize"; } catch {}
+    try { document.body.style.userSelect = "none"; } catch {}
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }, [visible, railTopPxStored, railSplit, railBottomPxStored, railBottomLocked]);
+
+  const workspaceStyles = useMemo(() => {
+    const showOrderBook = !!visible?.orderBook;
+    const showOrderTicket = !!visible?.orderTicket;
+    const showRail = !!(showOrderBook || showOrderTicket);
+    const showSplitRail = showOrderBook && showOrderTicket;
+    const showMain = !!(visible?.chart || visible?.tables);
+    const railInset = 0;
+    const laneWidth = Math.max(460, Number(railWidth) || 0);
+    const railGap = 0;
+    const railWidthHandleGutter = 18;
+    const laneHeight = Number.isFinite(workspaceViewportHeight) && Number.isFinite(workspaceViewportTop)
+      ? Math.max(480, workspaceViewportHeight + workspaceViewportTop - railInset)
+      : (Number.isFinite(workspaceViewportHeight) ? workspaceViewportHeight : 700);
+    const splitterHeight = showSplitRail ? 24 : 0;
+    const bottomSplitterHeight = showOrderTicket ? 24 : 0;
+    const laneBodyVisibleHeight = Math.max(460, laneHeight - splitterHeight - bottomSplitterHeight);
+    const railTopMinPx = 80;
+    const railBottomVisibleMinPx = 220;
+    const topPx = showSplitRail
+      ? Math.max(
+          railTopMinPx,
+          Math.min(
+            laneBodyVisibleHeight - railBottomVisibleMinPx,
+            Math.round(Number.isFinite(Number(railTopPxStored)) ? Number(railTopPxStored) : laneBodyVisibleHeight * railSplit)
+          )
+        )
+      : showOrderBook
+        ? laneBodyVisibleHeight
+        : 0;
+    const bottomVisiblePx = showOrderTicket
+      ? showSplitRail
+        ? Math.max(railBottomVisibleMinPx, laneBodyVisibleHeight - topPx)
+        : laneBodyVisibleHeight
+      : 0;
+    const bottomTilePx = showOrderTicket
+      ? Math.max(bottomVisiblePx, Number.isFinite(Number(railBottomPxStored)) ? Number(railBottomPxStored) : bottomVisiblePx)
+      : 0;
+
+    return {
+      outer: {
+        ...workspaceShellStyles.outer,
+        flex: "1 1 auto",
+        minHeight: 0,
+        height: workspaceViewportHeight ? `${workspaceViewportHeight}px` : "auto",
+        overflow: "hidden",
+      },
+      inner: {
+        ...workspaceShellStyles.inner,
+        width: "100%",
+        maxWidth: "none",
+        margin: 0,
+        gridTemplateColumns: "minmax(0, 1fr)",
+        height: "100%",
+        minHeight: 0,
+        alignItems: "stretch",
+      },
+      main: {
+        ...workspaceShellStyles.main,
+        display: showMain ? "grid" : "none",
+        width: "100%",
+        maxWidth: "100%",
+        justifySelf: "start",
+        minHeight: 0,
+        position: "relative",
+        overflowY: "scroll",
+        overflowX: "hidden",
+        overscrollBehavior: "contain",
+        overflowAnchor: "none",
+        paddingRight: showRail && showMain ? `${laneWidth + 12}px` : 0,
+        boxSizing: "border-box",
+        alignContent: "start",
+        gridAutoRows: "max-content",
+        scrollbarWidth: "none",
+        msOverflowStyle: "none",
+        zIndex: 1,
+      },
+      rail: {
+        ...workspaceShellStyles.rail,
+        width: laneWidth,
+        minWidth: laneWidth,
+        maxWidth: laneWidth,
+        position: "fixed",
+        right: railInset,
+        top: railInset,
+        height:
+          Number.isFinite(workspaceViewportHeight) && Number.isFinite(workspaceViewportTop)
+            ? `${Math.max(320, workspaceViewportHeight + workspaceViewportTop - railInset)}px`
+            : `calc(100vh - ${railInset * 2}px)`,
+        maxHeight:
+          Number.isFinite(workspaceViewportHeight) && Number.isFinite(workspaceViewportTop)
+            ? `${Math.max(320, workspaceViewportHeight + workspaceViewportTop - railInset)}px`
+            : `calc(100vh - ${railInset * 2}px)`,
+        minHeight: 0,
+        display: showRail ? "flex" : "none",
+        flexDirection: "column",
+        justifyContent: "flex-start",
+        alignItems: "stretch",
+        overflow: "hidden",
+        boxSizing: "border-box",
+        paddingRight: 0,
+        paddingLeft: railWidthHandleGutter,
+        zIndex: 80,
+      },
+      railViewport: {
+        flex: "1 1 auto",
+        width: "100%",
+        height: "100%",
+        minHeight: 0,
+        maxHeight: "100%",
+        overflowY: "scroll",
+        overflowX: "hidden",
+        boxSizing: "border-box",
+        paddingTop: 0,
+        paddingRight: 0,
+        paddingLeft: 0,
+        marginTop: 0,
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "flex-start",
+        alignItems: "stretch",
+        scrollbarWidth: "thin",
+        alignSelf: "stretch",
+        overscrollBehavior: "contain",
+        overflowAnchor: "none",
+      },
+      railContent: {
+        minHeight: "100%",
+        height: showOrderTicket ? "auto" : "100%",
+        width: "100%",
+        maxWidth: "100%",
+        display: "grid",
+        gridTemplateRows: showOrderBook && showOrderTicket
+          ? `${topPx}px ${splitterHeight}px ${bottomTilePx}px ${bottomSplitterHeight}px`
+          : showOrderTicket
+            ? `${bottomTilePx}px ${bottomSplitterHeight}px`
+            : "minmax(0, 1fr)",
+        justifyContent: "stretch",
+        alignContent: "start",
+        gap: 0,
+        marginTop: 0,
+        marginLeft: 0,
+        paddingTop: 0,
+        paddingLeft: 0,
+        paddingRight: 0,
+        paddingBottom: 0,
+        flex: "1 1 auto",
+        boxSizing: "border-box",
+        alignItems: "stretch",
+        overflow: "visible",
+        minWidth: 0,
+      },
+      orderBookPanel: {
+        ...workspaceShellStyles.panel,
+        minHeight: 0,
+        height: "100%",
+        width: "100%",
+        maxWidth: "100%",
+        overflow: "hidden",
+        display: visible.orderBook ? "flex" : "none",
+        flexDirection: "column",
+      },
+      railSplitter: {
+        display: showSplitRail ? "flex" : "none",
+        flex: "0 0 24px",
+        height: 24,
+        minHeight: 24,
+        position: "relative",
+        zIndex: 45,
+        pointerEvents: "auto",
+        background: "transparent",
+        borderTop: "none",
+        borderBottom: "none",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: railSplitLocked ? "default" : "row-resize",
+        userSelect: "none",
+        touchAction: railSplitLocked ? "auto" : "none",
+      },
+      railSplitterLine: {
+        width: 220,
+        height: 10,
+        borderRadius: 999,
+        background: "rgba(255,255,255,0.34)",
+        boxShadow: "0 0 0 1px rgba(255,255,255,0.10)",
+        pointerEvents: "none",
+      },
+      railSplitterLockButton: {
+        position: "absolute",
+        right: 8,
+        top: "50%",
+        transform: "translateY(-50%)",
+        zIndex: 65,
+        padding: "1px 8px",
+        borderRadius: 999,
+        border: "1px solid rgba(255,255,255,0.14)",
+        background: railSplitLocked ? "rgba(255,160,0,0.18)" : "rgba(255,255,255,0.08)",
+        color: "var(--utt-page-fg, #eee)",
+        fontSize: 11,
+        fontWeight: 700,
+        cursor: "pointer",
+        userSelect: "none",
+      },
+      railResizeHandle: {
+        position: "absolute",
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: railWidthHandleGutter,
+        cursor: railWidthLocked ? "default" : "col-resize",
+        zIndex: 60,
+        pointerEvents: "auto",
+        touchAction: railWidthLocked ? "auto" : "none",
+        background: railWidthLocked ? "linear-gradient(90deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 55%, rgba(255,255,255,0.00) 100%)" : "linear-gradient(90deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.04) 55%, rgba(255,255,255,0.00) 100%)",
+        borderRight: "1px solid rgba(255,255,255,0.10)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      },
+      railResizeHandleGrip: {
+        width: 5,
+        height: 88,
+        borderRadius: 999,
+        background: "rgba(255,255,255,0.30)",
+        boxShadow: "0 0 0 1px rgba(255,255,255,0.08)",
+        pointerEvents: "none",
+      },
+      railWidthLockButton: {
+        position: "absolute",
+        top: 3,
+        left: 0,
+        zIndex: 75,
+        width: 18,
+        height: 18,
+        padding: 0,
+        borderRadius: 6,
+        border: "1px solid rgba(255,255,255,0.14)",
+        background: railWidthLocked ? "rgba(255,160,0,0.18)" : "rgba(255,255,255,0.08)",
+        color: "var(--utt-page-fg, #eee)",
+        fontSize: 11,
+        fontWeight: 800,
+        cursor: "pointer",
+        userSelect: "none",
+      },
+      orderTicketPanel: {
+        ...workspaceShellStyles.panel,
+        minHeight: 0,
+        height: "100%",
+        width: "100%",
+        maxWidth: "100%",
+        overflow: "hidden",
+        display: visible.orderTicket ? "flex" : "none",
+        flexDirection: "column",
+      },
+      railBottomSplitter: {
+        display: showOrderTicket ? "flex" : "none",
+        flex: "0 0 24px",
+        height: 24,
+        minHeight: 24,
+        position: "relative",
+        zIndex: 45,
+        pointerEvents: "auto",
+        background: "transparent",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: railBottomLocked ? "default" : "row-resize",
+        userSelect: "none",
+        touchAction: railBottomLocked ? "auto" : "none",
+      },
+      railBottomSplitterLine: {
+        width: 220,
+        height: 10,
+        borderRadius: 999,
+        background: "rgba(255,255,255,0.24)",
+        boxShadow: "0 0 0 1px rgba(255,255,255,0.08)",
+        pointerEvents: "none",
+      },
+      railBottomLockButton: {
+        position: "absolute",
+        right: 8,
+        top: "50%",
+        transform: "translateY(-50%)",
+        zIndex: 65,
+        padding: "1px 8px",
+        borderRadius: 999,
+        border: "1px solid rgba(255,255,255,0.14)",
+        background: railBottomLocked ? "rgba(255,160,0,0.18)" : "rgba(255,255,255,0.08)",
+        color: "var(--utt-page-fg, #eee)",
+        fontSize: 11,
+        fontWeight: 700,
+        cursor: "pointer",
+        userSelect: "none",
+      },
+      railTile: {
+        minHeight: 0,
+        height: "100%",
+        width: "100%",
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+        position: "relative",
+        isolation: "auto",
+        border: "1px solid rgba(255,255,255,0.16)",
+        borderRadius: 12,
+        background: "linear-gradient(180deg, rgba(18,18,18,0.96) 0%, rgba(10,10,10,0.98) 100%)",
+        boxShadow: "0 10px 24px rgba(0,0,0,0.28)",
+        outline: "1px solid rgba(255,255,255,0.05)",
+        outlineOffset: "-1px",
+      },
+      railTileBody: {
+        minHeight: 0,
+        flex: "1 1 auto",
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+        padding: 0,
+        position: "relative",
+        isolation: "auto",
+      },
+      panel: {
+        ...workspaceShellStyles.panel,
+        minHeight: 0,
+        width: "100%",
+        maxWidth: "100%",
+        justifySelf: "start",
+        overflow: "visible",
+      },
+    };
+  }, [visible, workspaceViewportHeight, workspaceViewportTop, railSplit, railWidth, railTopPxStored, railBottomPxStored, railWidthLocked, railSplitLocked, railBottomLocked]);
+
 
   const [armStatus, setArmStatus] = useState({ dry_run: null, armed: null });
   const [loadingArm, setLoadingArm] = useState(false);
@@ -2297,6 +3177,72 @@ export default function App() {
     }
   }
 
+  async function signAndSendSolanaTransactionB64(transactionB64) {
+    const { VersionedTransaction } = await import("@solana/web3.js");
+    const bytes = Uint8Array.from(atob(String(transactionB64 || "")), (c) => c.charCodeAt(0));
+    const tx = VersionedTransaction.deserialize(bytes);
+    const w = typeof window !== "undefined" ? window : null;
+    const provider = w?.solflare || w?.solana;
+    if (!provider) throw new Error("No Solana wallet provider found (Solflare).");
+    if (typeof provider.connect === "function" && !provider.publicKey) {
+      try { await provider.connect(); } catch {}
+    }
+    if (typeof provider.signAndSendTransaction !== "function") {
+      throw new Error("Wallet provider missing signAndSendTransaction.");
+    }
+    const res = await provider.signAndSendTransaction(tx);
+    const signature = res?.signature || res?.sig || res;
+    if (!signature) throw new Error("Missing signature from wallet response");
+    return String(signature);
+  }
+
+  async function doManualJupiterCancel(orderId, opts = {}) {
+    const order = String(orderId || "").trim();
+    if (!order) throw new Error("Missing Jupiter order id.");
+    const w = typeof window !== "undefined" ? window : null;
+    const provider = w?.solflare || w?.solana;
+    if (!provider) throw new Error("No Solana wallet provider found (Solflare).");
+    if (typeof provider.connect === "function" && !provider.publicKey) {
+      try { await provider.connect(); } catch {}
+    }
+    const user_pubkey = provider?.publicKey?.toBase58?.() || provider?.publicKey?.toString?.() || "";
+    if (!user_pubkey) throw new Error("Connect a Solana wallet first.");
+
+    const headers = { "Content-Type": "application/json" };
+    const tok = localStorage.getItem("utt_auth_token") || sessionStorage.getItem("utt_auth_token") || "";
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+
+    const base = String(API_BASE || "").replace(/\/+$/, "");
+    const resp = await fetch(`${base}/api/solana_dex/jupiter/trigger/cancel_order`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ order, user_pubkey }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(txt || `HTTP ${resp.status}`);
+    }
+    const j = await resp.json();
+    const sig = await signAndSendSolanaTransactionB64(j?.transaction);
+
+    if (opts?.markCanceled !== false) {
+      try {
+        await fetch(`${base}/api/solana_dex/jupiter/trigger/mark_canceled`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ order, signature: sig || "" }),
+        });
+      } catch {}
+    }
+
+    await Promise.allSettled([
+      doLoadAllOrders(),
+      doLoadOrders(),
+      doRefreshBalances?.(),
+    ]);
+    return sig;
+  }
+
   async function doCancelUnifiedOrder(payload) {
     const cancel_ref = String(payload?.cancel_ref || payload?.cancelRef || payload?.row?.cancel_ref || payload?.row?.cancelRef || "").trim();
 
@@ -2307,7 +3253,12 @@ export default function App() {
 
     try {
       setError(null);
-      await cancelOrderByRef(cancel_ref);
+      if (cancel_ref.toLowerCase().startsWith("solana_jupiter:")) {
+        const orderId = cancel_ref.split(":").slice(1).join(":").trim();
+        await doManualJupiterCancel(orderId, { markCanceled: true });
+      } else {
+        await cancelOrderByRef(cancel_ref);
+      }
     } catch (e) {
       const msg = e?.response?.data?.detail || e?.message || "Unknown error canceling unified order";
       setError(String(msg));
@@ -2331,6 +3282,10 @@ export default function App() {
   const [aoPageSize, setAoPageSize] = useState(50);
 
   const [hideCancelledUnified, setHideCancelledUnified] = useState(() => readBoolLS(LS_HIDE_CANCELLED_UNIFIED, false));
+  const [showManualCancelModal, setShowManualCancelModal] = useState(false);
+  const [manualCancelVenue, setManualCancelVenue] = useState("solana_jupiter");
+  const [manualCancelOrderId, setManualCancelOrderId] = useState("");
+  const [manualCancelBusy, setManualCancelBusy] = useState(false);
   useEffect(() => {
     localStorage.setItem(LS_HIDE_CANCELLED_UNIFIED, JSON.stringify(!!hideCancelledUnified));
   }, [hideCancelledUnified]);
@@ -2525,13 +3480,6 @@ export default function App() {
       setError(null);
 
       const scopeNorm = normalizeScope(aoScope);
-
-      // LOCAL scope does not require venue refresh.
-      if (scopeNorm === "LOCAL") {
-        await doLoadAllOrders();
-        return;
-      }
-
       const force = !!opts?.force;
 
       // Prefer caller-provided venue; fallback to UI aoVenue only if caller didn't provide one.
@@ -2545,6 +3493,28 @@ export default function App() {
 
       // If a specific venue was requested and is valid, refresh only that one. Otherwise refresh all candidates.
       const venuesToRefresh = wantsAllVenues ? refreshCandidates : refreshCandidates.includes(v) ? [v] : refreshCandidates;
+
+      // Solana DEX (two-stage): always run on All Orders Sync+Load before loading all_orders.
+      // Do not gate this on venuesToRefresh; manual console tests already proved the backend path works,
+      // and runtime venue filtering was causing the UI path to skip discovery/materialization entirely.
+      try {
+        await fetch(
+          `${API_BASE}/api/wallet_addresses/solana/tx/ingest?limit_per_address=200&write_ledger=false`,
+          { method: "POST" }
+        );
+        await fetch(
+          `${API_BASE}/api/wallet_addresses/solana/ingest_swap_orders?max_rows=10000&venue=solana_jupiter`,
+          { method: "POST" }
+        );
+      } catch (e) {
+        console.warn("Solana two-stage ingest failed:", e);
+      }
+
+      // LOCAL scope does not require venue refresh.
+      if (scopeNorm === "LOCAL") {
+        await doLoadAllOrders();
+        return;
+      }
 
       const now = Date.now();
       const errors = [];
@@ -3014,7 +3984,17 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     }
   }
 
-  function setActiveMarket(symbolCanon, venueCandidate, { applyToTab = true, setInput = true, setVenueIfValid = false } = {}) {
+  function setActiveMarket(
+    symbolCanon,
+    venueCandidate,
+    {
+      applyToTab = true,
+      setInput = true,
+      setVenueIfValid = false,
+      suppressAllOrdersReloadOnce = false,
+      forceAllOrdersSymbol = false,
+    } = {}
+  ) {
     const sym = normalizeSymbolCanon(symbolCanon);
 
     if (!sym) {
@@ -3029,11 +4009,13 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     const v = String(venueCandidate || "").trim().toLowerCase();
     const vOk = v && supportedVenues.includes(v);
 
+    if (suppressAllOrdersReloadOnce) suppressAllOrdersReloadOnceRef.current = true;
+
     if (setVenueIfValid && vOk) {
       if (String(venue || "").trim().toLowerCase() !== v) setVenue(v);
     }
 
-    if (applyToTab && applyMarketToTab) {
+    if ((applyToTab && applyMarketToTab) || (forceAllOrdersSymbol && tab === "allOrders")) {
       if (tab === "localOrders") setLocalSymbolFilter(sym);
       else if (tab === "allOrders") {
         setAoSymbol(sym);
@@ -3060,6 +4042,8 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
       applyToTab,
       ...rawOpts,
       setVenueIfValid: rawOpts?.setVenueIfValid ?? hasVenue,
+      suppressAllOrdersReloadOnce: !!rawOpts?.suppressAllOrdersReloadOnce,
+      forceAllOrdersSymbol: !!rawOpts?.forceAllOrdersSymbol,
     };
 
     setActiveMarket(sym, v, opts);
@@ -3075,11 +4059,21 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     clearTabMarketFilter(targetTab);
   }
 
-  function applyMarketSymbol() {
-    const sym = (marketInput || "").trim().toUpperCase();
+  function applyMarketSymbol(symbolOverride) {
+    const explicit =
+      typeof symbolOverride === "string"
+        ? symbolOverride.trim().toUpperCase()
+        : "";
+    const sym = explicit || (marketInput || "").trim().toUpperCase();
     if (!sym) return;
 
-    setActiveMarket(sym, venue, { applyToTab: !!applyMarketToTab });
+    // If an explicit symbol is supplied (e.g. BUY UTTT), commit it into parent state first
+    // so the controlled Market input and downstream widgets converge on the same value.
+    if (explicit && explicit !== String(marketInput || "").trim().toUpperCase()) {
+      setMarketInput(explicit);
+    }
+
+    setActiveMarket(sym, venue, { applyToTab: !!applyMarketToTab, setInput: true });
 
     // Update URL (unless we are currently applying state from the URL itself)
     if (!routeSyncRef.current) {
@@ -3117,7 +4111,13 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
   useEffect(() => {
     if (tab === "balances") doRefreshBalancesSafe();
     if (tab === "localOrders") doLoadOrders();
-    if (tab === "allOrders") doLoadAllOrders();
+    if (tab === "allOrders") {
+      if (suppressAllOrdersReloadOnceRef.current) {
+        suppressAllOrdersReloadOnceRef.current = false;
+      } else {
+        doLoadAllOrders();
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [venue]);
 
@@ -3243,8 +4243,64 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
 
   return (
     <AppErrorBoundary>
+      <style>{`
+        html, body, #root {
+          height: 100%;
+          min-height: 100%;
+          overflow: hidden;
+        }
+        .utt-main-scroll {
+          scrollbar-width: none;
+          -ms-overflow-style: none;
+        }
+        .utt-main-scroll::-webkit-scrollbar {
+          width: 0 !important;
+          height: 0 !important;
+          display: none !important;
+        }
+        .utt-rail-scroll {
+          scrollbar-gutter: stable;
+          scrollbar-width: thin;
+          scrollbar-color: rgba(255,255,255,0.42) rgba(255,255,255,0.10);
+        }
+        .utt-rail-scroll::-webkit-scrollbar {
+          width: 16px;
+        }
+        .utt-rail-scroll::-webkit-scrollbar-thumb {
+          background: rgba(255,255,255,0.40);
+          border-radius: 10px;
+          border: 3px solid rgba(0,0,0,0);
+          background-clip: padding-box;
+        }
+        .utt-rail-scroll::-webkit-scrollbar-track {
+          background: rgba(255,255,255,0.10);
+          border-left: 1px solid rgba(255,255,255,0.10);
+        }
+        .utt-rail-tile {
+          position: relative;
+          isolation: isolate;
+        }
+        .utt-rail-widget-mount {
+          min-height: 0;
+          flex: 1 1 auto;
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
+          position: relative;
+          isolation: isolate;
+        }
+        .utt-rail-widget-mount > *,
+        .utt-rail-widget-mount > * > * {
+          flex: 1 1 auto;
+          min-height: 0 !important;
+          max-height: 100% !important;
+          height: 100% !important;
+          width: 100%;
+          overflow: hidden !important;
+        }
+      `}</style>
       <div ref={appContainerRef} style={styles.page}>
-      <div style={styles.container}>
+      <div ref={headerShellRef} style={{ ...styles.container, flex: "0 0 auto" }}>
         <div style={styles.appRow}>
           <AppHeader
             headerRef={headerRef}
@@ -3303,172 +4359,323 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
         </div>
       </div>
 
-      {visible.chart && (
-        <TradingViewChartWidget
-          styles={styles}
-          appContainerRef={appContainerRef}
-          headerRef={headerRef}
-          venue={effectiveChartVenue}
-          symbolCanon={obSymbol}
-          interval="15"
-          hideVenueNames={hideVenueNames}
-          visible={visible}
-          setVisible={setVisible}
-        />
-      )}
+      <div ref={workspaceViewportRef} style={workspaceStyles.outer}>
+        <div style={workspaceStyles.inner}>
+          <div ref={mainViewportRef} className="utt-main-scroll" style={workspaceStyles.main}>
+            <div
+              ref={tablesLockBoundsRef}
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                right: (visible?.orderBook || visible?.orderTicket) ? `${Math.max(460, Number(railWidth) || 0) + 12}px` : 0,
+                height: Math.max(
+                  1400,
+                  Number(workspaceViewportHeight) || 0,
+                  (Number(tablesPaneReservedHeight) || 0) + 900
+                ),
+                pointerEvents: "none",
+                opacity: 0,
+                zIndex: 0,
+              }}
+            />
+            {visible.chart && (
+              <div style={workspaceStyles.panel}>
+                <TradingViewChartWidget
+                  styles={styles}
+                  appContainerRef={appContainerRef}
+                  headerRef={headerRef}
+                  venue={effectiveChartVenue}
+                  symbolCanon={obSymbol}
+                  interval="15"
+                  hideVenueNames={hideVenueNames}
+                  visible={visible}
+                  setVisible={setVisible}
+                />
+              </div>
+            )}
 
-      {visible.tables && (
-        <TerminalTablesWidget
-          styles={styles}
-          appContainerRef={appContainerRef}
-          headerRef={headerRef}
-          showChart={!!visible.chart}
-		  apiBase={API_BASE}
-          hideTableDataGlobal={hideTableDataGlobal}
-          hideVenueNames={hideVenueNames}
-          mask={mask}
-          maskMaybe={maskMaybe}
-          venue={venue}
-          ALL_VENUES_VALUE={ALL_VENUES_VALUE}
-          tab={tab}
-          setTab={setTab}
-          balancesSorted={balancesSorted}
-          balancesColSpan={balancesColSpan}
-          loadingBalances={loadingBalances}
-          doRefreshBalances={doRefreshBalances}
-          hideBalancesView={hideBalancesView}
-          setHideBalancesView={setHideBalancesView}
-          hideZeroBalances={hideZeroBalances}
-          setHideZeroBalances={setHideZeroBalances}
-          toggleBalanceSort={toggleBalanceSort}
-          balSortKey={balSortKey}
-          balSortDir={balSortDir}
-          portfolioTotalUsd={portfolioTotalUsd}
-          fmtUsd={fmtUsd}
-          fmtPxUsd={fmtPxUsd}
-          orders={localOrdersVisible}
-          loadingOrders={loadingOrders}
-          doLoadOrders={doLoadOrders}
-          doCancelOrder={doCancelOrder}
-          doCancelUnifiedOrder={doCancelUnifiedOrder}
-          statusFilter={statusFilter}
-          setStatusFilter={setStatusFilter}
-          localSymbolFilter={localSymbolFilter}
-          setLocalSymbolFilter={setLocalSymbolFilter}
-          hideCancelledLocal={hideCancelledLocal}
-          setHideCancelledLocal={setHideCancelledLocal}
-          statusIsCanceledLocal={statusIsCanceledLocal}
-          isCancelableStatus={isCancelableStatus}
-          allOrders={allOrdersVisible}
-          allTotal={allTotal}
-          loadingAll={loadingAll}
-          doLoadAllOrders={doLoadAllOrders}
-          doSyncAndLoadAllOrders={doSyncAndLoadAllOrders}
-          aoSource={aoScope}
-          setAoSource={setAoScope}
-          aoVenue={aoVenue}
-          setAoVenue={setAoVenue}
-          aoStatusBucket={aoStatusBucket}
-          setAoStatusBucket={setAoStatusBucket}
-          aoSymbol={aoSymbol}
-          setAoSymbol={setAoSymbol}
-          aoSortField={aoSortField}
-          aoSortDir={aoSortDir}
-          aoSort={aoSort}
-          toggleAllSort={toggleAllSort}
-          aoPage={aoPage}
-          setAoPage={setAoPage}
-          aoPageSize={aoPageSize}
-          setAoPageSize={setAoPageSize}
-          aoTotalPages={aoTotalPages}
-          hideCancelledUnified={hideCancelledUnified}
-          setHideCancelledUnified={setHideCancelledUnified}
-          setViewedConfirmed={setViewedConfirmed}
-          fmtTime={fmtTime}
-          fmtEco={fmtEco}
-          calcGrossTotal={calcGrossTotal}
-          calcFee={calcFee}
-          calcNetTotal={calcNetTotal}
-          isTerminalStatus={isTerminalStatus}
-          isTerminalBucket={isTerminalBucket}
-          SortHeader={SortHeader}
-          btn={btn}
-          isCanceledStatus={isCanceledStatus}
-          discVenue={discVenue}
-          setDiscVenue={setDiscVenue}
-          discEps={discEps}
-          setDiscEps={setDiscEps}
-          discNew={discNew}
-          discUnheld={discUnheld}
-          discMeta={discMeta}
-          loadingDiscover={loadingDiscover}
-          doLoadDiscover={doLoadDiscover}
-          applySymbolFromDiscover={applySymbolFromDiscover}
-          supportedVenues={supportedVenues}
-          isDiscoverySymbolViewed={isDiscoverySymbolViewed}
-          setDiscoverySymbolViewed={setDiscoverySymbolViewed}
-          toggleDiscoverySymbolViewed={toggleDiscoverySymbolViewed}
-          onPickMarket={handlePickMarket}
-          onClearMarketFilter={handleClearMarketFilter}
-          getVenueMarkets={getVenueMarkets}
-          tradingVenues={tradingVenuesList}
-          orderbookVenues={orderbookVenuesList}
-          balancesVenues={balancesVenuesList}
-        />
-      )}
+            {visible.tables && (
+              <div
+                ref={tablesPaneRef}
+                style={{
+                  ...workspaceStyles.panel,
+                  position: "relative",
+                  overflow: "visible",
+                  overflowAnchor: "none",
+                  width: "100%",
+                  maxWidth: "100%",
+                  minWidth: 0,
+                  justifySelf: "stretch",
+                  alignSelf: "stretch",
+                  minHeight: Math.max(380, Number(tablesPaneReservedHeight) || 0),
+                  display: "block",
+                  boxSizing: "border-box",
+                }}
+                onPointerDownCapture={(e) => {
+                  if (isTablesLockInteractionTarget(e.target)) armTablesLockScrollGuard();
+                }}
+                onMouseDownCapture={(e) => {
+                  if (isTablesLockInteractionTarget(e.target)) armTablesLockScrollGuard();
+                }}
+                onChangeCapture={(e) => {
+                  if (isTablesLockInteractionTarget(e.target)) armTablesLockScrollGuard();
+                }}
+                onClickCapture={(e) => {
+                  if (isTablesLockInteractionTarget(e.target)) armTablesLockScrollGuard();
+                }}
+              >
+                <TerminalTablesWidget
+                  key="terminal-tables-main-pane-v24-local-pane-lock-fix"
+                  styles={styles}
+                  appContainerRef={tablesPaneRef}
+                  headerRef={headerRef}
+                  showChart={!!visible.chart}
+                  apiBase={API_BASE}
+                  hideTableDataGlobal={hideTableDataGlobal}
+                  hideVenueNames={hideVenueNames}
+                  mask={mask}
+                  maskMaybe={maskMaybe}
+                  venue={venue}
+                  ALL_VENUES_VALUE={ALL_VENUES_VALUE}
+                  tab={tab}
+                  setTab={setTab}
+                  balancesSorted={balancesSorted}
+                  balancesColSpan={balancesColSpan}
+                  loadingBalances={loadingBalances}
+                  doRefreshBalances={doRefreshBalances}
+                  hideBalancesView={hideBalancesView}
+                  setHideBalancesView={setHideBalancesView}
+                  hideZeroBalances={hideZeroBalances}
+                  setHideZeroBalances={setHideZeroBalances}
+                  toggleBalanceSort={toggleBalanceSort}
+                  balSortKey={balSortKey}
+                  balSortDir={balSortDir}
+                  portfolioTotalUsd={portfolioTotalUsd}
+                  fmtUsd={fmtUsd}
+                  fmtPxUsd={fmtPxUsd}
+                  orders={localOrdersVisible}
+                  loadingOrders={loadingOrders}
+                  doLoadOrders={doLoadOrders}
+                  doCancelOrder={doCancelOrder}
+                  doCancelUnifiedOrder={doCancelUnifiedOrder}
+                  showManualCancelModal={showManualCancelModal}
+                  setShowManualCancelModal={setShowManualCancelModal}
+                  manualCancelVenue={manualCancelVenue}
+                  setManualCancelVenue={setManualCancelVenue}
+                  manualCancelOrderId={manualCancelOrderId}
+                  setManualCancelOrderId={setManualCancelOrderId}
+                  manualCancelBusy={manualCancelBusy}
+                  doManualJupiterCancel={doManualJupiterCancel}
+                  onManualCancelError={setError}
+                  statusFilter={statusFilter}
+                  setStatusFilter={setStatusFilter}
+                  localSymbolFilter={localSymbolFilter}
+                  setLocalSymbolFilter={setLocalSymbolFilter}
+                  hideCancelledLocal={hideCancelledLocal}
+                  setHideCancelledLocal={setHideCancelledLocal}
+                  statusIsCanceledLocal={statusIsCanceledLocal}
+                  isCancelableStatus={isCancelableStatus}
+                  allOrders={allOrdersVisible}
+                  allTotal={allTotal}
+                  loadingAll={loadingAll}
+                  doLoadAllOrders={doLoadAllOrders}
+                  doSyncAndLoadAllOrders={doSyncAndLoadAllOrders}
+                  aoSource={aoScope}
+                  setAoSource={setAoScope}
+                  aoVenue={aoVenue}
+                  setAoVenue={setAoVenue}
+                  aoStatusBucket={aoStatusBucket}
+                  setAoStatusBucket={setAoStatusBucket}
+                  aoSymbol={aoSymbol}
+                  setAoSymbol={setAoSymbol}
+                  aoSortField={aoSortField}
+                  aoSortDir={aoSortDir}
+                  aoSort={aoSort}
+                  toggleAllSort={toggleAllSort}
+                  aoPage={aoPage}
+                  setAoPage={setAoPage}
+                  aoPageSize={aoPageSize}
+                  setAoPageSize={setAoPageSize}
+                  aoTotalPages={aoTotalPages}
+                  hideCancelledUnified={hideCancelledUnified}
+                  setHideCancelledUnified={setHideCancelledUnified}
+                  setViewedConfirmed={setViewedConfirmed}
+                  fmtTime={fmtTime}
+                  fmtEco={fmtEco}
+                  calcGrossTotal={calcGrossTotal}
+                  calcFee={calcFee}
+                  calcNetTotal={calcNetTotal}
+                  isTerminalStatus={isTerminalStatus}
+                  isTerminalBucket={isTerminalBucket}
+                  SortHeader={SortHeader}
+                  btn={btn}
+                  isCanceledStatus={isCanceledStatus}
+                  discVenue={discVenue}
+                  setDiscVenue={setDiscVenue}
+                  discEps={discEps}
+                  setDiscEps={setDiscEps}
+                  discNew={discNew}
+                  discUnheld={discUnheld}
+                  discMeta={discMeta}
+                  loadingDiscover={loadingDiscover}
+                  doLoadDiscover={doLoadDiscover}
+                  applySymbolFromDiscover={applySymbolFromDiscover}
+                  supportedVenues={supportedVenues}
+                  isDiscoverySymbolViewed={isDiscoverySymbolViewed}
+                  setDiscoverySymbolViewed={setDiscoverySymbolViewed}
+                  toggleDiscoverySymbolViewed={toggleDiscoverySymbolViewed}
+                  onPickMarket={handlePickMarket}
+                  onClearMarketFilter={handleClearMarketFilter}
+                  getVenueMarkets={getVenueMarkets}
+                  tradingVenues={tradingVenuesList}
+                  orderbookVenues={orderbookVenuesList}
+                  balancesVenues={balancesVenuesList}
+                />
+              </div>
+            )}
+          </div>
 
-      {visible.orderBook &&
-        (canShowOrderBook ? (
-          <OrderBookWidget
-            apiBase={API_BASE}
-            effectiveVenue={effectiveObVenue}
-            fmtNum={fmtNum}
-            styles={styles}
-            obSymbol={obSymbol}
-            setObSymbol={setObSymbol}
-            obDepth={obDepth}
-            setObDepth={setObDepth}
-            appContainerRef={appContainerRef}
-            hideVenueNames={hideVenueNames}
-            onPickPrice={(px) => setOtLimitPrice(String(px))}
-            onPickQty={(q) => setOtQty(String(q))}
-            venues={orderbookVenuesList.length > 0 ? orderbookVenuesList : supportedVenues}
-          />
-        ) : (
-          widgetGatePanel(
-            "Order Book unavailable",
-            isAllMode
-              ? "No enabled venues currently advertise orderbook support in the registry."
-              : `This venue does not support orderbook. Select a venue that supports orderbook, or switch to ALL.`
-          )
-        ))}
+          {!!(visible.orderBook || visible.orderTicket) && (
+            <div ref={railShellRef} style={workspaceStyles.rail}>
+              <div
+                style={workspaceStyles.railResizeHandle}
+                onPointerDown={onRailResizePointerDown}
+                title={railWidthLocked ? "Right-lane width locked" : "Drag to resize right lane width"}
+              >
+                <div style={workspaceStyles.railResizeHandleGrip} />
+              </div>
+              <button
+                type="button"
+                style={workspaceStyles.railWidthLockButton}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => setRailWidthLocked((v) => !v)}
+                title={railWidthLocked ? "Unlock right-lane width" : "Lock right-lane width"}
+              >
+                W
+              </button>
+              <div
+                key={`rail-${visible.orderBook ? "ob" : "_"}-${visible.orderTicket ? "ot" : "_"}-${workspaceViewportHeight || 0}-${railWidth}-${railSplit}` }
+                ref={railViewportRef}
+                className="utt-rail-scroll"
+                style={workspaceStyles.railViewport}
+              >
+                <div style={workspaceStyles.railContent}>
+              {visible.orderBook &&
+                (canShowOrderBook ? (
+                  <div style={workspaceStyles.orderBookPanel}>
+                    <div className="utt-rail-tile" style={workspaceStyles.railTile}>
+                      <div className="utt-rail-widget-mount" style={workspaceStyles.railTileBody}>
+                        <OrderBookWidget
+                          apiBase={API_BASE}
+                          effectiveVenue={effectiveObVenue}
+                          fmtNum={fmtNum}
+                          styles={styles}
+                          obSymbol={obSymbol}
+                          setObSymbol={setObSymbol}
+                          obDepth={obDepth}
+                          setObDepth={setObDepth}
+                          appContainerRef={appContainerRef}
+                          hideVenueNames={hideVenueNames}
+                          onPickPrice={(px) => setOtLimitPrice(String(px))}
+                          onPickQty={(q) => setOtQty(String(q))}
+                          venues={orderbookVenuesList.length > 0 ? orderbookVenuesList : supportedVenues}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={workspaceStyles.panel}>
+                    {widgetGatePanel(
+                      "Order Book unavailable",
+                      isAllMode
+                        ? "No enabled venues currently advertise orderbook support in the registry."
+                        : `This venue does not support orderbook. Select a venue that supports orderbook, or switch to ALL.`
+                    )}
+                  </div>
+                ))}
 
-      {visible.orderTicket &&
-        (canShowOrderTicket ? (
-          <OrderTicketWidget
-            apiBase={API_BASE}
-            effectiveVenue={effectiveTradeVenue}
-            fmtNum={fmtNum}
-            styles={styles}
-            otSymbol={otSymbol}
-            setOtSymbol={setOtSymbol}
-            appContainerRef={appContainerRef}
-            hideVenueNames={hideVenueNames}
-            hideTableData={hideTableDataGlobal}
-            qty={otQty}
-            setQty={setOtQty}
-            limitPrice={otLimitPrice}
-            setLimitPrice={setOtLimitPrice}
-            venues={tradingVenuesList.length > 0 ? tradingVenuesList : supportedVenues}
-          />
-        ) : (
-          widgetGatePanel(
-            "Order Ticket unavailable",
-            isAllMode
-              ? "No enabled venues currently advertise trading support in the registry."
-              : `This venue does not support trading. Select a venue that supports trading, or switch to ALL.`
-          )
-        ))}
+              {visible.orderBook && visible.orderTicket && (
+                <div
+                  style={workspaceStyles.railSplitter}
+                  onPointerDown={onRailSplitterPointerDown}
+                  title={railSplitLocked ? "Right-lane tile split locked" : "Drag to resize right-lane tiles"}
+                >
+                  <div style={workspaceStyles.railSplitterLine} />
+                  <button
+                    type="button"
+                    data-utt-rail-split-lock="1"
+                    style={workspaceStyles.railSplitterLockButton}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={() => setRailSplitLocked((v) => !v)}
+                    title={railSplitLocked ? "Unlock center splitter" : "Lock center splitter"}
+                  >
+                    {railSplitLocked ? "Split: locked" : "Split: unlocked"}
+                  </button>
+                </div>
+              )}
+
+              {visible.orderTicket &&
+                (canShowOrderTicket ? (
+                  <div style={workspaceStyles.orderTicketPanel}>
+                    <div className="utt-rail-tile" style={workspaceStyles.railTile}>
+                      <div className="utt-rail-widget-mount" style={workspaceStyles.railTileBody}>
+                        <OrderTicketWidget
+                          apiBase={API_BASE}
+                          effectiveVenue={effectiveTradeVenue}
+                          fmtNum={fmtNum}
+                          styles={styles}
+                          otSymbol={otSymbol}
+                          setOtSymbol={setOtSymbol}
+                          appContainerRef={appContainerRef}
+                          hideVenueNames={hideVenueNames}
+                          hideTableData={hideTableDataGlobal}
+                          qty={otQty}
+                          setQty={setOtQty}
+                          limitPrice={otLimitPrice}
+                          setLimitPrice={setOtLimitPrice}
+                          venues={tradingVenuesList.length > 0 ? tradingVenuesList : supportedVenues}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={workspaceStyles.panel}>
+                    {widgetGatePanel(
+                      "Order Ticket unavailable",
+                      isAllMode
+                        ? "No enabled venues currently advertise trading support in the registry."
+                        : `This venue does not support trading. Select a venue that supports trading, or switch to ALL.`
+                    )}
+                  </div>
+                ))}
+
+              {visible.orderTicket && (
+                <div
+                  style={workspaceStyles.railBottomSplitter}
+                  onPointerDown={onRailBottomSplitterPointerDown}
+                  title={railBottomLocked ? "Bottom tile height locked" : "Drag to extend the bottom right-lane tile"}
+                >
+                  <div style={workspaceStyles.railBottomSplitterLine} />
+                  <button
+                    type="button"
+                    data-utt-rail-bottom-lock="1"
+                    style={workspaceStyles.railBottomLockButton}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={() => setRailBottomLocked((v) => !v)}
+                    title={railBottomLocked ? "Unlock bottom tile height" : "Lock bottom tile height"}
+                  >
+                    {railBottomLocked ? "Bottom: locked" : "Bottom: unlocked"}
+                  </button>
+                </div>
+              )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* Tool windows */}
       <WindowManager
@@ -3547,6 +4754,15 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                 hideTableDataGlobal={hideTableDataGlobal}
                 hideVenueNames={hideVenueNames}
                 onClose={() => closeToolWindow(TOOL_IDS.deposits)}
+              />
+            );
+
+          if (w.id === TOOL_IDS.tokenRegistry)
+            return (
+              <TokenRegistryWindow
+                {...common}
+                apiBase={API_BASE}
+                onClose={() => closeToolWindow(TOOL_IDS.tokenRegistry)}
               />
             );
 

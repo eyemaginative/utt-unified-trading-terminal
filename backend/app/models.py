@@ -232,6 +232,54 @@ Index("ix_venue_symbols_venue_time", VenueSymbolSnapshot.venue, VenueSymbolSnaps
 Index("ix_venue_symbols_symbol_canon", VenueSymbolSnapshot.symbol_canon, VenueSymbolSnapshot.captured_at)
 
 
+
+
+# =============================================================================
+# Token / Symbol Registry (UI-managed)
+# =============================================================================
+
+class TokenRegistry(Base):
+    """User-managed registry of token metadata.
+
+    This table is intentionally *readable* (unlike API Key Vault) and is used to
+    avoid hard-coding token mints/decimals in env JSON blobs.
+
+    Scope rules (v1):
+      - venue=NULL => global canonical mapping for a chain
+      - venue!=NULL => venue-specific override (future use; safe to store today)
+    """
+
+    __tablename__ = "token_registry"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # e.g. "solana" (lowercase)
+    chain: Mapped[str] = mapped_column(String(16), nullable=False, default="solana")
+
+    # NULL = global; else venue id like "coinbase" (optional)
+    venue: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Symbol ticker like "UTTT" (uppercase)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    # Contract address / mint (chain-specific). For Solana, this is the mint address.
+    address: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    decimals: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("chain", "venue", "symbol", name="uq_token_registry_chain_venue_symbol"),
+        Index("ix_token_registry_chain_symbol", "chain", "symbol"),
+        Index("ix_token_registry_chain_venue", "chain", "venue"),
+        Index("ix_token_registry_chain_address", "chain", "address"),
+    )
+
+
 # =============================================================================
 # NEW (additive): Deposits + Basis Lots
 # =============================================================================
@@ -489,3 +537,16 @@ class WalletAddressTx(Base):
         Index("ix_wallet_addr_tx_time", "wallet_address_id", "tx_time"),
         Index("ix_wallet_addr_tx_txid", "txid"),
     )
+
+
+class RuntimeSetting(Base):
+    __tablename__ = "runtime_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value_json: Mapped[dict | list | str | int | float | bool | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+Index("ix_runtime_settings_updated_at", RuntimeSetting.updated_at)

@@ -1,12 +1,14 @@
 # routers/orders.py
 from fastapi import APIRouter, Depends, Query, HTTPException, Body
 from sqlalchemy.orm import Session
+from sqlalchemy import asc, desc
 from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel
 
 from ..db import get_db
+from ..models import VenueOrderRow
 from ..schemas import OrderCreate, OrderOut, OrdersPage, CancelAllRequest
 from ..services.orders import create_order, cancel_order, cancel_all, list_orders, cancel_by_ref
 from ..services.venue_orders import refresh_venue_orders as refresh_venue_orders_ro
@@ -14,6 +16,87 @@ from ..services.venue_orders import refresh_venue_orders as refresh_venue_orders
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
 
+
+
+def _to_order_out_from_venue_row(o) -> dict:
+    return {
+        "id": getattr(o, "id", None) or f"VENUE:{getattr(o, 'venue', '')}:{getattr(o, 'venue_order_id', '')}",
+        "client_order_id": getattr(o, "client_order_id", None)
+        or getattr(o, "venue_order_id", None)
+        or f"VENUE:{getattr(o, 'venue', '')}:{getattr(o, 'id', '')}",
+        "source": "venue_row",
+        "source_name": "VENUE",
+        "external_order_id": getattr(o, "venue_order_id", None),
+        "venue": getattr(o, "venue", None),
+        "symbol_canon": getattr(o, "symbol_canon", None),
+        "symbol_venue": getattr(o, "symbol_venue", None),
+        "side": getattr(o, "side", None),
+        "type": getattr(o, "type", None),
+        "qty": getattr(o, "qty", None),
+        "limit_price": getattr(o, "limit_price", None),
+        "status": getattr(o, "status", None),
+        "raw_status": getattr(o, "raw_status", None),
+        "filled_qty": getattr(o, "filled_qty", None),
+        "avg_fill_price": getattr(o, "avg_fill_price", None),
+        "fee_total": getattr(o, "fee", None),
+        "fee_asset": getattr(o, "fee_asset", None),
+        "gross_total": None,
+        "net_total_after_fee": getattr(o, "total_after_fee", None),
+        "viewed_confirmed": False,
+        "venue_order_id": getattr(o, "venue_order_id", None),
+        "reject_reason": getattr(o, "reject_reason", None),
+        "created_at": getattr(o, "created_at", None),
+        "submitted_at": getattr(o, "created_at", None),
+        "updated_at": getattr(o, "updated_at", None),
+    }
+
+
+def _list_venue_rows_as_orders(
+    db: Session,
+    venue: str,
+    symbol: Optional[str],
+    status: Optional[str],
+    side: Optional[str],
+    type: Optional[str],
+    from_: Optional[datetime],
+    to: Optional[datetime],
+    sort: Optional[str],
+    page: int,
+    page_size: int,
+):
+    q = db.query(VenueOrderRow).filter(VenueOrderRow.venue == venue)
+
+    if symbol:
+        sym = str(symbol).strip()
+        q = q.filter((VenueOrderRow.symbol_canon == sym) | (VenueOrderRow.symbol_venue == sym))
+    if status:
+        q = q.filter(VenueOrderRow.status == str(status).strip())
+    if side:
+        q = q.filter(VenueOrderRow.side == str(side).strip())
+    if type:
+        q = q.filter(VenueOrderRow.type == str(type).strip())
+    if from_ is not None:
+        q = q.filter(VenueOrderRow.created_at >= from_)
+    if to is not None:
+        q = q.filter(VenueOrderRow.created_at <= to)
+
+    total = q.count()
+
+    field = "created_at"
+    direction = "desc"
+    try:
+        raw = str(sort or "created_at:desc").strip()
+        if raw:
+            parts = raw.split(":", 1)
+            field = (parts[0] or "created_at").strip() or "created_at"
+            direction = (parts[1] if len(parts) > 1 else "desc").strip().lower() or "desc"
+    except Exception:
+        pass
+
+    col = getattr(VenueOrderRow, field, None) or VenueOrderRow.created_at
+    q = q.order_by(desc(col) if direction != "asc" else asc(col))
+    items = q.offset((page - 1) * page_size).limit(page_size).all()
+    return items, total
 def _to_order_out(o) -> dict:
     return {
         "id": o.id,
@@ -68,6 +151,13 @@ def get_orders(
     page_size: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
+    _venue = (venue or "").strip().lower()
+    if _venue in ("solana_jupiter", "solana") or _venue.startswith("solana"):
+        items, total = _list_venue_rows_as_orders(
+            db, _venue, symbol, status, side, type, from_, to, sort, page, page_size
+        )
+        return {"items": [_to_order_out_from_venue_row(o) for o in items], "page": page, "page_size": page_size, "total": total}
+
     items, total = list_orders(
         db, venue, source_name, symbol, status, side, type, viewed_confirmed, from_, to, sort, page, page_size
     )

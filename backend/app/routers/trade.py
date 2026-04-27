@@ -1,21 +1,69 @@
 # app/routers/trade.py
 
+import base64
+import hashlib
+import hmac
+import secrets
+import time
+import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..config import settings
 from ..schemas import OrderCreate, OrderOut
 from ..services.orders import create_order, cancel_by_ref
-
-# Auth moved to app/routers/auth.py (kept backwards-compatible behavior).
-from .auth import require_auth
+from ..routers.auth import require_auth
+from ..models import RuntimeSetting
 
 
 router = APIRouter(prefix="/api/trade", tags=["trade"])
+
+RUNTIME_REALIZED_FIELDS_KEY = "realized_fields_enabled"
+
+def _parse_boolish(v, fallback: bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v or "").strip().lower()
+    if s in ("1", "true", "yes", "on"): return True
+    if s in ("0", "false", "no", "off"): return False
+    return fallback
+
+def _env_realized_fields_default() -> bool:
+    raw = str(os.getenv("UTT_REALIZED_FIELDS_V1", "") or "").strip()
+    if not raw:
+        return True
+    return _parse_boolish(raw, True)
+
+def _get_runtime_setting(db: Session, key: str):
+    return db.execute(select(RuntimeSetting).where(RuntimeSetting.key == key)).scalar_one_or_none()
+
+def _get_realized_fields_enabled(db: Session) -> bool:
+    row = _get_runtime_setting(db, RUNTIME_REALIZED_FIELDS_KEY)
+    if row is not None:
+        return _parse_boolish(getattr(row, "value_json", None), _env_realized_fields_default())
+    return _env_realized_fields_default()
+
+def _set_runtime_setting(db: Session, key: str, value):
+    row = _get_runtime_setting(db, key)
+    if row is None:
+        row = RuntimeSetting(key=key, value_json=value)
+        db.add(row)
+    else:
+        row.value_json = value
+    db.commit()
+    try:
+        db.refresh(row)
+    except Exception:
+        pass
+    return row
+
 def _effective_dry_run() -> bool:
     # Mirror services/orders.py policy:
     # live routing is only allowed when DRY_RUN=false AND ARMED=true
@@ -116,3 +164,27 @@ def post_trade_cancel(req: CancelRequest, db: Session = Depends(get_db), _auth: 
         raise HTTPException(status_code=400, detail=str(e))
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+class RuntimeFlagsOut(BaseModel):
+    realized_fields_enabled: bool
+
+
+class RuntimeFlagsUpdate(BaseModel):
+    realized_fields_enabled: Optional[bool] = None
+
+
+@router.get("/runtime_flags", response_model=RuntimeFlagsOut)
+def get_runtime_flags(db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
+    return {
+        "realized_fields_enabled": _get_realized_fields_enabled(db),
+    }
+
+
+@router.post("/runtime_flags", response_model=RuntimeFlagsOut)
+def post_runtime_flags(req: RuntimeFlagsUpdate, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
+    if req.realized_fields_enabled is not None:
+        _set_runtime_setting(db, RUNTIME_REALIZED_FIELDS_KEY, bool(req.realized_fields_enabled))
+    return {
+        "realized_fields_enabled": _get_realized_fields_enabled(db),
+    }

@@ -5,12 +5,13 @@ from datetime import datetime
 from typing import Optional, Tuple, Any, Dict, List
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select, false, func, or_
+from sqlalchemy import select, false, func, or_, Table, MetaData
 
-from ..models import Order, VenueOrderRow, OrderView
+from ..models import Order, VenueOrderRow, OrderView, RuntimeSetting
 
 # NEW (3.5): realized sourcing from lot_journal
 from ..models_lot_journal import LotJournal
+import re
 
 # Fill may not exist in some envs (defensive import)
 try:
@@ -51,6 +52,81 @@ ALLOWED_SORT_FIELDS = {
 
 _TERMINAL = {"filled", "canceled", "cancelled", "rejected", "done", "closed", "expired", "failed"}
 _OPENISH = {"new", "open", "routed", "acked", "partial", "live", "pending"}
+
+
+# ----------------------------
+# Swap orders (DEX aggregators)
+# ----------------------------
+
+
+def _swap_orders_table(db: Session):
+    """Best-effort reflection of the generic swap_orders table.
+
+    The table is created lazily by routers (e.g., routers/solana_dex.py).
+    This reflection must NEVER break existing CEX flows, so failures return None.
+    """
+    try:
+        bind = db.get_bind()
+        md = MetaData()
+        return Table('swap_orders', md, autoload_with=bind)
+    except Exception:
+        return None
+
+
+def _to_unified_swap(mp: dict) -> Dict[str, Any]:
+    """Normalize a swap_orders row mapping into the All Orders unified shape.
+
+    Keep this minimal + compatible with downstream enrichment steps.
+    """
+    ts = mp.get('ts')
+    status = (str(mp.get('status') or '').strip().lower() or None)
+    side = (str(mp.get('side') or '').strip().lower() or None)
+
+    base_qty = mp.get('base_qty')
+    quote_qty = mp.get('quote_qty')
+    price = mp.get('price')
+    fee = mp.get('fee_quote')
+
+    status_bucket = 'terminal' if status in ('confirmed', 'failed') else _status_bucket(status)
+
+    def _f(x):
+        return float(x) if isinstance(x, (int, float)) else None
+
+    return {
+        'id': str(mp.get('signature') or ''),
+        'source': 'SWAP',
+        'venue': str(mp.get('venue') or ''),
+        'view_key': _view_key_swap(str(mp.get('venue') or ''), str(mp.get('signature') or mp.get('tx_signature') or mp.get('tx_sig') or '')),
+        'symbol': str(mp.get('resolved_symbol') or mp.get('raw_symbol') or ''),
+        'symbol_canon': str(mp.get('resolved_symbol') or ''),
+        'symbol_venue': str(mp.get('raw_symbol') or ''),
+        'side': side,
+        'type': 'swap',
+        'status': status,
+        'status_bucket': status_bucket,
+        'qty': _f(base_qty),
+        'filled_qty': _f(base_qty),
+        'limit_price': None,
+        'avg_fill_price': _f(price),
+        'fee': _f(fee),
+        'total_after_fee': (_f(quote_qty) - _f(fee)) if (side == 'sell' and _f(quote_qty) is not None and _f(fee) is not None) else (_f(quote_qty) if side == 'sell' else None),
+        'client_order_id': None,
+        'venue_order_id': str(mp.get('signature') or ''),
+        'can_cancel': False,
+        'cancel_ref': None,
+        'created_at': ts,
+        'updated_at': ts,
+        'captured_at': ts,
+        'closed_at': ts if status_bucket == 'terminal' else None,
+        'viewed_confirmed': False,
+        'viewed_at': None,
+        # extra swap context (harmless to UI consumers that ignore)
+        'swap_chain': mp.get('chain'),
+        'swap_wallet': mp.get('wallet_address'),
+        'swap_base_mint': mp.get('base_mint'),
+        'swap_quote_mint': mp.get('quote_mint'),
+        'swap_quote_qty': _f(quote_qty),
+    }
 
 
 def _norm_venue(v: Any) -> str:
@@ -146,6 +222,12 @@ def _view_key_venue(v: VenueOrderRow) -> str:
     return f"VENUE:{_norm_venue(v.venue)}:{oid}"
 
 
+
+def _view_key_swap(venue: str, signature: str) -> str:
+    # Stable key for swap (Solana/Jupiter etc) rows so they can participate in OrderView hydration.
+    # Signature is the most stable identifier for swap-derived orders.
+    return f"SWAP:{venue}:{signature or ''}"
+
 def _to_unified_local(o: Order) -> Dict[str, Any]:
     closed_at, closed_at_inferred = _closed_at_local(o.status, o.created_at, o.updated_at)
     view_key = _view_key_local(o)
@@ -227,27 +309,64 @@ def _normalize_dir(direction: str) -> str:
     return "asc" if d == "asc" else "desc"
 
 
-def _normalize_sort_value(val: Any) -> Any:
-    """
-    Normalize to values that compare cleanly in Python.
-    - datetime -> float timestamp
-    - str -> lowercased string
-    - bool -> int
-    - numeric -> numeric
-    - other -> as-is
+def _normalize_sort_value(val: Any, field: Optional[str] = None) -> Any:
+    """Normalize values used for in-memory sorting.
+
+    We combine rows from multiple sources (CEX orders, swap_orders, etc.). Different
+    sources can represent time/numeric fields as datetime, epoch float/int, or strings.
+    Python cannot compare mixed types (e.g., float vs str) during sort, so we coerce
+    into stable sortable primitives.
     """
     if val is None:
         return None
+
+    # Datetime -> epoch seconds (float)
     if isinstance(val, datetime):
         try:
-            return val.timestamp()
+            return float(val.timestamp())
         except Exception:
             return None
+
+    # Numeric -> float
+    if isinstance(val, (int, float)):
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    # Strings: attempt time/number coercions, otherwise stable string sort
     if isinstance(val, str):
-        return val.lower()
-    if isinstance(val, bool):
-        return 1 if val else 0
-    return val
+        s = val.strip()
+        if s == "":
+            return None
+
+        # If this looks like a time field, try ISO parse -> epoch seconds
+        is_time_field = False
+        if field:
+            f = field.lower()
+            is_time_field = f.endswith("_at") or f in ("ts", "time", "timestamp", "created", "closed")
+        if is_time_field or ("T" in s and ":" in s and "-" in s):
+            try:
+                iso = s.replace("Z", "+00:00")
+                return float(datetime.fromisoformat(iso).timestamp())
+            except Exception:
+                pass
+
+        # Pure numeric string -> float
+        try:
+            # Fast path: allow leading +/- and decimals
+            if re.match(r"^[+-]?\d+(?:\.\d+)?$", s):
+                return float(s)
+        except Exception:
+            pass
+
+        return s.lower()
+
+    # Fallback: stringify
+    try:
+        return str(val).lower()
+    except Exception:
+        return None
 
 
 def _missing_rank_for_field(field: str, is_missing: bool, reverse: bool) -> int:
@@ -273,7 +392,7 @@ def _sort_with_tiebreakers(combined: List[Dict[str, Any]], field: str, direction
 
     def key(it: Dict[str, Any]) -> tuple:
         raw_primary = it.get(f)
-        primary_norm = _normalize_sort_value(raw_primary)
+        primary_norm = _normalize_sort_value(raw_primary, f)
 
         is_missing = primary_norm is None or primary_norm == ""
         if is_missing:
@@ -294,24 +413,31 @@ def _sort_with_tiebreakers(combined: List[Dict[str, Any]], field: str, direction
     combined.sort(key=key, reverse=reverse)
 
 
+def _chunked(seq, size: int = 500):
+    if size <= 0:
+        size = 500
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def _reconcile_client_order_ids(db: Session, combined: List[Dict[str, Any]]) -> None:
-    venue_oids = {
+    venue_oids = list({
         str(it.get("venue_order_id"))
         for it in combined
         if it.get("source") != "LOCAL" and it.get("venue_order_id")
-    }
+    })
     if not venue_oids:
         return
 
-    rows = db.execute(
-        select(Order.venue_order_id, Order.client_order_id)
-        .where(Order.venue_order_id.in_(list(venue_oids)))
-    ).all()
-
     oid_to_client: Dict[str, str] = {}
-    for oid, cid in rows:
-        if oid and cid:
-            oid_to_client[str(oid)] = str(cid)
+    for oid_chunk in _chunked(venue_oids, 500):
+        rows = db.execute(
+            select(Order.venue_order_id, Order.client_order_id)
+            .where(Order.venue_order_id.in_(oid_chunk))
+        ).all()
+        for oid, cid in rows:
+            if oid and cid:
+                oid_to_client[str(oid)] = str(cid)
 
     if not oid_to_client:
         return
@@ -320,25 +446,25 @@ def _reconcile_client_order_ids(db: Session, combined: List[Dict[str, Any]]) -> 
         if it.get("source") == "LOCAL":
             continue
         oid = it.get("venue_order_id")
-        if oid and oid in oid_to_client:
-            it["client_order_id"] = oid_to_client[oid]
+        if oid and str(oid) in oid_to_client:
+            it["client_order_id"] = oid_to_client[str(oid)]
 
 
 def _hydrate_views(db: Session, combined: List[Dict[str, Any]]) -> None:
-    keys = [it.get("view_key") for it in combined if it.get("view_key")]
+    keys = list({str(it.get("view_key")) for it in combined if it.get("view_key")})
     if not keys:
         return
 
-    rows = db.execute(
-        select(OrderView.view_key, OrderView.viewed_confirmed, OrderView.viewed_at)
-        .where(OrderView.view_key.in_(keys))
-    ).all()
-
     m: Dict[str, Dict[str, Any]] = {}
-    for k, vc, va in rows:
-        if not k:
-            continue
-        m[str(k)] = {"viewed_confirmed": bool(vc), "viewed_at": va}
+    for key_chunk in _chunked(keys, 500):
+        rows = db.execute(
+            select(OrderView.view_key, OrderView.viewed_confirmed, OrderView.viewed_at)
+            .where(OrderView.view_key.in_(key_chunk))
+        ).all()
+        for k, vc, va in rows:
+            if not k:
+                continue
+            m[str(k)] = {"viewed_confirmed": bool(vc), "viewed_at": va}
 
     for it in combined:
         k = it.get("view_key")
@@ -521,9 +647,31 @@ def _apply_cancelability(combined: List[Dict[str, Any]]) -> None:
 # NEW (3.5) realized enrichment
 # ----------------------------
 
-def _realized_flag_enabled() -> bool:
-    v = str(os.getenv("UTT_REALIZED_FIELDS_V1", "") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+def _boolish(v: Any, fallback: bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v or "").strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return fallback
+
+
+def _realized_flag_enabled(db: Session) -> bool:
+    env_raw = str(os.getenv("UTT_REALIZED_FIELDS_V1", "") or "").strip()
+    env_default = _boolish(env_raw, True) if env_raw else True
+    try:
+        row = db.execute(
+            select(RuntimeSetting).where(RuntimeSetting.key == "realized_fields_enabled")
+        ).scalar_one_or_none()
+        if row is not None:
+            return _boolish(getattr(row, "value_json", None), env_default)
+    except Exception:
+        pass
+    return env_default
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -670,7 +818,7 @@ def _apply_realized_fields(db: Session, combined: List[Dict[str, Any]]) -> None:
     for it in combined:
         _seed_realized_fields(it)
 
-    if not _realized_flag_enabled():
+    if not _realized_flag_enabled(db):
         return
 
     sell_local_order_ids: List[str] = []
@@ -1146,11 +1294,53 @@ def list_all_orders(
     local_items = db.execute(local_stmt).scalars().all()
     venue_items = db.execute(venue_stmt).scalars().all()
 
+    # SWAPS (DEX) — best-effort include if table exists (must not break CEX flows)
+    swap_items: List[Dict[str, Any]] = []
+    t_swaps = _swap_orders_table(db)
+    if t_swaps is not None:
+        try:
+            include_swaps = scope_norm in ('ALL', 'VENUES')
+            if source and str(source).strip().upper() == 'LOCAL':
+                include_swaps = False
+            if include_swaps:
+                sstmt = select(t_swaps)
+
+                # Mirror venue/source filtering semantics
+                if source and str(source).strip().upper() != 'LOCAL':
+                    sstmt = sstmt.where(func.lower(t_swaps.c.venue) == _norm_venue(source))
+                if venue:
+                    sstmt = sstmt.where(func.lower(t_swaps.c.venue) == _norm_venue(venue))
+
+                if status_bucket:
+                    sb = str(status_bucket).strip().lower()
+                    if sb == 'terminal':
+                        sstmt = sstmt.where(func.lower(t_swaps.c.status).in_(list(_TERMINAL)))
+                    elif sb == 'open':
+                        sstmt = sstmt.where(or_(t_swaps.c.status.is_(None), ~func.lower(t_swaps.c.status).in_(list(_TERMINAL))))
+
+                if symbol:
+                    # Some venues will only populate raw_symbol; prefer resolved_symbol when present
+                    sstmt = sstmt.where((t_swaps.c.resolved_symbol == symbol) | (t_swaps.c.raw_symbol == symbol))
+                if dt_from:
+                    sstmt = sstmt.where(t_swaps.c.ts >= dt_from)
+                if dt_to:
+                    sstmt = sstmt.where(t_swaps.c.ts <= dt_to)
+                if status:
+                    sstmt = sstmt.where(t_swaps.c.status == status)
+
+                for mp in db.execute(sstmt).mappings().all():
+                    swap_items.append(_to_unified_swap(dict(mp)))
+        except Exception:
+            swap_items = []
+
     combined: List[Dict[str, Any]] = []
     for o in local_items:
         combined.append(_to_unified_local(o))
     for vrow in venue_items:
         combined.append(_to_unified_venue(vrow))
+
+    for sw in swap_items:
+        combined.append(sw)
 
     if status_bucket:
         sb = str(status_bucket).lower().strip()

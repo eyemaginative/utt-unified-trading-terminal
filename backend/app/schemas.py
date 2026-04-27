@@ -22,7 +22,7 @@ class OrderCreate(BaseModel):
 class OrderOut(BaseModel):
     id: str
     client_order_id: str
-    venue: Venue
+    venue: str
     symbol_canon: str
     symbol_venue: str
     side: Side

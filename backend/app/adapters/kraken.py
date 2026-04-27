@@ -632,8 +632,31 @@ class KrakenAdapter(ExchangeAdapter):
         sec = getattr(settings, "kraken_api_secret", None) or os.getenv("KRAKEN_API_SECRET")
         key = (key or "").strip()
         sec = (sec or "").strip()
+
+        # DB-vault fallback (Profile → API Keys) via settings.kraken_private_creds()
+        if (not key) or (not sec):
+            fn = getattr(settings, "kraken_private_creds", None)
+            if callable(fn):
+                try:
+                    v = fn()
+                    k2 = s2 = None
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        k2, s2 = v[0], v[1]
+                    elif isinstance(v, dict):
+                        k2 = v.get("api_key") or v.get("key")
+                        s2 = v.get("api_secret") or v.get("secret")
+                    if k2 is not None:
+                        key = str(k2).strip()
+                    if s2 is not None:
+                        sec = str(s2).strip()
+                except Exception:
+                    pass
+
         if not key or not sec:
-            raise Exception("Missing Kraken credentials: set KRAKEN_API_KEY and KRAKEN_API_SECRET")
+            raise Exception(
+                "Missing Kraken credentials: save venue=kraken in Profile → API Keys "
+                "(or set KRAKEN_API_KEY and KRAKEN_API_SECRET)"
+            )
         return key, sec
 
     def _api_sign(self, urlpath: str, data: Dict[str, str], secret_b64: str) -> str:

@@ -141,6 +141,7 @@ class DexTradeAdapter(ExchangeAdapter):
         base_url = _sget_str("dex_trade_base_url", "") or self._DEFAULT_BASE_URL
         self._base_url = base_url.rstrip("/")
 
+        # creds are resolved lazily; allow DB-vault to override at runtime
         self._token = _sget_str("dex_trade_login_token", "")
         self._secret = _sget_str("dex_trade_secret", "")
 
@@ -154,10 +155,38 @@ class DexTradeAdapter(ExchangeAdapter):
         self._book_neg_cache_ttl = max(2.0, float(_env_int("DEX_TRADE_BOOK_NEG_CACHE_MS", 60000)) / 1000.0)
         self._log_suppress_ttl = max(0.5, float(_env_int("DEX_TRADE_BOOK_LOG_SUPPRESS_MS", 3000)) / 1000.0)
 
+
+    def _refresh_private_creds(self) -> None:
+        """
+        DB-first credential resolution hook (vault-first), with env/settings fallback.
+
+        If `settings.dex_trade_private_creds` exists and is callable, it may return:
+          - (token, secret)
+          - {"token": "...", "secret": "..."}
+        """
+        fn = _sget("dex_trade_private_creds", None)
+        if callable(fn):
+            try:
+                v = fn()
+                token = secret = None
+                if isinstance(v, (list, tuple)) and len(v) >= 2:
+                    token, secret = v[0], v[1]
+                elif isinstance(v, dict):
+                    token = v.get("token") or v.get("login_token")
+                    secret = v.get("secret")
+                if token is not None:
+                    self._token = str(token).strip()
+                if secret is not None:
+                    self._secret = str(secret).strip()
+            except Exception:
+                # never break adapter init/requests because a vault resolver hiccuped
+                pass
+
     # ─────────────────────────────────────────────────────────────
     # Private API enablement
     # ─────────────────────────────────────────────────────────────
     def _effective_enabled(self) -> bool:
+        self._refresh_private_creds()
         fn = _sget("dex_trade_effective_enabled", None)
         if callable(fn):
             try:
@@ -237,10 +266,11 @@ class DexTradeAdapter(ExchangeAdapter):
             return r.json()
 
     def _private_post(self, path: str, payload: Dict[str, Any]) -> Any:
+        self._refresh_private_creds()
         if not self._effective_enabled():
             raise RuntimeError(
                 "Dex-Trade private API is not enabled/configured. "
-                "Set DEX_TRADE_ENABLED=true and provide DEX_TRADE_LOGIN_TOKEN + DEX_TRADE_SECRET."
+                "Set DEX_TRADE_ENABLED=true and provide Dex-Trade creds (prefer DB vault; env fallback allowed)."
             )
 
         if not payload.get("request_id"):

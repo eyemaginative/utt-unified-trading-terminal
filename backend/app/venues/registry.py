@@ -111,7 +111,7 @@ def _make_registry() -> Dict[str, VenueSpec]:
 
     def solana_dex_factory():
         # On-chain Solana DEX / aggregator execution + reads
-        from ..adapters.solana_dex import SolanaDexAdapter
+        from ..adapters.solana_onchain import SolanaDexAdapter
         return SolanaDexAdapter()
 
     reg: Dict[str, VenueSpec] = {

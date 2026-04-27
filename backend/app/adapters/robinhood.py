@@ -565,6 +565,30 @@ class RobinhoodAdapter(ExchangeAdapter):
         api_key = (api_key or "").strip()
         priv_b64 = (priv_b64 or "").strip()
 
+        # Vault fallback (Profile → API Keys)
+        if (not api_key) or (not priv_b64):
+            try:
+                vc = getattr(settings, "robinhood_private_creds", None)
+                if callable(vc):
+                    v = vc()
+                    vk = vs = vp = None
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        vk, vs = v[0], v[1]
+                        vp = v[2] if len(v) >= 3 else None
+                    elif isinstance(v, dict):
+                        vk = v.get("api_key") or v.get("api_key_id") or v.get("key")
+                        vs = v.get("api_secret") or v.get("private_key_b64") or v.get("secret")
+                        vp = v.get("passphrase") or v.get("public_key_b64")
+                    if (not api_key) and vk is not None:
+                        api_key = str(vk).strip()
+                    if (not priv_b64) and vs is not None:
+                        priv_b64 = str(vs).strip()
+                    # public key (vp) not required by adapter today
+            except Exception:
+                pass
+
+
+
         if not api_key or not priv_b64:
             raise Exception(
                 "Missing Robinhood credentials. Set ROBINHOOD_CRYPTO_API_KEY_ID and ROBINHOOD_CRYPTO_PRIVATE_KEY_B64."

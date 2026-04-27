@@ -24,6 +24,7 @@ from ..schemas_wallet_addresses import (
 
 # Reuse existing USD pricing helper so on-chain balances display like venue balances
 from ..services.market import prices_usd_from_assets
+from ..config import settings
 
 # Pricing venue used for USD valuation (market data venue, not where funds are held)
 _PRICING_VENUE = (os.getenv("UTT_PRICING_VENUE", "coinbase") or "coinbase").strip().lower()
@@ -55,8 +56,22 @@ _BLOCKCYPHER_CHAIN = {
     "DOGE": "doge",
 }
 
-# Env var names (either works)
-_BLOCKCYPHER_TOKEN = os.getenv("BLOCKCYPHER_TOKEN") or os.getenv("UTT_BLOCKCYPHER_TOKEN")
+# Env var names (either works). Vault fallback uses venue='blockcypher' (api_key).
+def _blockcypher_token() -> str:
+    tok = (os.getenv("BLOCKCYPHER_TOKEN") or os.getenv("UTT_blockcypher_token()") or "").strip()
+    if tok:
+        return tok
+    # Vault-first (provider-style): do not gate features if missing; return "" to allow fallbacks.
+    try:
+        bundle = settings._vault_latest_bundle("blockcypher")
+        if isinstance(bundle, dict):
+            tok2 = (bundle.get("api_key") or "").strip()
+            if tok2:
+                return tok2
+    except Exception:
+        pass
+    return ""
+
 
 
 def _norm_asset(x: str) -> str:
@@ -73,24 +88,66 @@ def _norm_network(x: str, asset: str) -> str:
 # ------------------------------------------------------------------------------
 
 def _solana_rpc_url() -> str:
-    # Default to public mainnet-beta RPC (free, rate-limited).
-    return (os.getenv("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com").strip()
+    # Prefer env var (local dev + deployments).
+    url = (os.getenv("SOLANA_RPC_URL") or "").strip()
+    if url:
+        return url
+
+    # Fallback: read from DB-backed API Key Vault (write-only) if present.
+    # Expectation: store the FULL RPC URL as api_key under venue "solana_rpc".
+    try:
+        bundle = settings._vault_latest_bundle("solana_rpc")
+        if isinstance(bundle, dict):
+            v = (bundle.get("api_key") or "").strip()
+            if v:
+                return v
+    except Exception:
+        pass
+
+    # Last resort: public mainnet-beta RPC (free, rate-limited).
+    return "https://api.mainnet-beta.solana.com"
 
 
 async def _solana_rpc(method: str, params: Optional[list] = None) -> Dict:
-    url = _solana_rpc_url()
+    url = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
+    timeout_s = float(os.getenv("SOLANA_RPC_TIMEOUT_S", "20") or 20)
+    # Public RPCs rate-limit aggressively; retry with exponential backoff on 429.
+    max_retries = int(os.getenv("SOLANA_RPC_RETRIES", "5") or 5)
+
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(url, json=payload)
-        if r.status_code == 429:
-            raise RuntimeError("Solana RPC rate-limited (429). Set SOLANA_RPC_URL to a private RPC.")
-        r.raise_for_status()
-        js = r.json()
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                r = await client.post(url, json=payload)
+            # Handle rate-limit with backoff (+ optional Retry-After)
+            if r.status_code == 429:
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        sleep_s = float(ra)
+                    except Exception:
+                        sleep_s = 0.0
+                else:
+                    # 0.5, 1, 2, 4, 8 ... capped
+                    sleep_s = min(8.0, 0.5 * (2 ** attempt))
+                await asyncio.sleep(max(0.25, sleep_s))
+                continue
 
-    if (js or {}).get("error"):
-        raise RuntimeError(f"Solana RPC error: {(js or {}).get('error')}")
-    return js
+            js = r.json()
+            if not r.is_success:
+                raise RuntimeError(f"Solana RPC HTTP {r.status_code}: {js}")
+            if isinstance(js, dict) and js.get("error"):
+                raise RuntimeError(f"Solana RPC error: {js.get('error')}")
+            return js
+        except Exception as e:
+            last_err = e
+            # Backoff a bit on transient failures too.
+            await asyncio.sleep(min(2.0, 0.25 * (attempt + 1)))
+
+    # Exhausted retries
+    raise RuntimeError(f"Solana RPC failed after {max_retries} attempts: {last_err}")
 
 
 async def _fetch_solana_balance_lamports(address: str) -> Tuple[int, Dict]:
@@ -119,6 +176,47 @@ async def _fetch_solana_transaction(signature: str) -> Dict:
         ],
     )
     return js
+
+
+
+def _fetch_solana_tx_dashboard(signature: str, *, cached_raw: Optional[Dict] = None) -> Dict:
+    """Compatibility helper.
+
+    Earlier iterations referenced `_fetch_solana_tx_dashboard`. This project now uses
+    `_fetch_solana_transaction` (async). The ingest endpoints are sync (threadpool),
+    so we provide a small shim.
+
+    If a cached `raw` dict already contains a `result` payload (or a nested tx object),
+    we reuse it to avoid unnecessary RPC calls.
+    """
+    try:
+        if isinstance(cached_raw, dict) and cached_raw:
+            # Some caches store the full RPC response directly in raw
+            if isinstance(cached_raw.get("result"), dict):
+                return cached_raw
+            # Or nest it under a known key
+            for k in ("solana_tx", "tx", "transaction", "rpc"):
+                v = cached_raw.get(k)
+                if isinstance(v, dict):
+                    if isinstance(v.get("result"), dict):
+                        return v
+                    # Sometimes it's the `result` object itself
+                    if any(x in v for x in ("meta", "transaction", "slot", "blockTime")):
+                        return {"result": v}
+    except Exception:
+        pass
+
+    import asyncio
+    try:
+        return asyncio.run(_fetch_solana_transaction(signature))
+    except RuntimeError:
+        # Fallback in the unlikely case we're invoked from a running loop.
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_fetch_solana_transaction(signature))
+        finally:
+            loop.close()
+
 
 
 def _parse_solana_tx_netflow(js: Dict, address: str) -> Tuple[str, float, Optional[float], Optional[datetime]]:
@@ -183,6 +281,54 @@ def _parse_solana_tx_netflow(js: Dict, address: str) -> Tuple[str, float, Option
 
 def _solana_fee_only(amount_sol: float, fee_sol: Optional[float], eps: float = 1e-12) -> bool:
     return (fee_sol is not None) and (abs(float(amount_sol) - float(fee_sol)) <= float(eps))
+
+
+def _solana_native_sol_delta_from_tx(js: Dict, address: str) -> Optional[float]:
+    """
+    Best-effort signed native SOL delta for `address`, adjusted to exclude the network fee.
+
+    Returns signed SOL delta where:
+      - negative => net SOL spent (excluding fee)
+      - positive => net SOL received (excluding fee)
+
+    If the tx only moved the fee, returns None.
+    """
+    try:
+        result = (js or {}).get("result") or {}
+        meta = result.get("meta") or {}
+        tx = result.get("transaction") or {}
+        msg = tx.get("message") or {}
+
+        keys_raw = msg.get("accountKeys") or []
+        keys: List[str] = []
+        for k in keys_raw:
+            if isinstance(k, str):
+                keys.append(k)
+            elif isinstance(k, dict):
+                pk = k.get("pubkey")
+                if pk:
+                    keys.append(str(pk))
+        if not keys:
+            return None
+
+        idx = keys.index(address)
+        pre = meta.get("preBalances") or []
+        post = meta.get("postBalances") or []
+        if idx >= len(pre) or idx >= len(post):
+            return None
+
+        signed_delta = (int(post[idx] or 0) - int(pre[idx] or 0)) / 1_000_000_000.0
+        fee_lamports = meta.get("fee")
+        fee_sol = (int(fee_lamports) / 1_000_000_000.0) if fee_lamports is not None else 0.0
+
+        # Remove the network fee contribution from the wallet netflow.
+        signed_delta_ex_fee = signed_delta + fee_sol
+
+        if abs(signed_delta_ex_fee) <= 1e-12:
+            return None
+        return float(signed_delta_ex_fee)
+    except Exception:
+        return None
 
 
 def _solana_tx_is_swap_like(js: Dict, address: str) -> bool:
@@ -344,8 +490,8 @@ async def _fetch_blockcypher_balance_atomic(chain: str, address: str) -> Tuple[i
     url = f"{base}/v1/{chain}/main/addrs/{address}/balance"
 
     params: Dict = {}
-    if _BLOCKCYPHER_TOKEN:
-        params["token"] = _BLOCKCYPHER_TOKEN
+    if _blockcypher_token():
+        params["token"] = _blockcypher_token()
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.get(url, params=params)
@@ -719,7 +865,7 @@ async def _fetch_blockchair_tx_dashboard(chain: str, txid: str) -> Dict:
 # BlockCypher (token-supported) — DOGE/BTC address tx refs
 # ------------------------------------------------------------------------------
 
-# NOTE: _BLOCKCYPHER_CHAIN + _BLOCKCYPHER_TOKEN are defined above (used for balances too)
+# NOTE: _BLOCKCYPHER_CHAIN + _blockcypher_token() are defined above (used for balances too)
 
 
 async def _blockcypher_get_json(path: str, params: Optional[Dict] = None) -> Dict:
@@ -728,8 +874,8 @@ async def _blockcypher_get_json(path: str, params: Optional[Dict] = None) -> Dic
     url = f"{base}{path}"
 
     q = dict(params or {})
-    if _BLOCKCYPHER_TOKEN:
-        q.setdefault("token", _BLOCKCYPHER_TOKEN)
+    if _blockcypher_token():
+        q.setdefault("token", _blockcypher_token())
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.get(url, params=q)
@@ -992,7 +1138,16 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
             fee_only = False
             try:
                 if provider == "solana_rpc":
-                    txdash = await _fetch_solana_transaction(txid_s)
+                    txdash = None
+                    # If we've already cached this tx (raw contains the RPC result), reuse it to avoid extra RPC calls.
+                    if existing:
+                        for _r in existing:
+                            if isinstance(getattr(_r, "raw", None), dict) and _r.raw.get("result") is not None:
+                                txdash = _r.raw
+                                break
+                    if txdash is None:
+                        txdash = await _fetch_solana_transaction(txid_s)
+
                     solana_swap_like = _solana_tx_is_swap_like(txdash, a.address)
                     direction, amount, fee, tx_time = _parse_solana_tx_netflow(txdash, a.address)
                     fee_only = (direction == "out") and _solana_fee_only(float(amount), fee, eps=1e-12)
@@ -1049,9 +1204,6 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
                     db.rollback()
                     errors.append({"id": a.id, "txid": txid_s, "error": f"cache insert failed: {e}"})
                     continue
-
-            if not payload.write_ledger:
-                continue
 
             # SOL metadata-only tagging (runs even if already ingested),
             # so your DB stays debuggable without writing ledger rows.
@@ -1123,6 +1275,9 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
                         db.commit()
                 except Exception:
                     db.rollback()
+                continue
+
+            if not payload.write_ledger:
                 continue
 
             if tx_row and tx_row.ingested_to_ledger_at:
@@ -1453,3 +1608,1072 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
         "errors": errors,
     }
 
+# --- Solana/Jupiter: swap-like txs -> swap_orders ingestion (venue-gated) ---
+
+def _ensure_swap_orders_table(db: Session) -> None:
+    """
+    Ensure swap_orders table exists. Keep minimal schema required by all_orders.py normalizer.
+    """
+    from sqlalchemy import text, inspect
+
+    insp = inspect(db.bind)
+    if "swap_orders" in insp.get_table_names():
+        return
+
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS swap_orders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              venue TEXT NOT NULL,
+              chain TEXT NOT NULL,
+              wallet_address TEXT,
+              signature TEXT NOT NULL,
+              raw_symbol TEXT,
+              resolved_symbol TEXT,
+              side TEXT,
+              type TEXT,
+              status TEXT,
+              base_qty REAL,
+              quote_qty REAL,
+              price REAL,
+              fee_quote REAL,
+              base_mint TEXT,
+              quote_mint TEXT,
+              ts TEXT,
+              raw JSON
+            );
+            """
+        )
+    )
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_swap_orders_venue_sig ON swap_orders(venue, signature);"))
+    db.commit()
+
+
+def _solana_token_deltas_from_tx(js: Dict, owner_addr: str) -> Dict[str, float]:
+    """
+    Return {mint: delta_ui_amount} for token accounts attributable to owner_addr using
+    meta.preTokenBalances/postTokenBalances. This is heuristic: many swaps touch ATAs/wSOL.
+    """
+    result = (js or {}).get("result") or {}
+    meta = result.get("meta") or {}
+
+    # accountKeys indices let us map token balances to owners
+    tx = (result.get("transaction") or {})
+    msg = (tx.get("message") or {})
+    keys_raw = msg.get("accountKeys") or []
+    keys: List[str] = []
+    for k in keys_raw:
+        if isinstance(k, str):
+            keys.append(k)
+        elif isinstance(k, dict):
+            pk = k.get("pubkey")
+            if pk:
+                keys.append(str(pk))
+
+    def _owner_for(tb: Dict) -> Optional[str]:
+        # token balance objects may include 'owner' on some nodes. Do NOT try to derive
+        # owner from accountIndex -> accountKeys; that key is typically the token account,
+        # not the wallet owner, which causes false owner mismatches.
+        o = tb.get("owner")
+        if isinstance(o, str) and o:
+            return o
+        return None
+
+    def _ui_amount(tb: Dict) -> float:
+        ui = ((tb.get("uiTokenAmount") or {}).get("uiAmount"))
+        if ui is None:
+            # fallback: amount/decimals
+            amt = (tb.get("uiTokenAmount") or {}).get("amount")
+            dec = (tb.get("uiTokenAmount") or {}).get("decimals")
+            try:
+                return float(int(amt)) / (10 ** int(dec))
+            except Exception:
+                return 0.0
+        try:
+            return float(ui)
+        except Exception:
+            return 0.0
+
+    pre = meta.get("preTokenBalances") or []
+    post = meta.get("postTokenBalances") or []
+
+    # key by (mint, owner, accountIndex) to align pre/post
+    pre_map: Dict[Tuple[str, str, int], float] = {}
+    for tb in pre:
+        if not isinstance(tb, dict):
+            continue
+        mint = tb.get("mint")
+        if not isinstance(mint, str) or not mint:
+            continue
+        owner = _owner_for(tb) or ""
+        if owner != owner_addr:
+            continue
+        try:
+            ai = int(tb.get("accountIndex"))
+        except Exception:
+            ai = -1
+        pre_map[(mint, owner, ai)] = _ui_amount(tb)
+
+    deltas: Dict[str, float] = {}
+    seen_keys = set()
+
+    for tb in post:
+        if not isinstance(tb, dict):
+            continue
+        mint = tb.get("mint")
+        if not isinstance(mint, str) or not mint:
+            continue
+        owner = _owner_for(tb) or ""
+        if owner != owner_addr:
+            continue
+        try:
+            ai = int(tb.get("accountIndex"))
+        except Exception:
+            ai = -1
+        k = (mint, owner, ai)
+        seen_keys.add(k)
+        post_amt = _ui_amount(tb)
+        pre_amt = pre_map.get(k, 0.0)
+        d = post_amt - pre_amt
+        if abs(d) > 0:
+            deltas[mint] = deltas.get(mint, 0.0) + float(d)
+
+    # include pre-only entries that went to zero / closed
+    for k, pre_amt in pre_map.items():
+        if k in seen_keys:
+            continue
+        mint = k[0]
+        d = 0.0 - float(pre_amt)
+        if abs(d) > 0:
+            deltas[mint] = deltas.get(mint, 0.0) + d
+
+
+    # Normalize wrapped SOL (wSOL) to native SOL so multi-route swaps can pair legs.
+    _WSOL_MINT = "So11111111111111111111111111111111111111112"
+    if _WSOL_MINT in deltas:
+        deltas["SOL"] = deltas.get("SOL", 0.0) + deltas.pop(_WSOL_MINT)
+
+    # Add native SOL delta (lamports) for this owner when present.
+    # Jupiter swaps often have one leg in native SOL, which is not represented in pre/postTokenBalances.
+    try:
+        result = (js or {}).get("result") or {}
+        meta = result.get("meta") or {}
+        pre_bal = meta.get("preBalances") or []
+        post_bal = meta.get("postBalances") or []
+        fee_lamports = int(meta.get("fee") or 0)
+
+        tx = (result.get("transaction") or {})
+        msg = (tx.get("message") or {})
+        keys_raw = msg.get("accountKeys") or []
+        keys: List[str] = []
+        for k in keys_raw:
+            if isinstance(k, str):
+                keys.append(k)
+            elif isinstance(k, dict):
+                pk = k.get("pubkey")
+                if pk:
+                    keys.append(str(pk))
+
+        if owner_addr in keys:
+            idx = keys.index(owner_addr)
+            if idx < len(pre_bal) and idx < len(post_bal):
+                pre_l = int(pre_bal[idx] or 0)
+                post_l = int(post_bal[idx] or 0)
+                d_l = post_l - pre_l
+
+                # Remove fee from the payer's delta so swaps don't get misclassified as one-sided.
+                # pre/post balances already include the fee deduction, so add the fee back.
+                if keys and keys[0] == owner_addr and fee_lamports:
+                    d_l += fee_lamports
+
+                d_sol = float(d_l) / 1e9
+                if abs(d_sol) > 0:
+                    deltas["SOL"] = deltas.get("SOL", 0.0) + d_sol
+    except Exception:
+        pass
+
+    return deltas
+
+
+def _solana_token_deltas_from_tx_relaxed(js: Dict, owner_addr: str) -> Dict[str, float]:
+    """
+    Relaxed fallback used when owner-attributed token deltas are empty or one-sided.
+
+    Aggregates token balance deltas by mint across the tx even if token balance rows do
+    not expose `owner` (common on some Solana/Jupiter routes). This is only used after a
+    tx has already been classified as swap-like, so it is a best-effort recovery path for
+    missed Jupiter fills rather than the primary attribution path.
+    """
+    result = (js or {}).get("result") or {}
+    meta = result.get("meta") or {}
+
+    def _ui_amount(tb: Dict) -> float:
+        ui = ((tb.get("uiTokenAmount") or {}).get("uiAmount"))
+        if ui is None:
+            amt = (tb.get("uiTokenAmount") or {}).get("amount")
+            dec = (tb.get("uiTokenAmount") or {}).get("decimals")
+            try:
+                return float(int(amt)) / (10 ** int(dec))
+            except Exception:
+                return 0.0
+        try:
+            return float(ui)
+        except Exception:
+            return 0.0
+
+    pre = meta.get("preTokenBalances") or []
+    post = meta.get("postTokenBalances") or []
+
+    pre_map: Dict[Tuple[str, int], float] = {}
+    for tb in pre:
+        if not isinstance(tb, dict):
+            continue
+        mint = tb.get("mint")
+        if not isinstance(mint, str) or not mint:
+            continue
+        try:
+            ai = int(tb.get("accountIndex"))
+        except Exception:
+            ai = -1
+        pre_map[(mint, ai)] = _ui_amount(tb)
+
+    deltas: Dict[str, float] = {}
+    seen_keys = set()
+    for tb in post:
+        if not isinstance(tb, dict):
+            continue
+        mint = tb.get("mint")
+        if not isinstance(mint, str) or not mint:
+            continue
+        try:
+            ai = int(tb.get("accountIndex"))
+        except Exception:
+            ai = -1
+        k = (mint, ai)
+        seen_keys.add(k)
+        post_amt = _ui_amount(tb)
+        pre_amt = pre_map.get(k, 0.0)
+        d = post_amt - pre_amt
+        if abs(d) > 0:
+            deltas[mint] = deltas.get(mint, 0.0) + float(d)
+
+    for k, pre_amt in pre_map.items():
+        if k in seen_keys:
+            continue
+        mint = k[0]
+        d = 0.0 - float(pre_amt)
+        if abs(d) > 0:
+            deltas[mint] = deltas.get(mint, 0.0) + d
+
+    _WSOL_MINT = "So11111111111111111111111111111111111111112"
+    if _WSOL_MINT in deltas:
+        deltas["SOL"] = deltas.get("SOL", 0.0) + deltas.pop(_WSOL_MINT)
+
+    # Add the owner's native SOL delta as the non-token leg when present.
+    try:
+        tx = (result.get("transaction") or {})
+        msg = (tx.get("message") or {})
+        keys_raw = msg.get("accountKeys") or []
+        keys: List[str] = []
+        for k in keys_raw:
+            if isinstance(k, str):
+                keys.append(k)
+            elif isinstance(k, dict):
+                pk = k.get("pubkey")
+                if pk:
+                    keys.append(str(pk))
+
+        pre_bal = meta.get("preBalances") or []
+        post_bal = meta.get("postBalances") or []
+        fee_lamports = int(meta.get("fee") or 0)
+
+        if owner_addr in keys:
+            idx = keys.index(owner_addr)
+            if idx < len(pre_bal) and idx < len(post_bal):
+                pre_l = int(pre_bal[idx] or 0)
+                post_l = int(post_bal[idx] or 0)
+                d_l = post_l - pre_l
+                if keys and keys[0] == owner_addr and fee_lamports:
+                    d_l += fee_lamports
+                d_sol = float(d_l) / 1e9
+                if abs(d_sol) > 0:
+                    deltas["SOL"] = deltas.get("SOL", 0.0) + d_sol
+    except Exception:
+        pass
+
+    return deltas
+
+
+
+
+
+def _solana_token_meta_from_tx(js: Dict) -> Dict[str, Dict[str, Optional[int]]]:
+    """Best-effort mint -> metadata map from pre/post token balances.
+
+    Returns { mint: {"decimals": int|None} }. Symbols are not reliably present in Solana RPC
+    token balance payloads, so decimals are the dependable field we preserve.
+    """
+    result = (js or {}).get("result") or {}
+    meta = result.get("meta") or {}
+    out: Dict[str, Dict[str, Optional[int]]] = {}
+    for tb in [*(meta.get("preTokenBalances") or []), *(meta.get("postTokenBalances") or [])]:
+        if not isinstance(tb, dict):
+            continue
+        mint = str(tb.get("mint") or "").strip()
+        if not mint:
+            continue
+        dec = (tb.get("uiTokenAmount") or {}).get("decimals")
+        try:
+            dec_i = int(dec) if dec is not None else None
+        except Exception:
+            dec_i = None
+        cur = out.get(mint) or {}
+        if cur.get("decimals") is None and dec_i is not None:
+            cur["decimals"] = dec_i
+        out[mint] = cur
+    return out
+
+
+_RAYDIUM_PROGRAM_ID_HINTS = {
+    # Raydium AMM v4
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    # Raydium CLMM
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUQ1Jj3D5m2wNw7wTzM",
+    # Raydium CPMM / router ecosystems vary across deployments; keep broad textual fallbacks too.
+}
+
+
+def _solana_program_ids_from_tx(js: Dict) -> List[str]:
+    result = (js or {}).get("result") or {}
+    meta = result.get("meta") or {}
+    tx = (result.get("transaction") or {})
+    msg = (tx.get("message") or {})
+
+    keys_raw = msg.get("accountKeys") or []
+    keys: List[str] = []
+    for k in keys_raw:
+        if isinstance(k, str):
+            keys.append(k)
+        elif isinstance(k, dict):
+            pk = k.get("pubkey")
+            if pk:
+                keys.append(str(pk))
+
+    def _pid_from_index(ix: Optional[int]) -> Optional[str]:
+        if ix is None:
+            return None
+        try:
+            i = int(ix)
+            if 0 <= i < len(keys):
+                return keys[i]
+        except Exception:
+            return None
+        return None
+
+    out: List[str] = []
+    for ins in (msg.get("instructions") or []):
+        if not isinstance(ins, dict):
+            continue
+        pid = ins.get("programId")
+        if isinstance(pid, str) and pid:
+            out.append(pid)
+        pid2 = _pid_from_index(ins.get("programIdIndex"))
+        if pid2:
+            out.append(pid2)
+    for ii in (meta.get("innerInstructions") or []):
+        if not isinstance(ii, dict):
+            continue
+        for ins in (ii.get("instructions") or []):
+            if not isinstance(ins, dict):
+                continue
+            pid = ins.get("programId")
+            if isinstance(pid, str) and pid:
+                out.append(pid)
+            pid2 = _pid_from_index(ins.get("programIdIndex"))
+            if pid2:
+                out.append(pid2)
+    return out
+
+
+def _solana_is_probable_raydium_liquidity_event(js: Dict, deltas: Dict[str, float]) -> Tuple[bool, Optional[str]]:
+    """
+    Best-effort filter for Raydium add/remove liquidity events so they do not surface as swaps.
+
+    Heuristics:
+      - Raydium program/log involvement must be present.
+      - Liquidity events usually have 3+ material mint legs (two assets + LP mint/burn),
+        or at least 2 positive + 1 negative / 2 negative + 1 positive token deltas.
+      - We intentionally keep this conservative to avoid suppressing normal swaps.
+    """
+    result = (js or {}).get("result") or {}
+    meta = result.get("meta") or {}
+
+    program_ids = _solana_program_ids_from_tx(js)
+    log_messages = [str(x) for x in (meta.get("logMessages") or []) if isinstance(x, str)]
+    raydium_seen = False
+    for pid in program_ids:
+        if pid in _RAYDIUM_PROGRAM_ID_HINTS:
+            raydium_seen = True
+            break
+    if not raydium_seen:
+        joined = "\n".join(log_messages).lower()
+        if "raydium" in joined or "ray_log" in joined:
+            raydium_seen = True
+    if not raydium_seen:
+        return False, None
+
+    material = [(m, float(d)) for m, d in (deltas or {}).items() if abs(float(d)) > 1e-9]
+    pos = [(m, d) for m, d in material if d > 0]
+    neg = [(m, d) for m, d in material if d < 0]
+    token_only_material = [(m, d) for m, d in material if str(m or "").strip() != "SOL"]
+    token_only_pos = [(m, d) for m, d in pos if str(m or "").strip() != "SOL"]
+    token_only_neg = [(m, d) for m, d in neg if str(m or "").strip() != "SOL"]
+
+    if len(token_only_material) >= 3 and ((len(token_only_pos) >= 2 and len(token_only_neg) >= 1) or (len(token_only_neg) >= 2 and len(token_only_pos) >= 1)):
+        return True, "solana_liquidity_event"
+
+    return False, None
+
+
+# Prefer stable quote legs over incidental SOL/wSOL settlement legs when a swap/fill tx
+# exposes multiple negative deltas. This is especially important for Jupiter limit-order
+# fills where the settlement tx can include a SOL leg even though the actual quote spent
+# was USDC.
+_SOLANA_STABLE_QUOTE_MINTS = {
+    # USDC
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    # Symbol-like fallbacks if a caller ever resolves names upstream
+    "USDC",
+    "USDT",
+    "PYUSD",
+}
+
+def _solana_pick_base_quote_legs(
+    pos: List[Tuple[str, float]],
+    neg: List[Tuple[str, float]],
+    token_meta: Optional[Dict[str, Dict[str, Optional[int]]]] = None,
+) -> Tuple[str, float, str, float, Optional[str]]:
+    """
+    Pick (base_mint, base_qty, quote_mint, quote_delta, selection_hint).
+
+    Heuristics:
+      1) Prefer the largest positive NON-SOL leg as base when available.
+      2) Prefer a stable-quote negative leg (USDC/USDT/PYUSD or 6-dec non-SOL token)
+         over an incidental SOL leg when both are present.
+      3) Fall back to the old heuristic otherwise.
+    """
+    token_meta = token_meta or {}
+
+    # Base: if we have multiple positive legs and at least one is non-SOL, use the largest non-SOL leg.
+    non_sol_pos = [(m, d) for m, d in pos if str(m or "").strip() != "SOL"]
+    if non_sol_pos:
+        base_mint, base_qty = max(non_sol_pos, key=lambda x: x[1])
+        base_hint = "prefer_non_sol_positive"
+    else:
+        base_mint, base_qty = max(pos, key=lambda x: x[1])
+        base_hint = None
+
+    # Quote: old heuristic baseline
+    default_quote_mint, default_quote_delta = min(neg, key=lambda x: x[1])
+
+    def _is_known_stable(mint: str) -> bool:
+        m = str(mint or "").strip()
+        return m in _SOLANA_STABLE_QUOTE_MINTS
+
+    def _decimals_for(mint: str) -> Optional[int]:
+        try:
+            return (token_meta.get(str(mint or "").strip()) or {}).get("decimals")
+        except Exception:
+            return None
+
+    # Strong preference: explicit stable quote mint(s)
+    stable_neg = [(m, d) for m, d in neg if _is_known_stable(m)]
+    if stable_neg and str(base_mint or "").strip() != "SOL":
+        quote_mint, quote_delta = min(stable_neg, key=lambda x: x[1])  # largest spend among stable legs
+        return base_mint, base_qty, quote_mint, quote_delta, "prefer_known_stable_quote"
+
+    # Fallback preference: if SOL is one of several negative legs, and another non-SOL leg has 6 decimals,
+    # prefer the 6-decimal token as quote. This catches USDC-like fills even when only mint addresses are present.
+    has_sol_neg = any(str(m or "").strip() == "SOL" for m, _ in neg)
+    six_dec_non_sol_neg = [
+        (m, d) for m, d in neg
+        if str(m or "").strip() != "SOL" and _decimals_for(m) == 6
+    ]
+    if has_sol_neg and six_dec_non_sol_neg and str(base_mint or "").strip() != "SOL":
+        quote_mint, quote_delta = min(six_dec_non_sol_neg, key=lambda x: x[1])
+        return base_mint, base_qty, quote_mint, quote_delta, "prefer_6dec_quote_over_sol"
+
+    return base_mint, base_qty, default_quote_mint, default_quote_delta, base_hint
+
+
+
+def _solana_pick_canonical_swap_legs(
+    deltas: Dict[str, float],
+    token_meta: Optional[Dict[str, Dict[str, Optional[int]]]] = None,
+) -> Optional[Tuple[str, float, str, float, str, Optional[str]]]:
+    """
+    Return a canonicalized pair orientation:
+      (base_mint, base_qty_abs, quote_mint, quote_qty_abs, side, selection_hint)
+
+    For token/SOL and token/stable pairs, keep the non-SOL / non-stable asset as BASE so
+    both buys and sells resolve to a consistent symbol like UTTT-SOL or UTTT-USDC.
+
+    side semantics:
+      - buy  => base delta > 0 (received base, spent quote)
+      - sell => base delta < 0 (spent base, received quote)
+    """
+    token_meta = token_meta or {}
+    material = [(str(m or "").strip(), float(d)) for m, d in (deltas or {}).items() if abs(float(d)) > 1e-9]
+    if len(material) < 2:
+        return None
+
+    pos = [(m, d) for m, d in material if d > 0]
+    neg = [(m, d) for m, d in material if d < 0]
+    if not pos or not neg:
+        return None
+
+    material_mints = [m for m, _d in material]
+    unique_mints = list(dict.fromkeys(material_mints))
+
+    def _is_known_stable(mint: str) -> bool:
+        m = str(mint or "").strip()
+        return m in _SOLANA_STABLE_QUOTE_MINTS
+
+    # Strong canonicalization: exactly one non-SOL mint paired with SOL.
+    if "SOL" in unique_mints:
+        non_sol = [m for m in unique_mints if m != "SOL"]
+        if len(non_sol) == 1:
+            base_mint = non_sol[0]
+            quote_mint = "SOL"
+            base_delta = float(deltas.get(base_mint) or 0.0)
+            quote_delta = float(deltas.get(quote_mint) or 0.0)
+            if abs(base_delta) > 1e-9 and abs(quote_delta) > 1e-9:
+                side = "buy" if base_delta > 0 else "sell"
+                return base_mint, abs(base_delta), quote_mint, abs(quote_delta), side, "canonical_non_sol_vs_sol"
+
+    # Strong canonicalization: exactly one stable mint and one non-stable mint.
+    stable_mints = [m for m in unique_mints if _is_known_stable(m)]
+    non_stable = [m for m in unique_mints if not _is_known_stable(m)]
+    if len(stable_mints) == 1 and len(non_stable) == 1:
+        base_mint = non_stable[0]
+        quote_mint = stable_mints[0]
+        base_delta = float(deltas.get(base_mint) or 0.0)
+        quote_delta = float(deltas.get(quote_mint) or 0.0)
+        if abs(base_delta) > 1e-9 and abs(quote_delta) > 1e-9:
+            side = "buy" if base_delta > 0 else "sell"
+            return base_mint, abs(base_delta), quote_mint, abs(quote_delta), side, "canonical_non_stable_vs_stable"
+
+    # Fallback to existing positive/negative leg picker.
+    base_mint, base_qty, quote_mint, quote_delta, selection_hint = _solana_pick_base_quote_legs(
+        pos, neg, token_meta=token_meta
+    )
+    side = "buy"
+    try:
+        base_delta = float(deltas.get(base_mint) or 0.0)
+        if base_delta < 0:
+            side = "sell"
+    except Exception:
+        pass
+    return base_mint, abs(float(base_qty)), quote_mint, abs(float(quote_delta)), side, selection_hint
+
+def _solana_owner_mint_deltas_from_tx(js: Dict) -> Dict[Tuple[str, str], float]:
+    """
+    Return {(mint, owner_key): delta_ui_amount} using pre/post token balances.
+    We intentionally keep owner scope because Jupiter limit-order settlement txs can expose
+    the true received base leg on one owner and the spent quote leg on another related owner.
+    """
+    result = (js or {}).get("result") or {}
+    meta = result.get("meta") or {}
+
+    def _ui_amount(tb: Dict) -> float:
+        ui = ((tb.get("uiTokenAmount") or {}).get("uiAmount"))
+        if ui is None:
+            amt = (tb.get("uiTokenAmount") or {}).get("amount")
+            dec = (tb.get("uiTokenAmount") or {}).get("decimals")
+            try:
+                return float(int(amt)) / (10 ** int(dec))
+            except Exception:
+                return 0.0
+        try:
+            return float(ui)
+        except Exception:
+            return 0.0
+
+    pre = meta.get("preTokenBalances") or []
+    post = meta.get("postTokenBalances") or []
+
+    def _owner_key(tb: Dict) -> str:
+        owner = str(tb.get("owner") or "").strip()
+        if owner:
+            return owner
+        try:
+            ai = int(tb.get("accountIndex"))
+        except Exception:
+            ai = -1
+        return f"acct:{ai}"
+
+    pre_map: Dict[Tuple[str, str, int], float] = {}
+    for tb in pre:
+        if not isinstance(tb, dict):
+            continue
+        mint = str(tb.get("mint") or "").strip()
+        if not mint:
+            continue
+        owner_key = _owner_key(tb)
+        try:
+            ai = int(tb.get("accountIndex"))
+        except Exception:
+            ai = -1
+        pre_map[(mint, owner_key, ai)] = _ui_amount(tb)
+
+    deltas: Dict[Tuple[str, str], float] = {}
+    seen = set()
+    for tb in post:
+        if not isinstance(tb, dict):
+            continue
+        mint = str(tb.get("mint") or "").strip()
+        if not mint:
+            continue
+        owner_key = _owner_key(tb)
+        try:
+            ai = int(tb.get("accountIndex"))
+        except Exception:
+            ai = -1
+        k = (mint, owner_key, ai)
+        seen.add(k)
+        post_amt = _ui_amount(tb)
+        pre_amt = pre_map.get(k, 0.0)
+        d = post_amt - pre_amt
+        if abs(d) > 0:
+            deltas[(mint, owner_key)] = deltas.get((mint, owner_key), 0.0) + float(d)
+
+    for k, pre_amt in pre_map.items():
+        if k in seen:
+            continue
+        mint, owner_key, _ai = k
+        d = 0.0 - float(pre_amt)
+        if abs(d) > 0:
+            deltas[(mint, owner_key)] = deltas.get((mint, owner_key), 0.0) + d
+
+    _WSOL_MINT = "So11111111111111111111111111111111111111112"
+    out: Dict[Tuple[str, str], float] = {}
+    for (mint, owner_key), delta in deltas.items():
+        mint2 = "SOL" if mint == _WSOL_MINT else mint
+        out[(mint2, owner_key)] = out.get((mint2, owner_key), 0.0) + float(delta)
+    return out
+
+
+def _solana_pick_base_quote_legs_from_owner_extrema(
+    js: Dict,
+    token_meta: Optional[Dict[str, Dict[str, Optional[int]]]] = None,
+) -> Optional[Tuple[str, float, str, float, Optional[str]]]:
+    """
+    Recover legs from the strongest per-owner token-balance deltas in the tx.
+
+    This is designed for Jupiter limit-order settlement fills where:
+      - the user-facing received base leg may land on one owned token account
+      - the spent quote leg may be reflected on a different related owner/account
+      - naive owner-specific aggregation can therefore collapse to a tiny dust delta
+    """
+    token_meta = token_meta or {}
+    owner_deltas = _solana_owner_mint_deltas_from_tx(js)
+    if not owner_deltas:
+        return None
+
+    pos = [(mint, delta, owner) for (mint, owner), delta in owner_deltas.items() if delta > 0]
+    neg = [(mint, delta, owner) for (mint, owner), delta in owner_deltas.items() if delta < 0]
+    if not pos or not neg:
+        return None
+
+    non_sol_pos = [(m, d, o) for (m, d, o) in pos if str(m or "").strip() != "SOL"]
+    if non_sol_pos:
+        base_mint, base_qty, _base_owner = max(non_sol_pos, key=lambda x: x[1])
+    else:
+        base_mint, base_qty, _base_owner = max(pos, key=lambda x: x[1])
+
+    def _is_known_stable(mint: str) -> bool:
+        m = str(mint or "").strip()
+        return m in _SOLANA_STABLE_QUOTE_MINTS
+
+    def _decimals_for(mint: str) -> Optional[int]:
+        try:
+            return (token_meta.get(str(mint or "").strip()) or {}).get("decimals")
+        except Exception:
+            return None
+
+    stable_neg = [(m, d, o) for (m, d, o) in neg if _is_known_stable(m)]
+    if stable_neg and str(base_mint or "").strip() != "SOL":
+        quote_mint, quote_delta, _quote_owner = min(stable_neg, key=lambda x: x[1])
+        return base_mint, float(base_qty), quote_mint, float(quote_delta), "owner_extrema_prefer_known_stable_quote"
+
+    has_sol_neg = any(str(m or "").strip() == "SOL" for m, _d, _o in neg)
+    six_dec_non_sol_neg = [
+        (m, d, o) for (m, d, o) in neg
+        if str(m or "").strip() != "SOL" and _decimals_for(m) == 6
+    ]
+    if has_sol_neg and six_dec_non_sol_neg and str(base_mint or "").strip() != "SOL":
+        quote_mint, quote_delta, _quote_owner = min(six_dec_non_sol_neg, key=lambda x: x[1])
+        return base_mint, float(base_qty), quote_mint, float(quote_delta), "owner_extrema_prefer_6dec_quote_over_sol"
+
+    quote_mint, quote_delta, _quote_owner = min(neg, key=lambda x: x[1])
+    return base_mint, float(base_qty), quote_mint, float(quote_delta), "owner_extrema_fallback"
+
+
+@router.post("/solana/tx/ingest")
+async def wallet_addresses_solana_tx_ingest(
+    limit_per_address: int = Query(50, ge=1, le=500),
+    write_ledger: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """Discover + cache Solana txs for SOL wallet addresses only.
+
+    This is a Solana-only variant of /tx/ingest. It intentionally defaults to
+    write_ledger=False because swap materialization is handled by /solana/ingest_swap_orders.
+    """
+    wallet_addresses = db.execute(select(WalletAddress)).scalars().all()
+    sol_ids = [str(wa.id) for wa in wallet_addresses if _norm_asset(wa.asset) == "SOL"]
+    if not sol_ids:
+        return {"ok": True, "cached": 0, "ledger_written": 0, "errors": []}
+
+    payload = WalletAddressTxIngestRequest(
+        ids=sol_ids,
+        limit_per_address=limit_per_address,
+        write_ledger=write_ledger,
+    )
+    return await wallet_addresses_tx_ingest(payload=payload, db=db)
+
+
+@router.post("/solana/ingest_swap_orders")
+def ingest_solana_swap_orders(
+    wallet_address: Optional[str] = None,
+    max_rows: int = 5000,
+    venue: str = "solana_jupiter",
+    db: Session = Depends(get_db),
+):
+    """
+    Reads cached wallet_address_txs rows tagged utt.skip_ledger_reason == solana_swap_like,
+    re-fetches tx jsonParsed from Solana RPC, derives base/quote legs, and writes idempotently
+    into swap_orders for All Orders history.
+    """
+    _ensure_swap_orders_table(db)
+
+    q = select(WalletAddressTx).where(WalletAddressTx.network == "solana")
+    if wallet_address:
+        q = q.where(WalletAddressTx.address == wallet_address)
+    q = q.order_by(WalletAddressTx.tx_time.desc()).limit(int(max_rows))
+
+    rows = db.execute(q).scalars().all()
+
+    inserted = 0
+    ignored = 0
+    skipped = 0
+    errors: List[Dict] = []
+
+    # Diagnostics: why swap-like txs fail to materialize into swap_orders.
+    skip_reasons: Dict[str, int] = {}
+    skipped_examples: List[Dict] = []
+    _SKIP_EXAMPLES_MAX = 10
+
+    from sqlalchemy import text
+
+    for tx in rows:
+        raw = tx.raw or {}
+        utt = (raw.get("utt") or {})
+        sig = tx.txid
+        addr = tx.address
+
+        tagged_swap_like = str(utt.get("skip_ledger_reason") or "") == "solana_swap_like"
+        second_chance_swap_like = False
+        js = None
+
+        if not tagged_swap_like:
+            try:
+                js = _fetch_solana_tx_dashboard(sig, cached_raw=raw)
+                meta = ((js.get("result") or {}).get("meta") or {})
+                pre_tb = meta.get("preTokenBalances") or []
+                post_tb = meta.get("postTokenBalances") or []
+                if pre_tb or post_tb:
+                    second_chance_swap_like = True
+                if not second_chance_swap_like and _solana_tx_is_swap_like(js, addr):
+                    second_chance_swap_like = True
+                if not second_chance_swap_like:
+                    deltas_probe = _solana_token_deltas_from_tx(js, addr)
+                    pos_probe = [(m, d) for m, d in deltas_probe.items() if d > 0]
+                    neg_probe = [(m, d) for m, d in deltas_probe.items() if d < 0]
+                    if pos_probe and neg_probe:
+                        second_chance_swap_like = True
+                if not second_chance_swap_like:
+                    relaxed_probe = _solana_token_deltas_from_tx_relaxed(js, addr)
+                    pos_probe = [(m, d) for m, d in relaxed_probe.items() if d > 0]
+                    neg_probe = [(m, d) for m, d in relaxed_probe.items() if d < 0]
+                    if pos_probe and neg_probe:
+                        second_chance_swap_like = True
+            except Exception:
+                second_chance_swap_like = False
+
+            if not second_chance_swap_like:
+                skip_reasons["not_swap_like"] = skip_reasons.get("not_swap_like", 0) + 1
+                continue
+
+        # Track existing row, but do not skip: corrected materialization logic should be able
+        # to repair previously misclassified rows on re-ingest.
+        exists = db.execute(
+            text("SELECT 1 FROM swap_orders WHERE venue = :v AND signature = :s LIMIT 1"),
+            {"v": venue, "s": sig},
+        ).first()
+
+        try:
+            if js is None:
+                js = _fetch_solana_tx_dashboard(sig, cached_raw=raw)
+            # token deltas for owner
+            deltas = _solana_token_deltas_from_tx(js, addr)
+            # Diagnostics helpers (owner may be missing on some token balance nodes)
+            _owner_missing = 0
+            try:
+                meta = ((js.get("result") or {}).get("meta") or {})
+                for tb in (meta.get("preTokenBalances") or []):
+                    if not (tb.get("owner") or ""):
+                        _owner_missing += 1
+                for tb in (meta.get("postTokenBalances") or []):
+                    if not (tb.get("owner") or ""):
+                        _owner_missing += 1
+            except Exception:
+                _owner_missing = 0
+
+            # Fallback for newer Jupiter routes / limit-order settlements where token balance
+            # rows may omit owner or produce one-sided owner-attributed deltas.
+            pos = [(m, d) for m, d in deltas.items() if d > 0]
+            neg = [(m, d) for m, d in deltas.items() if d < 0]
+            if (not deltas) or (not pos) or (not neg):
+                relaxed = _solana_token_deltas_from_tx_relaxed(js, addr)
+                pos_r = [(m, d) for m, d in relaxed.items() if d > 0]
+                neg_r = [(m, d) for m, d in relaxed.items() if d < 0]
+                if relaxed and pos_r and neg_r:
+                    deltas = relaxed
+                    pos = pos_r
+                    neg = neg_r
+
+            if not deltas:
+                skipped += 1
+                reason = "no_token_deltas_owner_missing" if _owner_missing else "no_token_deltas"
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                if len(skipped_examples) < _SKIP_EXAMPLES_MAX:
+                    skipped_examples.append({"sig": sig, "reason": reason})
+                continue
+
+            is_liquidity_event, liquidity_reason = _solana_is_probable_raydium_liquidity_event(js, deltas)
+            if is_liquidity_event:
+                skipped += 1
+                reason = liquidity_reason or "solana_liquidity_event"
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                try:
+                    if isinstance(tx.raw, dict):
+                        prev_utt = dict((tx.raw or {}).get("utt") or {})
+                        prev_utt.update({"complex": True, "skip_ledger_reason": reason})
+                        tx.raw = {**tx.raw, "utt": prev_utt}
+                        db.add(tx)
+                except Exception:
+                    pass
+                if len(skipped_examples) < _SKIP_EXAMPLES_MAX:
+                    skipped_examples.append({"sig": sig, "reason": reason})
+                continue
+
+            # pick legs with stable-quote preference:
+            # - prefer non-SOL positive leg as base when available
+            # - prefer stable quote / 6-dec quote token over incidental SOL settlement leg
+            pos = [(m, d) for m, d in deltas.items() if d > 0]
+            neg = [(m, d) for m, d in deltas.items() if d < 0]
+
+            if not pos or not neg:
+                # Native SOL legs may only appear in lamport balance deltas rather than token balance deltas.
+                native_sol_delta = _solana_native_sol_delta_from_tx(js, addr)
+                has_non_sol_material = any(str(m or "").strip() != "SOL" and abs(float(d)) > 1e-9 for m, d in deltas.items())
+                if native_sol_delta is not None and has_non_sol_material:
+                    if abs(float(native_sol_delta)) > 1e-9:
+                        deltas = dict(deltas)
+                        deltas["SOL"] = float(deltas.get("SOL") or 0.0) + float(native_sol_delta)
+                        pos = [(m, d) for m, d in deltas.items() if d > 0]
+                        neg = [(m, d) for m, d in deltas.items() if d < 0]
+
+                if not pos or not neg:
+                    # can't form 2-leg swap; skip
+                    skipped += 1
+                    reason = "no_pos_leg" if not pos else "no_neg_leg"
+                    skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    if len(skipped_examples) < _SKIP_EXAMPLES_MAX:
+                        skipped_examples.append({"sig": sig, "reason": reason})
+                    continue
+
+            token_meta = _solana_token_meta_from_tx(js)
+
+            canonical = _solana_pick_canonical_swap_legs(deltas, token_meta=token_meta)
+            if canonical is not None:
+                base_mint, base_qty, quote_mint, quote_qty, side, selection_hint = canonical
+                quote_delta = -float(quote_qty)
+            else:
+                base_mint, base_qty, quote_mint, quote_delta, selection_hint = _solana_pick_base_quote_legs(
+                    pos,
+                    neg,
+                    token_meta=token_meta,
+                )
+                quote_qty = abs(float(quote_delta))
+                side = "buy" if float(deltas.get(base_mint) or 0.0) >= 0 else "sell"
+
+            # Second-pass recovery for Jupiter limit-order settlement fills:
+            # if owner-specific / relaxed deltas produced a tiny dust-sized base or quote leg,
+            # try strongest per-owner pre/post token-balance deltas across the tx.
+            extrema = _solana_pick_base_quote_legs_from_owner_extrema(js, token_meta=token_meta)
+            if extrema is not None:
+                ex_base_mint, ex_base_qty, ex_quote_mint, ex_quote_delta, ex_hint = extrema
+                current_quote_qty = abs(float(quote_delta))
+                extrema_quote_qty = abs(float(ex_quote_delta))
+
+                # Promote the owner-extrema candidate when it is materially larger than the current
+                # owner-specific result. This preserves existing behavior for normal swaps while
+                # fixing mis-reconciled Jupiter settlement fills like UTTT-USDC -> dust.
+                if (
+                    (float(base_qty) <= 0.0)
+                    or (current_quote_qty <= 0.0)
+                    or (abs(float(ex_base_qty)) > abs(float(base_qty)) * 1000.0)
+                    or (extrema_quote_qty > current_quote_qty * 1000.0)
+                ):
+                    base_mint, base_qty, quote_mint, quote_delta, selection_hint = extrema
+                    quote_qty = abs(float(ex_quote_delta))
+                    try:
+                        if float(deltas.get(base_mint) or 0.0) < 0:
+                            side = "sell"
+                        else:
+                            side = "buy"
+                    except Exception:
+                        side = "buy"
+
+            quote_qty = abs(float(quote_delta))
+
+            # Native-SOL recovery for real TOKEN-SOL swaps that temporarily collapse into
+            # a fake self-pair before the self-pair guard runs. If both legs resolve to the
+            # same non-SOL mint, but the tx still has a material SOL delta, restore SOL as
+            # the quote leg and continue through normal materialization.
+            try:
+                _bm = str(base_mint or "").strip()
+                _qm = str(quote_mint or "").strip()
+                _sol_delta = float(deltas.get("SOL") or 0.0)
+                if _bm and (_bm == _qm) and (_bm != "SOL") and (abs(_sol_delta) > 0.0):
+                    quote_mint = "SOL"
+                    quote_delta = _sol_delta
+                    quote_qty = abs(_sol_delta)
+            except Exception:
+                pass
+
+            if str(base_mint or "").strip() == str(quote_mint or "").strip():
+                skipped += 1
+                reason = "solana_self_pair"
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                try:
+                    if isinstance(tx.raw, dict):
+                        prev_utt = dict((tx.raw or {}).get("utt") or {})
+                        prev_utt.update({"complex": True, "skip_ledger_reason": reason})
+                        tx.raw = {**tx.raw, "utt": prev_utt}
+                        db.add(tx)
+                except Exception:
+                    pass
+                if len(skipped_examples) < _SKIP_EXAMPLES_MAX:
+                    skipped_examples.append({"sig": sig, "reason": reason})
+                continue
+
+            price = (quote_qty / float(base_qty)) if float(base_qty) != 0 else None
+
+            # Determine side in UTT semantics: buy = spend quote, receive base; sell = spend base, receive quote
+            status = "filled"
+            typ = "market"
+
+            # Timestamp: try from js.blockTime else tx.tx_time
+            ts = None
+            try:
+                bt = (js.get("result") or {}).get("blockTime")
+                if bt is not None:
+                    ts = datetime.utcfromtimestamp(int(bt)).isoformat()
+            except Exception:
+                ts = None
+            if not ts and tx.tx_time:
+                ts = tx.tx_time.isoformat()
+
+            raw_symbol = f"{base_mint}-{quote_mint}"
+
+            payload = {
+                "venue": venue,
+                "chain": "solana",
+                "wallet_address": addr,
+                "signature": sig,
+                "raw_symbol": raw_symbol,
+                "resolved_symbol": None,
+                "side": side,
+                "type": typ,
+                "status": status,
+                "base_qty": float(base_qty),
+                "quote_qty": float(quote_qty),
+                "price": float(price) if price is not None else None,
+                "fee_quote": None,
+                "base_mint": base_mint,
+                "quote_mint": quote_mint,
+                "ts": ts,
+                "raw": json.dumps({
+                    "tx": raw,
+                    "deltas": deltas,
+                    "token_meta": token_meta,
+                    "selection_hint": selection_hint,
+                }),
+            }
+
+            db.execute(
+                text(
+                    """
+                    INSERT INTO swap_orders
+                    (venue, chain, wallet_address, signature, raw_symbol, resolved_symbol, side, type, status,
+                     base_qty, quote_qty, price, fee_quote, base_mint, quote_mint, ts, raw)
+                    VALUES
+                    (:venue, :chain, :wallet_address, :signature, :raw_symbol, :resolved_symbol, :side, :type, :status,
+                     :base_qty, :quote_qty, :price, :fee_quote, :base_mint, :quote_mint, :ts, :raw)
+                    ON CONFLICT(venue, signature) DO UPDATE SET
+                      chain=excluded.chain,
+                      wallet_address=excluded.wallet_address,
+                      raw_symbol=excluded.raw_symbol,
+                      resolved_symbol=excluded.resolved_symbol,
+                      side=excluded.side,
+                      type=excluded.type,
+                      status=excluded.status,
+                      base_qty=excluded.base_qty,
+                      quote_qty=excluded.quote_qty,
+                      price=excluded.price,
+                      fee_quote=excluded.fee_quote,
+                      base_mint=excluded.base_mint,
+                      quote_mint=excluded.quote_mint,
+                      ts=excluded.ts,
+                      raw=excluded.raw
+                    """
+                ),
+                payload,
+            )
+            if exists:
+                ignored += 1
+                skip_reasons["updated_existing"] = skip_reasons.get("updated_existing", 0) + 1
+            else:
+                inserted += 1
+
+        except Exception as e:
+            errors.append({"signature": sig, "error": str(e)})
+            skipped += 1
+            skip_reasons["exception"] = skip_reasons.get("exception", 0) + 1
+            if len(skipped_examples) < _SKIP_EXAMPLES_MAX:
+                skipped_examples.append({"sig": sig, "reason": "exception"})
+
+    db.commit()
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "ignored": ignored,
+        "skipped": skipped,
+        "skip_reasons": skip_reasons,
+        "skipped_examples": skipped_examples,
+        "errors": errors,
+    }

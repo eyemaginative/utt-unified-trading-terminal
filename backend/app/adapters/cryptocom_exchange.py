@@ -409,8 +409,24 @@ class CryptoComExchangeAdapter(ExchangeAdapter):
         sec = getattr(settings, "cryptocom_exchange_api_secret", None) or os.getenv("CRYPTOCOM_EXCHANGE_API_SECRET")
         key = (key or "").strip()
         sec = (sec or "").strip()
+
+        # Vault-first fallback (Profile → API Keys). Non-secret env toggles can remain.
+        if (not key) or (not sec):
+            vc = None
+            try:
+                vc = getattr(settings, "cryptocom_private_creds", lambda: None)()
+            except Exception:
+                vc = None
+            if isinstance(vc, (list, tuple)) and len(vc) >= 2:
+                k2 = (vc[0] or "").strip()
+                s2 = (vc[1] or "").strip()
+                if (not key) and k2:
+                    key = k2
+                if (not sec) and s2:
+                    sec = s2
+
         if not key or not sec:
-            raise Exception("Missing Crypto.com Exchange credentials: set CRYPTOCOM_EXCHANGE_API_KEY and CRYPTOCOM_EXCHANGE_API_SECRET")
+            raise Exception("Missing Crypto.com Exchange credentials: set CRYPTOCOM_EXCHANGE_API_KEY and CRYPTOCOM_EXCHANGE_API_SECRET (or save venue='cryptocom' in Profile → API Keys)")
         return key, sec
 
     # ─────────────────────────────────────────────────────────────

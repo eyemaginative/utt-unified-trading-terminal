@@ -1,6 +1,9 @@
 // frontend/src/OrderTicketWidget.jsx
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Connection, clusterApiUrl } from "@solana/web3.js";
+import { useWallet } from "@solana/wallet-adapter-react";
+import { UnifiedWalletButton } from "@jup-ag/wallet-adapter";
 import { getOrderRules } from "./lib/api";
 import { expandExponential } from "./lib/format";
 
@@ -8,6 +11,571 @@ import { expandExponential } from "./lib/format";
 const UTT_AUTH_TOKEN_KEY = 'utt_auth_token_v1';
 function getAuthToken() {
   try { return localStorage.getItem(UTT_AUTH_TOKEN_KEY) || ''; } catch { return ''; }
+}
+
+const LS_OT_SOL_WALLET = "utt_ot_sol_wallet_v1";
+const LS_OT_SOL_ROUTER = "utt_ot_sol_router_v1";
+
+function getPreferredSolanaWalletKey() {
+  try { return localStorage.getItem(LS_OT_SOL_WALLET) || "solflare"; } catch { return "solflare"; }
+}
+function setPreferredSolanaWalletKey(v) {
+  try { localStorage.setItem(LS_OT_SOL_WALLET, String(v || "solflare")); } catch {}
+}
+function getPreferredSolanaRouterMode() {
+  try {
+    const raw = String(localStorage.getItem(LS_OT_SOL_ROUTER) || "auto").toLowerCase().trim();
+    const v = raw === "jupiter" ? "metis" : raw; // back-compat
+    return v === "ultra" || v === "metis" || v === "raydium" ? v : "auto";
+  } catch {
+    return "auto";
+  }
+}
+function setPreferredSolanaRouterMode(v) {
+  try {
+    const next = String(v || "auto").toLowerCase().trim();
+    localStorage.setItem(LS_OT_SOL_ROUTER, next === "ultra" || next === "metis" || next === "raydium" ? next : "auto");
+  } catch {}
+}
+
+function solanaProviderPubkeyBase58(provider) {
+  try {
+    const pk = provider?.publicKey;
+    if (!pk) return null;
+    if (typeof pk?.toBase58 === "function") return pk.toBase58();
+    if (typeof pk?.toString === "function") return pk.toString();
+    if (typeof pk === "string") return pk;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isSolanaProviderLike(provider) {
+  try {
+    return !!provider && (
+      typeof provider?.connect === "function" ||
+      typeof provider?.signTransaction === "function" ||
+      typeof provider?.signAndSendTransaction === "function" ||
+      !!provider?.publicKey
+    );
+  } catch {
+    return false;
+  }
+}
+
+function unwrapSolanaProvider(candidate) {
+  try {
+    if (!candidate) return null;
+    if (isSolanaProviderLike(candidate)) return candidate;
+    if (isSolanaProviderLike(candidate?.solana)) return candidate.solana;
+    if (isSolanaProviderLike(candidate?.provider)) return candidate.provider;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isJupiterLikeProvider(provider) {
+  try {
+    if (!provider) return false;
+    return !!(
+      provider?.isJupiter ||
+      provider?.isJupiterWallet ||
+      provider?.isJup ||
+      provider?.isJupWallet ||
+      String(provider?.name || provider?.walletName || provider?.providerName || "").toLowerCase().includes("jupiter")
+    );
+  } catch {
+    return false;
+  }
+}
+
+const WALLET_STANDARD_REGISTER_EVENT = "register-wallet";
+const WALLET_STANDARD_APP_READY_EVENT = "app-ready";
+
+function getWalletStandardState() {
+  try {
+    const w = typeof window !== "undefined" ? window : null;
+    if (!w) return null;
+    if (!w.__uttWalletStandardState) {
+      w.__uttWalletStandardState = {
+        initialized: false,
+        primed: false,
+        wallets: [],
+        seen: new Set(),
+        listeners: new Set(),
+        onRegister: null,
+      };
+    }
+    return w.__uttWalletStandardState;
+  } catch {
+    return null;
+  }
+}
+
+function walletStandardWalletId(wallet) {
+  try {
+    const name = String(wallet?.name || "").trim().toLowerCase();
+    const version = String(wallet?.version || "").trim().toLowerCase();
+    const chains = Array.isArray(wallet?.chains) ? wallet.chains.map((x) => String(x || "").trim().toLowerCase()).sort().join(",") : "";
+    const features = wallet?.features && typeof wallet.features === "object"
+      ? Object.keys(wallet.features).map((x) => String(x || "").trim().toLowerCase()).sort().join(",")
+      : "";
+    const icon = String(wallet?.icon || "").trim().toLowerCase();
+    return [name, version, chains, features, icon].join("|");
+  } catch {
+    return "";
+  }
+}
+
+function isWalletStandardSolanaWallet(wallet) {
+  try {
+    if (!wallet || typeof wallet !== "object") return false;
+    const name = String(wallet?.name || "").trim();
+    if (!name) return false;
+
+    const chains = Array.isArray(wallet?.chains) ? wallet.chains.map((x) => String(x || "").toLowerCase()) : [];
+    const featureKeys = wallet?.features && typeof wallet.features === "object"
+      ? Object.keys(wallet.features).map((x) => String(x || "").toLowerCase())
+      : [];
+
+    return (
+      chains.some((c) => c.includes("solana")) ||
+      featureKeys.some((k) => k.includes("solana:")) ||
+      isJupiterLikeProvider(wallet)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWalletStandardJupiterWallet(wallet) {
+  try {
+    return isJupiterLikeProvider(wallet) || String(wallet?.name || "").toLowerCase().includes("jupiter");
+  } catch {
+    return false;
+  }
+}
+
+function notifyWalletStandardListeners() {
+  try {
+    const st = getWalletStandardState();
+    if (!st) return;
+    const snapshot = Array.isArray(st.wallets) ? st.wallets.slice() : [];
+    for (const cb of st.listeners || []) {
+      try { cb(snapshot); } catch {}
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function addWalletStandardWalletCandidate(candidate) {
+  try {
+    const wallet =
+      candidate?.wallet ||
+      candidate?.adapter ||
+      candidate ||
+      null;
+
+    if (!isWalletStandardSolanaWallet(wallet)) return;
+
+    const st = getWalletStandardState();
+    if (!st) return;
+
+    const id = walletStandardWalletId(wallet);
+    if (!id) return;
+    if (st.seen.has(id)) return;
+
+    st.seen.add(id);
+    st.wallets = [...(Array.isArray(st.wallets) ? st.wallets : []), wallet];
+    notifyWalletStandardListeners();
+  } catch {
+    // ignore
+  }
+}
+
+function handleWalletStandardRegisterEvent(event) {
+  try {
+    const detail = event?.detail;
+
+    if (typeof detail?.register === "function") {
+      detail.register((wallet) => addWalletStandardWalletCandidate(wallet));
+      return;
+    }
+
+    if (typeof detail === "function") {
+      detail((wallet) => addWalletStandardWalletCandidate(wallet));
+      return;
+    }
+
+    if (Array.isArray(detail?.wallets)) {
+      detail.wallets.forEach((wallet) => addWalletStandardWalletCandidate(wallet));
+      return;
+    }
+
+    if (Array.isArray(detail)) {
+      detail.forEach((wallet) => addWalletStandardWalletCandidate(wallet));
+      return;
+    }
+
+    addWalletStandardWalletCandidate(detail?.wallet || detail);
+  } catch {
+    // ignore
+  }
+}
+
+function ensureWalletStandardBridge() {
+  try {
+    const st = getWalletStandardState();
+    const w = typeof window !== "undefined" ? window : null;
+    if (!st || !w || st.initialized) return;
+
+    st.initialized = true;
+    st.onRegister = (event) => handleWalletStandardRegisterEvent(event);
+
+    w.addEventListener(WALLET_STANDARD_REGISTER_EVENT, st.onRegister);
+
+    try {
+      w.dispatchEvent(new Event(WALLET_STANDARD_APP_READY_EVENT));
+    } catch {
+      // ignore
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function primeWalletStandardWallets() {
+  try {
+    const st = getWalletStandardState();
+    if (!st || st.primed) return;
+    st.primed = true;
+    ensureWalletStandardBridge();
+
+    try {
+      // Keep this package-free so Vite does not hard-fail when @wallet-standard/app
+      // is not installed in the frontend. Wallet-standard extensions can still
+      // register through the browser event bridge above.
+      const navWallets = typeof navigator !== "undefined" ? navigator?.wallets : null;
+      const wallets =
+        Array.isArray(navWallets) ? navWallets :
+        Array.isArray(navWallets?.wallets) ? navWallets.wallets :
+        typeof navWallets?.get === "function" ? navWallets.get() :
+        [];
+      if (Array.isArray(wallets)) {
+        wallets.forEach((wallet) => addWalletStandardWalletCandidate(wallet));
+      }
+    } catch {
+      // Event bridge still works without any helper package.
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function getWalletStandardWallets() {
+  try {
+    ensureWalletStandardBridge();
+    const st = getWalletStandardState();
+    return Array.isArray(st?.wallets) ? st.wallets.slice() : [];
+  } catch {
+    return [];
+  }
+}
+
+function subscribeWalletStandardWallets(callback) {
+  try {
+    ensureWalletStandardBridge();
+    const st = getWalletStandardState();
+    if (!st || typeof callback !== "function") return () => {};
+
+    st.listeners.add(callback);
+    callback(getWalletStandardWallets());
+    return () => {
+      try { st.listeners.delete(callback); } catch {}
+    };
+  } catch {
+    return () => {};
+  }
+}
+
+const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58EncodeBytes(bytesLike) {
+  try {
+    const bytes = bytesLike instanceof Uint8Array ? bytesLike : Uint8Array.from(bytesLike || []);
+    if (!bytes.length) return "";
+    let zeros = 0;
+    while (zeros < bytes.length && bytes[zeros] === 0) zeros += 1;
+
+    let digits = [0];
+    for (let i = zeros; i < bytes.length; i += 1) {
+      let carry = bytes[i];
+      for (let j = 0; j < digits.length; j += 1) {
+        const x = digits[j] * 256 + carry;
+        digits[j] = x % 58;
+        carry = Math.floor(x / 58);
+      }
+      while (carry > 0) {
+        digits.push(carry % 58);
+        carry = Math.floor(carry / 58);
+      }
+    }
+
+    let out = "1".repeat(zeros);
+    for (let i = digits.length - 1; i >= 0; i -= 1) out += B58_ALPHABET[digits[i]];
+    return out;
+  } catch {
+    return "";
+  }
+}
+
+function coerceWalletStandardSignature(value) {
+  try {
+    if (!value) return null;
+    if (typeof value === "string") return value;
+    if (value instanceof Uint8Array) return base58EncodeBytes(value);
+    if (ArrayBuffer.isView(value)) return base58EncodeBytes(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    if (value instanceof ArrayBuffer) return base58EncodeBytes(new Uint8Array(value));
+    if (Array.isArray(value)) return base58EncodeBytes(Uint8Array.from(value));
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function walletStandardAccountAddress(account) {
+  try {
+    return String(account?.address || account?.publicKey || "").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function walletStandardPublicKeyShim(address) {
+  if (!address) return null;
+  return {
+    toBase58: () => String(address),
+    toString: () => String(address),
+  };
+}
+
+function walletStandardSolanaChain(wallet) {
+  try {
+    const chains = Array.isArray(wallet?.chains) ? wallet.chains.map((x) => String(x || "")) : [];
+    return chains.find((c) => c.toLowerCase().includes("solana")) || "solana:mainnet";
+  } catch {
+    return "solana:mainnet";
+  }
+}
+
+async function callWalletStandardFeatureMethod(featureObj, methodName, input) {
+  if (!featureObj || typeof featureObj?.[methodName] !== "function") {
+    throw new Error(`Wallet missing ${methodName}`);
+  }
+  try {
+    return await featureObj[methodName](input);
+  } catch (e1) {
+    try {
+      return await featureObj[methodName]([input]);
+    } catch {
+      throw e1;
+    }
+  }
+}
+
+function createWalletStandardSolanaProvider(wallet) {
+  const provider = {
+    __walletStandard: true,
+    __walletStandardWallet: wallet,
+    __walletStandardAccount: (Array.isArray(wallet?.accounts) ? wallet.accounts[0] : null) || null,
+    get publicKey() {
+      const account = this.__walletStandardAccount || (Array.isArray(this.__walletStandardWallet?.accounts) ? this.__walletStandardWallet.accounts[0] : null);
+      return walletStandardPublicKeyShim(walletStandardAccountAddress(account));
+    },
+    async connect() {
+      const feature = this.__walletStandardWallet?.features?.["standard:connect"];
+      if (feature && typeof feature.connect === "function") {
+        const out = await feature.connect();
+        const accounts =
+          Array.isArray(out?.accounts) ? out.accounts :
+          Array.isArray(this.__walletStandardWallet?.accounts) ? this.__walletStandardWallet.accounts :
+          [];
+        this.__walletStandardAccount = accounts[0] || this.__walletStandardAccount || null;
+      } else if (!this.__walletStandardAccount && Array.isArray(this.__walletStandardWallet?.accounts)) {
+        this.__walletStandardAccount = this.__walletStandardWallet.accounts[0] || null;
+      }
+
+      return this.publicKey ? { publicKey: this.publicKey } : null;
+    },
+    async signTransaction(transaction) {
+      const wallet = this.__walletStandardWallet;
+      const account = this.__walletStandardAccount || (await this.connect(), this.__walletStandardAccount);
+      if (!account) throw new Error("Wallet account unavailable.");
+
+      const feature = wallet?.features?.["solana:signTransaction"];
+      const out = await callWalletStandardFeatureMethod(feature, "signTransaction", {
+        account,
+        chain: walletStandardSolanaChain(wallet),
+        transaction,
+      });
+
+      const first = Array.isArray(out) ? out[0] : out;
+      return first?.signedTransaction || first?.transaction || first || null;
+    },
+    async signAndSendTransaction(transaction) {
+      const wallet = this.__walletStandardWallet;
+      const account = this.__walletStandardAccount || (await this.connect(), this.__walletStandardAccount);
+      if (!account) throw new Error("Wallet account unavailable.");
+
+      const feature = wallet?.features?.["solana:signAndSendTransaction"];
+      const out = await callWalletStandardFeatureMethod(feature, "signAndSendTransaction", {
+        account,
+        chain: walletStandardSolanaChain(wallet),
+        transaction,
+      });
+
+      const first = Array.isArray(out) ? out[0] : out;
+      const signature =
+        coerceWalletStandardSignature(first?.signature) ||
+        coerceWalletStandardSignature(Array.isArray(first?.signatures) ? first.signatures[0] : null);
+
+      if (!signature) throw new Error("Wallet did not return a signature.");
+      return { signature };
+    },
+  };
+
+  return provider;
+}
+
+function collectSolanaProviderCandidates(root) {
+  const out = [];
+  const push = (candidate) => {
+    try {
+      if (!candidate) return;
+      out.push(candidate);
+      if (Array.isArray(candidate?.providers)) {
+        for (const p of candidate.providers) out.push(p);
+      }
+      if (Array.isArray(candidate?.wallets)) {
+        for (const p of candidate.wallets) out.push(p);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  try {
+    push(root?.solana);
+    push(root?.phantom);
+    push(root?.phantom?.solana);
+    push(root?.solflare);
+    push(root?.solflare?.solana);
+    push(root?.backpack);
+    push(root?.backpack?.solana);
+    push(root?.jupiterWallet);
+    push(root?.jupiterWallet?.solana);
+    push(root?.jupiter);
+    push(root?.jupiter?.solana);
+    push(root?.jup);
+    push(root?.jup?.solana);
+    push(root?.xnft?.solana);
+  } catch {
+    // ignore
+  }
+
+  return out;
+}
+
+function classifyInjectedSolanaProvider(candidate) {
+  try {
+    const provider = unwrapSolanaProvider(candidate) || candidate || null;
+    if (!provider) return { key: null, provider: null };
+
+    if (isJupiterLikeProvider(candidate) || isJupiterLikeProvider(provider)) {
+      return { key: "jupiter", provider };
+    }
+    if (provider?.isPhantom || candidate?.isPhantom) {
+      return { key: "phantom", provider };
+    }
+    if (provider?.isBackpack || candidate?.isBackpack) {
+      return { key: "backpack", provider };
+    }
+    if (provider?.isSolflare || candidate?.isSolflare) {
+      return { key: "solflare", provider };
+    }
+
+    const nameBlob = [
+      candidate?.name,
+      candidate?.walletName,
+      candidate?.providerName,
+      provider?.name,
+      provider?.walletName,
+      provider?.providerName,
+    ].map((x) => String(x || "").toLowerCase()).join(" ");
+
+    if (nameBlob.includes("jupiter")) return { key: "jupiter", provider };
+    if (nameBlob.includes("phantom")) return { key: "phantom", provider };
+    if (nameBlob.includes("backpack")) return { key: "backpack", provider };
+    if (nameBlob.includes("solflare")) return { key: "solflare", provider };
+
+    return { key: null, provider: null };
+  } catch {
+    return { key: null, provider: null };
+  }
+}
+
+function getInjectedSolanaProviders(walletStandardWallets = null) {
+  try {
+    ensureWalletStandardBridge();
+    const w = typeof window !== "undefined" ? window : null;
+    if (!w) return {};
+
+    const providers = {};
+    const candidates = collectSolanaProviderCandidates(w);
+    for (const candidate of candidates) {
+      const { key, provider } = classifyInjectedSolanaProvider(candidate);
+      if (!key || !provider || providers[key]) continue;
+      providers[key] = provider;
+    }
+
+    const walletStandardList = Array.isArray(walletStandardWallets) ? walletStandardWallets : getWalletStandardWallets();
+    const wsJupiter = walletStandardList.find((wallet) => isWalletStandardJupiterWallet(wallet));
+    if (!providers.jupiter && wsJupiter) {
+      providers.jupiter = createWalletStandardSolanaProvider(wsJupiter);
+    }
+
+    return providers;
+  } catch {
+    return {};
+  }
+}
+
+function getInjectedSolanaProvider(preferred = "solflare", walletStandardWallets = null) {
+  const providers = getInjectedSolanaProviders(walletStandardWallets);
+  const order = ["jupiter", "solflare", "phantom", "backpack"];
+
+  const pref = String(preferred || "solflare").toLowerCase().trim();
+  if (providers[pref]) return { key: pref, provider: providers[pref] };
+
+  for (const key of order) {
+    const p = providers[key];
+    if (p && solanaProviderPubkeyBase58(p)) return { key, provider: p };
+  }
+  for (const key of order) {
+    const p = providers[key];
+    if (p) return { key, provider: p };
+  }
+  return { key: null, provider: null };
+}
+
+function getInstalledSolanaWalletOptions(walletStandardWallets = null) {
+  const providers = getInjectedSolanaProviders(walletStandardWallets);
+  const labels = { jupiter: "Jupiter", solflare: "Solflare", phantom: "Phantom", backpack: "Backpack" };
+  const order = ["jupiter", "solflare", "phantom", "backpack"];
+  return order.filter((k) => !!providers[k]).map((k) => ({ key: k, label: labels[k] || k }));
 }
 
 
@@ -72,6 +640,152 @@ function extractRulesError(e) {
   }
 }
 
+
+function classifyWalletAdapterNameToKey(nameLike) {
+  try {
+    const s = String(nameLike || "").toLowerCase().trim();
+    if (!s) return null;
+    if (s.includes("jupiter") || s.includes("jup.ag") || s === "jup" || s.includes(" jup ")) return "jupiter";
+    if (s.includes("solflare")) return "solflare";
+    if (s.includes("phantom")) return "phantom";
+    if (s.includes("backpack")) return "backpack";
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function createWalletAdapterBridgeProvider(walletApi, connection) {
+  if (!walletApi) return null;
+
+  return {
+    __walletAdapterBridge: true,
+    get publicKey() {
+      return walletApi?.publicKey || null;
+    },
+    async connect() {
+      if (walletApi?.connected && walletApi?.publicKey) {
+        return { publicKey: walletApi.publicKey };
+      }
+      if (typeof walletApi?.connect === "function") {
+        await walletApi.connect();
+      }
+      return walletApi?.publicKey ? { publicKey: walletApi.publicKey } : null;
+    },
+    async signTransaction(transaction) {
+      if (typeof walletApi?.signTransaction !== "function") {
+        throw new Error("Selected wallet does not support signTransaction.");
+      }
+      return await walletApi.signTransaction(transaction);
+    },
+    async signAndSendTransaction(transaction) {
+      if (typeof walletApi?.sendTransaction === "function") {
+        const signature = await walletApi.sendTransaction(transaction, connection);
+        if (!signature) throw new Error("Wallet did not return a signature.");
+        return { signature: String(signature) };
+      }
+      if (typeof walletApi?.signTransaction === "function") {
+        const signed = await walletApi.signTransaction(transaction);
+        const raw = typeof signed?.serialize === "function" ? signed.serialize() : null;
+        if (!raw) throw new Error("Wallet did not return a serializable signed transaction.");
+        const signature = await connection.sendRawTransaction(raw);
+        if (!signature) throw new Error("RPC did not return a signature.");
+        return { signature: String(signature) };
+      }
+      throw new Error("Selected wallet does not support sendTransaction or signTransaction.");
+    },
+  };
+}
+
+function shortenWalletAddress(addr, left = 6, right = 4) {
+  try {
+    const s = String(addr || "").trim();
+    if (!s) return "";
+    if (s.length <= left + right + 1) return s;
+    return `${s.slice(0, left)}…${s.slice(-right)}`;
+  } catch {
+    return "";
+  }
+}
+
+function getSolanaWalletVisualMeta(key, nameLike, iconLike) {
+  try {
+    const k = String(key || "").toLowerCase().trim();
+    const name = String(nameLike || "").trim();
+    const icon = String(iconLike || "").trim();
+
+    const presets = {
+      jupiter: {
+        label: "Jupiter",
+        color: "#43d3c5",
+        border: "rgba(67, 211, 197, 0.35)",
+        glow: "rgba(67, 211, 197, 0.18)",
+        fallbackBg: "linear-gradient(135deg, #36cfc9, #2f7cf6)",
+        fallbackFg: "#071014",
+        fallbackText: "J",
+      },
+      solflare: {
+        label: "Solflare",
+        color: "#f7d34a",
+        border: "rgba(247, 211, 74, 0.35)",
+        glow: "rgba(247, 211, 74, 0.18)",
+        fallbackBg: "#f7d34a",
+        fallbackFg: "#101010",
+        fallbackText: "S",
+      },
+      phantom: {
+        label: "Phantom",
+        color: "#a78bfa",
+        border: "rgba(167, 139, 250, 0.35)",
+        glow: "rgba(167, 139, 250, 0.18)",
+        fallbackBg: "#8b5cf6",
+        fallbackFg: "#ffffff",
+        fallbackText: "P",
+      },
+      backpack: {
+        label: "Backpack",
+        color: "#ef4444",
+        border: "rgba(239, 68, 68, 0.35)",
+        glow: "rgba(239, 68, 68, 0.18)",
+        fallbackBg: "#ef4444",
+        fallbackFg: "#ffffff",
+        fallbackText: "B",
+      },
+    };
+
+    const byKey = presets[k];
+    if (byKey) {
+      return {
+        ...byKey,
+        icon,
+        label: byKey.label || name || "Wallet",
+      };
+    }
+
+    return {
+      label: name || "Wallet",
+      color: "#7dd3fc",
+      border: "rgba(125, 211, 252, 0.30)",
+      glow: "rgba(125, 211, 252, 0.16)",
+      fallbackBg: "#0f172a",
+      fallbackFg: "#e5f3ff",
+      fallbackText: String((name || "W").slice(0, 1) || "W").toUpperCase(),
+      icon,
+    };
+  } catch {
+    return {
+      label: "Wallet",
+      color: "#7dd3fc",
+      border: "rgba(125, 211, 252, 0.30)",
+      glow: "rgba(125, 211, 252, 0.16)",
+      fallbackBg: "#0f172a",
+      fallbackFg: "#e5f3ff",
+      fallbackText: "W",
+      icon: "",
+    };
+  }
+}
+
 export default function OrderTicketWidget({
   apiBase,
   effectiveVenue,
@@ -95,7 +809,13 @@ export default function OrderTicketWidget({
     ? (window.__uttOnToast || window.uttOnToast)
     : undefined;
 
+  const walletKit = useWallet();
+  const walletKitButtonHostRef = useRef(null);
+  const solanaRpcConnection = useMemo(() => new Connection(clusterApiUrl("mainnet-beta"), "confirmed"), []);
+
   const [side, setSide] = useState("buy");
+  const [solanaOrderMode, setSolanaOrderMode] = useState("swap"); // solana_jupiter only: "swap" | "limit"
+  const JUPITER_LIMIT_MIN_USD = 10.10;
 
   const [qtyLocal, setQtyLocal] = useState("");
   const [limitPriceLocal, setLimitPriceLocal] = useState("");
@@ -112,6 +832,8 @@ export default function OrderTicketWidget({
 
   const [postOnly, setPostOnly] = useState(false);
   const [tif, setTif] = useState("gtc");
+  const [solanaExpiryPreset, setSolanaExpiryPreset] = useState("never"); // solana_jupiter limit only
+  const [solanaExpiryCustom, setSolanaExpiryCustom] = useState("");
   const [clientOid, setClientOid] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
@@ -133,8 +855,125 @@ export default function OrderTicketWidget({
     const v = String(effectiveVenue || "").toLowerCase().trim();
     return v === "solana_jupiter" || v === "solana_dex" || v.startsWith("solana_");
   }, [effectiveVenue]);
+  const isSolanaJupiterVenue = useMemo(() => {
+    const v = String(effectiveVenue || "").toLowerCase().trim();
+    return v === "solana_jupiter";
+  }, [effectiveVenue]);
+  const isSolanaLimitMode = isSolanaJupiterVenue && solanaOrderMode === "limit";
+  const [preferredSolanaWallet, setPreferredSolanaWallet] = useState(() => getPreferredSolanaWalletKey());
+  const [preferredSolanaRouterMode, setPreferredSolanaRouterModeState] = useState(() => getPreferredSolanaRouterMode());
+  const [walletStandardWallets, setWalletStandardWallets] = useState(() => getWalletStandardWallets());
+  const [walletKitPendingConnectName, setWalletKitPendingConnectName] = useState("");
+  useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
+  useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
+  useEffect(() => {
+    if (!isSolanaDexVenue) return;
+    const unsub = subscribeWalletStandardWallets((wallets) => setWalletStandardWallets(Array.isArray(wallets) ? wallets : []));
+    void primeWalletStandardWallets().then(() => {
+      try { setWalletStandardWallets(getWalletStandardWallets()); } catch {}
+    });
+    return () => {
+      try { unsub?.(); } catch {}
+    };
+  }, [isSolanaDexVenue]);
 
-  const [inlineMode, setInlineMode] = useState(false);
+  const walletKitRawAdapterName = useMemo(() => {
+    return String(
+      walletKit?.wallet?.adapter?.name ||
+      walletKit?.wallet?.name ||
+      walletKit?.wallet?.adapter?.url ||
+      ""
+    ).trim();
+  }, [walletKit?.wallet]);
+
+  const walletKitSelectedKey = useMemo(() => {
+    const selectedName =
+      walletKit?.wallet?.adapter?.name ||
+      walletKit?.wallet?.adapter?.url ||
+      walletKit?.wallet?.adapter?.icon ||
+      walletKit?.wallet?.adapter?.publicKey ||
+      walletKit?.wallet?.adapter?.toString?.() ||
+      walletKit?.wallet?.name ||
+      "";
+    return classifyWalletAdapterNameToKey(selectedName);
+  }, [walletKit?.wallet]);
+
+  const walletKitConnected = useMemo(() => {
+    return !!walletKit?.connected && !!walletKit?.publicKey;
+  }, [walletKit?.connected, walletKit?.publicKey]);
+
+  const walletKitBridgeProvider = useMemo(() => {
+    if (!isSolanaDexVenue) return null;
+    if (!walletKitSelectedKey) return null;
+    return createWalletAdapterBridgeProvider(walletKit, solanaRpcConnection);
+  }, [isSolanaDexVenue, walletKitSelectedKey, walletKit, solanaRpcConnection]);
+
+  useEffect(() => {
+    if (!isSolanaDexVenue) return;
+    if (!walletKitConnected) return;
+    if (!walletKitSelectedKey) return;
+    if (preferredSolanaWallet === walletKitSelectedKey) return;
+    setPreferredSolanaWallet(walletKitSelectedKey);
+  }, [isSolanaDexVenue, walletKitConnected, walletKitSelectedKey, preferredSolanaWallet]);
+
+  const resolveInjectedSolanaProvider = useMemo(() => {
+    return (preferred) => {
+      const baseProviders = getInjectedSolanaProviders(walletStandardWallets);
+      const merged = { ...baseProviders };
+      if (walletKitSelectedKey && walletKitBridgeProvider) {
+        merged[walletKitSelectedKey] = walletKitBridgeProvider;
+      }
+
+      const order = ["jupiter", "solflare", "phantom", "backpack"];
+
+      if (walletKitConnected && walletKitSelectedKey && merged[walletKitSelectedKey]) {
+        return { key: walletKitSelectedKey, provider: merged[walletKitSelectedKey] };
+      }
+
+      const pref = String(preferred || "solflare").toLowerCase().trim();
+      if (merged[pref]) return { key: pref, provider: merged[pref] };
+
+      for (const key of order) {
+        const p = merged[key];
+        if (p && solanaProviderPubkeyBase58(p)) return { key, provider: p };
+      }
+      for (const key of order) {
+        const p = merged[key];
+        if (p) return { key, provider: p };
+      }
+      return { key: null, provider: null };
+    };
+  }, [walletStandardWallets, walletKitSelectedKey, walletKitBridgeProvider, walletKitConnected]);
+
+  const installedSolanaWallets = useMemo(() => {
+    if (!isSolanaDexVenue) return [];
+    const base = getInstalledSolanaWalletOptions(walletStandardWallets);
+    const labels = { jupiter: "Jupiter", solflare: "Solflare", phantom: "Phantom", backpack: "Backpack" };
+    if (walletKitSelectedKey && !base.some((x) => x?.key === walletKitSelectedKey)) {
+      return [{ key: walletKitSelectedKey, label: labels[walletKitSelectedKey] || walletKitSelectedKey }, ...base];
+    }
+    return base;
+  }, [isSolanaDexVenue, walletStandardWallets, walletKitSelectedKey]);
+  const solanaWalletState = useMemo(() => {
+    if (!isSolanaDexVenue) return { key: null, label: null, connected: false, address: null };
+    const { key, provider } = resolveInjectedSolanaProvider(preferredSolanaWallet);
+    const labels = { jupiter: "Jupiter", solflare: "Solflare", phantom: "Phantom", backpack: "Backpack" };
+    const address = solanaProviderPubkeyBase58(provider);
+    return {
+      key,
+      label: labels[key] || "Wallet",
+      connected: !!address,
+      address: address || null,
+    };
+  }, [isSolanaDexVenue, preferredSolanaWallet, resolveInjectedSolanaProvider]);
+  const solanaWalletLabel = solanaWalletState.label;
+  const solanaWalletConnected = solanaWalletState.connected;
+
+
+  const [inlineMode, setInlineMode] = useState(true);
+
+  // Right-rail tile containment mode: keep this widget fully contained inside the App rail tile.
+  const forceTileMode = true;
 
   const DEFAULT_W = 420;
   const DEFAULT_H = 330;
@@ -253,6 +1092,11 @@ export default function OrderTicketWidget({
   }
 
   useEffect(() => {
+    if (forceTileMode) {
+      setInlineMode(true);
+      return;
+    }
+
     const recompute = () => {
       const b = getGutterBounds();
       const canGutter = Number.isFinite(b.gutterWidth) ? b.gutterWidth >= MIN_W + 4 : false;
@@ -305,7 +1149,7 @@ export default function OrderTicketWidget({
       if (HAS_WINDOW) window.removeEventListener("resize", recompute);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [forceTileMode]);
 
   useEffect(() => {
     if (inlineMode) return;
@@ -451,11 +1295,91 @@ export default function OrderTicketWidget({
         );
 
         if (cancelled || rulesReqIdRef.current !== reqId) return;
-        setRules(data || null);
+
+        // Solana-Jupiter is swap-style; if backend returns "unknown constraints" (often with 0 decimals),
+        // override with sane defaults so ticket math + validation behaves like CEX precision-wise.
+        const vLower = String(v || "").trim().toLowerCase();
+        const isSol = vLower === "solana_jupiter" || vLower === "solana-dex" || vLower.startsWith("solana_");
+        const warns = Array.isArray(data?.warnings) ? data.warnings.map((x) => String(x || "")) : [];
+        const warnText = warns.join(" ").toLowerCase();
+
+        if (
+          isSol &&
+          (
+            data == null ||
+            Number(data?.price_decimals ?? 0) <= 0 ||
+            Number(data?.qty_decimals ?? 0) <= 0 ||
+            warnText.includes("does not implement get_order_rules") ||
+            warnText.includes("constraints unknown")
+          )
+        ) {
+          setRules({
+            ...(data || {}),
+            venue: vLower,
+            symbol: s,
+            type: "swap",
+            price_decimals: 9,
+            qty_decimals: 6,
+            price_increment: 0.000000001,
+            qty_increment: 0.000001,
+            min_qty: Number(data?.min_qty ?? 0) || 0,
+            min_notional: Number(data?.min_notional ?? 0) || 0,
+            errors: [],
+            warnings: [],
+          });
+          setRulesErr(null);
+        } else {
+          // Solana pairs quoted in SOL often require 9dp pricing; ensure we never clamp below that.
+          if (isSol && data && typeof data === "object") {
+            const symU = String(s || "").toUpperCase();
+            const isSolQuoted = symU.endsWith("-SOL") || symU.startsWith("SOL-");
+            if (isSolQuoted) {
+              const pd = Math.max(Number(data?.price_decimals ?? 0) || 0, 9);
+              const pi = 1 / Math.pow(10, pd);
+              setRules({
+                ...data,
+                price_decimals: pd,
+                price_increment: Number.isFinite(pi) ? pi : data?.price_increment,
+              });
+              return;
+            }
+          }
+          setRules(data || null);
+        }
       } catch (e) {
         if (cancelled || rulesReqIdRef.current !== reqId) return;
-        setRules(null);
-        setRulesErr(extractRulesError(e));
+
+        const vLower = String(v || "").trim().toLowerCase();
+        const errMsg = extractRulesError(e);
+
+        // Solana-Jupiter is swap-style; if backend doesn't implement get_order_rules yet,
+        // fall back to sane decimals so UI doesn't clamp to 0 and block.
+        if (
+          (vLower === "solana_jupiter" || vLower === "solana-dex" || vLower.startsWith("solana_")) &&
+          typeof errMsg === "string" &&
+          (
+            errMsg.toLowerCase().includes("does not implement get_order_rules") ||
+            errMsg.toLowerCase().includes("constraints unknown")
+          )
+        ) {
+          setRules({
+            venue: vLower,
+            symbol: s,
+            type: "swap",
+            // Conservative defaults for USDC/SOL style quoting
+            price_decimals: 9,
+            qty_decimals: 6,
+            price_increment: 0.000000001,
+            qty_increment: 0.000001,
+            min_qty: 0,
+            min_notional: 0,
+            errors: [],
+          });
+          setRulesErr(null);
+        } else {
+          setRules(null);
+          setRulesErr(errMsg);
+        }
       } finally {
         if (cancelled || rulesReqIdRef.current !== reqId) return;
         setRulesLoading(false);
@@ -721,6 +1645,10 @@ export default function OrderTicketWidget({
   useEffect(() => {
     if (limitEditingRef.current) return;
 
+    // DEX (Solana) venues: limit price is informational for swap-style flows.
+    // Do NOT clamp/round it using CEX-style venue rules (which may be unknown and default to 0 decimals).
+    if (isSolanaDexVenue) return;
+
     const lp = String(limitPrice ?? "");
     if (!lp) return;
 
@@ -835,6 +1763,14 @@ export default function OrderTicketWidget({
   const [balLoading, setBalLoading] = useState(false);
   const [balErr, setBalErr] = useState(null);
 
+  useEffect(() => {
+    if (!isSolanaDexVenue) setBalErr(null);
+  }, [isSolanaDexVenue]);
+
+  useEffect(() => {
+    if (!isSolanaJupiterVenue) setSolanaOrderMode("swap");
+  }, [isSolanaJupiterVenue]);
+
   function normalizeBalItems(items, venueKey) {
     const out = {};
     for (const b of items || []) {
@@ -887,34 +1823,127 @@ export default function OrderTicketWidget({
 
   // ─────────────────────────────────────────────────────────────
   // Solana DEX balances support (DEX-only, opt-in by venue)
-  // Uses injected wallet (Solflare) public key + backend /api/solana_dex endpoints.
+  // Uses injected Solana wallet public key (Jupiter / Solflare / Phantom / Backpack) + backend /api/solana_dex endpoints.
   // ─────────────────────────────────────────────────────────────
   const solanaResolveCacheRef = useRef({}); // assetKey -> { mint, decimals }
 
   function getInjectedSolanaPubkeyBase58() {
     try {
-      const w = typeof window !== "undefined" ? window : null;
-      if (!w) return null;
-
-      // Prefer Solflare if present
-      const sf = w.solflare;
-      const pk1 = sf?.publicKey;
-      if (pk1) {
-        if (typeof pk1?.toBase58 === "function") return pk1.toBase58();
-        if (typeof pk1?.toString === "function") return pk1.toString();
-        if (typeof pk1 === "string") return pk1;
-      }
-
-      // Fallback: generic solana provider
-      const sol = w.solana;
-      const pk2 = sol?.publicKey;
-      if (pk2) {
-        if (typeof pk2?.toBase58 === "function") return pk2.toBase58();
-        if (typeof pk2?.toString === "function") return pk2.toString();
-        if (typeof pk2 === "string") return pk2;
-      }
-
+      const { provider } = resolveInjectedSolanaProvider(preferredSolanaWallet);
+      return solanaProviderPubkeyBase58(provider);
+    } catch {
       return null;
+    }
+  }
+
+  function getInjectedSolanaWalletLabel() {
+    try {
+      const { key } = resolveInjectedSolanaProvider(preferredSolanaWallet);
+      if (key === "jupiter") return "Jupiter";
+      if (key === "solflare") return "Solflare";
+      if (key === "phantom") return "Phantom";
+      if (key === "backpack") return "Backpack";
+      return "Wallet";
+    } catch {
+      return "Wallet";
+    }
+  }
+
+  function getInjectedSolanaWalletConnected() {
+    try {
+      return !!getInjectedSolanaPubkeyBase58();
+    } catch {
+      return false;
+    }
+  }
+
+  function isBlockedJupiterTokenError(msg) {
+    const s = String(msg || "").toLowerCase();
+    if (!s) return false;
+    return (
+      s.includes("not tradable on jupiter") ||
+      s.includes("not supported on jupiter") ||
+      s.includes("token not tradable") ||
+      s.includes("token_not_tradable") ||
+      s.includes("not supported") ||
+      s.includes("could not find any route") ||
+      s.includes("no route") ||
+      s.includes("route not found") ||
+      s.includes("jupiter_swap_failed")
+    );
+  }
+
+  async function fetchSolanaSwapTx({ provider, symbol, side, amount, address, slippageBps, tok }) {
+    const base = String(apiBase || "").replace(/\/+$/, "");
+    const route =
+      provider === "raydium"
+        ? `${base}/api/solana_dex/raydium/swap_tx`
+        : provider === "jupiter_ultra"
+          ? `${base}/api/solana_dex/jupiter/ultra_order`
+          : `${base}/api/solana_dex/jupiter/swap_tx`;
+
+    const headers = { "Content-Type": "application/json" };
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+
+    const payload = {
+      symbol,
+      side,
+      amount,
+      slippage_bps: slippageBps,
+      user_pubkey: address,
+    };
+
+    const r = await fetch(route, { method: "POST", headers, body: JSON.stringify(payload) });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(txt || `HTTP ${r.status}`);
+    }
+
+    const j = await r.json();
+    const txB64 =
+      j?.swapTransaction ||
+      j?.transaction ||
+      (Array.isArray(j?.transactions) && j.transactions.length ? j.transactions[0] : null);
+
+    if (!txB64) {
+      throw new Error(`Missing swap transaction in ${provider} response`);
+    }
+
+    return { provider: provider || "jupiter_metis", data: j, txB64: String(txB64) };
+  }
+
+  async function executeSolanaUltraSwap({ signedTransaction, requestId, tok }) {
+    const base = String(apiBase || "").replace(/\/+$/, "");
+    const route = `${base}/api/solana_dex/jupiter/ultra_execute`;
+    const headers = { "Content-Type": "application/json" };
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+
+    const r = await fetch(route, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ signedTransaction, requestId }),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(txt || `HTTP ${r.status}`);
+    }
+    return await r.json();
+  }
+
+
+  async function ensureSolanaWalletConnected() {
+    try {
+      const { provider } = resolveInjectedSolanaProvider(preferredSolanaWallet);
+      if (!provider) return null;
+
+      const existing = solanaProviderPubkeyBase58(provider);
+      if (existing) return existing;
+
+      if (typeof provider.connect === "function") {
+        await provider.connect();
+      }
+
+      return solanaProviderPubkeyBase58(provider);
     } catch {
       return null;
     }
@@ -965,8 +1994,12 @@ export default function OrderTicketWidget({
       if (!apiBase) throw new Error("apiBase not set");
       // DEX-only: Solana venues do not have adapter-backed /api/balances/latest.
       if (isSolanaDexVenue) {
-        const address = getInjectedSolanaPubkeyBase58();
-        if (!address) throw new Error("Connect a Solana wallet (Solflare) to load balances.");
+        let address = getInjectedSolanaPubkeyBase58();
+        if (!address) {
+          const addr2 = await ensureSolanaWalletConnected();
+          if (!addr2) throw new Error("Connect a supported Solana wallet (Jupiter / Solflare / Phantom / Backpack) to load balances.");
+          address = addr2;
+        }
 
         const url = new URL(`${apiBase}/api/solana_dex/balances`);
         url.searchParams.set("address", address);
@@ -989,11 +2022,30 @@ export default function OrderTicketWidget({
 
         const toks = Array.isArray(j?.tokens) ? j.tokens : [];
         const mintToUi = {};
+        const symbolToUi = {};
+        const uiAmtFromToken = (t) => {
+          const uiRaw = t?.uiAmount ?? t?.ui_amount ?? t?.uiAmountString ?? t?.ui_amount_string ?? t?.uiAmountStr;
+          let ui = typeof uiRaw === "number" ? uiRaw : parseFloat(String(uiRaw ?? ""));
+          if (Number.isFinite(ui)) return ui;
+
+          const amtRaw = t?.amount ?? t?.rawAmount ?? t?.raw_amount ?? t?.tokenAmount ?? t?.token_amount;
+          const decRaw = t?.decimals ?? t?.decimal ?? t?.dec ?? t?.precision;
+          const amt = typeof amtRaw === "number" ? amtRaw : parseFloat(String(amtRaw ?? ""));
+          const dec = typeof decRaw === "number" ? decRaw : parseInt(String(decRaw ?? ""), 10);
+          if (Number.isFinite(amt) && Number.isFinite(dec) && dec >= 0) return amt / Math.pow(10, dec);
+
+          return null;
+        };
+
         for (const t of toks) {
-          const mint = String(t?.mint || "").trim();
-          const uiAmt = Number(t?.uiAmount);
+          const mint = String(t?.mint || t?.address || t?.tokenMint || t?.token_mint || "").trim();
           if (!mint) continue;
-          mintToUi[mint] = Number.isFinite(uiAmt) ? uiAmt : null;
+
+          const uiAmt = uiAmtFromToken(t);
+          mintToUi[mint] = uiAmt;
+
+          const sym = String(t?.symbol || t?.asset || "").trim();
+          if (sym) symbolToUi[sym.toUpperCase()] = uiAmt;
         }
 
         // Resolve only what we need for this ticket (base/quote + common aliases).
@@ -1005,12 +2057,17 @@ export default function OrderTicketWidget({
 
         for (const a of want) {
           if (a === "SOL" || a === "WSOL") continue;
+          const symUi = symbolToUi[String(a).toUpperCase()];
+          if (Number.isFinite(symUi)) {
+            nextAvail[a] = { available: symUi, total: symUi, hold: null };
+            continue;
+          }
           try {
             const res = await solanaResolveAsset(a);
             const mint = res?.mint;
             if (!mint) continue;
             const ui = mintToUi[mint];
-            if (ui === null || ui === undefined) continue;
+            if (!Number.isFinite(ui)) continue;
             nextAvail[a] = { available: ui, total: ui, hold: null };
 
             // Convenience: treat USD as USDC for Solana venues (keep both keys filled if present).
@@ -1181,9 +2238,13 @@ export default function OrderTicketWidget({
   }
 
   useEffect(() => {
+    if (isSolanaDexVenue) {
+      setBalAvail({});
+      setBalErr(null);
+    }
     loadAvailBalances();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveVenue, apiBase, baseAsset, quoteAsset]);
+  }, [effectiveVenue, apiBase, baseAsset, quoteAsset, isSolanaDexVenue, walletKitConnected, walletKitSelectedKey, solanaWalletState?.address]);
 
   const baseBal = useMemo(() => (baseAsset ? (balAvail?.[baseAsset] ?? null) : null), [balAvail, baseAsset]);
   const quoteBal = useMemo(() => (quoteAsset ? (balAvail?.[quoteAsset] ?? null) : null), [balAvail, quoteAsset]);
@@ -1249,6 +2310,56 @@ export default function OrderTicketWidget({
     return Number.isFinite(raw) && raw > 0 ? raw : null;
   }, [qtyNum, pxNum]);
 
+  const jupiterFrontendInputUsdValue = useMemo(() => {
+    if (!isSolanaLimitMode) return null;
+    const q = String(quoteAsset || "").toUpperCase().trim();
+    const stableQuote = q === "USD" || q === "USDC" || q === "USDT" || q === "PYUSD";
+    if (!stableQuote) return null;
+
+    if (side === "buy") {
+      return totalQuoteNum !== null && totalQuoteNum > 0 ? totalQuoteNum : null;
+    }
+    return notional !== null && notional > 0 ? notional : null;
+  }, [isSolanaLimitMode, quoteAsset, side, totalQuoteNum, notional]);
+
+  const jupiterMinFrontendEnforceable = useMemo(() => {
+    return isSolanaLimitMode && jupiterFrontendInputUsdValue !== null;
+  }, [isSolanaLimitMode, jupiterFrontendInputUsdValue]);
+  const solanaExpiredAt = useMemo(() => {
+    if (!isSolanaLimitMode) return undefined;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const preset = String(solanaExpiryPreset || "never").toLowerCase().trim();
+
+    if (preset === "never") return undefined;
+    if (preset === "10m") return nowSec + 10 * 60;
+    if (preset === "1h") return nowSec + 60 * 60;
+    if (preset === "1d") return nowSec + 24 * 60 * 60;
+    if (preset === "7d") return nowSec + 7 * 24 * 60 * 60;
+    if (preset === "custom") {
+      const raw = String(solanaExpiryCustom || "").trim();
+      if (!raw) return null;
+      const ms = Date.parse(raw);
+      if (!Number.isFinite(ms)) return null;
+      const sec = Math.floor(ms / 1000);
+      if (sec <= nowSec) return null;
+      return sec;
+    }
+    return undefined;
+  }, [isSolanaLimitMode, solanaExpiryPreset, solanaExpiryCustom]);
+
+  const solanaExpiryLabel = useMemo(() => {
+    const preset = String(solanaExpiryPreset || "never").toLowerCase().trim();
+    if (!isSolanaLimitMode) return "—";
+    if (preset === "never") return "Never";
+    if (preset === "10m") return "10m";
+    if (preset === "1h") return "1h";
+    if (preset === "1d") return "1d";
+    if (preset === "7d") return "7d";
+    if (preset === "custom") return solanaExpiryCustom ? String(solanaExpiryCustom) : "Custom";
+    return "Never";
+  }, [isSolanaLimitMode, solanaExpiryPreset, solanaExpiryCustom]);
+
   useEffect(() => {
     if (!autoCalc) return;
 
@@ -1304,6 +2415,48 @@ export default function OrderTicketWidget({
     const fails = [];
 
     if (rulesLoading) return { status: "neutral", title: "Pre-trade checks: loading…", lines: [], block: false };
+
+    if (isSolanaLimitMode) {
+      if (qtyNum === null) {
+        lines.push("Qty missing/invalid.");
+        fails.push("qty_missing");
+      }
+      if (pxNum === null) {
+        lines.push("Limit price missing/invalid.");
+        fails.push("px_missing");
+      }
+
+      if (jupiterMinFrontendEnforceable) {
+        if (jupiterFrontendInputUsdValue + 1e-12 < JUPITER_LIMIT_MIN_USD) {
+          lines.push(
+            hideTableData
+              ? "Jupiter limit minimum not met."
+              : `Jupiter limit minimum: need current input-token value ≥ $${JUPITER_LIMIT_MIN_USD.toFixed(2)}.`
+          );
+          fails.push("jupiter_min_usd");
+        }
+      } else {
+        lines.push(
+          hideTableData
+            ? "Jupiter limit minimum will be checked on submit."
+            : `Jupiter limit minimum (${JUPITER_LIMIT_MIN_USD.toFixed(2)} USD current input value) will be enforced by backend on submit.`
+        );
+      }
+
+      if (String(solanaExpiryPreset || "never").toLowerCase().trim() === "custom") {
+        if (solanaExpiredAt === null) {
+          lines.push(
+            hideTableData
+              ? "Custom expiry invalid."
+              : "Custom expiry must be a valid future date/time."
+          );
+          fails.push("solana_expiry_invalid");
+        }
+      }
+
+      if (fails.length === 0) return { status: "ok", title: "Pre-trade checks: OK", lines, block: false };
+      return { status: "fail", title: "Pre-trade checks: FAIL (blocked)", lines, block: true };
+    }
 
     if (rulesErr || !rules) {
       return {
@@ -1409,7 +2562,24 @@ export default function OrderTicketWidget({
 
     if (fails.length === 0) return { status: "ok", title: "Pre-trade checks: OK", lines: [], block: false };
     return { status: "fail", title: "Pre-trade checks: FAIL (blocked)", lines, block: true };
-  }, [rulesLoading, rulesErr, rules, uiMinQty, qty, limitPrice, qtyNum, pxNum, notional, hideTableData]);
+  }, [
+    rulesLoading,
+    rulesErr,
+    rules,
+    uiMinQty,
+    qty,
+    limitPrice,
+    qtyNum,
+    pxNum,
+    notional,
+    hideTableData,
+    isSolanaLimitMode,
+    jupiterFrontendInputUsdValue,
+    jupiterMinFrontendEnforceable,
+    side,
+    solanaExpiryPreset,
+    solanaExpiredAt,
+  ]);
 
   const preTradeStyle = useMemo(() => {
     if (!preTrade) return null;
@@ -1421,8 +2591,22 @@ export default function OrderTicketWidget({
   const canSubmitBase = useMemo(() => {
     const v = String(effectiveVenue || "").trim();
     const s = String(otSymbol || "").trim();
-    return !!v && !!s && qtyNum !== null && pxNum !== null && (side === "buy" || side === "sell");
-  }, [effectiveVenue, otSymbol, qtyNum, pxNum, side]);
+    if (!v || !s) return false;
+    if (!(side === "buy" || side === "sell")) return false;
+
+    // Solana DEX venues are swap-style:
+    // - BUY uses Total (quote spend)
+    // - SELL uses Qty (base spend)
+    // Limit price is not required.
+    if (isSolanaDexVenue) {
+      if (isSolanaLimitMode) return qtyNum !== null && pxNum !== null;
+      if (side === "buy") return totalQuoteNum !== null;
+      return qtyNum !== null;
+    }
+
+    // CEX-style limit order
+    return qtyNum !== null && pxNum !== null;
+  }, [effectiveVenue, otSymbol, side, isSolanaDexVenue, qtyNum, pxNum, totalQuoteNum]);
 
   const canSubmit = useMemo(() => {
     if (!canSubmitBase) return false;
@@ -1432,10 +2616,17 @@ export default function OrderTicketWidget({
 
   const buySpendQuote = useMemo(() => {
     if (side !== "buy") return null;
+
+    // Solana DEX BUY spends quote = Total field
+    if (isSolanaDexVenue) {
+      return totalQuoteNum === null ? null : totalQuoteNum;
+    }
+
+    // CEX BUY spends quote = qty * limit
     if (qtyNum === null || pxNum === null) return null;
     const spend = qtyNum * pxNum;
     return Number.isFinite(spend) ? spend : null;
-  }, [side, qtyNum, pxNum]);
+  }, [side, isSolanaDexVenue, qtyNum, pxNum, totalQuoteNum]);
 
   const buySpendCapacityQuote = useMemo(() => {
     if (side !== "buy") return null;
@@ -1544,7 +2735,376 @@ export default function OrderTicketWidget({
     }
   }
 
-  async function submitLimitOrder() {
+  
+  async function submitSolanaSwapOrder() {
+    const tok = getAuthToken();
+
+    if (!tok) {
+      const msg = "Login required to place orders.";
+      onToast?.({ kind: "warn", msg });
+      openSubmitResultModal("error", msg, "Swap Submit Failed");
+      return;
+    }
+
+    // Never silently no-op.
+    if (!canSubmit) {
+      const reason =
+        preTrade?.message ||
+        (preTrade?.status ? String(preTrade.status) : "") ||
+        "Swap is not currently submittable — check Qty/Total and venue rules.";
+      onToast?.({ kind: "warn", msg: reason });
+      openSubmitResultModal("error", reason, "Swap Not Submitted");
+      return;
+    }
+
+    if (!apiBase) {
+      const msg = "apiBase not set";
+      openSubmitResultModal("error", msg, "Swap Submit Failed");
+      return;
+    }
+
+    const v = String(effectiveVenue || "").toLowerCase().trim();
+    const sym = String(otSymbol || "").trim();
+    let address = getInjectedSolanaPubkeyBase58();
+
+    if (!address) {
+      address = await ensureSolanaWalletConnected();
+    }
+    if (!address) {
+      const msg = "Connect a supported Solana wallet (Jupiter / Solflare / Phantom / Backpack) to submit swaps.";
+      onToast?.({ kind: "warn", msg });
+      openSubmitResultModal("error", msg, "Swap Submit Failed");
+      return;
+    }
+
+    // Amount in HUMAN units of the INPUT token:
+    // - BUY  => QUOTE spend ("Total")
+    // - SELL => BASE qty ("Qty")
+    const amount = side === "buy" ? Number(totalQuoteNum) : Number(qtyNum);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      const msg = side === "buy" ? "Enter a valid Total amount." : "Enter a valid Qty amount.";
+      openSubmitResultModal("error", msg, "Swap Submit Failed");
+      return;
+    }
+
+    setSubmitting(true);
+    setSubmitError(null);
+    setSubmitOk(null);
+
+    try {
+      const slippageBps = 100;
+      let swapResp = null;
+
+      const routerMode = String(preferredSolanaRouterMode || "auto").toLowerCase().trim();
+      const preferRaydium = v === "solana_raydium" || routerMode === "raydium";
+      const ultraOnly = routerMode === "ultra";
+      const metisOnly = routerMode === "metis";
+
+      if (preferRaydium) {
+        swapResp = await fetchSolanaSwapTx({
+          provider: "raydium",
+          symbol: sym,
+          side,
+          amount,
+          address,
+          slippageBps,
+          tok,
+        });
+      } else if (ultraOnly) {
+        swapResp = await fetchSolanaSwapTx({
+          provider: "jupiter_ultra",
+          symbol: sym,
+          side,
+          amount,
+          address,
+          slippageBps,
+          tok,
+        });
+      } else if (metisOnly) {
+        swapResp = await fetchSolanaSwapTx({
+          provider: "jupiter_metis",
+          symbol: sym,
+          side,
+          amount,
+          address,
+          slippageBps,
+          tok,
+        });
+      } else {
+        try {
+          swapResp = await fetchSolanaSwapTx({
+            provider: "jupiter_ultra",
+            symbol: sym,
+            side,
+            amount,
+            address,
+            slippageBps,
+            tok,
+          });
+        } catch (eUltra) {
+          const msgUltra = eUltra?.message || "Failed to build Jupiter Ultra swap";
+          if (!isBlockedJupiterTokenError(msgUltra)) throw eUltra;
+
+          try {
+            swapResp = await fetchSolanaSwapTx({
+              provider: "jupiter_metis",
+              symbol: sym,
+              side,
+              amount,
+              address,
+              slippageBps,
+              tok,
+            });
+          } catch (eMetis) {
+            const msgMetis = eMetis?.message || "Failed to build Jupiter Metis swap";
+            if (!isBlockedJupiterTokenError(msgMetis)) throw eMetis;
+
+            onToast?.({
+              kind: "warn",
+              msg: "Jupiter Ultra/Metis blocked or could not route this token — retrying through Raydium.",
+            });
+
+            swapResp = await fetchSolanaSwapTx({
+              provider: "raydium",
+              symbol: sym,
+              side,
+              amount,
+              address,
+              slippageBps,
+              tok,
+            });
+          }
+        }
+      }
+
+      const { provider, data: j, txB64: b64 } = swapResp || {};
+      if (!b64) throw new Error("Missing swap transaction in response");
+
+      // Deserialize VersionedTransaction
+      const { VersionedTransaction } = await import("@solana/web3.js");
+      const bytes = Uint8Array.from(atob(String(b64)), (c) => c.charCodeAt(0));
+      const tx = VersionedTransaction.deserialize(bytes);
+
+      const { provider: providerWallet } = resolveInjectedSolanaProvider(preferredSolanaWallet);
+      if (!providerWallet) throw new Error("No supported Solana wallet provider found (Jupiter / Solflare / Phantom / Backpack).");
+
+      let signature = null;
+
+      if (provider === "jupiter_ultra") {
+        if (typeof providerWallet.signTransaction !== "function") {
+          throw new Error("Wallet provider missing signTransaction (required for Jupiter Ultra).");
+        }
+        const signedTx = await providerWallet.signTransaction(tx);
+        if (!signedTx || typeof signedTx.serialize !== "function") {
+          throw new Error("Wallet did not return a signed transaction for Jupiter Ultra.");
+        }
+        const signedBytes = signedTx.serialize();
+        const signedB64 = btoa(String.fromCharCode(...Array.from(signedBytes)));
+        const requestId = j?.requestId || j?.order?.requestId;
+        if (!requestId) throw new Error("Missing requestId from Jupiter Ultra order response.");
+        const execResp = await executeSolanaUltraSwap({ signedTransaction: signedB64, requestId, tok });
+        signature = execResp?.signature || "";
+      } else {
+        if (typeof providerWallet.signAndSendTransaction === "function") {
+          const res = await providerWallet.signAndSendTransaction(tx);
+          signature = res?.signature || res?.sig || res;
+        } else if (typeof providerWallet.signTransaction === "function") {
+          throw new Error("Wallet does not support signAndSendTransaction (required).");
+        } else {
+          throw new Error("Wallet provider missing signAndSendTransaction.");
+        }
+      }
+
+      signature = signature ? String(signature) : "";
+      if (!signature) throw new Error("Missing signature from wallet response");
+
+      if (provider === "jupiter" || provider === "jupiter_metis") {
+        const base = String(apiBase || "").replace(/\/+$/, "");
+        const recUrl = `${base}/api/solana_dex/jupiter/record_submit`;
+
+        try {
+          const headers = { "Content-Type": "application/json" };
+          if (tok) headers.Authorization = `Bearer ${tok}`;
+
+          const recPayload = {
+            signature,
+            chain: "solana",
+            venue: v || "solana_jupiter",
+            ts: Math.floor(Date.now() / 1000),
+            wallet_address: address,
+            raw_symbol: sym,
+            resolved_symbol: null,
+            side,
+            base_qty: side === "sell" ? Number(qtyNum) : null,
+            quote_qty: side === "buy" ? Number(totalQuoteNum) : null,
+            price: null,
+            fee_quote: null,
+            status: "submitted",
+            raw: { quote: j?.quote ?? null, last_valid_block_height: j?.last_valid_block_height ?? null },
+          };
+          await fetch(recUrl, { method: "POST", headers, body: JSON.stringify(recPayload) });
+        } catch {
+          // ignore
+        }
+      }
+
+      const okPayload = { ok: true, provider: provider || "jupiter_metis", signature };
+      setSubmitOk(okPayload);
+      openSubmitResultModal("ok", okPayload, `${String(provider || "jupiter_metis").replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase())} Swap Submitted`);
+
+      refreshBalancesAfterSubmit({ venueKey: provider === "raydium" ? "solana_raydium" : v, focusBase: baseAsset, focusQuote: quoteAsset });
+    } catch (e) {
+      const msg = e?.message || "Failed to submit swap";
+      setSubmitError(msg);
+      openSubmitResultModal("error", msg, "Swap Submit Failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+
+async function submitSolanaTriggerLimitOrder() {
+    const tok = getAuthToken();
+
+    if (!tok) {
+      const msg = "Login required to place orders.";
+      onToast?.({ kind: "warn", msg });
+      openSubmitResultModal("error", msg, "Jupiter Limit Submit Failed");
+      return;
+    }
+
+    if (!canSubmit) {
+      const reason =
+        preTrade?.message ||
+        (preTrade?.status ? String(preTrade.status) : "") ||
+        "Jupiter limit order is not currently submittable — check Qty/Price and minimum rules.";
+      onToast?.({ kind: "warn", msg: reason });
+      openSubmitResultModal("error", reason, "Jupiter Limit Not Submitted");
+      return;
+    }
+
+    if (!apiBase) {
+      const msg = "apiBase not set";
+      openSubmitResultModal("error", msg, "Jupiter Limit Submit Failed");
+      return;
+    }
+
+    let address = getInjectedSolanaPubkeyBase58();
+    if (!address) address = await ensureSolanaWalletConnected();
+    if (!address) {
+      const msg = "Connect a supported Solana wallet (Jupiter / Solflare / Phantom / Backpack) to submit Jupiter limit orders.";
+      onToast?.({ kind: "warn", msg });
+      openSubmitResultModal("error", msg, "Jupiter Limit Submit Failed");
+      return;
+    }
+
+    const quantity = Number(qtyNum);
+    const limit_price = Number(pxNum);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      openSubmitResultModal("error", "Enter a valid Qty amount.", "Jupiter Limit Submit Failed");
+      return;
+    }
+    if (!Number.isFinite(limit_price) || limit_price <= 0) {
+      openSubmitResultModal("error", "Enter a valid Limit price.", "Jupiter Limit Submit Failed");
+      return;
+    }
+
+    setSubmitting(true);
+    setSubmitError(null);
+    setSubmitOk(null);
+
+    try {
+      const base = String(apiBase || "").replace(/\/+$/, "");
+      const url = `${base}/api/solana_dex/jupiter/trigger/create_order`;
+      const headers = { "Content-Type": "application/json" };
+      if (tok) headers.Authorization = `Bearer ${tok}`;
+
+      const expired_at = solanaExpiredAt === undefined ? undefined : String(solanaExpiredAt);
+
+      const payload = {
+        symbol: String(otSymbol || "").trim(),
+        side,
+        quantity,
+        limit_price,
+        user_pubkey: address,
+        payer: address,
+        expired_at,
+        slippage_bps: 0,
+        wrap_and_unwrap_sol: true,
+      };
+
+      const r = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(txt || `HTTP ${r.status}`);
+      }
+
+      const j = await r.json();
+      const txB64 = j?.transaction;
+      if (!txB64) throw new Error("Missing transaction in Jupiter Trigger response");
+
+      const { VersionedTransaction } = await import("@solana/web3.js");
+      const bytes = Uint8Array.from(atob(String(txB64)), (c) => c.charCodeAt(0));
+      const tx = VersionedTransaction.deserialize(bytes);
+
+      const w = typeof window !== "undefined" ? window : null;
+      const { provider, key: providerKey } = resolveInjectedSolanaProvider(preferredSolanaWallet);
+      if (!provider) throw new Error("No supported Solana wallet provider found (Jupiter / Solflare / Phantom / Backpack).");
+
+      let signature = null;
+      if (typeof provider.signAndSendTransaction === "function") {
+        const res = await provider.signAndSendTransaction(tx);
+        signature = res?.signature || res?.sig || res;
+      } else {
+        throw new Error("Wallet provider missing signAndSendTransaction.");
+      }
+
+      signature = signature ? String(signature) : "";
+
+      try {
+        await fetch(`${base}/api/solana_dex/jupiter/trigger/register_open_order`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            symbol: String(otSymbol || "").trim(),
+            side,
+            quantity,
+            limit_price,
+            user_pubkey: address,
+            signature: signature || "",
+            request_id: j?.requestId ?? null,
+            order: j?.order ?? "",
+            expired_at,
+          }),
+        });
+      } catch {}
+
+      const okPayload = {
+        ok: true,
+        mode: "limit",
+        signature: signature || null,
+        requestId: j?.requestId ?? null,
+        order: j?.order ?? null,
+      };
+
+      setSubmitOk(okPayload);
+      openSubmitResultModal("ok", okPayload, "Jupiter Limit Submitted");
+      refreshBalancesAfterSubmit({ venueKey: "solana_jupiter", focusBase: baseAsset, focusQuote: quoteAsset });
+    } catch (e) {
+      const msg = e?.message || "Failed to submit Jupiter limit order";
+      setSubmitError(msg);
+      openSubmitResultModal("error", msg, "Jupiter Limit Submit Failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+async function submitLimitOrder() {
   const tok = getAuthToken();
 
   // Never silently no-op.
@@ -1650,9 +3210,19 @@ export default function OrderTicketWidget({
     setShowConfirm(false);
     // Surface immediate feedback and never allow a silent no-op.
     openSubmitResultModal("info", "Submitting…", "Submitting");
-    void submitLimitOrder().catch((e) => {
+    void (
+      isSolanaLimitMode
+        ? submitSolanaTriggerLimitOrder()
+        : isSolanaDexVenue
+          ? submitSolanaSwapOrder()
+          : submitLimitOrder()
+    ).catch((e) => {
       const msg = e?.message || String(e);
-      openSubmitResultModal("error", msg, "Order Submit Failed");
+      openSubmitResultModal(
+        "error",
+        msg,
+        isSolanaLimitMode ? "Jupiter Limit Submit Failed" : isSolanaDexVenue ? "Swap Submit Failed" : "Order Submit Failed"
+      );
     });
   }
 
@@ -1664,14 +3234,49 @@ export default function OrderTicketWidget({
   const safeInput = safeStyles.input || {};
   const safeSelect = safeStyles.select || {};
   const safePill = safeStyles.pill || {};
+  const darkSelectStyle = {
+    ...safeSelect,
+    minWidth: 110,
+    padding: "4px 6px",
+    background: "#101010",
+    backgroundColor: "#101010",
+    color: "#eaeaea",
+    border: "1px solid rgba(255,255,255,0.14)",
+  };
+  const darkOptionStyle = { backgroundColor: "#101010", color: "#eaeaea" };
   const safeMuted = safeStyles.muted || {};
   const safeWidgetTitleRow = safeStyles.widgetTitleRow || {};
   const safeWidgetSub = safeStyles.widgetSub || {};
   const safeCodeError = safeStyles.codeError || {};
 
   const shellStyleBase = inlineMode
-    ? { ...safeDock, width: "100%", maxWidth: "100%", resize: "vertical", overflow: "hidden", marginTop: 0 }
-    : { ...safeDock, width: box.w, height: box.h, resize: "none", overflow: "hidden" };
+    ? {
+        ...safeDock,
+        width: "100%",
+        maxWidth: "100%",
+        height: "100%",
+        maxHeight: "100%",
+        resize: "none",
+        overflow: "hidden",
+        marginTop: 0,
+        display: "flex",
+        flexDirection: "column",
+        flex: "1 1 auto",
+        minHeight: 0,
+        minWidth: 0,
+        boxSizing: "border-box",
+      }
+    : {
+        ...safeDock,
+        width: box.w,
+        height: box.h,
+        resize: "none",
+        overflow: "hidden",
+        display: "flex",
+        flexDirection: "column",
+        minHeight: 0,
+        boxSizing: "border-box",
+      };
 
   const sideAccent = side === "buy" ? "#1f6f3a" : "#7a2b2b";
   const sideBg = side === "buy" ? "rgba(31, 111, 58, 0.07)" : "rgba(122, 43, 43, 0.07)";
@@ -1684,12 +3289,33 @@ export default function OrderTicketWidget({
   };
 
   const fixedWrapperStyle = inlineMode
-    ? {}
+    ? {
+        width: "100%",
+        height: "100%",
+        minHeight: 0,
+        minWidth: 0,
+        display: "flex",
+        flexDirection: "column",
+      }
     : { position: "fixed", left: box.x, top: box.y, zIndex: 61, userSelect: "none" };
 
   const rowStyle = { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" };
   const rowTightStyle = { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 6 };
   const sectionGap = 6;
+
+
+  const ticketScrollBodyStyle = {
+    display: "flex",
+    flexDirection: "column",
+    flex: "1 1 auto",
+    minHeight: 0,
+    minWidth: 0,
+    overflowY: "auto",
+    overflowX: "hidden",
+    paddingRight: 6,
+    scrollbarWidth: "thin",
+    scrollbarColor: "rgba(255,255,255,0.22) transparent",
+  };
 
   const sideBtnBase = { ...safeButton, padding: "6px 10px", borderRadius: 10, fontWeight: 800, lineHeight: 1.1 };
   const sideBtnActive = { background: "#151515", border: "1px solid #3a3a3a" };
@@ -1708,11 +3334,199 @@ export default function OrderTicketWidget({
     return q ? q : "Quote";
   }, [quoteAsset]);
 
+  const walletKitButtonLabel = useMemo(() => {
+    if (!walletKitConnected) return "Connect Wallet";
+
+    const address =
+      solanaWalletState?.address ||
+      solanaProviderPubkeyBase58(walletKitBridgeProvider) ||
+      (typeof walletKit?.publicKey?.toBase58 === "function"
+        ? walletKit.publicKey.toBase58()
+        : typeof walletKit?.publicKey?.toString === "function"
+          ? walletKit.publicKey.toString()
+          : "");
+
+    if (!address) return "Wallet Connected";
+    return hideTableData ? "••••" : shortenWalletAddress(address);
+  }, [walletKitConnected, solanaWalletState?.address, walletKitBridgeProvider, walletKit?.publicKey, hideTableData]);
+
+  const walletKitButtonTitle = useMemo(() => {
+    if (!walletKitConnected) return "Open the Jupiter Wallet Kit connect dialog";
+    const address = solanaWalletState?.address || "";
+    const label = solanaWalletLabel || walletKitRawAdapterName || "Wallet";
+    if (address && !hideTableData) return `${label}: ${address}`;
+    return "Open the Jupiter Wallet Kit wallet manager";
+  }, [walletKitConnected, solanaWalletState?.address, solanaWalletLabel, walletKitRawAdapterName, hideTableData]);
+
+  const walletButtonVisualKey = useMemo(() => {
+    return solanaWalletState?.key || walletKitSelectedKey || classifyWalletAdapterNameToKey(walletKitRawAdapterName) || null;
+  }, [solanaWalletState?.key, walletKitSelectedKey, walletKitRawAdapterName]);
+
+  const walletButtonVisualAddress = useMemo(() => {
+    return (
+      solanaWalletState?.address ||
+      solanaProviderPubkeyBase58(walletKitBridgeProvider) ||
+      (typeof walletKit?.publicKey?.toBase58 === "function"
+        ? walletKit.publicKey.toBase58()
+        : typeof walletKit?.publicKey?.toString === "function"
+          ? walletKit.publicKey.toString()
+          : "")
+    );
+  }, [solanaWalletState?.address, walletKitBridgeProvider, walletKit?.publicKey]);
+
+  const walletButtonVisualMeta = useMemo(() => {
+    return getSolanaWalletVisualMeta(
+      walletButtonVisualKey,
+      solanaWalletLabel || walletKitRawAdapterName || "Wallet",
+      walletKit?.wallet?.adapter?.icon || walletKit?.wallet?.icon || ""
+    );
+  }, [walletButtonVisualKey, solanaWalletLabel, walletKitRawAdapterName, walletKit?.wallet]);
+
+  const walletKitSelectableWallets = useMemo(() => {
+    const raw = Array.isArray(walletKit?.wallets) ? walletKit.wallets : [];
+    const seen = new Set();
+    const out = [];
+
+    for (const entry of raw) {
+      const adapterName = String(entry?.adapter?.name || entry?.name || "").trim();
+      const key = classifyWalletAdapterNameToKey(adapterName);
+      if (!key || !adapterName) continue;
+      const uniq = `${key}::${adapterName}`;
+      if (seen.has(uniq)) continue;
+      seen.add(uniq);
+      out.push({
+        key,
+        name: adapterName,
+        label: getSolanaWalletVisualMeta(key, adapterName, entry?.adapter?.icon || entry?.icon || "").label || adapterName,
+      });
+    }
+
+    const order = { jupiter: 0, solflare: 1, phantom: 2, backpack: 3 };
+    out.sort((a, b) => {
+      const oa = Number.isFinite(order[a.key]) ? order[a.key] : 99;
+      const ob = Number.isFinite(order[b.key]) ? order[b.key] : 99;
+      if (oa !== ob) return oa - ob;
+      return String(a.label || a.name || "").localeCompare(String(b.label || b.name || ""));
+    });
+    return out;
+  }, [walletKit?.wallets]);
+
+  const walletKitSelectedAdapterName = useMemo(() => {
+    return String(walletKit?.wallet?.adapter?.name || walletKit?.wallet?.name || "").trim();
+  }, [walletKit?.wallet]);
+
+  async function handleWalletKitSelectChange(nextName) {
+    const targetName = String(nextName || "").trim();
+    if (!targetName) return;
+
+    try {
+      const currentName = String(walletKit?.wallet?.adapter?.name || walletKit?.wallet?.name || "").trim();
+      const sameWallet = currentName && currentName === targetName;
+
+      setBalAvail({});
+      setBalErr(null);
+      setWalletKitPendingConnectName(targetName);
+
+      const nextKey = classifyWalletAdapterNameToKey(targetName);
+      if (nextKey) setPreferredSolanaWallet(nextKey);
+
+      if (sameWallet) {
+        if (!walletKit?.connected && typeof walletKit?.connect === "function") {
+          try { await walletKit.connect(); } finally { setWalletKitPendingConnectName(""); }
+        } else {
+          setWalletKitPendingConnectName("");
+        }
+        return;
+      }
+
+      // Let Wallet Kit switch adapters first; keep the manager button usable in case
+      // the target wallet requires an explicit modal step/approval.
+      if (typeof walletKit?.select === "function") {
+        walletKit.select(targetName);
+      }
+
+      if (typeof window !== "undefined") {
+        window.setTimeout(() => {
+          try { openWalletKitManager(); } catch {}
+        }, 40);
+      }
+    } catch (e) {
+      const msg = e?.message || `Failed to switch wallet to ${targetName}.`;
+      setWalletKitPendingConnectName("");
+      setSubmitError(msg);
+      openSubmitResultModal("error", msg, "Wallet Switch Failed");
+    }
+  }
+
+  useEffect(() => {
+    if (!isSolanaDexVenue) return;
+    const targetName = String(walletKitPendingConnectName || "").trim();
+    if (!targetName) return;
+
+    const selectedName = String(walletKit?.wallet?.adapter?.name || walletKit?.wallet?.name || "").trim();
+    if (!selectedName || selectedName !== targetName) return;
+
+    if (walletKit?.connected && walletKit?.publicKey) {
+      setWalletKitPendingConnectName("");
+      return;
+    }
+
+    if (typeof walletKit?.connect !== "function") {
+      setWalletKitPendingConnectName("");
+      return;
+    }
+
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void (async () => {
+        try {
+          await walletKit.connect();
+        } catch (e) {
+          if (cancelled) return;
+          const msg = e?.message || `Failed to connect ${targetName}.`;
+          setSubmitError(msg);
+          openSubmitResultModal("error", msg, "Wallet Connect Failed");
+        } finally {
+          if (!cancelled) setWalletKitPendingConnectName("");
+        }
+      })();
+    }, 160);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [isSolanaDexVenue, walletKitPendingConnectName, walletKit?.wallet, walletKit?.connected, walletKit?.publicKey]);
+
+  useEffect(() => {
+    const targetName = String(walletKitPendingConnectName || "").trim();
+    if (!targetName) return;
+
+    const t = setTimeout(() => {
+      setWalletKitPendingConnectName((cur) => (String(cur || "").trim() === targetName ? "" : cur));
+    }, 2500);
+
+    return () => clearTimeout(t);
+  }, [walletKitPendingConnectName]);
+
+
+
   // NEW: allow re-opening the last submit result without re-submitting
   const hasLastSubmitResult = useMemo(
     () => submitResultPayload !== null && submitResultKind !== null,
     [submitResultPayload, submitResultKind]
   );
+
+  const solanaSubmitEndpointLabel = useMemo(() => {
+    if (!isSolanaDexVenue) return "/api/trade/order";
+    if (isSolanaLimitMode) return "/api/solana_dex/jupiter/trigger/create_order";
+    const v = String(effectiveVenue || "").toLowerCase().trim();
+    const routerMode = String(preferredSolanaRouterMode || "auto").toLowerCase().trim();
+    if (v === "solana_raydium" || routerMode === "raydium") return "/api/solana_dex/raydium/swap_tx";
+    if (routerMode === "ultra") return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute";
+    if (routerMode === "metis") return "/api/solana_dex/jupiter/swap_tx";
+    return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute → fallback /api/solana_dex/jupiter/swap_tx → fallback /api/solana_dex/raydium/swap_tx";
+  }, [isSolanaDexVenue, isSolanaLimitMode, effectiveVenue, preferredSolanaRouterMode]);
 
   async function copySubmitResultToClipboard() {
     try {
@@ -1747,14 +3561,16 @@ export default function OrderTicketWidget({
       { k: "Venue", v: hideVenueNames ? "••••" : v },
       { k: "Symbol", v: hideTableData ? "••••" : sym },
       { k: "Side", v: side.toUpperCase() },
-      { k: "Type", v: "LIMIT" },
+      { k: "Type", v: isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "LIMIT" : "SWAP") : "LIMIT" },
       { k: "Qty", v: hideTableData ? "••••" : qStr },
       { k: "Limit", v: hideTableData ? "••••" : pxStr },
       { k: `Total (${totalLabel})`, v: hideTableData ? "••••" : totStr },
       ...(autoCalc ? [{ k: `Requested Total (${totalLabel})`, v: hideTableData ? "••••" : reqTotStr }] : []),
-      { k: "TIF", v: String(tif || "gtc").toUpperCase() },
-      { k: "Post-only", v: postOnly ? "YES" : "NO" },
-      ...(clientOid ? [{ k: "Client OID", v: hideTableData ? "••••" : String(clientOid) }] : []),
+      ...(isSolanaLimitMode
+        ? [{ k: "Expiry", v: hideTableData ? "••••" : solanaExpiryLabel }]
+        : [{ k: "TIF", v: String(tif || "gtc").toUpperCase() }]),
+      ...(!isSolanaLimitMode ? [{ k: "Post-only", v: postOnly ? "YES" : "NO" }] : []),
+      ...(!isSolanaLimitMode && clientOid ? [{ k: "Client OID", v: hideTableData ? "••••" : String(clientOid) }] : []),
     ];
   }, [
     venueLabel,
@@ -1773,7 +3589,25 @@ export default function OrderTicketWidget({
     hideTableData,
     hideVenueNames,
     autoCalc,
+    isSolanaJupiterVenue,
+    isSolanaLimitMode,
+    solanaOrderMode,
+    solanaExpiryLabel,
   ]);
+
+  function openWalletKitManager() {
+    try {
+      const host = walletKitButtonHostRef.current;
+      if (!host) return;
+      const btn = host.querySelector('button, [role="button"], a');
+      if (btn && typeof btn.click === "function") {
+        btn.click();
+      }
+    } catch {
+      // ignore
+    }
+  }
+
 
   return (
     <div style={fixedWrapperStyle}>
@@ -1795,7 +3629,30 @@ export default function OrderTicketWidget({
           </span>
         </div>
 
-        <div style={rowStyle}>
+
+        {(forceTileMode || !inlineMode) && (
+          <style>{`
+            .utt-order-ticket-scroll::-webkit-scrollbar { width: 10px; }
+            .utt-order-ticket-scroll::-webkit-scrollbar-track { background: transparent; }
+            .utt-order-ticket-scroll::-webkit-scrollbar-thumb {
+              background: rgba(255,255,255,0.18);
+              border-radius: 999px;
+              border: 2px solid transparent;
+              background-clip: padding-box;
+            }
+            .utt-order-ticket-scroll::-webkit-scrollbar-thumb:hover {
+              background: rgba(255,255,255,0.28);
+              border: 2px solid transparent;
+              background-clip: padding-box;
+            }
+          `}</style>
+        )}
+
+        <div
+          style={ticketScrollBodyStyle}
+          className="utt-order-ticket-scroll"
+        >
+          <div style={rowStyle}>
           <div style={safePill}>
             <span>Symbol</span>
             <input
@@ -1830,6 +3687,35 @@ export default function OrderTicketWidget({
               Sell
             </button>
           </div>
+
+          {isSolanaJupiterVenue && (
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <button
+                style={{
+                  ...sideBtnBase,
+                  ...(solanaOrderMode === "swap" ? sideBtnActive : null),
+                  boxShadow: solanaOrderMode === "swap" ? "0 0 0 1px #2f4f8f inset" : undefined,
+                }}
+                onClick={() => setSolanaOrderMode("swap")}
+                type="button"
+                title="Use the existing Jupiter swap flow"
+              >
+                Swap
+              </button>
+              <button
+                style={{
+                  ...sideBtnBase,
+                  ...(solanaOrderMode === "limit" ? sideBtnActive : null),
+                  boxShadow: solanaOrderMode === "limit" ? "0 0 0 1px #8f6a2f inset" : undefined,
+                }}
+                onClick={() => setSolanaOrderMode("limit")}
+                type="button"
+                title="Use Jupiter Trigger limit orders"
+              >
+                Limit
+              </button>
+            </div>
+          )}
 
           <label style={safePill} title="Lock position + size">
             <input type="checkbox" checked={locked} onChange={(e) => {
@@ -1899,6 +3785,30 @@ export default function OrderTicketWidget({
           </div>
         )}
 
+        {isSolanaLimitMode && (
+          <div
+            style={{
+              marginTop: 6,
+              padding: "6px 8px",
+              borderRadius: 10,
+              fontSize: 11,
+              lineHeight: 1.15,
+              whiteSpace: "pre-wrap",
+              border: "1px solid #3b3413",
+              background: "#151208",
+              color: "#f2e6b7",
+            }}
+            title="Jupiter requires a minimum current input-token value for Trigger limit orders."
+          >
+            Jupiter limit minimum: <b>${JUPITER_LIMIT_MIN_USD.toFixed(2)}</b>
+            {jupiterMinFrontendEnforceable && jupiterFrontendInputUsdValue !== null ? (
+              <> • Current frontend-estimated input value: <b>${jupiterFrontendInputUsdValue.toFixed(4)}</b></>
+            ) : (
+              <> • Backend will enforce current USD input-value minimum on submit.</>
+            )}
+          </div>
+        )}
+
         <div style={{ ...rowTightStyle, marginTop: sectionGap }}>
           <div style={safePill}>
             <span>Qty</span>
@@ -1933,6 +3843,12 @@ export default function OrderTicketWidget({
 
                 const cleaned = sanitizeDecimalInput(e.target.value);
 
+                // Solana DEX venues: keep the user-picked decimal price as-is; do not CEX-normalize.
+                if (isSolanaDexVenue) {
+                  setLimitPrice(cleaned);
+                  return;
+                }
+
                 // If user pasted/entered too many decimals, normalize immediately (prevents “stuck disabled button”).
                 const d = countDecimalsFromString(expandExponential(cleaned));
                 const pxDec = rules?.price_decimals;
@@ -1954,6 +3870,10 @@ export default function OrderTicketWidget({
                 limitSourceRef.current = "blur";
 
                 if (!limitPrice) return;
+
+                // Solana DEX venues: do not clamp/round limit price on blur.
+                if (isSolanaDexVenue) return;
+
                 const normalized = normalizeLimitPriceStr(limitPrice, rules, side);
                 if (normalized && normalized !== String(limitPrice)) setLimitPrice(normalized);
               }}
@@ -2035,7 +3955,209 @@ export default function OrderTicketWidget({
             </button>
           </div>
 
-          {balErr && (
+          {isSolanaDexVenue && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+                marginTop: 6,
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.03)",
+                fontSize: 12,
+                opacity: 0.95,
+              }}
+            >
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                <span
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: 999,
+                    background: solanaWalletConnected ? "rgba(46, 204, 113, 0.95)" : "rgba(231, 76, 60, 0.95)",
+                    boxShadow: "0 0 0 2px rgba(0,0,0,0.35)",
+                  }}
+                />
+                {solanaWalletConnected ? (
+                  <span>
+                    Connected w/<b style={{ marginLeft: 4 }}>{solanaWalletLabel || "Wallet"}</b>
+                  </span>
+                ) : (
+                  <span>
+                    Disconnected <span style={{ opacity: 0.75 }}>({solanaWalletLabel || "Wallet"})</span>
+                  </span>
+                )}
+              </span>
+
+              <span style={{ ...safeMuted, fontSize: 11, lineHeight: 1.1, opacity: 0.9 }}>
+                {walletKitRawAdapterName
+                  ? `Managed by Wallet Kit: ${hideTableData ? "••••" : walletKitRawAdapterName}`
+                  : solanaWalletLabel
+                    ? `Resolved wallet: ${hideTableData ? "••••" : solanaWalletLabel}`
+                    : "Use Wallet Kit to connect a supported Solana wallet."}
+              </span>
+
+              {isSolanaJupiterVenue ? (
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginLeft: "auto", opacity: 0.92, flexWrap: "nowrap" }}>
+                  <span>Router</span>
+                  <select
+                    style={{ ...darkSelectStyle, minWidth: 104 }}
+                    value={preferredSolanaRouterMode}
+                    onChange={(e) => setPreferredSolanaRouterModeState(e.target.value)}
+                    title="Swap routing source"
+                  >
+                    <option value="auto" style={darkOptionStyle}>Auto</option>
+                    <option value="ultra" style={darkOptionStyle}>Jupiter Ultra</option>
+                    <option value="metis" style={darkOptionStyle}>Jupiter Metis</option>
+                    <option value="raydium" style={darkOptionStyle}>Raydium</option>
+                  </select>
+                </label>
+              ) : null}
+            </div>
+          )}
+
+          {isSolanaDexVenue && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+                marginTop: 6,
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.02)",
+                fontSize: 12,
+                opacity: 0.95,
+                position: "relative",
+              }}
+            >
+              <span style={{ opacity: 0.9, fontWeight: 700 }}>Wallet Kit</span>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap" }}>
+                <span style={{ opacity: 0.82 }}>Wallet</span>
+                <select
+                  style={{ ...darkSelectStyle, minWidth: 112 }}
+                  value={walletKitSelectedAdapterName || ""}
+                  onChange={(e) => { void handleWalletKitSelectChange(e.target.value); }}
+                  title="Switch Wallet Kit wallet"
+                  
+                >
+                  {!walletKitSelectedAdapterName && <option value="" style={darkOptionStyle}>Select wallet</option>}
+                  {walletKitSelectableWallets.map((opt) => (
+                    <option key={opt.name} value={opt.name} style={darkOptionStyle}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <span style={{ ...safeMuted, fontSize: 11, lineHeight: 1.1 }}>
+                {walletKitPendingConnectName
+                  ? `Switching to: ${hideTableData ? "••••" : walletKitPendingConnectName}`
+                  : walletKitRawAdapterName
+                    ? `${walletKitConnected ? "Selected" : "Last selected"}: ${hideTableData ? "••••" : walletKitRawAdapterName}`
+                    : "Open wallet manager"}
+              </span>
+              <button
+                type="button"
+                style={{
+                  ...safeButton,
+                  padding: walletKitConnected ? "6px 8px" : "7px 10px",
+                  marginLeft: "auto",
+                  minWidth: walletKitConnected ? 132 : 120,
+                  maxWidth: walletKitConnected ? 176 : 144,
+                  flex: "0 1 auto",
+                  fontWeight: 800,
+                  borderColor: walletKitConnected ? walletButtonVisualMeta?.border : safeButton?.borderColor,
+                  boxShadow: walletKitConnected ? `0 0 0 1px ${walletButtonVisualMeta?.border || "rgba(255,255,255,0.10)"} inset, 0 0 14px ${walletButtonVisualMeta?.glow || "transparent"}` : undefined,
+                }}
+                onClick={openWalletKitManager}
+                title={walletKitButtonTitle}
+                
+              >
+                {walletKitConnected ? (
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 5, minWidth: 0, maxWidth: "100%" }}>
+                    {walletButtonVisualMeta?.icon ? (
+                      <img
+                        src={walletButtonVisualMeta.icon}
+                        alt={walletButtonVisualMeta.label || "Wallet"}
+                        style={{
+                          width: 18,
+                          height: 18,
+                          borderRadius: 6,
+                          objectFit: "cover",
+                          boxShadow: "0 0 0 1px rgba(255,255,255,0.12) inset",
+                          flex: "0 0 auto",
+                        }}
+                      />
+                    ) : (
+                      <span
+                        aria-hidden="true"
+                        style={{
+                          width: 18,
+                          height: 18,
+                          borderRadius: 6,
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          background: walletButtonVisualMeta?.fallbackBg || "#0f172a",
+                          color: walletButtonVisualMeta?.fallbackFg || "#e5f3ff",
+                          fontSize: 11,
+                          fontWeight: 900,
+                          lineHeight: 1,
+                          flex: "0 0 auto",
+                        }}
+                      >
+                        {walletButtonVisualMeta?.fallbackText || "W"}
+                      </span>
+                    )}
+
+                    <span style={{ display: "inline-flex", alignItems: "baseline", gap: 4, minWidth: 0, maxWidth: "100%", whiteSpace: "nowrap", overflow: "hidden" }}>
+                      <span style={{ color: walletButtonVisualMeta?.color || "#eaeaea", fontWeight: 900, fontSize: 11, flex: "0 0 auto" }}>
+                        {hideTableData ? "••••" : (walletButtonVisualMeta?.label || "Wallet")}
+                      </span>
+                      <span
+                        style={{
+                          color: walletButtonVisualMeta?.color || "#eaeaea",
+                          opacity: 0.98,
+                          fontWeight: 800,
+                          fontSize: 11,
+                          minWidth: 0,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {hideTableData ? "••••" : shortenWalletAddress(walletButtonVisualAddress)}
+                      </span>
+                    </span>
+                  </span>
+                ) : (
+                  walletKitButtonLabel
+                )}
+              </button>
+              <div
+                ref={walletKitButtonHostRef}
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  right: 0,
+                  bottom: 0,
+                  width: 1,
+                  height: 1,
+                  overflow: "hidden",
+                  opacity: 0,
+                  pointerEvents: "none",
+                }}
+              >
+                <UnifiedWalletButton />
+              </div>
+            </div>
+          )}
+
+          {balErr && (isSolanaDexVenue || !String(balErr).includes("429")) && (
             <div style={{ ...safeMuted, fontSize: 11, color: "#ff6b6b", lineHeight: 1.1 }}>
               Bal: {hideTableData ? "Hidden" : balErr}
             </div>
@@ -2061,34 +4183,65 @@ export default function OrderTicketWidget({
         )}
 
         <div style={{ ...rowTightStyle, marginTop: sectionGap }}>
-          <div style={safePill}>
-            <span>TIF</span>
-            <select style={safeSelect} value={tif} onChange={(e) => setTif(e.target.value)}>
-              <option value="gtc">GTC</option>
-              <option value="ioc">IOC</option>
-              <option value="fok">FOK</option>
-            </select>
-          </div>
+          {isSolanaLimitMode ? (
+            <>
+              <div style={safePill}>
+                <span>Expiry</span>
+                <select style={darkSelectStyle} value={solanaExpiryPreset} onChange={(e) => setSolanaExpiryPreset(e.target.value)}>
+                  <option value="never" style={darkOptionStyle}>Never</option>
+                  <option value="10m" style={darkOptionStyle}>10m</option>
+                  <option value="1h" style={darkOptionStyle}>1h</option>
+                  <option value="1d" style={darkOptionStyle}>1d</option>
+                  <option value="7d" style={darkOptionStyle}>7d</option>
+                  <option value="custom" style={darkOptionStyle}>Custom</option>
+                </select>
+              </div>
 
-          <label style={safePill}>
-            <input type="checkbox" checked={postOnly} onChange={(e) => setPostOnly(e.target.checked)} />
-            <span>Post-only</span>
-          </label>
+              {String(solanaExpiryPreset || "never").toLowerCase().trim() === "custom" && (
+                <div style={safePill}>
+                  <span>Custom</span>
+                  <input
+                    style={{ ...safeInput, width: 190 }}
+                    type="datetime-local"
+                    value={solanaExpiryCustom}
+                    onChange={(e) => setSolanaExpiryCustom(e.target.value)}
+                  />
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div style={safePill}>
+                <span>TIF</span>
+                <select style={darkSelectStyle} value={tif} onChange={(e) => setTif(e.target.value)}>
+                  <option value="gtc" style={darkOptionStyle}>GTC</option>
+                  <option value="ioc" style={darkOptionStyle}>IOC</option>
+                  <option value="fok" style={darkOptionStyle}>FOK</option>
+                </select>
+              </div>
 
-          <div style={safePill}>
-            <span>Client OID</span>
-            <input
-              style={{ ...safeInput, width: 140 }}
-              value={clientOid}
-              placeholder="optional"
-              onChange={(e) => setClientOid(e.target.value)}
-            />
-          </div>
+              <label style={safePill}>
+                <input type="checkbox" checked={postOnly} onChange={(e) => setPostOnly(e.target.checked)} />
+                <span>Post-only</span>
+              </label>
+
+              <div style={safePill}>
+                <span>Client OID</span>
+                <input
+                  style={{ ...safeInput, width: 140 }}
+                  value={clientOid}
+                  placeholder="optional"
+                  onChange={(e) => setClientOid(e.target.value)}
+                />
+              </div>
+            </>
+          )}
         </div>
 
         <div style={{ marginTop: 6, ...safeMuted, fontSize: 12, lineHeight: 1.15 }}>
-          Type: <b>Limit</b> • Est. Total ({totalLabel}):{" "}
-          <b>{notional === null ? "—" : fmtNum ? fmtNum(notional) : String(notional)}</b>
+          Type: <b>{isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : "Limit"}</b>
+          {isSolanaLimitMode ? <> • Expiry: <b>{hideTableData ? "••••" : solanaExpiryLabel}</b></> : null}
+          {" "}• Est. Total ({totalLabel}): <b>{notional === null ? "—" : fmtNum ? fmtNum(notional) : String(notional)}</b>
         </div>
 
         <div style={{ marginTop: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -2103,17 +4256,23 @@ export default function OrderTicketWidget({
             onClick={openConfirm}
             title={
               !canSubmitBase
-                ? "Fill symbol, qty, and limit price"
+                ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isSolanaDexVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
                 : preTrade?.block
                   ? "Blocked by pre-trade checks"
                   : "Review and confirm order"
             }
           >
-            {submitting ? "Submitting…" : side === "buy" ? "Place Buy Limit" : "Place Sell Limit"}
+            {submitting
+              ? "Submitting…"
+              : isSolanaLimitMode
+                ? side === "buy" ? "Place Buy Limit" : "Place Sell Limit"
+                : isSolanaDexVenue
+                  ? side === "buy" ? "Swap Buy" : "Swap Sell"
+                  : side === "buy" ? "Place Buy Limit" : "Place Sell Limit"}
           </button>
 
           <span style={{ ...safeMuted, fontSize: 11, lineHeight: 1.1 }}>
-            Endpoint: <code>/api/trade/order</code>
+            Endpoint: <code>{solanaSubmitEndpointLabel}</code>
           </span>
 
           {hasLastSubmitResult && (
@@ -2134,7 +4293,9 @@ export default function OrderTicketWidget({
           )}
         </div>
 
-        {!inlineMode && (
+        </div>
+
+        {(forceTileMode || !inlineMode) && (
           <div
             onMouseDown={onResizeMouseDown}
             title={locked ? "Locked" : "Resize from top-left"}
@@ -2183,7 +4344,9 @@ export default function OrderTicketWidget({
               onMouseDown={(e) => e.stopPropagation()}
             >
               <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
-                <div style={{ fontSize: 14, fontWeight: 900 }}>Confirm {side === "buy" ? "BUY" : "SELL"} Limit Order</div>
+                <div style={{ fontSize: 14, fontWeight: 900 }}>
+                  Confirm {side === "buy" ? "BUY" : "SELL"} {isSolanaLimitMode ? "Jupiter Limit Order" : isSolanaDexVenue ? "Swap" : "Limit Order"}
+                </div>
                 <button
                   type="button"
                   onClick={() => setShowConfirm(false)}
@@ -2255,7 +4418,9 @@ export default function OrderTicketWidget({
               </div>
 
               <div style={{ marginTop: 10, fontSize: 11, color: "#a9a9a9", lineHeight: 1.25 }}>
-                Confirm submits immediately via <code>/api/trade/order</code>. Cancel returns you to the form without submitting.
+                Confirm submits immediately via{" "}
+                <code>{solanaSubmitEndpointLabel}</code>.
+                {" "}Cancel returns you to the form without submitting.
               </div>
             </div>
           </div>

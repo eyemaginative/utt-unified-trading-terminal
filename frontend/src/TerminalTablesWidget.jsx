@@ -25,6 +25,7 @@ const LS_LOCK_KEY = "utt_tables_widget_lock_v1";
 // Docking (tables below chart)
 const LS_DOCK_KEY = "utt_tables_widget_dock_v1";
 const LS_DOCK_OFFSET_KEY = "utt_tables_widget_dock_offset_v1";
+const LS_DOCK_OFFSET_X_KEY = "utt_tables_widget_dock_offset_x_v1";
 
 // Definitive TradingViewChartWidget localStorage key for {x,y,w,h,locked}
 const CHART_GEOM_KEY = "utt_tv_chart_geom_v1";
@@ -63,6 +64,9 @@ const LS_THEME_KEY = "utt_tables_theme_v1";
 
 // NEW: Custom theme palette payload
 const LS_THEME_CUSTOM_KEY = "utt_tables_theme_custom_v1";
+
+// NEW: Solana detected token suggestions (for Token Registry auto-fill)
+const LS_SOLANA_DETECTED_TOKENS_KEY = "utt_solana_detected_tokens_v1";
 
 // Discovery-enabled venues (UI allow-list)
 // We only show venues that are BOTH supported by the app AND in this allow-list.
@@ -239,6 +243,27 @@ function writeNumLS(key, val) {
   } catch {
     // ignore
   }
+}
+
+
+function copyTextSafe(text) {
+  const s = String(text || "").trim();
+  if (!s) return;
+  try { if (navigator?.clipboard?.writeText) { navigator.clipboard.writeText(s).catch(() => {}); return; } } catch {}
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = s; ta.setAttribute("readonly", "readonly");
+    ta.style.position = "fixed"; ta.style.left = "-9999px";
+    document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+  } catch {}
+}
+
+function readJsonLS(key, fallback) {
+  try { const raw = localStorage.getItem(key); const parsed = safeParseJson(raw || ""); return parsed && typeof parsed === "object" ? parsed : fallback; } catch { return fallback; }
+}
+
+function writeJsonLS(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
 }
 
 
@@ -778,6 +803,15 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
 
       // NEW: cancel unified orders by cancel_ref (preferred).
       doCancelUnifiedOrder,
+      showManualCancelModal,
+      setShowManualCancelModal,
+      manualCancelVenue,
+      setManualCancelVenue,
+      manualCancelOrderId,
+      setManualCancelOrderId,
+      manualCancelBusy,
+      doManualJupiterCancel,
+      onManualCancelError,
 
       // Discover
       discVenue,
@@ -892,8 +926,89 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     // Filters the already-selected venue scope (or "ALL") by asset symbol.
     const [balancesSymbolQuery, setBalancesSymbolQuery] = useState("");
 
+
+    // ─────────────────────────────────────────────────────────────
+    // Solana on-chain balances (live RPC via backend) — opt-in and non-breaking
+    // Used to display balances for solana_* venues even when not ingested into Wallet Addresses.
+    // ─────────────────────────────────────────────────────────────
+    const [solanaOnchain, setSolanaOnchain] = useState(() => ({
+
+      address: "",
+      items: [], // [{ asset, amount, mint, symbol }]
+      loading: false,
+      err: "",
+      fetchedAt: null,
+    }));
+
+  // Solana Token Registry: mint/address -> symbol (UI-only enrichment for balances)
+  const [solanaTokenRegistryMap, setSolanaTokenRegistryMap] = useState(() => ({}));
+
+  const [solanaPrices, setSolanaPrices] = useState({ ok: false, items: {}, ts: 0 });
+  // Canonical wrapped SOL mint (for Jupiter pricing lookups)
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  // Solana venues do NOT use the CEX balances refresh pipeline
+  const isSolanaVenue = String(venue || "").toLowerCase().startsWith("solana");
+  const [showSolanaOnchainDetails, setShowSolanaOnchainDetails] = useState(false);
+
+
+    function getSolanaUsdPriceForMint(mint) {
+      const m = String(mint || "").trim();
+      if (!m) return null;
+      const p = solanaPrices || {};
+      const items = p.items || p.data || p.prices || p.results || {};
+      const entry = items?.[m] ?? items?.[String(m).toLowerCase()] ?? null;
+      if (entry == null) return null;
+      if (typeof entry === "number") return entry;
+      const cand =
+        entry.price ??
+        entry.priceUsd ??
+        entry.priceUSD ??
+        entry.price_usd ??
+        entry.usdPrice ??
+        entry.usd ??
+        entry.value ??
+        entry.v ??
+        null;
+      if (typeof cand === "number") return cand;
+      // tolerate numeric strings (some price APIs return strings)
+      if (typeof cand === "string") {
+        const f = Number(cand);
+        return Number.isFinite(f) ? f : null;
+      }
+      return null;
+    }
+
     const balancesFiltered = useMemo(() => {
-      const rows = balancesSorted || [];
+      let rows = balancesSorted || [];
+      if (isSolanaVenue) {
+        // When the selected venue is Solana, balances come from live on-chain RPC
+        // (solanaOnchain.items normalized earlier). Shape it to match the balances table.
+        rows = (solanaOnchain?.items || []).map((it) => {
+          const mint = String(it?.mint || "").trim();
+          const mintShort = mint ? `${mint.slice(0, 6)}…` : "";
+          // Prefer explicit symbol or Token Registry (mint->symbol).
+          // Avoid falling back to `it.asset` here because for mint-only rows `asset` is already mint-short,
+          // which would make the UI show the mint twice.
+          const symbol = String(it?.symbol || (mint ? (solanaTokenRegistryMap?.[mint] || solanaTokenRegistryMap?.[String(mint).toLowerCase()]) : "") || "").trim();
+          const assetLabel = symbol || mintShort || mint || "";
+          const amt = Number(it?.amount ?? 0);
+          const px = getSolanaUsdPriceForMint(mint);
+          return {
+            venue: venue || "solana",
+            asset: assetLabel,
+            symbol: symbol || null,
+            mint: mint || null,
+            // Only show mint on a second line when we have a real symbol.
+            mint_short: symbol ? (mintShort || null) : null,
+            total: amt,
+            available: amt,
+            hold: 0,
+            px_usd: typeof px === "number" ? px : null,
+            total_usd: typeof px === "number" ? amt * px : null,
+            usd_source_symbol: "USDC",
+          };
+        });
+      }
       const q = String(balancesSymbolQuery || "")
         .trim()
         .toUpperCase();
@@ -905,7 +1020,20 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         const a = String(b?.asset || "").trim().toUpperCase();
         return a.includes(q);
       });
-    }, [balancesSorted, balancesSymbolQuery]);
+    }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, solanaOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
+
+  const solanaPortfolioTotalUsd = useMemo(() => {
+    if (!isSolanaVenue) return null;
+    const items = solanaOnchain?.items || [];
+    let sum = 0;
+    for (const t of items) {
+      const mint = String(t?.mint || "").trim();
+      const amt = Number(t?.amount ?? 0) || 0;
+      const p = getSolanaUsdPriceForMint(mint);
+      if (typeof p === "number") sum += amt * p;
+    }
+    return sum;
+  }, [isSolanaVenue, solanaOnchain, solanaPrices]);
 
     // Status visuals derived from palette
     const statusVisualMap = useMemo(() => {
@@ -1001,6 +1129,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     // - show non-destructive banner on errors
     // ─────────────────────────────────────────────────────────────
     const balancesRefreshRef = useRef({ inFlight: false, seq: 0 });
+    const solanaRefreshRef = useRef({ inFlight: false, lastAt: 0 });
     const balancesBannerTimerRef = useRef(null);
 
     const [balancesRefreshingLocal, setBalancesRefreshingLocal] = useState(false);
@@ -1009,6 +1138,283 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       kind: "error", // "error" | "warn" | "info"
       msg: "",
     }));
+    function getInjectedSolanaProvider() {
+      try {
+        return window.solflare || window.solana || null;
+      } catch {
+        return null;
+      }
+    }
+
+    function pubkeyToBase58(pk) {
+      try {
+        if (!pk) return "";
+        if (typeof pk === "string") return pk;
+        if (typeof pk?.toBase58 === "function") return pk.toBase58();
+        if (typeof pk?.toString === "function") return pk.toString();
+      } catch {
+        // ignore
+      }
+      return "";
+    }
+
+    async function ensureSolanaConnected() {
+      const provider = getInjectedSolanaProvider();
+      if (!provider) throw new Error("No Solana wallet found (install Solflare).");
+
+      // Some providers expose isConnected; some require connect().
+      const already = !!provider.publicKey;
+      if (!already) {
+        if (typeof provider.connect === "function") {
+          await provider.connect();
+        }
+      }
+
+      const addr = pubkeyToBase58(provider.publicKey);
+      if (!addr) throw new Error("Could not read wallet public key.");
+      return { provider, address: addr };
+    }
+
+    
+  
+  async function fetchJSONMaybe(url) {
+    // Prefer App-provided/global fetchJSON when available.
+    if (typeof fetchJSON === "function") return await fetchJSON(url);
+
+    // Fallback: direct fetch with optional auth token (mirrors token-registry behavior)
+    const headers = { "Content-Type": "application/json" };
+    const tok = (typeof getAuthToken === "function") ? getAuthToken() : null;
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
+
+    const resp = await fetch(url, { headers });
+    let js = {};
+    try { js = await resp.json(); } catch (e) { js = {}; }
+
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) ? (js.detail || js.error) : `Request failed (${resp.status})`;
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+async function loadSolanaTokenRegistryMap() {
+    // Best-effort: token registry is local DB-backed, so no paid dependency.
+    // Try a couple query shapes; backend can ignore unknown params.
+    const urls = [
+      "/api/token_registry?network=solana",
+      "/api/token_registry?chain=solana",
+      "/api/token_registry",
+    ];
+
+    let data = null;
+    for (const u of urls) {
+      try {
+        // NOTE: use the existing fetchJSON helper (and fall back to a manual fetch with auth) so token_registry doesn't silently fail.
+        if (typeof fetchJSON === "function") {
+          data = await fetchJSON(u);
+        } else {
+          const headers = { "Content-Type": "application/json" };
+          const tok = getAuthToken?.();
+          if (tok) headers["Authorization"] = `Bearer ${tok}`;
+          const resp = await fetch(u, { headers });
+          const js = await resp.json().catch(() => ({}));
+          if (!resp.ok) throw new Error(js?.detail || js?.error || `token_registry failed (${resp.status})`);
+          data = js;
+        }
+        if (data) break;
+      } catch (e) {
+        // keep trying
+      }
+    }
+
+    const items = Array.isArray(data)
+      ? data
+      : (data && (data.items || data.mappings || data.tokens)) || [];
+    const map = {};
+
+    for (const it of items || []) {
+      const symRaw = it.symbol || it.asset || it.ticker;
+      if (!symRaw) continue;
+      const sym = String(symRaw).trim();
+      if (!sym) continue;
+
+      const addr =
+        it.mint ||
+        it.address ||
+        it.contract_address ||
+        it.contractAddress ||
+        it.mint_address ||
+        it.mintAddress ||
+        it.addr;
+
+      if (!addr) continue;
+      const a = String(addr).trim();
+      if (!a) continue;
+
+      const v = String(it.venue || it.venue_override || it.venueOverride || "").trim();
+      const isGlobal = !v;
+      const isSol = v === "solana" || v === "solana_jupiter" || v.startsWith("solana");
+
+      if (isGlobal || isSol) {
+        map[a] = sym;
+        map[String(a).toLowerCase()] = sym;
+      }
+    }
+
+    return map;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Auto-load Solana token registry for All Orders whenever either:
+  // - the explicit All Orders venue filter is a Solana venue, OR
+  // - the current All Orders dataset contains Solana rows while aoVenue is blank/"all"
+  // This fixes mixed-venue views where symbol resolution needs the registry even though
+  // the venue filter itself is not set to a Solana-specific value.
+  // ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+  const v = String(aoVenue || "").toLowerCase();
+  const venueImpliesSolana = v.startsWith("solana");
+  const rowsImpliesSolana =
+    tab === "allOrders" &&
+    Array.isArray(allOrders) &&
+    allOrders.some((r) => String(r?.venue || "").toLowerCase().startsWith("solana"));
+
+  if (!venueImpliesSolana && !rowsImpliesSolana) return;
+
+  const m = solanaTokenRegistryMap;
+  const has = m && typeof m === "object" && Object.keys(m).length > 0;
+  if (has) return;
+
+  let cancelled = false;
+  (async () => {
+    try {
+      const reg = await loadSolanaTokenRegistryMap();
+      if (cancelled) return;
+      if (reg && typeof reg === "object") {
+        setSolanaTokenRegistryMap(reg);
+      }
+    } catch (e) {
+      // loadSolanaTokenRegistryMap already handles errors/toasts
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+  };
+}, [aoVenue, tab, allOrders, solanaTokenRegistryMap]);
+
+
+async function refreshSolanaOnchainBalances() {
+      if (!isSolanaVenue) return;
+
+      // Prevent overlap / click-spam bursts (helps avoid public RPC 429 cascades).
+      if (solanaRefreshRef?.current?.inFlight) return;
+      const now = Date.now();
+      const lastAt = Number(solanaRefreshRef?.current?.lastAt || 0);
+      if (now - lastAt < 750) return;
+      solanaRefreshRef.current.inFlight = true;
+      solanaRefreshRef.current.lastAt = now;
+
+      setSolanaOnchain((p) => ({ ...p, loading: true, err: "" }));
+
+      // Enrich mint-only balances with Token Registry symbols (local DB). Refresh this map opportunistically.
+      let regMap = solanaTokenRegistryMap;
+      try {
+        if (!regMap || Object.keys(regMap).length === 0) {
+          regMap = await loadSolanaTokenRegistryMap();
+          setSolanaTokenRegistryMap(regMap || {});
+        }
+      } catch (e) {
+        // ignore; we can still render mint-short
+        regMap = regMap || {};
+      }
+
+      try {
+        const { address } = await ensureSolanaConnected();
+        const headers = { "Content-Type": "application/json" };
+        const tok = getAuthToken();
+        if (tok) headers["Authorization"] = `Bearer ${tok}`;
+
+        const resp = await fetch(`/api/solana_dex/balances?address=${encodeURIComponent(address)}`, { headers });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data?.ok === false) {
+          throw new Error(data?.detail || data?.error || `balances failed (${resp.status})`);
+        }
+
+        // Normalize response into {asset, amount, mint, symbol}
+        const items = [];
+        const sol = data?.sol ?? data?.sol_ui ?? data?.sol_balance ?? null;
+        if (typeof sol === "number") {
+          // Give SOL a canonical mint so we can fetch a USD price from Jupiter.
+          items.push({ asset: "SOL", amount: sol, mint: SOL_MINT, symbol: "SOL" });
+        } else if (typeof data?.sol_lamports === "number") {
+          items.push({ asset: "SOL", amount: data.sol_lamports / 1e9, mint: SOL_MINT, symbol: "SOL" });
+        }
+
+        const toks = Array.isArray(data?.tokens) ? data.tokens : [];
+        for (const t of toks) {
+          const mint = String(t?.mint || "").trim();
+          const symFromRegistry = regMap[mint] || regMap[String(mint).toLowerCase()] || "";
+          const sym = String(t?.symbol || t?.ticker || symFromRegistry || "").trim();
+          const asset = sym || mint ? (sym || mint.slice(0, 6) + "…") : "SPL";
+          const amt =
+            typeof t?.uiAmount === "number"
+              ? t.uiAmount
+              : typeof t?.ui_amount === "number"
+              ? t.ui_amount
+              : typeof t?.amount_ui === "number"
+              ? t.amount_ui
+              : null;
+          if (amt == null) continue;
+          items.push({ asset, amount: amt, mint, symbol: sym || "" });
+        }
+
+        setSolanaOnchain({
+          address,
+          items,
+          loading: false,
+          err: "",
+          fetchedAt: Date.now(),
+        });
+
+        // Solana pricing (Jupiter): fetch USDC-ish prices for displayed mints
+        try {
+          const mints = items
+            .map((t) => String(t?.mint || "").trim())
+            .filter(Boolean)
+            .slice(0, 100);
+          if (mints.length) {
+            const pr = await fetchJSONMaybe(`/api/solana_dex/jupiter/prices?ids=${encodeURIComponent(mints.join(","))}`);
+            // Accept multiple backend response shapes.
+            // Examples we tolerate:
+            //  - { ok: true, items: { <mint>: { price: 1.23 } } }
+            //  - { data: { <mint>: { price: 1.23 } } }
+            //  - { prices: { <mint>: 1.23 } }
+            //  - { <mint>: { price: 1.23 } }
+            const normalized =
+              pr?.items ||
+              pr?.data ||
+              pr?.prices ||
+              pr?.results ||
+              (pr && typeof pr === "object" ? pr : {}) ||
+              {};
+            setSolanaPrices({ ok: pr?.ok !== false, items: normalized || {}, ts: Date.now() });
+          } else {
+            setSolanaPrices({ ok: true, items: {}, ts: Date.now() });
+          }
+        } catch (e) {
+          setSolanaPrices({ ok: false, items: {}, ts: Date.now(), error: String(e) });
+        }
+      } catch (e) {
+        setSolanaOnchain((p) => ({
+          ...p,
+          loading: false,
+          err: String(e?.message || e || "Failed to load Solana balances"),
+        }));
+      }
+    }
+
+      try { solanaRefreshRef.current.inFlight = false; } catch { /* ignore */ }
 
     useEffect(() => {
       return () => {
@@ -1037,6 +1443,13 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     }
 
     async function safeRefreshBalancesFromUI() {
+      // For Solana venues, balances refresh must NOT hit /api/balances/refresh (CEX-only).
+      // Instead we use the on-chain RPC-backed endpoint via /api/solana_dex/balances.
+      if (isSolanaVenue) {
+        await refreshSolanaOnchainBalances();
+        return;
+      }
+
       if (typeof doRefreshBalances !== "function") return;
 
       // Hard guard against overlap (independent of loadingBalances prop)
@@ -1092,6 +1505,8 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     pointerId: null,
   });
 
+  const lockRafRef = useRef(0);
+
   const [locked, setLocked] = useState(() => {
     const v = safeParseJson(localStorage.getItem(LS_LOCK_KEY) || "");
     return !!v;
@@ -1100,6 +1515,14 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   useEffect(() => {
     localStorage.setItem(LS_LOCK_KEY, JSON.stringify(locked));
   }, [locked]);
+
+  useEffect(() => () => {
+    try {
+      if (lockRafRef.current) window.cancelAnimationFrame(lockRafRef.current);
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const [dockBelowChart, setDockBelowChart] = useState(() => {
     const v = safeParseJson(localStorage.getItem(LS_DOCK_KEY) || "");
@@ -1115,6 +1538,71 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   // When unlocked, the widget should move freely (both X and Y), regardless of the Dock toggle.
   const effectiveDockBelowChart = dockBelowChart && locked;
 
+  // Important: when the chart is hidden, the Dock toggle should stay latent.
+  // The widget must preserve its current viewport x/y instead of snapping back
+  // to the tables-pane left edge just because Dock is enabled.
+  const activeDockBelowChart = effectiveDockBelowChart && !!showChart;
+
+  function handleLockedChange(nextLocked) {
+    const next = !!nextLocked;
+
+    try {
+      if (lockRafRef.current) {
+        window.cancelAnimationFrame(lockRafRef.current);
+        lockRafRef.current = 0;
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!next) {
+      setLocked(false);
+      return;
+    }
+
+    try {
+      const r = widgetRef.current?.getBoundingClientRect?.();
+      if (r) {
+        const snapX = Number.isFinite(r.left) ? Math.round(r.left) : Math.round(Number(geom?.x) || 24);
+        const snapY = Number.isFinite(r.top) ? Math.round(r.top) : Math.round(Number(geom?.y) || 160);
+        const snapW = Number.isFinite(r.width) ? Math.round(r.width) : Math.round(Number(geom?.w) || 0);
+        const snapH = Number.isFinite(r.height) ? Math.round(r.height) : Math.round(Number(geom?.h) || 560);
+
+        setYh((prev) => ({ ...prev, x: snapX, y: snapY, h: snapH }));
+        if (Number.isFinite(snapW) && snapW > 0) {
+          setXw((prev) => ({ ...(prev || {}), w: snapW }));
+        }
+
+        if (dockBelowChart && showChart) {
+          const cx = Number(chartGeom?.x);
+          const cw = Number(chartGeom?.w);
+          const baseLeft = Number.isFinite(cx) && Number.isFinite(cw) && cw > 0
+            ? cx
+            : containerInnerRaw.left;
+
+          const cy = Number(chartGeom?.y);
+          const ch = Number(chartGeom?.h);
+          const chartBottom = Number.isFinite(cy) && Number.isFinite(ch) && ch > 0
+            ? cy + ch
+            : getHeaderSafeY(containerInnerRaw.top);
+
+          setDockOffsetX(Math.round(snapX - baseLeft));
+          setDockOffsetY(Math.max(0, Math.round(snapY - chartBottom)));
+        }
+      }
+    } catch {
+      // ignore snapshot failures
+    }
+
+    // Important: defer the actual lock flip one frame so the snapshotted x/y/w and dock offsets
+    // land first. Hiding/showing Tables already proves the remounted locked state is correct;
+    // the bad left jump is happening during the live lock transition.
+    lockRafRef.current = window.requestAnimationFrame(() => {
+      lockRafRef.current = 0;
+      setLocked(true);
+    });
+  }
+
   const [dockOffsetY, setDockOffsetY] = useState(() => {
     const v = safeParseJson(localStorage.getItem(LS_DOCK_OFFSET_KEY) || "");
     return Number.isFinite(Number(v)) ? Number(v) : 12;
@@ -1123,6 +1611,15 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   useEffect(() => {
     localStorage.setItem(LS_DOCK_OFFSET_KEY, JSON.stringify(dockOffsetY));
   }, [dockOffsetY]);
+
+  const [dockOffsetX, setDockOffsetX] = useState(() => {
+    const v = safeParseJson(localStorage.getItem(LS_DOCK_OFFSET_X_KEY) || "");
+    return Number.isFinite(Number(v)) ? Number(v) : 0;
+  });
+
+  useEffect(() => {
+    localStorage.setItem(LS_DOCK_OFFSET_X_KEY, JSON.stringify(dockOffsetX));
+  }, [dockOffsetX]);
 
   const [yh, setYh] = useState(() => {
     const saved = safeParseJson(localStorage.getItem(LS_GEOM_KEY) || "");
@@ -1155,7 +1652,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   const [chartGeom, setChartGeom] = useState(() => readChartGeomFromStorage());
 
   useEffect(() => {
-    if (!effectiveDockBelowChart) return;
+    if (!activeDockBelowChart) return;
     if (!showChart) return;
 
     let alive = true;
@@ -1192,8 +1689,8 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     tick();
     return () => {
       alive = false;
-    };
-  }, [effectiveDockBelowChart, showChart]);
+     };
+  }, [activeDockBelowChart, showChart]);
 
   function getContainerRectInner() {
     const el = appContainerRef?.current;
@@ -1279,22 +1776,28 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     const chartX = Number(chartGeom?.x);
     const chartW = Number(chartGeom?.w);
 
-    const wantChartFrame = effectiveDockBelowChart && showChart && Number.isFinite(chartX) && Number.isFinite(chartW) && chartW > 0;
+    const wantChartFrame = activeDockBelowChart && Number.isFinite(chartX) && Number.isFinite(chartW) && chartW > 0;
 
     const baseX = wantChartFrame ? chartX : containerInner.left;
     const baseW = wantChartFrame ? chartW : Math.max(320, containerInner.width);
 
-    // When undocked, x comes from persisted state so the widget can move freely.
-    const rawX = effectiveDockBelowChart ? baseX : Number.isFinite(yh?.x) ? yh.x : baseX;
+    // When docked + locked, preserve the live horizontal placement by storing a dock-relative X offset
+    // on lock, instead of snapping back to the chart/container left edge.
+    const dockX = Number(dockOffsetX);
+    const rawX = activeDockBelowChart
+      ? baseX + (Number.isFinite(dockX) ? dockX : 0)
+      : Number.isFinite(yh?.x)
+        ? yh.x
+        : baseX;
 
     // Width override (horizontal resize). Docked mode should not exceed the chart/container width;
     // undocked can grow to the full viewport width.
     const wOverride = Number(xw?.w);
     const hasOverride = Number.isFinite(wOverride) && wOverride > 0;
-    const desiredW = hasOverride ? (effectiveDockBelowChart ? Math.min(baseW, wOverride) : wOverride) : baseW;
+    const desiredW = hasOverride ? (activeDockBelowChart ? Math.min(baseW, wOverride) : wOverride) : baseW;
 
-    const clampLeft = effectiveDockBelowChart ? containerInner.left : 8;
-    const clampW = effectiveDockBelowChart ? containerInner.width : Math.max(320, (window.innerWidth || 1200) - 16);
+    const clampLeft = activeDockBelowChart ? containerInner.left : 8;
+    const clampW = activeDockBelowChart ? containerInner.width : Math.max(320, (window.innerWidth || 1200) - 16);
 
     const { x, w } = clampGeomToContainer(rawX, desiredW, clampLeft, clampW);
 
@@ -1305,11 +1808,11 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     let y0 = Number(yh.y) || 160;
     let h0 = Number(yh.h) || 560;
 
-    const candidateY = effectiveDockBelowChart ? dockedTop : y0;
+    const candidateY = activeDockBelowChart ? dockedTop : y0;
 
     // When free-floating (not docked-under-chart), allow the panel to move anywhere on the viewport
     // including over the AppHeader. When docked, keep it below the header/chart-safe line.
-    const minYBase = effectiveDockBelowChart ? dockedTop : 0;
+    const minYBase = activeDockBelowChart ? dockedTop : 0;
     const minY = clamp(minYBase, 0, Math.max(0, window.innerHeight - minH - 10));
     const maxY_init = Math.max(minY, window.innerHeight - minH - 10);
     const y1 = clamp(candidateY, minY, maxY_init);
@@ -1331,7 +1834,8 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     containerInner.width,
     containerInner.top,
     headerRef,
-    effectiveDockBelowChart,
+    activeDockBelowChart,
+    dockOffsetX,
     dockOffsetY,
     chartGeom?.x,
     chartGeom?.y,
@@ -1345,7 +1849,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       if (locked) return;
 
       if (dragRef.current.dragging) {
-        if (effectiveDockBelowChart) {
+        if (activeDockBelowChart) {
           const dy = e.clientY - dragRef.current.startClientY;
           const nextOffset = dragRef.current.startOffset + dy;
           setDockOffsetY(clamp(nextOffset, 0, 600));
@@ -1366,7 +1870,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           const nextH = startH + dy;
           setYh((prev) => ({ ...prev, h: nextH }));
         } else if (mode === "top") {
-          if (effectiveDockBelowChart) {
+          if (activeDockBelowChart) {
             const nextH = startH - dy;
             setYh((prev) => ({ ...prev, h: nextH }));
           } else {
@@ -1400,7 +1904,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [locked, effectiveDockBelowChart]);
+  }, [locked, activeDockBelowChart]);
 
   function startDrag(e) {
     if (locked) return;
@@ -1528,21 +2032,32 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   // Clickable symbol cells → onPickMarket(...)
   // FIX: Always use the object signature so we cannot swap args accidentally.
   // ─────────────────────────────────────────────────────────────
-  function callPickMarket(symbolCanon, venueMaybe) {
+  function callPickMarket(symbolCanon, venueMaybe, applyToTab = true, opts = {}) {
     const sym = String(symbolCanon || "").trim();
     if (!sym || typeof onPickMarket !== "function") return;
 
     const ven = String(venueMaybe || "").trim();
 
-    // App.jsx handlePickMarket supports {symbolCanon, venue, applyToTab}
+    // App.jsx handlePickMarket supports {symbolCanon, venue, applyToTab, opts}
     onPickMarket({
       symbolCanon: sym,
       venue: ven,
-      applyToTab: true,
+      applyToTab: !!applyToTab,
+      opts: opts && typeof opts === "object" ? opts : {},
     });
   }
 
-  function renderClickableSymbolCell({ symbolCanon, venueMaybe }) {
+  function renderClickableSymbolCell({
+    symbolCanon,
+    venueMaybe,
+    subLabel,
+    subLabelTitle,
+    subCopyText,
+    onPicked,
+    applyToTabOnPick = true,
+    pickOpts = {},
+    reapplyPickedDelayMs = 0,
+  }) {
     const sym = String(symbolCanon || "").trim();
     const ven = String(venueMaybe || "").trim();
 
@@ -1560,18 +2075,70 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         title={clickable ? `Pick market: ${sym}${ven ? ` (${ven})` : ""}` : undefined}
         onClick={() => {
           if (!clickable) return;
-          callPickMarket(sym, ven);
+          callPickMarket(sym, ven, applyToTabOnPick, pickOpts);
+          try {
+            const runPicked = () => {
+              try {
+                onPicked?.(sym, ven);
+              } catch {
+                // ignore
+              }
+            };
+            if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+              window.requestAnimationFrame(() => {
+                window.requestAnimationFrame(runPicked);
+              });
+            } else {
+              window.setTimeout(runPicked, 0);
+            }
+
+            const delayMs = Number(reapplyPickedDelayMs);
+            if (Number.isFinite(delayMs) && delayMs > 0) {
+              window.setTimeout(runPicked, delayMs);
+            }
+          } catch {
+            // ignore
+          }
         }}
       >
-        <span
-          data-no-drag="1"
-          style={{
-            color: clickable ? pal.link : undefined,
-            fontWeight: clickable ? 700 : undefined,
-          }}
-        >
-          {text}
-        </span>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <span
+            data-no-drag="1"
+            style={{
+              color: clickable ? pal.link : undefined,
+              fontWeight: clickable ? 700 : undefined,
+            }}
+          >
+            {text}
+          </span>
+          {subLabel ? (
+            <span
+              data-no-drag="1"
+              style={{
+                ...sx.muted,
+                fontSize: 11,
+                lineHeight: 1.1,
+                userSelect: "text",
+                textDecoration: subCopyText && !hideTableDataGlobal ? "underline dotted" : "none",
+                textUnderlineOffset: subCopyText && !hideTableDataGlobal ? 2 : undefined,
+                cursor: subCopyText && !hideTableDataGlobal ? "copy" : "text",
+              }}
+              title={hideTableDataGlobal ? undefined : (subLabelTitle || (subCopyText ? `Click to copy: ${subCopyText}` : undefined))}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (hideTableDataGlobal || !subCopyText) return;
+                copyTextSafe(subCopyText);
+                try {
+                  window.prompt("Copy full mint / contract address pair:", String(subCopyText));
+                } catch {
+                  // ignore
+                }
+              }}
+            >
+              {hideTableDataGlobal ? "••••" : subLabel}
+            </span>
+          ) : null}
+        </div>
       </td>
     );
   }
@@ -1835,6 +2402,11 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       market.length >= 5 &&
       market.length <= 30;
 
+    const mintShort = String(b?.mint_short || "").trim();
+    const mintFallback = String(b?.mint || "").trim();
+    const mintShort2 = mintShort || (mintFallback ? `${mintFallback.slice(0, 6)}…` : "");
+    // Only show the mint line when we have a symbol label (otherwise we'd just duplicate the mint twice).
+    const showMint = !hideTableDataGlobal && !!mintShort2 && !!String(b?.symbol || "").trim();
     const display = hideTableDataGlobal ? "••••" : asset || "—";
 
     // Venue hint: if viewing All venues, use the row venue; otherwise use current venue selection.
@@ -1879,15 +2451,18 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           callPickMarket(market, venueMaybe);
         }}
       >
-        <span
-          data-no-drag="1"
-          style={{
-            color: clickable ? pal.link : undefined,
-            fontWeight: clickable ? 700 : undefined,
-          }}
-        >
-          {display}
-        </span>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <span
+            data-no-drag="1"
+            style={{
+              color: clickable ? pal.link : undefined,
+              fontWeight: clickable ? 700 : undefined,
+            }}
+          >
+            {display}
+          </span>
+          {showMint ? <span style={{ fontSize: 11, opacity: 0.7 }}>{mintShort2}</span> : null}
+        </div>
       </td>
     );
   }
@@ -2144,6 +2719,23 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     setCancelModal({ open: false, kind: "", row: null, title: "" });
   }
 
+  async function submitManualCancelOrder() {
+    const oid = String(manualCancelOrderId || "").trim();
+    if (!oid || manualCancelBusy) return;
+    try {
+      onManualCancelError?.(null);
+      if (manualCancelVenue !== "solana_jupiter") {
+        throw new Error(`Manual cancel by order id is not wired for venue "${manualCancelVenue}" yet.`);
+      }
+      await doManualJupiterCancel?.(oid, { markCanceled: true });
+      setManualCancelOrderId?.("");
+      setShowManualCancelModal?.(false);
+    } catch (e) {
+      const msg = e?.response?.data?.detail || e?.message || "Failed to cancel order";
+      onManualCancelError?.(String(msg));
+    }
+  }
+
   function openCancelModalUnified(o) {
     if (!o) return;
     const sym = pickSymbolCanon(o) || o.symbol || "";
@@ -2282,8 +2874,14 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   }, []);
 
   async function runRefreshBalances(venueMaybe) {
-    if (typeof doRefreshBalances !== "function") return;
     const ven = String(venueMaybe || "").trim();
+    // For Solana venues, skip CEX balances refresh (it 422s) and refresh on-chain balances instead.
+    if (String(ven || venue || "").toLowerCase().startsWith("solana")) {
+      await refreshSolanaOnchainBalances();
+      return;
+    }
+
+    if (typeof doRefreshBalances !== "function") return;
     try {
       // If App.jsx supports an optional venue arg, respect it.
       if (doRefreshBalances.length >= 1 && ven) await doRefreshBalances(ven);
@@ -2782,13 +3380,262 @@ const bucket = orderBucket(o);
       );
     }
 
-    if (col === COLS.symbol) {
-      const sym = o.symbol_canon || o.symbol || "";
-      const ven = o.venue || aoVenue || (venue === ALL_VENUES_VALUE ? "" : venue) || "";
-      return renderClickableSymbolCell({ symbolCanon: sym, venueMaybe: ven });
-    }
+    
+      if (col === COLS.symbol) {
+        const isSolanaRow =
+          typeof o?.venue === "string" &&
+          (o.venue === "solana_jupiter" || o.venue === "solana" || o.venue.startsWith("solana"));
 
-    if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "••••" : o.side || "—"}</td>;
+        if (!isSolanaRow) {
+          // For CEX / non-Solana rows, update App immediately *and* re-assert the All Orders
+          // symbol filter locally after the venue-change cycle settles. This keeps Main UI
+          // Market/Venue in sync while preventing the table from snapping back to the full set.
+          return renderClickableSymbolCell({
+            symbolCanon: o.symbolCanon || o.symbol || o.raw_symbol || "—",
+            venueMaybe: o.venue,
+            subLabel: o.subLabel || null,
+            applyToTabOnPick: true,
+            pickOpts: {
+              suppressAllOrdersReloadOnce: true,
+              forceAllOrdersSymbol: true,
+            },
+            onPicked: (sym, ven) => applyAoSymbolImmediate(sym, ven),
+            reapplyPickedDelayMs: 260,
+          });
+        }
+
+        // Local helpers (do not depend on other table helpers)
+        const _shortMint = (s) => {
+          const x = (s ?? "").toString().trim();
+          if (!x) return "";
+          if (x.length <= 10) return x;
+          return `${x.slice(0, 4)}…${x.slice(-4)}`;
+        };
+
+        const _regGet = (addr) => {
+          const key = (addr ?? "").toString().trim();
+          if (!key) return null;
+          const lower = key.toLowerCase();
+          const upper = key.toUpperCase();
+
+          // solanaTokenRegistryMap might be a Map or a plain object
+          try {
+            if (solanaTokenRegistryMap && typeof solanaTokenRegistryMap.get === "function") {
+              return (
+                solanaTokenRegistryMap.get(key) ??
+                solanaTokenRegistryMap.get(lower) ??
+                solanaTokenRegistryMap.get(upper) ??
+                null
+              );
+            }
+          } catch (e) {
+            // fall through
+          }
+          if (solanaTokenRegistryMap && typeof solanaTokenRegistryMap === "object") {
+            return solanaTokenRegistryMap[key] ?? solanaTokenRegistryMap[lower] ?? solanaTokenRegistryMap[upper] ?? null;
+          }
+          return null;
+        };
+
+        const _regSymbol = (addr) => {
+          const e = _regGet(addr);
+          if (!e) return null;
+          if (typeof e === "string") return e;
+          if (typeof e?.symbol === "string" && e.symbol.trim()) return e.symbol.trim();
+          return null;
+        };
+
+        // Prefer explicit mint fields, then parsed raw payload, then exact raw_symbol parts, then broad extraction.
+        let rawObj = null;
+        try {
+          rawObj = typeof o?.raw === "string" ? JSON.parse(o.raw) : (o?.raw && typeof o.raw === "object" ? o.raw : null);
+        } catch {
+          rawObj = null;
+        }
+
+        const _rawTx = rawObj?.tx || rawObj || null;
+        const _rawMeta = _rawTx?.meta || rawObj?.meta || null;
+        const _rawDeltas = rawObj?.deltas && typeof rawObj.deltas === "object" ? rawObj.deltas : null;
+        const _isMintish = (x) => /^[1-9A-HJ-NP-Za-km-z]{32,120}$/.test(String(x || "").trim());
+        const _isKnownMint = (addr) => {
+          const s = String(addr || "").trim();
+          if (!s) return false;
+          if (s === SOL_MINT) return true;
+          return !!_regSymbol(s);
+        };
+        const _mintLabel = (addr) => {
+          const s = String(addr || "").trim();
+          if (!s) return "";
+          if (s === SOL_MINT) return "SOL";
+          return _regSymbol(s) || _shortMint(s);
+        };
+        const _resolveFlatSymbolPart = (part) => {
+          const s = String(part || "").trim();
+          if (!s) return "";
+          if (s === SOL_MINT || s.toUpperCase() === "SOL") return "SOL";
+          const reg = _regSymbol(s);
+          if (reg) return reg;
+          return s;
+        };
+
+        let baseMint =
+          o?.swap_base_mint ||
+          o?.base_mint ||
+          o?.input_mint ||
+          o?.raw?.inputMint ||
+          o?.raw?.input_mint ||
+          rawObj?.base_mint ||
+          rawObj?.input_mint ||
+          _rawTx?.base_mint ||
+          _rawTx?.inputMint ||
+          null;
+
+        let quoteMint =
+          o?.swap_quote_mint ||
+          o?.quote_mint ||
+          o?.output_mint ||
+          o?.raw?.outputMint ||
+          o?.raw?.output_mint ||
+          rawObj?.quote_mint ||
+          rawObj?.output_mint ||
+          _rawTx?.quote_mint ||
+          _rawTx?.outputMint ||
+          null;
+
+        const candidates = [];
+        const _push = (x) => {
+          const s = (x ?? "").toString().trim();
+          if (s && !candidates.includes(s)) candidates.push(s);
+        };
+
+        _push(baseMint);
+        _push(quoteMint);
+
+        // Deltas written by backend are the most reliable source of actual traded mints.
+        if (_rawDeltas) {
+          for (const k of Object.keys(_rawDeltas)) {
+            if (_isMintish(k)) _push(k);
+          }
+        }
+
+        // Token balance arrays often contain mint addresses even when top-level fields are missing.
+        for (const tb of [
+          ...(_rawMeta?.preTokenBalances || []),
+          ...(_rawMeta?.postTokenBalances || []),
+        ]) {
+          const m = tb?.mint;
+          if (_isMintish(m)) _push(m);
+        }
+
+        const symStr = (o?.raw_symbol || o?.symbol || o?.symbol_venue || "").toString().trim();
+        const flatSymbolParts = symStr ? symStr.split("-").map((s) => s.trim()).filter(Boolean) : [];
+        const rawMintParts = [];
+        if (symStr) {
+          // First, prefer explicit dash-separated parts (raw_symbol is often base_mint-quote_mint).
+          const parts = symStr.split("-").map((s) => s.trim()).filter(Boolean);
+          for (const p of parts) {
+            if (_isMintish(p)) {
+              rawMintParts.push(p);
+              _push(p);
+            }
+          }
+          // Then fall back to broad extraction from long base58-ish substrings.
+          const matches = symStr.match(/[1-9A-HJ-NP-Za-km-z]{32,120}/g) || [];
+          for (const m of matches) _push(m);
+        }
+
+        // Highest-priority fix for flat unresolved symbol strings already stored on the row,
+        // e.g. EPjFW...-SOL. Resolve each dash-separated side directly through the registry
+        // before falling back to deeper mint extraction.
+        if (flatSymbolParts.length === 2) {
+          const [leftRaw, rightRaw] = flatSymbolParts;
+          const leftResolved = _resolveFlatSymbolPart(leftRaw);
+          const rightResolved = _resolveFlatSymbolPart(rightRaw);
+          const leftChanged = leftResolved && leftResolved !== leftRaw;
+          const rightChanged = rightResolved && rightResolved !== rightRaw;
+          const leftIsSol = String(leftResolved || "").toUpperCase() === "SOL";
+          const rightIsSol = String(rightResolved || "").toUpperCase() === "SOL";
+          if (leftChanged || rightChanged || leftIsSol || rightIsSol) {
+            const mainDirect = `${leftResolved || leftRaw}-${rightResolved || rightRaw}`;
+            const subDirect = `${_shortMint(leftRaw)} / ${_shortMint(rightRaw)}`;
+            return renderClickableSymbolCell({
+              symbolCanon: mainDirect,
+              venueMaybe: o.venue,
+              subLabel: subDirect,
+              subLabelTitle: `${leftRaw}${leftRaw && rightRaw ? " / " : ""}${rightRaw}` ,
+              subCopyText: `${leftRaw}${leftRaw && rightRaw ? " / " : ""}${rightRaw}` ,
+              applyToTabOnPick: false,
+              pickOpts: { suppressAllOrdersReloadOnce: true },
+              onPicked: (sym, ven) => applyAoSymbolImmediate(sym, ven),
+            });
+          }
+        }
+
+        // Prefer registry-known mints first, but never let an arbitrary unknown outrank a parsed known raw_symbol part.
+        const known = [];
+        const unknown = [];
+        for (const c of candidates) {
+          if (_isKnownMint(c) && _mintLabel(c) && _mintLabel(c) !== _shortMint(c)) known.push(c);
+          else unknown.push(c);
+        }
+
+        // Strong preference: if raw_symbol already encodes a plausible mint pair and at least one side is registry-known,
+        // trust that order before looser fallback candidates. This fixes cases like USDC-SOL where the row also carries
+        // unrelated top-level mint fields that would otherwise outrank the raw_symbol pair.
+        if (rawMintParts.length >= 2) {
+          const a = rawMintParts[0];
+          const b = rawMintParts[1];
+          const aKnown = _isKnownMint(a);
+          const bKnown = _isKnownMint(b);
+          if ((aKnown && bKnown) || ((a === SOL_MINT || b === SOL_MINT) && (aKnown || bKnown))) {
+            baseMint = a;
+            quoteMint = b;
+          }
+        }
+
+        // Secondary preference: when one side is SOL and the other is any registry-known mint, prefer the known-mint/SOL pair.
+        if ((!_isKnownMint(baseMint) || !_isKnownMint(quoteMint)) && candidates.includes(SOL_MINT)) {
+          const knownNonSol = candidates.filter((c) => c !== SOL_MINT && !!_regSymbol(c));
+          if (knownNonSol.length) {
+            const rawKnownNonSol = rawMintParts.find((c) => c !== SOL_MINT && !!_regSymbol(c));
+            const preferredNonSol = rawKnownNonSol || knownNonSol[0];
+            if (rawMintParts.length >= 2 && rawMintParts.includes(SOL_MINT) && rawMintParts.includes(preferredNonSol)) {
+              baseMint = rawMintParts[0];
+              quoteMint = rawMintParts[1];
+            } else {
+              baseMint = preferredNonSol;
+              quoteMint = SOL_MINT;
+            }
+          }
+        }
+
+        if (!baseMint || !_isMintish(baseMint) || !_mintLabel(baseMint) || baseMint === quoteMint) {
+          baseMint = known[0] || candidates[0] || baseMint || null;
+        }
+        if (!quoteMint || !_isMintish(quoteMint) || !_mintLabel(quoteMint) || quoteMint === baseMint) {
+          quoteMint = known.find((x) => x !== baseMint) || candidates.find((x) => x !== baseMint) || quoteMint || null;
+        }
+
+        const baseSym = _mintLabel(baseMint) || _shortMint(baseMint);
+        const quoteSym = _mintLabel(quoteMint) || _shortMint(quoteMint);
+        const main = baseSym && quoteSym ? `${baseSym}-${quoteSym}` : (o?.symbol || o?.raw_symbol || "—");
+        const sub =
+          baseMint || quoteMint
+            ? `${_shortMint(baseMint)}${baseMint && quoteMint ? " / " : ""}${_shortMint(quoteMint)}`
+            : null;
+
+        return renderClickableSymbolCell({
+          symbolCanon: main,
+          venueMaybe: o.venue,
+          subLabel: sub,
+          subLabelTitle: `${String(baseMint || "").trim()}${baseMint && quoteMint ? " / " : ""}${String(quoteMint || "").trim()}` ,
+          subCopyText: `${String(baseMint || "").trim()}${baseMint && quoteMint ? " / " : ""}${String(quoteMint || "").trim()}` ,
+          applyToTabOnPick: false,
+          pickOpts: { suppressAllOrdersReloadOnce: true },
+          onPicked: (sym, ven) => applyAoSymbolImmediate(sym, ven),
+        });
+      }
+if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "••••" : o.side || "—"}</td>;
 
     // UPDATED: use high-precision formatter
     if (col === COLS.qty) return <td style={td}>{mask?.(fmtQty?.(o.qty ?? o.filled_qty))}</td>;
@@ -2796,8 +3643,22 @@ const bucket = orderBucket(o);
     if (col === COLS.net)   return <td style={td}>{maskMaybe?.(net === null ? "—" : fmtMoney?.(net))}</td>;
     // Tax (backend if present; else Mode A fallback on USD FILLED SELL when eligible)
     if (col === COLS.tax) {
+      const isInventoryError =
+        String(o?.realized_status || "").trim().toLowerCase() === "unapplied" &&
+        String(o?.realized_error || "").trim().toLowerCase() === "insufficient_inventory";
       const displayTax = backendTax !== null ? backendTax : fallbackTax;
-      return <td style={td}>{maskMaybe?.(displayTax === null ? "—" : fmtMoney?.(displayTax))}</td>;
+      const displayText =
+        displayTax === null
+          ? (isInventoryError ? "I/E" : "—")
+          : fmtMoney?.(displayTax);
+      return (
+        <td
+          style={td}
+          title={isInventoryError && displayTax === null ? "Insufficient inventory" : undefined}
+        >
+          {maskMaybe?.(displayText)}
+        </td>
+      );
     }
     if (col === COLS.netAfterTax) return <td style={td}>{maskMaybe?.(netAfterTax === null ? "—" : fmtMoney?.(netAfterTax))}</td>;
     if (col === COLS.fee)   return <td style={td}>{maskMaybe?.(fee === null ? "—" : fmtFee?.(fee))}</td>;
@@ -2904,19 +3765,30 @@ const bucket = orderBucket(o);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aoStatusBucket]);
 
+  const [aoSymbolDraft, setAoSymbolDraft] = useState(() => aoSymbol || "");
+  const [aoLocalSymbolFilter, setAoLocalSymbolFilter] = useState("");
+  useEffect(() => {
+    if (aoLocalSymbolFilter) return;
+    setAoSymbolDraft(aoSymbol || "");
+  }, [aoSymbol, aoLocalSymbolFilter]);
+
   const allOrdersLoadKey = useMemo(() => {
     return JSON.stringify({
       tab,
       aoSource: aoSource || "",
       aoVenue: aoVenue || "",
       aoStatusBucket: aoStatusBucketEff || "", // ALL => ""
-      aoSymbol: aoSymbol || "",
+      // Critical: when a friendly Solana local symbol filter is active, do NOT let the
+      // backend load path keep sending aoSymbol=UTTT-USDC (or similar), because the server
+      // stores many Solana rows under raw/mint-style symbols. In that mode, filtering is
+      // intentionally client-side over the already loaded dataset.
+      aoSymbol: aoLocalSymbolFilter ? "" : (aoSymbol || ""),
       aoSort: aoSort || "",
       aoPage: Number(aoPage) || 1,
       aoPageSize: Number(aoPageSize) || 25,
       hideCancelledUnified: !!hideCancelledUnified,
     });
-  }, [tab, aoSource, aoVenue, aoStatusBucketEff, aoSymbol, aoSort, aoPage, aoPageSize, hideCancelledUnified]);
+  }, [tab, aoSource, aoVenue, aoStatusBucketEff, aoSymbol, aoLocalSymbolFilter, aoSort, aoPage, aoPageSize, hideCancelledUnified]);
 
   const lastAllOrdersLoadKeyRef = useRef("");
 
@@ -2929,12 +3801,168 @@ const bucket = orderBucket(o);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allOrdersLoadKey]);
 
-  const [aoSymbolDraft, setAoSymbolDraft] = useState(() => aoSymbol || "");
-  useEffect(() => {
-    setAoSymbolDraft(aoSymbol || "");
-  }, [aoSymbol]);
+  function shouldUseLocalSolanaSymbolFilter(nextValue, venueMaybe = "") {
+    const v = String(nextValue || "").trim();
+    if (!v) return false;
+
+    const looksPair = /^[A-Za-z0-9._-]+-[A-Za-z0-9._-]+$/.test(v) && !/[\/] /.test(v);
+    if (!looksPair) return false;
+
+    const ven = String(venueMaybe || "").trim().toLowerCase();
+    if (ven.startsWith("solana")) return true;
+
+    const aoVen = String(aoVenue || "").trim().toLowerCase();
+    if (aoVen.startsWith("solana")) return true;
+
+    // Also honor the MAIN app venue selector. This is the missing case for
+    // manual entry: if the user is already in Solana/Jupiter context but types
+    // a friendly pair manually, we still need to use the local Solana alias path.
+    const mainVen = String(venue || "").trim().toLowerCase();
+    if (mainVen.startsWith("solana")) return true;
+
+    const qU = v.toUpperCase();
+    const rows = Array.isArray(aoRaw) ? aoRaw : [];
+    for (const o of rows) {
+      const rowVen = String(o?.venue || "").trim().toLowerCase();
+      if (!rowVen.startsWith("solana")) continue;
+      const cands = [o?.symbol, o?.raw_symbol, o?.symbol_venue, o?.symbol_canon];
+      for (const c of cands) {
+        const s = String(c || "").trim().toUpperCase();
+        if (s === qU) return true;
+      }
+    }
+
+    // Heuristic fallback for manual typing in mixed/all-venue views:
+    // if the pair looks like a Solana-friendly symbol and one side is a known
+    // Solana token-registry symbol (or a canonical SOL/USDC/USDT alias),
+    // prefer the local Solana filter path instead of backend CEX-only symbol search.
+    const [lhsRaw, rhsRaw] = v.split("-", 2);
+    const lhs = String(lhsRaw || "").trim().toUpperCase();
+    const rhs = String(rhsRaw || "").trim().toUpperCase();
+    const SOL_ALIASES = new Set(["SOL", "WSOL"]);
+    const USDQ_ALIASES = new Set(["USDC", "USDT"]);
+
+    const regMap = solanaTokenRegistryMap && typeof solanaTokenRegistryMap === "object" ? solanaTokenRegistryMap : {};
+    const regValueSet = new Set();
+    try {
+      for (const val of Object.values(regMap)) {
+        const s = String(val || "").trim().toUpperCase();
+        if (s) regValueSet.add(s);
+      }
+    } catch {
+      // ignore
+    }
+
+    const leftKnown = regValueSet.has(lhs) || SOL_ALIASES.has(lhs) || USDQ_ALIASES.has(lhs);
+    const rightKnown = regValueSet.has(rhs) || SOL_ALIASES.has(rhs) || USDQ_ALIASES.has(rhs);
+
+    if ((SOL_ALIASES.has(rhs) || USDQ_ALIASES.has(rhs)) && leftKnown) return true;
+    if ((SOL_ALIASES.has(lhs) || USDQ_ALIASES.has(lhs)) && rightKnown) return true;
+
+    return false;
+  }
+
+  function applyAoSymbolImmediate(nextValue, venueMaybe = "") {
+    const v = String(nextValue || "").trim();
+    setAoSymbolDraft(v);
+
+    const looksFriendlySolanaPair = shouldUseLocalSolanaSymbolFilter(v, venueMaybe);
+
+    const kickReload = () => {
+      try {
+        if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+          window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+              try { doLoadAllOrders?.(); } catch {}
+            });
+          });
+        } else {
+          window.setTimeout(() => {
+            try { doLoadAllOrders?.(); } catch {}
+          }, 0);
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    if (!v) {
+      setAoLocalSymbolFilter("");
+      setAoSymbol?.("");
+      setAoPage?.(1);
+      kickReload();
+      return;
+    }
+
+    if (looksFriendlySolanaPair) {
+      setAoLocalSymbolFilter(v);
+      // Always clear backend symbol for friendly Solana local-filter mode.
+      setAoSymbol?.("");
+      setAoPage?.(1);
+      kickReload();
+      return;
+    }
+
+    setAoLocalSymbolFilter(v);
+    setAoSymbol?.(v);
+    setAoPage?.(1);
+    kickReload();
+  }
+
+  const _detectSolanaTokenSuggestionsFromRows = useCallback((rows) => {
+    const existingMap = solanaTokenRegistryMap && typeof solanaTokenRegistryMap === "object" ? solanaTokenRegistryMap : {};
+    const existingRows = readJsonLS(LS_SOLANA_DETECTED_TOKENS_KEY, []);
+    const byAddress = new Map();
+    for (const it of Array.isArray(existingRows) ? existingRows : []) { const a = String(it?.address || "").trim(); if (a) byAddress.set(a, it); }
+    const isMintish = (x) => /^[1-9A-HJ-NP-Za-km-z]{32,120}$/.test(String(x || "").trim());
+    const regSym = (addr) => { const s = String(addr || "").trim(); return s ? String(existingMap[s] || existingMap[s.toLowerCase()] || "").trim() : ""; };
+    const maybeTokenSymbol = (part) => { const s = String(part || "").trim(); if (!s) return ""; if (s.toUpperCase() === "SOL") return "SOL"; if (isMintish(s)) return regSym(s); if (/^[A-Z0-9._-]{2,20}$/i.test(s)) return s.toUpperCase(); return ""; };
+    const parseRaw = (raw) => { if (!raw) return null; if (typeof raw === "string") { try { return JSON.parse(raw); } catch { return null; } } return raw && typeof raw === "object" ? raw : null; };
+    const pushSuggestion = (addr, symbol, decimals, row) => {
+      const a = String(addr || "").trim();
+      if (!isMintish(a) || a === SOL_MINT || regSym(a)) return;
+      const d = Number(decimals);
+      const prev = byAddress.get(a) || {};
+      byAddress.set(a, {
+        chain: "solana",
+        address: a,
+        symbol: String(symbol || prev.symbol || "").trim().toUpperCase(),
+        decimals: Number.isFinite(d) ? d : (Number.isFinite(Number(prev.decimals)) ? Number(prev.decimals) : null),
+        venue: String(row?.venue || prev.venue || "").trim() || "solana_jupiter",
+        sourceSymbol: String(row?.symbol || row?.raw_symbol || row?.symbol_venue || prev.sourceSymbol || "").trim(),
+        firstSeenAt: prev.firstSeenAt || new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      });
+    };
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!String(row?.venue || "").toLowerCase().startsWith("solana")) continue;
+      const rawObj = parseRaw(row?.raw);
+      const tx = rawObj?.tx || rawObj || {};
+      const meta = tx?.result?.meta || tx?.meta || rawObj?.meta || {};
+      const pair = String(row?.symbol || row?.raw_symbol || row?.symbol_venue || "").trim();
+      const parts = pair ? pair.split("-").map((s) => s.trim()).filter(Boolean) : [];
+      const symbols = parts.map(maybeTokenSymbol);
+      const topPairs = [[row?.base_mint || row?.swap_base_mint || null, symbols[0] || ""],[row?.quote_mint || row?.swap_quote_mint || null, symbols[1] || ""]];
+      for (const [addr,sym] of topPairs) pushSuggestion(addr,sym,null,row);
+      const balances=[...(meta?.preTokenBalances||[]),...(meta?.postTokenBalances||[])];
+      const mintToDecimals={};
+      for (const tb of balances){ const mint=String(tb?.mint||"").trim(); const dec=Number(tb?.uiTokenAmount?.decimals); if(mint&&Number.isFinite(dec)&&!(mint in mintToDecimals)) mintToDecimals[mint]=dec; }
+      const mintHints=[]; const rawSym=String(row?.raw_symbol || pair || "").trim();
+      for (const p of rawSym.split("-").map((s)=>s.trim()).filter(Boolean)) if (isMintish(p)) mintHints.push(p);
+      const mints=Array.from(new Set([row?.base_mint,row?.quote_mint,row?.swap_base_mint,row?.swap_quote_mint,...mintHints,...Object.keys(mintToDecimals)].filter(Boolean).map((s)=>String(s).trim())));
+      for (const mint of mints){ let sym=regSym(mint); if(!sym&&parts.length===2){ if(mint===topPairs[0][0]) sym=symbols[0]||sym; if(mint===topPairs[1][0]) sym=symbols[1]||sym; } pushSuggestion(mint,sym,mintToDecimals[mint],row); }
+    }
+    const next=Array.from(byAddress.values()).filter((it)=>it&&it.address&&it.address!==SOL_MINT).sort((a,b)=>String(b.lastSeenAt||"").localeCompare(String(a.lastSeenAt||"")));
+    writeJsonLS(LS_SOLANA_DETECTED_TOKENS_KEY,next);
+  }, [solanaTokenRegistryMap]);
 
   const aoRaw = Array.isArray(allOrders) ? allOrders : [];
+
+  useEffect(() => {
+    if (tab !== "allOrders") return;
+    if (!Array.isArray(aoRaw) || !aoRaw.length) return;
+    _detectSolanaTokenSuggestionsFromRows(aoRaw);
+  }, [tab, aoRaw, _detectSolanaTokenSuggestionsFromRows]);
 
   // Unified "Status" filter state (client-side; persists)
   const [aoStatusFilter, setAoStatusFilter] = useState(() => {
@@ -2985,16 +4013,101 @@ const bucket = orderBucket(o);
     });
   }, [aoFiltered, aoStatusTokens]);
 
+
+
+  // Bridge path for manual Market-field Apply from App.jsx:
+  // App's setActiveMarket() can still push a friendly Solana pair into aoSymbol directly.
+  // When that happens, migrate it into the local Solana alias filter here so All Orders
+  // does not depend on backend CEX-style symbol matching for Solana rows.
+  useEffect(() => {
+    const raw = String(aoSymbol || "").trim();
+    if (!raw) return;
+
+    const shouldLocalize = shouldUseLocalSolanaSymbolFilter(raw, aoVenue || venue || "");
+    if (!shouldLocalize) return;
+
+    if (String(aoLocalSymbolFilter || "").trim() !== raw) {
+      setAoLocalSymbolFilter(raw);
+    }
+    if (String(aoSymbol || "").trim()) {
+      setAoSymbol?.("");
+    }
+    setAoPage?.(1);
+
+    try {
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            try { doLoadAllOrders?.(); } catch {}
+          });
+        });
+      } else {
+        window.setTimeout(() => {
+          try { doLoadAllOrders?.(); } catch {}
+        }, 0);
+      }
+    } catch {
+      // ignore
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aoSymbol, aoVenue, venue]);
+
+  const aoVisibleClient = useMemo(() => {
+    const q = String(aoLocalSymbolFilter || "").trim();
+    if (!q) return aoVisible;
+    const qU = q.toUpperCase();
+    const regMap = solanaTokenRegistryMap && typeof solanaTokenRegistryMap === "object" ? solanaTokenRegistryMap : {};
+    const regGet = (v) => {
+      const s = String(v || "").trim();
+      if (!s) return "";
+      return String(regMap[s] || regMap[s.toLowerCase()] || regMap[s.toUpperCase()] || "").trim();
+    };
+    const looksMintish = (v) => /^[1-9A-HJ-NP-Za-km-z]{32,120}$/.test(String(v || "").trim());
+    const normPart = (part) => {
+      const s = String(part || "").trim();
+      if (!s) return "";
+      if (s === SOL_MINT || s.toUpperCase() === "SOL") return "SOL";
+      const reg = regGet(s);
+      if (reg) return String(reg).trim().toUpperCase();
+      if (looksMintish(s)) return s;
+      return s.toUpperCase();
+    };
+    const buildAliases = (o) => {
+      const out = new Set();
+      const add = (v) => {
+        const s = String(v || "").trim();
+        if (!s) return;
+        out.add(s);
+        out.add(s.toUpperCase());
+        const parts = s.split("-").map((x) => String(x || "").trim()).filter(Boolean);
+        if (parts.length === 2) out.add(`${normPart(parts[0])}-${normPart(parts[1])}`.toUpperCase());
+      };
+      add(o?.symbol);
+      add(o?.raw_symbol);
+      add(o?.symbol_venue);
+      add(o?.symbol_canon);
+      const baseMint = o?.base_mint || o?.swap_base_mint || o?.input_mint || "";
+      const quoteMint = o?.quote_mint || o?.swap_quote_mint || o?.output_mint || "";
+      if (baseMint && quoteMint) add(`${baseMint}-${quoteMint}`);
+      return out;
+    };
+    return aoVisible.filter((o) => {
+      const aliases = buildAliases(o);
+      for (const a of aliases) if (String(a).toUpperCase() === qU) return true;
+      return false;
+    });
+  }, [aoVisible, aoLocalSymbolFilter, solanaTokenRegistryMap]);
+
   const aoCounts = useMemo(() => {
     let openN = 0;
     let termN = 0;
-    for (const o of aoVisible) {
+    for (const o of aoVisibleClient) {
       const b = orderBucket(o);
       if (b === "terminal") termN += 1;
       else openN += 1;
     }
     return { open: openN, terminal: termN };
-  }, [aoVisible]);
+  }, [aoVisibleClient]);
 
   // ─────────────────────────────────────────────────────────────
   // Audible notification: new FILLED order detected (All Orders)
@@ -3054,6 +4167,15 @@ const [aoTaxStatePct, setAoTaxStatePct] = useState(() => {
 const [aoTaxAssumeNetWhenGainUnknown, setAoTaxAssumeNetWhenGainUnknown] = useState(() =>
   readBoolLS(LS_AO_TAX_ASSUME_NET_WHEN_UNKNOWN_KEY, false)
 );
+const [aoBackendRealizedEnabled, setAoBackendRealizedEnabled] = useState(true);
+const [aoBackendRealizedBusy, setAoBackendRealizedBusy] = useState(false);
+const [aoBackendRealizedLoaded, setAoBackendRealizedLoaded] = useState(false);
+
+  // All Orders: Tax settings floating window (in-page)
+  const [aoTaxWinOpen, setAoTaxWinOpen] = useState(false);
+  const [aoTaxWinX, setAoTaxWinX] = useState(readNumLS(LS_AO_TAX_WIN_X_KEY, 60));
+  const [aoTaxWinY, setAoTaxWinY] = useState(readNumLS(LS_AO_TAX_WIN_Y_KEY, 120));
+
 useEffect(
   () => writeBoolLS(LS_AO_TAX_WITHHOLD_ENABLED_KEY, !!aoTaxWithholdEnabled),
   [aoTaxWithholdEnabled]
@@ -3061,13 +4183,52 @@ useEffect(
 useEffect(() => writeNumLS(LS_AO_TAX_FED_PCT_KEY, aoTaxFedPct), [aoTaxFedPct]);
 useEffect(() => writeNumLS(LS_AO_TAX_STATE_PCT_KEY, aoTaxStatePct), [aoTaxStatePct]);
 useEffect(() => writeBoolLS(LS_AO_TAX_ASSUME_NET_WHEN_UNKNOWN_KEY, !!aoTaxAssumeNetWhenGainUnknown), [aoTaxAssumeNetWhenGainUnknown]);
+useEffect(() => writeNumLS(LS_AO_TAX_WIN_X_KEY, aoTaxWinX), [aoTaxWinX]);
+useEffect(() => writeNumLS(LS_AO_TAX_WIN_Y_KEY, aoTaxWinY), [aoTaxWinY]);
 
-  // All Orders: Tax settings floating window (in-page)
-  const [aoTaxWinOpen, setAoTaxWinOpen] = useState(false);
-  const [aoTaxWinX, setAoTaxWinX] = useState(readNumLS(LS_AO_TAX_WIN_X_KEY, 60));
-  const [aoTaxWinY, setAoTaxWinY] = useState(readNumLS(LS_AO_TAX_WIN_Y_KEY, 120));
-  useEffect(() => writeNumLS(LS_AO_TAX_WIN_X_KEY, aoTaxWinX), [aoTaxWinX]);
-  useEffect(() => writeNumLS(LS_AO_TAX_WIN_Y_KEY, aoTaxWinY), [aoTaxWinY]);
+const loadAoRuntimeFlags = useCallback(async () => {
+  try {
+    const js = await fetchJSONMaybe("/api/trade/runtime_flags");
+    if (typeof js?.realized_fields_enabled === "boolean") {
+      setAoBackendRealizedEnabled(!!js.realized_fields_enabled);
+    } else {
+      setAoBackendRealizedEnabled(true);
+    }
+  } catch {
+    setAoBackendRealizedEnabled(true);
+  } finally {
+    setAoBackendRealizedLoaded(true);
+  }
+}, []);
+
+const saveAoRuntimeFlags = useCallback(async (nextEnabled) => {
+  setAoBackendRealizedBusy(true);
+  try {
+    const tok = (typeof getAuthToken === "function") ? getAuthToken() : null;
+    const headers = { "Content-Type": "application/json" };
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
+    const resp = await fetch("/api/trade/runtime_flags", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ realized_fields_enabled: !!nextEnabled }),
+    });
+    let js = {};
+    try { js = await resp.json(); } catch { js = {}; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) ? (js.detail || js.error) : `Request failed (${resp.status})`;
+      throw new Error(msg);
+    }
+    setAoBackendRealizedEnabled(typeof js?.realized_fields_enabled === "boolean" ? !!js.realized_fields_enabled : !!nextEnabled);
+  } finally {
+    setAoBackendRealizedBusy(false);
+  }
+}, []);
+
+useEffect(() => {
+  if (aoTaxWinOpen && !aoBackendRealizedLoaded) {
+    loadAoRuntimeFlags();
+  }
+}, [aoTaxWinOpen, aoBackendRealizedLoaded, loadAoRuntimeFlags]);
 
   // All Orders: Ledger sync (lot-journal) settings
   function clampLedgerLimit(n, fallback = 5000) {
@@ -3384,6 +4545,29 @@ const aoTaxCombinedPct = useMemo(() => {
               </div>
             </div>
           </label>
+
+          <label style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <input
+              type="checkbox"
+              checked={!!aoBackendRealizedEnabled}
+              disabled={!!aoBackendRealizedBusy}
+              onChange={async (e) => {
+                const next = !!e.target.checked;
+                setAoBackendRealizedEnabled(next);
+                try {
+                  await saveAoRuntimeFlags(next);
+                } catch {
+                  setAoBackendRealizedEnabled(!next);
+                }
+              }}
+            />
+            <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.1 }}>
+              <div style={{ fontWeight: 600 }}>Enable backend realized gain fields</div>
+              <div style={{ opacity: 0.8, fontSize: 12 }}>
+                Controls backend realized proceeds, basis, pnl, and tax support. Defaults to on.
+              </div>
+            </div>
+          </label>
         </div>
       </div>,
       document.body
@@ -3397,6 +4581,9 @@ const aoTaxCombinedPct = useMemo(() => {
     aoTaxFedPct,
     aoTaxStatePct,
     aoTaxAssumeNetWhenGainUnknown,
+    aoBackendRealizedEnabled,
+    aoBackendRealizedBusy,
+    saveAoRuntimeFlags,
     btn,
     smallBtn,
     sx.pillInput,
@@ -3835,7 +5022,17 @@ function renderFillToasts() {
           <div style={{ marginLeft: "auto", ...sx.muted, fontSize: 13 }}>
             Portfolio Total:{" "}
             <b style={{ color: pal.text }}>
-              ${hideTableDataGlobal ? "••••" : portfolioTotalUsd === null ? "—" : fmtUsd?.(portfolioTotalUsd)}
+              ${
+                hideTableDataGlobal
+                  ? "••••"
+                  : isSolanaVenue
+                      ? solanaPortfolioTotalUsd === null
+                        ? "—"
+                        : fmtUsd?.(solanaPortfolioTotalUsd)
+                      : portfolioTotalUsd === null
+                        ? "—"
+                        : fmtUsd?.(portfolioTotalUsd)
+              }
             </b>
           </div>
         </div>
@@ -3935,6 +5132,72 @@ function renderFillToasts() {
               )}
             </tbody>
           </table>
+        )}
+
+        {isSolanaVenue && (
+          <div style={{ marginTop: 12, borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: 10 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <div style={{ fontWeight: 800 }}>On-chain (Solana)</div>
+              <span style={{ ...sx.muted, fontSize: 12 }}>Source: Solana RPC (live)</span>
+              <button
+                data-no-drag="1"
+                style={btn?.(solanaOnchain.loading) ?? smallBtn(solanaOnchain.loading)}
+                disabled={solanaOnchain.loading}
+                onClick={() => refreshSolanaOnchainBalances()}
+              >
+                {solanaOnchain.loading ? "Loading…" : solanaOnchain.address ? "Refresh on-chain" : "Connect + Load"}
+              </button>
+
+              <button
+                data-no-drag="1"
+                style={btn?.(false) ?? smallBtn(false)}
+                onClick={() => setShowSolanaOnchainDetails((v) => !v)}
+              >
+                {showSolanaOnchainDetails ? "Hide details" : "Show details"}
+              </button>
+
+              {solanaOnchain.address && (
+                <span style={{ ...sx.muted, fontSize: 12 }}>
+                  {solanaOnchain.address.slice(0, 6)}…{solanaOnchain.address.slice(-4)}
+                </span>
+              )}
+
+              {solanaOnchain.err && <span style={{ ...sx.badge, background: "rgba(255,80,80,0.18)" }}>{solanaOnchain.err}</span>}
+            </div>
+
+            {showSolanaOnchainDetails ? (
+              <div style={{ marginTop: 8 }}>
+                <table style={{ ...sx.table, fontSize: 13 }}>
+                  <thead>
+                    <tr>
+                      <th style={sx.th}>Token</th>
+                      <th style={sx.th}>Mint</th>
+                      <th style={sx.thRight}>Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(solanaOnchain.items || [])
+                      .filter((it) => (hideZeroBalances ? Number(it?.amount || 0) !== 0 : true))
+                      .map((it, idx) => (
+                        <tr key={it.mint || it.asset || idx}>
+                          <td style={sx.td}>{it.symbol || it.asset || "—"}</td>
+                          <td style={sx.td}>{hideTableDataGlobal ? "••••" : (it.mint ? `${String(it.mint).slice(0, 6)}…` : "—")}</td>
+                          <td style={sx.tdRight}>{hideTableDataGlobal ? "••••" : fmtBal(it.amount)}</td>
+                        </tr>
+                      ))}
+
+                    {(solanaOnchain.items || []).length === 0 && (
+                      <tr>
+                        <td style={sx.td} colSpan={3}>
+                          <span style={sx.muted}>{solanaOnchain.loading ? "Loading…" : "No on-chain balances loaded."}</span>
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
         )}
       </>
     );
@@ -4093,8 +5356,48 @@ function renderFillToasts() {
 
     const applyAoSymbol = () => {
       const v = String(aoSymbolDraft || "").trim();
+      // Important: manual entry in All Orders must honor BOTH the explicit All Orders venue
+      // filter and the main app venue selector, otherwise Solana-friendly pairs like
+      // UTTT-USDC / USDC-SOL fall back to backend CEX-only symbol search when aoVenue is blank.
+      const looksFriendlySolanaPair = shouldUseLocalSolanaSymbolFilter(v, aoVenue || venue || "");
+
+      const kickReload = () => {
+        try {
+          if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+            window.requestAnimationFrame(() => {
+              window.requestAnimationFrame(() => {
+                try { doLoadAllOrders?.(); } catch {}
+              });
+            });
+          } else {
+            window.setTimeout(() => {
+              try { doLoadAllOrders?.(); } catch {}
+            }, 0);
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      if (!v) {
+        setAoLocalSymbolFilter("");
+        setAoSymbol?.("");
+        setAoPage?.(1);
+        kickReload();
+        return;
+      }
+      if (looksFriendlySolanaPair) {
+        setAoLocalSymbolFilter(v);
+        // Always clear backend symbol for friendly Solana local-filter mode.
+        setAoSymbol?.("");
+        setAoPage?.(1);
+        kickReload();
+        return;
+      }
+      setAoLocalSymbolFilter(v);
       setAoSymbol?.(v);
       setAoPage?.(1);
+      kickReload();
     };
 
     return (
@@ -4402,7 +5705,7 @@ function renderFillToasts() {
           </button>
 
           <div style={{ marginLeft: "auto", ...sx.muted, fontSize: 12 }}>
-            Showing <b style={{ color: pal.text }}>{hideTableDataGlobal ? "••••" : aoVisible.length}</b> /{" "}
+            Showing <b style={{ color: pal.text }}>{hideTableDataGlobal ? "••••" : aoVisibleClient.length}</b> /{" "}
             <b style={{ color: pal.text }}>{hideTableDataGlobal ? "••••" : allTotal}</b>{" "}
             <span style={{ marginLeft: 10 }}>
               Open: <b style={{ color: pal.text }}>{hideTableDataGlobal ? "••••" : aoCounts.open}</b> • Terminal:{" "}
@@ -4527,13 +5830,13 @@ function renderFillToasts() {
               <tr>{columns.map((c) => renderAllOrdersHeader(c))}</tr>
             </thead>
             <tbody>
-              {aoVisible.map((o, idx) => (
+              {aoVisibleClient.map((o, idx) => (
                 <tr key={o.view_key || o.id || `${o.created_at || ""}-${idx}`} style={orderRowStyle(o)}>
                   {columns.map((c) => renderAllOrdersCell(o, c))}
                 </tr>
               ))}
 
-              {aoVisible.length === 0 && (
+              {aoVisibleClient.length === 0 && (
                 <tr>
                   <td style={sx.td} colSpan={Math.max(1, columns.length)}>
                     <span style={sx.muted}>
@@ -4916,6 +6219,125 @@ function renderFillToasts() {
 
   const dockHint = dockBelowChart ? "Docked under chart" : "Floating";
 
+  function renderManualCancelModal() {
+    if (!showManualCancelModal) return null;
+
+    const overlay = {
+      position: "absolute",
+      left: 0,
+      top: 0,
+      width: "100%",
+      height: "100%",
+      background: "rgba(0,0,0,0.55)",
+      zIndex: 110,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 12,
+    };
+
+    const card = {
+      width: "min(560px, 100%)",
+      border: `1px solid ${pal.border}`,
+      background: pal.widgetBg,
+      borderRadius: 12,
+      boxShadow: `0 18px 40px ${pal.shadow}`,
+      padding: 16,
+      color: pal.text,
+    };
+
+    const disableSubmit = !!manualCancelBusy || !String(manualCancelOrderId || "").trim();
+
+    return (
+      <div
+        data-no-drag="1"
+        style={overlay}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          if (manualCancelBusy) return;
+          setShowManualCancelModal?.(false);
+        }}
+      >
+        <div
+          data-no-drag="1"
+          style={card}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 18, fontWeight: 800 }}>Manual Cancel</div>
+              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+                Cancel by order id. Solana-Jupiter is wired now; other venues can be added to this same flow later.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                if (manualCancelBusy) return;
+                setShowManualCancelModal?.(false);
+              }}
+              style={{ ...sx.button, padding: "6px 10px" }}
+            >
+              Close
+            </button>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: 10, alignItems: "center" }}>
+            <div style={{ fontSize: 12, opacity: 0.8, fontWeight: 700 }}>Venue</div>
+            <select
+              value={manualCancelVenue}
+              onChange={(e) => setManualCancelVenue?.(e.target.value)}
+              style={sx.select}
+            >
+              <option value="solana_jupiter">Solana-Jupiter</option>
+              <option value="coinbase">Coinbase (later)</option>
+              <option value="kraken">Kraken (later)</option>
+              <option value="robinhood">Robinhood (later)</option>
+              <option value="dex_trade">Dex-Trade (later)</option>
+            </select>
+
+            <div style={{ fontSize: 12, opacity: 0.8, fontWeight: 700 }}>Order ID</div>
+            <input
+              value={manualCancelOrderId}
+              onChange={(e) => setManualCancelOrderId?.(e.target.value)}
+              placeholder={manualCancelVenue === "solana_jupiter" ? "Paste Jupiter order id" : "Paste order id"}
+              style={{ ...sx.input, width: "100%" }}
+            />
+          </div>
+
+          <div style={{ fontSize: 12, opacity: 0.72, marginTop: 10 }}>
+            {manualCancelVenue === "solana_jupiter"
+              ? "Use the Jupiter order account id, not the transaction signature."
+              : "This venue is not wired yet, but the modal is ready for future order-id cancel flows."}
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+            <button
+              type="button"
+              onClick={() => {
+                if (manualCancelBusy) return;
+                setShowManualCancelModal?.(false);
+              }}
+              style={sx.button}
+            >
+              Close
+            </button>
+            <button
+              type="button"
+              onClick={submitManualCancelOrder}
+              disabled={disableSubmit}
+              style={{ ...sx.button, ...(disableSubmit ? sx.buttonDisabled : {}), fontWeight: 700 }}
+            >
+              {manualCancelBusy ? "Canceling…" : "Cancel Order"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // Cancel confirmation modal (rendered over widget)
   function renderCancelConfirmModal() {
     if (!cancelModal.open) return null;
@@ -5173,8 +6595,10 @@ function renderFillToasts() {
   // Widget shell / tabs
   // ─────────────────────────────────────────────────────────────
   const shell = {
-    // When unlocked, use `fixed` so the widget can move over the AppHeader.
-    position: locked ? "absolute" : "fixed",
+    // Keep viewport coordinates in a single reference frame.
+    // Switching to `absolute` on lock was reinterpreting the same x/y inside the tables pane,
+    // which is what shoved the widget to the lower-left / bottom on lock.
+    position: "fixed",
     left: geom.x,
     top: geom.y,
     width: geom.w,
@@ -5321,8 +6745,18 @@ function renderFillToasts() {
         </div>
 
         <div data-no-drag="1" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            data-no-drag="1"
+            type="button"
+            onClick={() => setShowManualCancelModal?.(true)}
+            style={{ ...sx.button, fontWeight: 700 }}
+            title="Cancel an order by venue + order id"
+          >
+            Cancel Order
+          </button>
+
           <label data-no-drag="1" style={sx.pill} title="Lock widget position/size">
-            <input data-no-drag="1" type="checkbox" checked={!!locked} onChange={(e) => setLocked(e.target.checked)} />
+            <input data-no-drag="1" type="checkbox" checked={!!locked} onChange={(e) => handleLockedChange(e.target.checked)} />
             <span>Lock</span>
           </label>
 
@@ -5345,6 +6779,7 @@ function renderFillToasts() {
       </div>
 
       {/* Modal overlays */}
+      {renderManualCancelModal()}
       {renderCancelConfirmModal()}
 
       {/* Floating windows */}

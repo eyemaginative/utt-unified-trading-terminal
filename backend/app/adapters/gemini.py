@@ -193,8 +193,26 @@ class GeminiAdapter(ExchangeAdapter):
     def _sign_payload(self, request_path: str, payload: Dict[str, Any]) -> Dict[str, str]:
         import json as _json, base64, hmac, hashlib, time as _time
 
-        if not settings.gemini_api_key or not settings.gemini_api_secret:
-            raise Exception("Missing Gemini credentials: set GEMINI_API_KEY and GEMINI_API_SECRET")
+        api_key = (settings.gemini_api_key or "").strip()
+        api_secret = (settings.gemini_api_secret or "").strip()
+
+        # DB-vault override (optional): settings.gemini_private_creds() -> (api_key, api_secret) or dict
+        if (not api_key) or (not api_secret):
+            fn = getattr(settings, "gemini_private_creds", None)
+            if callable(fn):
+                try:
+                    v = fn()
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        api_key = str(v[0] or "").strip()
+                        api_secret = str(v[1] or "").strip()
+                    elif isinstance(v, dict):
+                        api_key = str(v.get("api_key") or v.get("key") or "").strip()
+                        api_secret = str(v.get("api_secret") or v.get("secret") or "").strip()
+                except Exception:
+                    pass
+
+        if (not api_key) or (not api_secret):
+            raise Exception("Missing Gemini credentials: set GEMINI_API_KEY and GEMINI_API_SECRET (or store in Profile → API Keys for venue=gemini)")
 
         p = dict(payload or {})
         p["request"] = request_path
@@ -204,14 +222,14 @@ class GeminiAdapter(ExchangeAdapter):
         payload_b64 = base64.b64encode(payload_json.encode("utf-8")).decode("utf-8")
 
         signature = hmac.new(
-            settings.gemini_api_secret.encode("utf-8"),
+            api_secret.encode("utf-8"),
             payload_b64.encode("utf-8"),
             hashlib.sha384,
         ).hexdigest()
 
         return {
             "Content-Type": "text/plain",
-            "X-GEMINI-APIKEY": settings.gemini_api_key,
+            "X-GEMINI-APIKEY": api_key,
             "X-GEMINI-PAYLOAD": payload_b64,
             "X-GEMINI-SIGNATURE": signature,
             "Cache-Control": "no-cache",

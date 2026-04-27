@@ -55,6 +55,21 @@ except Exception as e:
     print("solana_dex router import failed:", repr(e))
     solana_dex_router = None
 
+
+# NEW: token registry router (/api/token_registry/*)
+try:
+    from .routers.token_registry import router as token_registry_router
+except Exception as e:
+    print("token_registry router import failed:", repr(e))
+    token_registry_router = None
+
+# NEW: airdrop router (/api/airdrop/*)
+try:
+    from .routers.airdrop import router as airdrop_router
+except Exception as e:
+    print("airdrop router import failed:", repr(e))
+    airdrop_router = None
+
 # Optional: symbol view confirmation router (only if file exists)
 try:
     from .routers.symbol_views import router as symbol_views_router
@@ -99,6 +114,14 @@ def create_app() -> FastAPI:
     if solana_dex_router is not None:
         app.include_router(solana_dex_router)
 
+    # Airdrop registration / status
+    if airdrop_router is not None:
+        app.include_router(airdrop_router)
+
+    
+    # Token / Symbol Registry
+    if token_registry_router is not None:
+        app.include_router(token_registry_router)
     app.include_router(orders_router)
     app.include_router(market_router)
     app.include_router(arm_router)

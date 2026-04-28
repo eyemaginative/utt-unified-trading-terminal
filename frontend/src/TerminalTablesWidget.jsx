@@ -287,21 +287,20 @@ function numPx(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function normalizeChartGeom(candidate) {
+  if (!candidate || typeof candidate !== "object") return null;
+  const x = Number(candidate.x);
+  const y = Number(candidate.y);
+  const w = Number(candidate.w);
+  const h = Number(candidate.h);
+  const ok = Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0;
+  return ok ? { x, y, w, h } : null;
+}
+
 function readChartGeomFromStorage() {
   const raw = localStorage.getItem(CHART_GEOM_KEY);
   const parsed = safeParseJson(raw || "");
-  if (parsed && typeof parsed === "object") {
-    const x = Number(parsed.x);
-    const y = Number(parsed.y);
-    const w = Number(parsed.w);
-    const h = Number(parsed.h);
-
-    const okYH = Number.isFinite(y) && Number.isFinite(h) && h > 0;
-    const okXW = Number.isFinite(x) && Number.isFinite(w) && w > 0;
-
-    if (okYH || okXW) return { x, y, w, h };
-  }
-  return null;
+  return normalizeChartGeom(parsed);
 }
 
 function pickSymbolCanon(row) {
@@ -729,6 +728,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
 
       // whether chart is currently visible (controls docking behavior)
       showChart,
+      chartGeomOverride,
 
       hideTableDataGlobal,
       hideVenueNames,
@@ -1649,13 +1649,40 @@ async function refreshSolanaOnchainBalances() {
     }
   }, [xw]);
 
-  const [chartGeom, setChartGeom] = useState(() => readChartGeomFromStorage());
+  const [chartGeom, setChartGeom] = useState(() => normalizeChartGeom(chartGeomOverride) || readChartGeomFromStorage());
 
   useEffect(() => {
+    const next = normalizeChartGeom(chartGeomOverride);
+    if (!next) return;
+
+    setChartGeom((prev) => {
+      const px = Number(prev?.x);
+      const py = Number(prev?.y);
+      const pw = Number(prev?.w);
+      const ph = Number(prev?.h);
+
+      const nx = Number(next?.x);
+      const ny = Number(next?.y);
+      const nw = Number(next?.w);
+      const nh = Number(next?.h);
+
+      const dx = Number.isFinite(px) && Number.isFinite(nx) ? Math.abs(px - nx) : 999;
+      const dy = Number.isFinite(py) && Number.isFinite(ny) ? Math.abs(py - ny) : 999;
+      const dw = Number.isFinite(pw) && Number.isFinite(nw) ? Math.abs(pw - nw) : 999;
+      const dh = Number.isFinite(ph) && Number.isFinite(nh) ? Math.abs(ph - nh) : 999;
+
+      if (dx > 0.5 || dy > 0.5 || dw > 0.5 || dh > 0.5) return next;
+      return prev;
+    });
+  }, [chartGeomOverride?.x, chartGeomOverride?.y, chartGeomOverride?.w, chartGeomOverride?.h]);
+
+  useEffect(() => {
+    if (normalizeChartGeom(chartGeomOverride)) return;
     if (!activeDockBelowChart) return;
     if (!showChart) return;
 
     let alive = true;
+    let timer = null;
     const tick = () => {
       if (!alive) return;
 
@@ -1683,14 +1710,15 @@ async function refreshSolanaOnchainBalances() {
         return prev;
       });
 
-      setTimeout(tick, 200);
+      timer = window.setTimeout(tick, 200);
     };
 
     tick();
     return () => {
       alive = false;
+      if (timer) window.clearTimeout(timer);
      };
-  }, [activeDockBelowChart, showChart]);
+  }, [activeDockBelowChart, showChart, chartGeomOverride?.x, chartGeomOverride?.y, chartGeomOverride?.w, chartGeomOverride?.h]);
 
   function getContainerRectInner() {
     const el = appContainerRef?.current;
@@ -1796,8 +1824,17 @@ async function refreshSolanaOnchainBalances() {
     const hasOverride = Number.isFinite(wOverride) && wOverride > 0;
     const desiredW = hasOverride ? (activeDockBelowChart ? Math.min(baseW, wOverride) : wOverride) : baseW;
 
-    const clampLeft = activeDockBelowChart ? containerInner.left : 8;
-    const clampW = activeDockBelowChart ? containerInner.width : Math.max(320, (window.innerWidth || 1200) - 16);
+    const clampLeft = wantChartFrame
+      ? chartX
+      : activeDockBelowChart
+        ? containerInner.left
+        : 8;
+
+    const clampW = wantChartFrame
+      ? chartW
+      : activeDockBelowChart
+        ? containerInner.width
+        : Math.max(320, (window.innerWidth || 1200) - 16);
 
     const { x, w } = clampGeomToContainer(rawX, desiredW, clampLeft, clampW);
 

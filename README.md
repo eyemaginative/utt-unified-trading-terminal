@@ -21,7 +21,7 @@ UTT is a desktop-style browser application today, but architecturally it functio
 - **Backend:** FastAPI application providing venue adapters, market/order routes, auth/profile endpoints, wallet and ledger tooling, and Solana DEX routing
 - **Frontend:** React interface providing a modular multi-window trading terminal UI
 - **Storage / local state:** local database and runtime state kept outside of public source control
-- **Secrets model:** local or external environment loading and encrypted credential storage rather than committed secrets
+- **Secrets model:** local or external environment loading for runtime config, plus profile-managed encrypted credential storage for exchange API keys
 
 This repository contains the application code, not live credentials, private keys, or production database state.
 
@@ -75,10 +75,11 @@ UTT is intentionally structured so the code can be published while sensitive run
 
 That includes:
 
-- external env-path loading
+- external env-path loading for runtime configuration
 - keeping live backend secrets outside the repo
 - avoiding committed database and key files
-- using local or private credential handling instead of plaintext repository secrets
+- using **Profile → API Keys** for venue credentials instead of tracked env files
+- storing user-entered venue keys in the app’s local encrypted credential store rather than plaintext repository files
 
 ---
 
@@ -230,6 +231,9 @@ Supporting routes and tooling also include:
 ### Tables / Balances View
 ![Tables and Balances](docs/screenshots/tables-balances.png)
 
+### Profile / API Keys
+![Profile API Keys](docs/screenshots/profile-api-keys.png)
+
 ---
 
 ## Quick start
@@ -244,7 +248,7 @@ Recommended baseline:
 - **Node.js 18+** and npm
 - Windows PowerShell for the Windows-oriented commands below
 - a local Solana wallet extension if using Solana DEX features
-- venue API credentials if testing exchange integrations
+- venue access and any required API credentials for the venues you plan to test
 
 ### 1) Clone the repository
 
@@ -255,7 +259,7 @@ cd utt-unified-trading-terminal
 
 ### 2) Configure backend environment
 
-The project uses an external env-path pattern so secrets can live **outside** the repo.
+The backend environment is for runtime configuration and local pathing, **not** for storing exchange API keys.
 
 Relevant files:
 
@@ -269,7 +273,7 @@ A typical pattern is:
 UTT_ENV_PATH=C:\path\to\your\private\backend.env
 ```
 
-The private `backend.env` file lives outside the repo and contains local-only secrets and configuration.
+The private `backend.env` file lives outside the repo and contains local-only runtime configuration.
 
 ### 3) Create and activate a backend virtual environment
 
@@ -320,6 +324,20 @@ VITE_API_BASE=http://127.0.0.1:8000
 npm run dev
 ```
 
+### 9) Add venue API keys in the app
+
+Venue credentials are added inside the app through the user profile, not by editing tracked env files.
+
+Open:
+
+- **Profile**
+- **API Keys**
+- add the venue
+- enter the required key material for that venue
+- save it through the UI
+
+The current codebase uses profile and API-key management flows with local encrypted secret-bundle handling rather than relying on committed backend files.
+
 ---
 
 ## Installation notes by environment
@@ -361,6 +379,7 @@ UTT is intentionally structured so that public source code can live in git while
 
 - keep private env files outside the repo
 - use tracked stub files only
+- add venue API credentials through **Profile → API Keys**
 - scan staged diffs before every push
 - keep wallet and account testing material separate from source control
 
@@ -404,6 +423,8 @@ Examples of functionality reflected in the current repository include:
 - API-key management UI flows
 - DB-backed and encrypted secret-bundle patterns in code
 - local runtime settings and operator preferences
+
+Venue API keys are added through the **Profile / API Keys** interface and stored in the application’s local credential store rather than being committed to backend files or repository env files.
 
 ---
 
@@ -472,8 +493,9 @@ Check:
 
 Check:
 
-- local env path is correct
-- required credentials exist in the private env or local credential store
+- local runtime env path is correct
+- the venue API key was actually added and saved in **Profile → API Keys**
+- the correct venue was configured in the profile
 - no real credentials were placed into tracked files
 
 ### Solana wallet connects but a trade fails

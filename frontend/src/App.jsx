@@ -316,6 +316,10 @@ const ALL_VENUES_VALUE = "ALL";
 // Do not restrict it to “discovery-capable” venues.
 const DEFAULT_SUPPORTED_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade"];
 
+// Frontend-only DEX venues whose backend route exists before the generic venues registry advertises them.
+// Keep these opt-in through the normal Manage-venues UI override.
+const FRONTEND_LOCAL_DEX_VENUES = ["polkadot_hydration"];
+
 // Arb venues (preferred cross-venue scan list)
 const ARB_VENUES = ["coinbase", "kraken", "gemini", "robinhood", "dex_trade"];
 
@@ -774,6 +778,415 @@ function normalizePricesUsdResponse(res) {
   }
 
   return {};
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// App-level DEX portfolio totals
+// These are intentionally best-effort and isolated from the CEX balances pipeline.
+// CEX totals continue to come from /api/balances/latest; DEX totals are added
+// from live wallet/RPC paths only when an address is available.
+// ─────────────────────────────────────────────────────────────
+const APP_SOL_MINT = "So11111111111111111111111111111111111111112";
+
+function appFiniteNumberOrNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function appAuthHeaders(extra = {}) {
+  const headers = { Accept: "application/json", ...extra };
+  try {
+    const tok = localStorage.getItem("utt_auth_token") || sessionStorage.getItem("utt_auth_token") || "";
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+  } catch {
+    // ignore
+  }
+  return headers;
+}
+
+async function appFetchJson(path) {
+  const base = String(API_BASE || "").replace(/\/+$/, "");
+  const p = String(path || "");
+  const url = p.startsWith("http") ? p : `${base}${p.startsWith("/") ? p : `/${p}`}`;
+  const r = await fetch(url, { headers: appAuthHeaders(), cache: "no-store" });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data?.ok === false) {
+    throw new Error(data?.detail || data?.error || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
+function appGetSolanaConnectedAddressNoPrompt() {
+  try {
+    const w = typeof window !== "undefined" ? window : null;
+    const providers = [w?.solflare, w?.phantom?.solana, w?.solana].filter(Boolean);
+    for (const provider of providers) {
+      const pk = provider?.publicKey;
+      const addr = pk?.toBase58?.() || pk?.toString?.() || "";
+      if (addr) return String(addr);
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+function appSolanaUsdPriceFromMap(pricePayload, mint) {
+  const m = String(mint || "").trim();
+  if (!m) return null;
+  const items = pricePayload?.items || pricePayload?.data || pricePayload?.prices || pricePayload?.results || pricePayload || {};
+  const entry = items?.[m] ?? items?.[m.toLowerCase()] ?? null;
+  if (entry == null) return null;
+  if (typeof entry === "number") return Number.isFinite(entry) ? entry : null;
+  const val = appFiniteNumberOrNull(entry?.price ?? entry?.priceUsd ?? entry?.priceUSD ?? entry?.price_usd ?? entry?.usdPrice ?? entry?.usd ?? entry?.value);
+  return val !== null && val > 0 ? val : null;
+}
+
+async function appFetchSolanaDexPortfolioTotalUsd() {
+  const address = appGetSolanaConnectedAddressNoPrompt();
+  if (!address) return null;
+
+  try {
+    const data = await appFetchJson(`/api/solana_dex/balances?address=${encodeURIComponent(address)}`);
+    const items = [];
+    const sol = appFiniteNumberOrNull(data?.sol ?? data?.sol_ui ?? data?.sol_balance);
+    if (sol !== null) items.push({ amount: sol, mint: APP_SOL_MINT });
+    const lamports = appFiniteNumberOrNull(data?.sol_lamports);
+    if (sol === null && lamports !== null) items.push({ amount: lamports / 1e9, mint: APP_SOL_MINT });
+
+    const toks = Array.isArray(data?.tokens) ? data.tokens : [];
+    for (const t of toks) {
+      const mint = String(t?.mint || "").trim();
+      const amount = appFiniteNumberOrNull(t?.uiAmount ?? t?.ui_amount ?? t?.amount_ui);
+      if (mint && amount !== null) items.push({ amount, mint });
+    }
+
+    const mints = Array.from(new Set(items.map((it) => String(it?.mint || "").trim()).filter(Boolean))).slice(0, 100);
+    if (!mints.length) return 0;
+
+    const prices = await appFetchJson(`/api/solana_dex/jupiter/prices?ids=${encodeURIComponent(mints.join(","))}`);
+    let totalUsd = 0;
+    let hasUsd = false;
+    for (const it of items) {
+      const px = appSolanaUsdPriceFromMap(prices, it.mint);
+      const amount = appFiniteNumberOrNull(it.amount);
+      if (px !== null && amount !== null) {
+        totalUsd += amount * px;
+        hasUsd = true;
+      }
+    }
+    return hasUsd ? totalUsd : null;
+  } catch {
+    return null;
+  }
+}
+
+function appCanonicalHydrationSymbol(symbol, assetId) {
+  const s = String(symbol || "").trim();
+  const id = String(assetId || "").trim();
+  const key = (s || id).toLowerCase();
+  const byId = {
+    "0": "HDX",
+    native: "HDX",
+    hdx: "HDX",
+    "5": "DOT",
+    dot: "DOT",
+    "10": "USDT",
+    usdt: "USDT",
+    "222": "HOLLAR",
+    hollar: "HOLLAR",
+    "1001331": "UTTT",
+    uttt: "UTTT",
+  };
+  return byId[key] || s || id;
+}
+
+function appFirstHydrationOrderbookPrice(levels) {
+  const arr = Array.isArray(levels) ? levels : [];
+  for (const lvl of arr) {
+    const px = Array.isArray(lvl)
+      ? appFiniteNumberOrNull(lvl?.[0] ?? lvl?.price)
+      : appFiniteNumberOrNull(lvl?.price ?? lvl?.px ?? lvl?.rate ?? lvl?.limit ?? lvl?.p);
+    if (px !== null && px > 0) return px;
+  }
+  return null;
+}
+
+function appHydrationOrderbookMid(data) {
+  const direct = appFiniteNumberOrNull(
+    data?.mid ?? data?.midPrice ?? data?.mid_price ?? data?.price ?? data?.markPrice ?? data?.mark_price ??
+    data?.spotPrice ?? data?.spot_price ?? data?.pool?.spotPrice ?? data?.pool?.spot_price
+  );
+  if (direct !== null && direct > 0) return direct;
+
+  const bid = appFiniteNumberOrNull(data?.bestBid ?? data?.best_bid ?? data?.bid ?? data?.bids?.[0]?.price) ?? appFirstHydrationOrderbookPrice(data?.bids);
+  const ask = appFiniteNumberOrNull(data?.bestAsk ?? data?.best_ask ?? data?.ask ?? data?.asks?.[0]?.price) ?? appFirstHydrationOrderbookPrice(data?.asks);
+  if (bid !== null && ask !== null && bid > 0 && ask > 0) return (bid + ask) / 2;
+  if (bid !== null && bid > 0) return bid;
+  if (ask !== null && ask > 0) return ask;
+  return null;
+}
+
+async function appFetchHydrationOrderbookMid(symbol) {
+  try {
+    const sym = String(symbol || "").trim().toUpperCase();
+    if (sym !== "UTTT-HDX") return null;
+    const data = await appFetchJson(`/api/polkadot_dex/hydration/orderbook?symbol=${encodeURIComponent(sym)}&depth=5&route_mode=manual_xyk`);
+    const mid = appHydrationOrderbookMid(data);
+    return mid !== null && mid > 0 ? mid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function appFetchHydrationDerivedUsdPrices() {
+  const out = {
+    prices: { USDT: 1, USDC: 1, HOLLAR: 1 },
+    sources: { USDT: "stable", USDC: "stable", HOLLAR: "stable" },
+  };
+
+  try {
+    const data = await appFetchJson("/api/polkadot_dex/hydration/prices?assets=HDX,DOT,USDT,UTTT,HOLLAR&refresh=true");
+    const maps = [
+      data?.prices_usd,
+      data?.usd_prices,
+      data?.pricesUsd,
+      data?.usdPrices,
+      data?.prices,
+      data?.price_map,
+      data?.priceMap,
+      data?.usd,
+    ];
+    const sourceMaps = [
+      data?.priceSources,
+      data?.price_sources,
+      data?.usd_sources,
+      data?.usdSources,
+      data?.sources,
+    ];
+    const symbols = ["HDX", "DOT", "UTTT", "USDT", "USDC", "HOLLAR"];
+
+    for (const sym of symbols) {
+      for (const m of maps) {
+        if (!m || typeof m !== "object") continue;
+        const entry = m?.[sym] ?? m?.[sym.toLowerCase()];
+        const val = appFiniteNumberOrNull(
+          entry && typeof entry === "object"
+            ? entry?.px_usd ?? entry?.price_usd ?? entry?.priceUsd ?? entry?.usd_price ?? entry?.usdPrice ?? entry?.price ?? entry?.usd
+            : entry
+        );
+        if (val !== null) {
+          out.prices[sym] = val;
+          break;
+        }
+      }
+
+      for (const sm of sourceMaps) {
+        if (!sm || typeof sm !== "object") continue;
+        const src = sm?.[sym] ?? sm?.[sym.toLowerCase()];
+        if (src !== undefined && src !== null && String(src).trim()) {
+          out.sources[sym] = String(src);
+          break;
+        }
+      }
+    }
+  } catch {
+    // Keep stablecoin defaults and avoid falling back to generic Hydration orderbook pairs.
+  }
+
+  return out;
+}
+
+function appHydrationUsdPriceFromData(data, symbol, assetId, item = null) {
+  const direct = appFiniteNumberOrNull(
+    item?.px_usd ?? item?.price_usd ?? item?.priceUsd ?? item?.usd_price ?? item?.usdPrice ?? item?.priceUSD ?? item?.usd
+  );
+  if (direct !== null) return direct;
+
+  const sym = String(symbol || "").trim().toUpperCase();
+  const id = String(assetId || "").trim();
+  if (sym === "USDT" || sym === "USDC" || sym === "HOLLAR") return 1;
+
+  const maps = [data?.prices_usd, data?.pricesUsd, data?.usd_prices, data?.usdPrices, data?.prices, data?.price_map, data?.priceMap, data?.usd];
+  const keys = [sym, sym.toLowerCase(), id, id.toLowerCase()].filter(Boolean);
+  for (const m of maps) {
+    if (!m || typeof m !== "object") continue;
+    for (const k of keys) {
+      const entry = m?.[k];
+      const val = appFiniteNumberOrNull(
+        typeof entry === "object"
+          ? entry?.px_usd ?? entry?.price_usd ?? entry?.priceUsd ?? entry?.usd_price ?? entry?.usdPrice ?? entry?.price ?? entry?.usd
+          : entry
+      );
+      if (val !== null) return val;
+    }
+  }
+
+  return appFiniteNumberOrNull(
+    sym === "HDX" ? (data?.hdx_usd ?? data?.hdxUsd ?? data?.hdx_price_usd ?? data?.hdxPriceUsd) :
+    sym === "DOT" ? (data?.dot_usd ?? data?.dotUsd ?? data?.dot_price_usd ?? data?.dotPriceUsd) :
+    sym === "UTTT" ? (data?.uttt_usd ?? data?.utttUsd ?? data?.uttt_price_usd ?? data?.utttPriceUsd) :
+    null
+  );
+}
+
+function appNormalizeHydrationBalanceItems(data) {
+  let rawItems = Array.isArray(data?.items)
+    ? data.items
+    : Array.isArray(data?.balances)
+      ? data.balances
+      : Array.isArray(data?.tokens)
+        ? data.tokens
+        : Array.isArray(data?.assets)
+          ? data.assets
+          : data?.balances && typeof data.balances === "object"
+            ? Object.entries(data.balances).map(([asset, value]) => ({ asset, ...(value && typeof value === "object" ? value : { total: value }) }))
+            : data?.items && typeof data.items === "object"
+              ? Object.entries(data.items).map(([asset, value]) => ({ asset, ...(value && typeof value === "object" ? value : { total: value }) }))
+              : [];
+
+  const hasHdx = rawItems.some((it) => {
+    const sym = appCanonicalHydrationSymbol(it?.symbol ?? it?.asset ?? it?.ticker ?? it?.currency ?? it?.assetSymbol ?? it?.asset_symbol, it?.asset_id ?? it?.assetId ?? it?.id ?? it?.token_id ?? it?.tokenId);
+    return String(sym || "").toUpperCase() === "HDX";
+  });
+
+  if (!hasHdx) {
+    const nativeObj =
+      (data?.native && typeof data.native === "object" ? data.native : null) ||
+      (data?.native_balance && typeof data.native_balance === "object" ? data.native_balance : null) ||
+      (data?.nativeBalance && typeof data.nativeBalance === "object" ? data.nativeBalance : null) ||
+      (data?.hdx && typeof data.hdx === "object" ? data.hdx : null) ||
+      (data?.hdx_balance && typeof data.hdx_balance === "object" ? data.hdx_balance : null) ||
+      (data?.hdxBalance && typeof data.hdxBalance === "object" ? data.hdxBalance : null) ||
+      null;
+    const nativeNumber = appFiniteNumberOrNull(data?.hdx_ui ?? data?.hdxUi ?? data?.hdx_balance_ui ?? data?.hdxBalanceUi ?? data?.native_ui ?? data?.nativeUi ?? data?.native_balance_ui ?? data?.nativeBalanceUi ?? data?.hdx_balance ?? data?.hdxBalance ?? data?.native_balance ?? data?.nativeBalance);
+    if (nativeObj) rawItems = [{ asset: "HDX", symbol: "HDX", asset_id: "native", ...nativeObj }, ...rawItems];
+    else if (nativeNumber !== null) rawItems = [{ asset: "HDX", symbol: "HDX", asset_id: "native", total: nativeNumber, available: nativeNumber }, ...rawItems];
+  }
+
+  const out = [];
+  for (const it of rawItems || []) {
+    const assetId = String(it?.asset_id ?? it?.assetId ?? it?.id ?? it?.token_id ?? it?.tokenId ?? "").trim();
+    const sym = appCanonicalHydrationSymbol(
+      it?.symbol ?? it?.asset ?? it?.ticker ?? it?.currency ?? it?.assetSymbol ?? it?.asset_symbol,
+      assetId
+    );
+    if (!sym) continue;
+    const total = appFiniteNumberOrNull(it?.total ?? it?.balance ?? it?.amount ?? it?.free ?? it?.available ?? it?.uiAmount ?? it?.ui_amount ?? it?.amount_ui) ?? 0;
+    const available = appFiniteNumberOrNull(it?.available ?? it?.free ?? it?.spendable ?? it?.total ?? it?.balance ?? it?.amount) ?? total;
+    const hold = appFiniteNumberOrNull(it?.hold ?? it?.reserved ?? it?.frozen ?? it?.locked) ?? 0;
+    const px = appHydrationUsdPriceFromData(data, sym, assetId, it);
+    const totalUsd = appFiniteNumberOrNull(it?.total_usd ?? it?.usd_value ?? it?.value_usd ?? it?.totalUsd) ?? (px !== null ? total * px : null);
+    out.push({ asset: String(sym).toUpperCase(), asset_id: assetId || null, total, available, hold, px_usd: px, total_usd: totalUsd });
+  }
+  return out;
+}
+
+function appApplyHydrationDerivedUsdPrices(items, derived) {
+  const prices = derived?.prices || {};
+  return (items || []).map((it) => {
+    const sym = String(it?.asset || it?.symbol || "").trim().toUpperCase();
+    const total = appFiniteNumberOrNull(it?.total) ?? 0;
+    const existingPx = appFiniteNumberOrNull(it?.px_usd);
+    const existingTotalUsd = appFiniteNumberOrNull(it?.total_usd);
+    const derivedPx = appFiniteNumberOrNull(prices?.[sym]);
+    const px = existingPx !== null ? existingPx : derivedPx;
+    const totalUsd = existingTotalUsd !== null ? existingTotalUsd : (px !== null ? total * px : null);
+    return { ...it, px_usd: px !== null ? px : null, total_usd: totalUsd !== null ? totalUsd : null };
+  });
+}
+
+async function appLoadHydrationWalletAddressFromRegistry() {
+  const urls = [
+    "/api/wallet_addresses?venue=polkadot_hydration&network=hydration&limit=500",
+    "/api/wallet_addresses?asset=ALL&network=hydration&limit=500",
+    "/api/wallet_addresses?limit=500",
+  ];
+
+  for (const url of urls) {
+    try {
+      const js = await appFetchJson(url);
+      const rows = Array.isArray(js)
+        ? js
+        : Array.isArray(js?.items)
+          ? js.items
+          : Array.isArray(js?.rows)
+            ? js.rows
+            : Array.isArray(js?.addresses)
+              ? js.addresses
+              : Array.isArray(js?.data)
+                ? js.data
+                : [];
+      const norm = (v) => String(v || "").trim().toLowerCase();
+      const hydrationRows = rows.filter((r) => {
+        const address = String(r?.address || r?.wallet_address || r?.walletAddress || "").trim();
+        if (!address) return false;
+        const network = norm(r?.network || r?.chain || r?.network_name);
+        const walletId = norm(r?.wallet_id || r?.walletId || r?.venue || r?.venue_override);
+        return network.includes("hydration") || walletId.includes("hydration");
+      });
+      const accountRows = hydrationRows.filter((r) => {
+        const asset = norm(r?.asset || r?.symbol || r?.scope);
+        return !asset || asset === "all" || asset === "*" || asset === "wallet";
+      });
+      const row = accountRows[0] || hydrationRows[0] || null;
+      if (row) return String(row?.address || row?.wallet_address || row?.walletAddress || "").trim();
+    } catch {
+      // try next shape/filter
+    }
+  }
+  return "";
+}
+
+async function appFetchHydrationDexPortfolioTotalUsd() {
+  const address = await appLoadHydrationWalletAddressFromRegistry();
+  if (!address) return null;
+  try {
+    const data = await appFetchJson(`/api/polkadot_dex/balances?address=${encodeURIComponent(address)}`);
+    const normalized = appNormalizeHydrationBalanceItems(data);
+    let items = normalized;
+    try {
+      const derived = await appFetchHydrationDerivedUsdPrices();
+      items = appApplyHydrationDerivedUsdPrices(normalized, derived);
+    } catch {
+      items = normalized;
+    }
+    let totalUsd = 0;
+    let hasUsd = false;
+    for (const it of items) {
+      const tu = appFiniteNumberOrNull(it?.total_usd);
+      if (tu !== null) {
+        totalUsd += tu;
+        hasUsd = true;
+      }
+    }
+    return hasUsd ? totalUsd : null;
+  } catch {
+    return null;
+  }
+}
+
+async function appFetchDexPortfolioTotalsUsd() {
+  const [solanaUsd, hydrationUsd] = await Promise.all([
+    appFetchSolanaDexPortfolioTotalUsd(),
+    appFetchHydrationDexPortfolioTotalUsd(),
+  ]);
+  let totalUsd = 0;
+  let hasAny = false;
+  for (const v of [solanaUsd, hydrationUsd]) {
+    const n = appFiniteNumberOrNull(v);
+    if (n !== null) {
+      totalUsd += n;
+      hasAny = true;
+    }
+  }
+  return {
+    solanaUsd: appFiniteNumberOrNull(solanaUsd),
+    hydrationUsd: appFiniteNumberOrNull(hydrationUsd),
+    totalUsd: hasAny ? totalUsd : null,
+  };
 }
 
 // All Orders scope model (Design A)
@@ -1410,8 +1823,14 @@ export default function App() {
   // Venue selector should only show *currently enabled* venues (after UI-local overrides),
   // while the Manage popup can still list all venues (enabled + disabled).
   const supportedVenuesForSelector = useMemo(() => {
-    return normalizeVenueList(venuesEnabled);
-  }, [venuesEnabled]);
+    const localDexVenues = (FRONTEND_LOCAL_DEX_VENUES || []).filter((v) => {
+      const id = normalizeVenue(v);
+      if (!id) return false;
+      if (Object.prototype.hasOwnProperty.call(venueOverrides || {}, id)) return !!venueOverrides[id];
+      return true;
+    });
+    return normalizeVenueList([...(venuesEnabled || []), ...localDexVenues]);
+  }, [venuesEnabled, venueOverrides]);
 
   const tradingVenues = useMemo(() => venuesEnabled.filter((v) => !!v?.supports?.trading), [venuesEnabled]);
   const orderbookVenues = useMemo(() => venuesEnabled.filter((v) => !!v?.supports?.orderbook), [venuesEnabled]);
@@ -1475,7 +1894,7 @@ export default function App() {
         const enabled = raw.filter((v) => isEnabled(v));
         const enabledIds = normalizeVenueList(enabled);
 
-        const merged = normalizeVenueList([...(DEFAULT_SUPPORTED_VENUES || []), ...(ARB_VENUES || []), ...(enabledIds || [])]);
+        const merged = normalizeVenueList([...(DEFAULT_SUPPORTED_VENUES || []), ...(ARB_VENUES || []), ...(FRONTEND_LOCAL_DEX_VENUES || []), ...(enabledIds || [])]);
 
         if (merged.length > 0) setSupportedVenues(merged);
       } catch {
@@ -1507,7 +1926,7 @@ export default function App() {
 
     const enabled = raw.filter((v) => isEnabled(v));
     const enabledIds = normalizeVenueList(enabled);
-    const merged = normalizeVenueList([...(DEFAULT_SUPPORTED_VENUES || []), ...(ARB_VENUES || []), ...(enabledIds || [])]);
+        const merged = normalizeVenueList([...(DEFAULT_SUPPORTED_VENUES || []), ...(ARB_VENUES || []), ...(FRONTEND_LOCAL_DEX_VENUES || []), ...(enabledIds || [])]);
     if (merged.length > 0) setSupportedVenues(merged);
   }, [venueOverrides, venuesRaw, venuesLoaded]);
 
@@ -1561,9 +1980,12 @@ export default function App() {
 
       if (row?.enabled === false) return false;
 
-      // Solana DEX venues are swap-based, but we still surface them as trade/orderbook-capable
-      // so the widgets mount (routing inside widgets is already Solana-gated).
-      if (v.startsWith("solana_") && (c === "orderbook" || c === "trading")) return true;
+      // DEX venues are swap/status based, but we still surface them as trade/orderbook-capable
+      // so the widgets mount. Routing/status behavior is handled inside each widget.
+      if (
+        (v.startsWith("solana_") || v === "polkadot_hydration" || v === "polkadot_dex" || v === "hydration" || v.startsWith("polkadot_")) &&
+        (c === "orderbook" || c === "trading")
+      ) return true;
 
       const sup = row?.supports ?? row?.capabilities ?? {};
       if (sup && typeof sup === "object" && Object.prototype.hasOwnProperty.call(sup, c)) return !!sup[c];
@@ -2568,6 +2990,9 @@ export default function App() {
     if (value === "kraken") return "Kraken";
     if (value === "robinhood") return "Robinhood";
     if (value === "dex_trade") return "Dex-Trade";
+    if (value === "polkadot_hydration") return "Polkadot-Hydration";
+    if (value === "polkadot_dex") return "Polkadot DEX";
+    if (value === "hydration") return "Hydration";
     return String(value || "");
   }
 
@@ -2834,7 +3259,7 @@ export default function App() {
 
     // Some venue-like sources are valid for markets/activity but are not balances-refreshable on the backend.
     // If they slip into the ALL candidate list, /api/balances/refresh will 422 and poison the fan-out.
-    const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter"]);
+    const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration"]);
     const filterBalancesRefreshVenues = (arr) =>
       (arr || []).filter((v) => {
         const vNorm = normalizeVenue(v);
@@ -2922,8 +3347,14 @@ export default function App() {
       setBalances(baseItems);
 
       if (baseItems.length === 0) {
-        setPortfolioTotalUsd(0);
-        if (isAllVenuesView) setPortfolioTotalUsdAllVenues(0);
+        let emptyViewTotal = 0;
+        if (isAllVenuesView) {
+          const dexTotals = await appFetchDexPortfolioTotalsUsd();
+          emptyViewTotal = Number.isFinite(Number(dexTotals?.totalUsd)) ? Number(dexTotals.totalUsd) : 0;
+          setPortfolioTotalUsdAllVenues(emptyViewTotal);
+          setPortfolioAllVenuesUpdatedAt(Date.now());
+        }
+        setPortfolioTotalUsd(emptyViewTotal);
         return;
       }
 
@@ -2983,10 +3414,19 @@ export default function App() {
       if (balancesReqIdRef.current !== reqId) return;
 
       setBalances(merged);
+
+      let dexTotalsForCurrentAllView = null;
+      if (isAllVenuesView) {
+        dexTotalsForCurrentAllView = await appFetchDexPortfolioTotalsUsd();
+        const dexTotal = Number.isFinite(Number(dexTotalsForCurrentAllView?.totalUsd)) ? Number(dexTotalsForCurrentAllView.totalUsd) : 0;
+        unifiedPortCurrentView += dexTotal;
+      }
+
       setPortfolioTotalUsd(Number.isFinite(unifiedPortCurrentView) ? unifiedPortCurrentView : null);
 
       if (isAllVenuesView) {
         setPortfolioTotalUsdAllVenues(Number.isFinite(unifiedPortCurrentView) ? unifiedPortCurrentView : null);
+        setPortfolioAllVenuesUpdatedAt(Date.now());
       } else if (forceAllVenuesTotal) {
       const allVenueItemsNested = await Promise.all(
         balancesVenueCandidates.map(async (v) => {
@@ -3028,6 +3468,10 @@ export default function App() {
         }
       }
 
+      const dexTotals = await appFetchDexPortfolioTotalsUsd();
+      const dexTotal = Number.isFinite(Number(dexTotals?.totalUsd)) ? Number(dexTotals.totalUsd) : 0;
+      allTotal += dexTotal;
+
       const finalTotal = Number.isFinite(allTotal) ? allTotal : null;
       setPortfolioTotalUsdAllVenues(finalTotal);
       setPortfolioAllVenuesUpdatedAt(Date.now());
@@ -3054,12 +3498,19 @@ export default function App() {
   // Recompute ONLY the header “All Venues” total without depending on current tab/venue.
   async function refreshAllVenuesTotalOnlySafe() {
     try {
-      const balancesVenueCandidates =
+      const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration"]);
+      const balancesVenueCandidates = (
         balancesVenuesList && balancesVenuesList.length > 0
           ? balancesVenuesList
-          : supportedVenues;
+          : supportedVenues
+      )
+        .map((v) => normalizeVenue(v))
+        .filter((v) => v && v !== ALL_VENUES_VALUE)
+        .filter((v) => !POISON_BALANCES_REFRESH_VENUES.has(v))
+        .filter((v) => venueSupports(v, "balances"));
 
-      // Pull latest balances WITH PRICES per venue (matches backend logs)
+      // Pull latest CEX balances WITH PRICES per venue (matches backend logs).
+      // DEX wallet totals are added separately below.
       const perVenue = await Promise.all(
         balancesVenueCandidates.map(async (v) => {
           try {
@@ -3094,6 +3545,10 @@ export default function App() {
           totalUsd += total * px;
         }
       }
+
+      const dexTotals = await appFetchDexPortfolioTotalsUsd();
+      const dexTotal = Number.isFinite(Number(dexTotals?.totalUsd)) ? Number(dexTotals.totalUsd) : 0;
+      totalUsd += dexTotal;
 
       const finalTotal = Number.isFinite(totalUsd) ? totalUsd : null;
 
@@ -4170,7 +4625,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
 
         // Keep background polling aligned with the manual ALL-venues refresh filtering.
         // These venue-like sources are not balances-refreshable on the backend.
-        const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter"]);
+        const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration"]);
         const balancesVenueCandidates = (balancesVenuesList.length > 0 ? balancesVenuesList : supportedVenues)
           .map((v) => normalizeVenue(v))
           .filter((v) => v && v !== ALL_VENUES_VALUE)
@@ -4453,6 +4908,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                   balSortKey={balSortKey}
                   balSortDir={balSortDir}
                   portfolioTotalUsd={portfolioTotalUsd}
+                  portfolioTotalUsdAllVenues={portfolioTotalUsdAllVenues}
                   fmtUsd={fmtUsd}
                   fmtPxUsd={fmtPxUsd}
                   orders={localOrdersVisible}

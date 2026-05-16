@@ -8,7 +8,7 @@ import React, { useEffect, useMemo, useState } from "react";
  *  - GET    /api/wallet_addresses?asset=&network=&limit=
  *  - POST   /api/wallet_addresses
  *  - DELETE /api/wallet_addresses/{address_id}
- *  - GET    /api/wallet_addresses/balances/latest?with_prices=1&limit=
+ *  - GET    /api/wallet_addresses/balances/latest?limit=
  *  - POST   /api/wallet_addresses/balances/refresh
  *  - POST   /api/wallet_addresses/tx/ingest
  *
@@ -61,6 +61,16 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
   const txStats = useMemo(() => deriveTxStats(txLastResult), [txLastResult]);
 
   const redacted = (v) => (hideTableData ? "••••••••" : v);
+
+  function applyHydrationWalletMode() {
+    setForm((p) => ({
+      ...p,
+      asset: "ALL",
+      wallet_id: "polkadot_hydration",
+      network: "hydration",
+      label: p.label || "Hydration SubWallet",
+    }));
+  }
 
 
   function _asInt(v) {
@@ -252,10 +262,394 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
       const res = await api(`/api/wallet_addresses/balances/latest?${qs.toString()}`);
       const items = Array.isArray(res) ? res : res?.items || [];
       setBalances(items);
+      return items;
     } catch (e) {
       setErr(e?.message || String(e));
+      return [];
     } finally {
       setBusy(false);
+    }
+  }
+
+  function isHydrationAddressRow(row) {
+    const walletId = String(row?.wallet_id ?? row?.walletId ?? row?.venue ?? row?.venue_override ?? "").trim().toLowerCase();
+    const network = String(row?.network ?? row?.chain ?? row?.network_name ?? "").trim().toLowerCase();
+    return (
+      walletId === "polkadot_hydration" ||
+      walletId === "hydration" ||
+      walletId.includes("hydration") ||
+      network === "hydration" ||
+      network === "polkadot_hydration" ||
+      network.includes("hydration")
+    );
+  }
+
+
+  function firstHydrationOrderbookPrice(levels) {
+    const arr = Array.isArray(levels) ? levels : [];
+    for (const lvl of arr) {
+      const px = Array.isArray(lvl)
+        ? Number(lvl?.[0] ?? lvl?.price)
+        : Number(lvl?.price ?? lvl?.px ?? lvl?.rate ?? lvl?.limit ?? lvl?.p);
+      if (Number.isFinite(px) && px > 0) return px;
+    }
+    return null;
+  }
+
+  function hydrationOrderbookMid(data) {
+    const direct = Number(
+      data?.mid ??
+      data?.midPrice ??
+      data?.mid_price ??
+      data?.price ??
+      data?.markPrice ??
+      data?.mark_price ??
+      data?.spotPrice ??
+      data?.spot_price ??
+      data?.pool?.spotPrice ??
+      data?.pool?.spot_price
+    );
+    if (Number.isFinite(direct) && direct > 0) return direct;
+
+    const rawBid = Number(data?.bestBid ?? data?.best_bid ?? data?.bid ?? data?.bids?.[0]?.price);
+    const rawAsk = Number(data?.bestAsk ?? data?.best_ask ?? data?.ask ?? data?.asks?.[0]?.price);
+    const bid = Number.isFinite(rawBid) && rawBid > 0 ? rawBid : firstHydrationOrderbookPrice(data?.bids);
+    const ask = Number.isFinite(rawAsk) && rawAsk > 0 ? rawAsk : firstHydrationOrderbookPrice(data?.asks);
+    if (bid !== null && ask !== null && bid > 0 && ask > 0) return (bid + ask) / 2;
+    if (bid !== null && bid > 0) return bid;
+    if (ask !== null && ask > 0) return ask;
+    return null;
+  }
+
+  async function fetchHydrationOrderbookMid(symbol) {
+    const sym = String(symbol || "").trim().toUpperCase();
+    if (sym !== "UTTT-HDX") return null;
+    try {
+      const data = await api(`/api/polkadot_dex/hydration/orderbook?symbol=${encodeURIComponent(sym)}&depth=5&route_mode=manual_xyk`);
+      if (data?.ok === false) return null;
+      const mid = hydrationOrderbookMid(data);
+      return mid !== null && mid > 0 ? mid : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function fetchHydrationDerivedUsdPrices() {
+    const out = {
+      prices: { USDT: 1, USDC: 1, HOLLAR: 1 },
+      sources: { USDT: "stable", USDC: "stable", HOLLAR: "stable" },
+    };
+
+    const asHydrationPriceNum = (v) => {
+      if (v == null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    try {
+      const data = await api("/api/polkadot_dex/hydration/prices?assets=HDX,DOT,USDT,UTTT,HOLLAR&refresh=true");
+      const maps = [
+        data?.prices_usd,
+        data?.usd_prices,
+        data?.pricesUsd,
+        data?.usdPrices,
+        data?.prices,
+        data?.price_map,
+        data?.priceMap,
+        data?.usd,
+      ];
+      const sourceMaps = [
+        data?.priceSources,
+        data?.price_sources,
+        data?.usd_sources,
+        data?.usdSources,
+        data?.sources,
+      ];
+      const symbols = ["HDX", "DOT", "UTTT", "USDT", "USDC", "HOLLAR"];
+
+      for (const sym of symbols) {
+        for (const m of maps) {
+          if (!m || typeof m !== "object") continue;
+          const entry = m?.[sym] ?? m?.[sym.toLowerCase()];
+          const val = asHydrationPriceNum(
+            entry && typeof entry === "object"
+              ? entry?.px_usd ?? entry?.price_usd ?? entry?.priceUsd ?? entry?.usd_price ?? entry?.usdPrice ?? entry?.price ?? entry?.usd
+              : entry
+          );
+          if (val !== null) {
+            out.prices[sym] = val;
+            break;
+          }
+        }
+
+        for (const sm of sourceMaps) {
+          if (!sm || typeof sm !== "object") continue;
+          const src = sm?.[sym] ?? sm?.[sym.toLowerCase()];
+          if (src !== undefined && src !== null && String(src).trim()) {
+            out.sources[sym] = String(src);
+            break;
+          }
+        }
+      }
+    } catch {
+      // Keep stablecoin defaults and avoid falling back to generic Hydration orderbook pairs.
+    }
+
+    return out;
+  }
+
+  function applyHydrationDerivedUsdPricesToSnapshotRows(items, derived) {
+    const prices = derived?.prices || {};
+    const sources = derived?.sources || {};
+    const asNum = (v) => {
+      if (v == null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    return (items || []).map((it) => {
+      const sym = String(it?.asset || it?.symbol || "").trim().toUpperCase();
+      const balance = asNum(it?.balance ?? it?.total ?? it?.available) ?? 0;
+      const existingPx = asNum(it?.usd_price ?? it?.px_usd ?? it?.price_usd);
+      const existingUsd = asNum(it?.usd_value ?? it?.total_usd ?? it?.value_usd);
+      const derivedPx = asNum(prices?.[sym]);
+      const px = existingPx !== null ? existingPx : derivedPx;
+      const usdValue = existingUsd !== null ? existingUsd : (px !== null ? balance * px : null);
+
+      return {
+        ...it,
+        usd_price: px !== null ? px : it?.usd_price ?? "",
+        usd_value: usdValue !== null ? usdValue : it?.usd_value ?? "",
+        usd_source_symbol: it?.usd_source_symbol && it.usd_source_symbol !== "—"
+          ? it.usd_source_symbol
+          : (px !== null ? (sources?.[sym] || "derived") : it?.usd_source_symbol || ""),
+      };
+    });
+  }
+
+  function normalizeHydrationBalanceRows(data, sourceRow) {
+    const address = String(sourceRow?.address || data?.address || "").trim();
+    const label = sourceRow?.label || "Hydration SubWallet";
+    const fetchedAt = data?.fetched_at || data?.fetchedAt || new Date().toISOString();
+
+    const asNum = (v) => {
+      if (v == null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const canonicalHydrationSymbol = (symbol, assetId) => {
+      const s = String(symbol || "").trim();
+      const id = String(assetId || "").trim();
+      const key = (s || id).toLowerCase();
+      const byId = {
+        "0": "HDX",
+        native: "HDX",
+        hdx: "HDX",
+        "5": "DOT",
+        dot: "DOT",
+        "10": "USDT",
+        usdt: "USDT",
+        "222": "HOLLAR",
+        hollar: "HOLLAR",
+        "1001331": "UTTT",
+        uttt: "UTTT",
+      };
+      return byId[key] || s || id;
+    };
+
+    const getHydrationUsdPrice = (symbol, assetId, item = null) => {
+      const direct = asNum(
+        item?.px_usd ??
+        item?.price_usd ??
+        item?.priceUsd ??
+        item?.usd_price ??
+        item?.usdPrice ??
+        item?.priceUSD ??
+        item?.usd
+      );
+      if (direct !== null) return direct;
+
+      const sym = String(symbol || "").trim().toUpperCase();
+      const id = String(assetId || "").trim();
+      if (sym === "USDT" || sym === "USDC" || sym === "HOLLAR") return 1;
+
+      const maps = [
+        data?.prices_usd,
+        data?.pricesUsd,
+        data?.usd_prices,
+        data?.usdPrices,
+        data?.prices,
+        data?.price_map,
+        data?.priceMap,
+        data?.usd,
+      ];
+      const keys = [sym, sym.toLowerCase(), id, id.toLowerCase()].filter(Boolean);
+      for (const m of maps) {
+        if (!m || typeof m !== "object") continue;
+        for (const k of keys) {
+          const entry = m?.[k];
+          const val = asNum(
+            typeof entry === "object"
+              ? entry?.px_usd ?? entry?.price_usd ?? entry?.priceUsd ?? entry?.usd_price ?? entry?.usdPrice ?? entry?.price ?? entry?.usd
+              : entry
+          );
+          if (val !== null) return val;
+        }
+      }
+
+      return asNum(
+        sym === "HDX" ? (data?.hdx_usd ?? data?.hdxUsd ?? data?.hdx_price_usd ?? data?.hdxPriceUsd) :
+        sym === "DOT" ? (data?.dot_usd ?? data?.dotUsd ?? data?.dot_price_usd ?? data?.dotPriceUsd) :
+        sym === "UTTT" ? (data?.uttt_usd ?? data?.utttUsd ?? data?.uttt_price_usd ?? data?.utttPriceUsd) :
+        null
+      );
+    };
+
+    let rawItems = Array.isArray(data?.items)
+      ? data.items
+      : Array.isArray(data?.balances)
+        ? data.balances
+        : Array.isArray(data?.tokens)
+          ? data.tokens
+          : Array.isArray(data?.assets)
+            ? data.assets
+            : data?.balances && typeof data.balances === "object"
+              ? Object.entries(data.balances).map(([asset, value]) => ({ asset, ...(value && typeof value === "object" ? value : { total: value }) }))
+              : data?.items && typeof data.items === "object"
+                ? Object.entries(data.items).map(([asset, value]) => ({ asset, ...(value && typeof value === "object" ? value : { total: value }) }))
+                : [];
+
+    const hasNativeHdx = (rawItems || []).some((it) => {
+      const sym = canonicalHydrationSymbol(
+        it?.symbol ?? it?.asset ?? it?.ticker ?? it?.currency ?? it?.assetSymbol ?? it?.asset_symbol,
+        it?.asset_id ?? it?.assetId ?? it?.id ?? it?.token_id ?? it?.tokenId
+      );
+      return String(sym || "").toUpperCase() === "HDX";
+    });
+
+    if (!hasNativeHdx) {
+      const nativeObj =
+        (data?.native && typeof data.native === "object" ? data.native : null) ||
+        (data?.native_balance && typeof data.native_balance === "object" ? data.native_balance : null) ||
+        (data?.nativeBalance && typeof data.nativeBalance === "object" ? data.nativeBalance : null) ||
+        (data?.hdx && typeof data.hdx === "object" ? data.hdx : null) ||
+        (data?.hdx_balance && typeof data.hdx_balance === "object" ? data.hdx_balance : null) ||
+        (data?.hdxBalance && typeof data.hdxBalance === "object" ? data.hdxBalance : null) ||
+        null;
+      const nativeNumber = asNum(
+        data?.hdx_ui ??
+        data?.hdxUi ??
+        data?.hdx_balance_ui ??
+        data?.hdxBalanceUi ??
+        data?.native_ui ??
+        data?.nativeUi ??
+        data?.native_balance_ui ??
+        data?.nativeBalanceUi ??
+        data?.hdx_balance ??
+        data?.hdxBalance ??
+        data?.native_balance ??
+        data?.nativeBalance
+      );
+      const candidate = nativeObj
+        ? { asset: "HDX", symbol: "HDX", asset_id: "native", ...nativeObj }
+        : nativeNumber !== null
+          ? { asset: "HDX", symbol: "HDX", asset_id: "native", total: nativeNumber, available: nativeNumber }
+          : null;
+      if (candidate) rawItems = [candidate, ...(rawItems || [])];
+    }
+
+    const out = [];
+    for (const it of rawItems || []) {
+      const rawAsset = String(
+        it?.symbol ??
+        it?.asset ??
+        it?.ticker ??
+        it?.currency ??
+        it?.assetSymbol ??
+        it?.asset_symbol ??
+        ""
+      ).trim();
+      const assetId = String(
+        it?.asset_id ??
+        it?.assetId ??
+        it?.id ??
+        it?.token_id ??
+        it?.tokenId ??
+        ""
+      ).trim();
+      const asset = canonicalHydrationSymbol(rawAsset, assetId);
+
+      const free = asNum(
+        it?.free_ui ??
+        it?.freeUi ??
+        it?.available_ui ??
+        it?.availableUi ??
+        it?.available ??
+        it?.free ??
+        it?.spendable ??
+        it?.amount_ui ??
+        it?.amountUi ??
+        it?.uiAmount ??
+        it?.ui_amount
+      );
+
+      const reserved = asNum(
+        it?.reserved_ui ??
+        it?.reservedUi ??
+        it?.reserved ??
+        it?.hold_ui ??
+        it?.holdUi ??
+        it?.hold ??
+        it?.locked ??
+        0
+      );
+
+      const totalExplicit = asNum(
+        it?.total_ui ??
+        it?.totalUi ??
+        it?.balance_ui ??
+        it?.balanceUi ??
+        it?.total ??
+        it?.balance ??
+        it?.amount
+      );
+
+      const balance = totalExplicit ?? ((free ?? 0) + (reserved ?? 0));
+      const usdPrice = getHydrationUsdPrice(asset, assetId, it);
+      const usdValue = asNum(it?.total_usd ?? it?.usd_value ?? it?.usdValue ?? it?.value_usd ?? it?.valueUsd) ??
+        (usdPrice != null && balance != null ? balance * usdPrice : null);
+
+      if (!asset && balance == null) continue;
+
+      out.push({
+        id: `hydration:${sourceRow?.id || address}:${asset || out.length}`,
+        asset: asset || "Hydration",
+        network: "hydration",
+        address,
+        label,
+        balance: balance ?? "",
+        usd_price: usdPrice ?? "",
+        usd_value: usdValue ?? "",
+        fetched_at: fetchedAt,
+        source: data?.source || data?.venue || "polkadot_dex/balances",
+      });
+    }
+    return out;
+  }
+
+  async function refreshHydrationBalanceRow(row) {
+    const address = String(row?.address || "").trim();
+    if (!address) throw new Error("Hydration wallet row is missing an address.");
+    const res = await api(`/api/polkadot_dex/balances?address=${encodeURIComponent(address)}`);
+    if (res?.ok === false) throw new Error(res?.detail || res?.error || "Hydration balances failed.");
+
+    const normalizedRows = normalizeHydrationBalanceRows(res, row);
+    try {
+      const derived = await fetchHydrationDerivedUsdPrices();
+      return applyHydrationDerivedUsdPricesToSnapshotRows(normalizedRows, derived);
+    } catch {
+      return normalizedRows;
     }
   }
 
@@ -263,21 +657,79 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
     setBusy(true);
     setErr("");
     try {
-      const body = ids ? { ids } : {};
-      const res = await api(`/api/wallet_addresses/balances/refresh`, { method: "POST", body });
+      const selectedRows = Array.isArray(ids) && ids.length
+        ? (addresses || []).filter((a) => ids.includes(a.id))
+        : (addresses || []);
 
-      // surface refresh result in the UI
-      setBalLastRefresh(res || null);
+      const hydrationRows = selectedRows.filter((a) => isHydrationAddressRow(a));
+      const legacyRows = selectedRows.filter((a) => !isHydrationAddressRow(a));
 
-      const refreshed = Number(res?.refreshed || 0);
-      const errors = Array.isArray(res?.errors) ? res.errors : [];
-      if (errors.length) {
-        console.error("[wallet_balances_refresh] errors:", errors);
-        setErr(`Balances refresh completed: refreshed ${refreshed}, errors ${errors.length} (see console).`);
+      const hydrationLiveRows = [];
+      const hydrationErrors = [];
+      for (const row of hydrationRows) {
+        try {
+          const rows = await refreshHydrationBalanceRow(row);
+          hydrationLiveRows.push(...rows);
+        } catch (e) {
+          hydrationErrors.push({
+            id: row?.id,
+            asset: row?.asset,
+            network: row?.network,
+            address: row?.address,
+            error: e?.message || String(e),
+          });
+        }
       }
 
-      // auto reload latest balances
-      await loadBalances();
+      const shouldRunLegacyRefresh = Array.isArray(ids) && ids.length
+        ? legacyRows.length > 0
+        : hydrationRows.length === 0 || legacyRows.length > 0;
+
+      let res = null;
+      let latest = [];
+      if (shouldRunLegacyRefresh) {
+        const body = Array.isArray(ids) && ids.length
+          ? { ids: legacyRows.map((a) => a.id).filter(Boolean) }
+          : hydrationRows.length && legacyRows.length
+            ? { ids: legacyRows.map((a) => a.id).filter(Boolean) }
+            : {};
+
+        if (!Array.isArray(body.ids) || body.ids.length) {
+          res = await api(`/api/wallet_addresses/balances/refresh`, { method: "POST", body });
+          latest = await loadBalances();
+        }
+      }
+
+      const mergedErrors = [
+        ...(Array.isArray(res?.errors) ? res.errors : []),
+        ...hydrationErrors,
+      ];
+
+      const refreshed = Number(res?.refreshed || 0) + hydrationRows.length - hydrationErrors.length;
+      const finalResult = {
+        ...(res || {}),
+        refreshed,
+        errors: mergedErrors,
+        hydration_live: {
+          attempted: hydrationRows.length,
+          refreshed: hydrationRows.length - hydrationErrors.length,
+          rows: hydrationLiveRows.length,
+          endpoint: "/api/polkadot_dex/balances",
+        },
+      };
+
+      // surface refresh result in the UI
+      setBalLastRefresh(finalResult);
+
+      if (hydrationLiveRows.length) {
+        setBalances([...(hydrationLiveRows || []), ...(latest || [])]);
+        setTab("balances");
+      }
+
+      if (mergedErrors.length) {
+        console.error("[wallet_balances_refresh] errors:", mergedErrors);
+        setErr(`Balances refresh completed: refreshed ${refreshed}, errors ${mergedErrors.length} (see console).`);
+      }
     } catch (e) {
       setErr(e?.message || String(e));
     } finally {
@@ -315,17 +767,24 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
     setBusy(true);
     setErr("");
     try {
+      const walletId = String(form.wallet_id || "").trim();
+      const network = String(form.network || "").trim();
+      const isHydrationWallet =
+        walletId.toLowerCase() === "polkadot_hydration" ||
+        network.toLowerCase() === "hydration";
+      const asset = String(form.asset || "").trim().toUpperCase() || (isHydrationWallet ? "ALL" : "");
+
       const payload = {
-        asset: String(form.asset || "").trim().toUpperCase(),
-        wallet_id: String(form.wallet_id || "").trim() || null,
-        network: String(form.network || "").trim(),
+        asset,
+        wallet_id: walletId || null,
+        network,
         address: String(form.address || "").trim(),
         label: String(form.label || "").trim() || null,
         owner_scope: String(form.owner_scope || "user").trim().toLowerCase(),
       };
 
       if (!payload.address) throw new Error("Address is required.");
-      if (!payload.asset) throw new Error("Asset is required.");
+      if (!payload.asset) throw new Error("Asset is required. Use ALL for Hydration/SubWallet all-asset detection.");
       if (!payload.network) throw new Error("Network is required.");
 
       if (editingId) {
@@ -424,22 +883,36 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
           <div style={{ marginBottom: 12, padding: 10, border: "1px solid #ddd" }}>
             <div style={{ fontWeight: 700, marginBottom: 8 }}>Add Wallet Address (MVP)</div>
 
+            <div style={{ marginBottom: 10, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+              <div style={{ fontWeight: 600, opacity: 0.9 }}>Hydration/SubWallet:</div>
+              <button type="button" onClick={applyHydrationWalletMode} disabled={busy}>
+                Use Hydration wallet
+              </button>
+              <div style={{ flexBasis: "100%", opacity: 0.75 }}>
+                Use one account-level Hydration row: <b>Asset</b> <code>ALL</code>, <b>Venue</b> <code>polkadot_hydration</code>, and <b>Network</b> <code>hydration</code>. The same SubWallet/Substrate address can be scanned for all supported Hydration assets; no per-asset address rows are needed.
+              </div>
+            </div>
+
             <div style={{ display: "grid", gridTemplateColumns: "140px 1fr 140px 1fr", gap: 8 }}>
-              <label>Asset</label>
-              <input value={form.asset} onChange={(e) => setForm((p) => ({ ...p, asset: e.target.value.toUpperCase() }))} />
+              <label>Asset / scope</label>
+              <input
+                placeholder="e.g. BTC, SOL, UTTT, or ALL for Hydration"
+                value={form.asset}
+                onChange={(e) => setForm((p) => ({ ...p, asset: e.target.value.toUpperCase() }))}
+              />
 
               <label>Venue</label>
               <input
-                placeholder="e.g. robinhood, dex-trade (blank = self-custody)"
+                placeholder="e.g. polkadot_hydration, robinhood, dex-trade (blank = self-custody)"
                 value={form.wallet_id}
                 onChange={(e) => setForm((p) => ({ ...p, wallet_id: e.target.value }))}
               />
 
               <label>Network</label>
-              <input value={form.network} onChange={(e) => setForm((p) => ({ ...p, network: e.target.value }))} />
+              <input placeholder="e.g. hydration, solana, mainnet" value={form.network} onChange={(e) => setForm((p) => ({ ...p, network: e.target.value }))} />
 
               <label>Address</label>
-              <input value={form.address} onChange={(e) => setForm((p) => ({ ...p, address: e.target.value }))} />
+              <input placeholder="SubWallet/Substrate or chain address" value={form.address} onChange={(e) => setForm((p) => ({ ...p, address: e.target.value }))} />
 
               <label>Label</label>
               <input value={form.label} onChange={(e) => setForm((p) => ({ ...p, label: e.target.value }))} />
@@ -465,7 +938,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
                 </button>
               ) : null}
               <div style={{ opacity: 0.75 }}>
-                Next step: extend to <b>Venue</b> + <b>Purpose</b> + <b>Chain/Network registry</b> + <b>tx ingest</b> once backend is updated.
+                Hydration/SubWallet rows should normally use <b>Asset</b> <code>ALL</code>, <b>Venue</b> <code>polkadot_hydration</code>, and <b>Network</b> <code>hydration</code>. Blank venue remains self-custody.
               </div>
             </div>
           </div>
@@ -498,7 +971,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
                 Ingest txs (all)
               </button>
               <div style={{ opacity: 0.75 }}>
-                Uses <code>/api/wallet_addresses/tx/ingest</code>. Enforces policy (skip coinbase; deposits-only robinhood/dex-trade; self-custody both).
+                Uses <code>/api/wallet_addresses/tx/ingest</code>. Enforces policy (skip coinbase; deposits-only robinhood/dex-trade; self-custody both). Hydration wallet rows use <code>ALL</code> + <code>polkadot_hydration</code> + <code>hydration</code>; backend asset scanning/tx ingest support remains endpoint-dependent.
               </div>
             </div>
 
@@ -566,7 +1039,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
 
               <label>Venue</label>
               <input
-                placeholder="e.g. robinhood, dex-trade"
+                placeholder="e.g. polkadot_hydration, robinhood, dex-trade"
                 value={flt.wallet_id}
                 onChange={(e) => setFlt((p) => ({ ...p, wallet_id: e.target.value }))}
               />
@@ -584,9 +1057,19 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               />
             </div>
 
-            <div style={{ marginTop: 10 }}>
+            <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
               <button onClick={loadAddresses} disabled={busy}>
                 Apply
+              </button>
+              <button
+                type="button"
+                onClick={() => setFlt((p) => ({ ...p, wallet_id: "polkadot_hydration", network: "hydration" }))}
+                disabled={busy}
+              >
+                Filter Hydration
+              </button>
+              <button type="button" onClick={() => setFlt((p) => ({ ...p, asset: "", wallet_id: "", network: "" }))} disabled={busy}>
+                Clear filters
               </button>
             </div>
           </div>
@@ -682,16 +1165,23 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
                 Load latest
               </button>
               <button onClick={() => refreshBalances(null)} disabled={busy}>
-                Refresh all (explorer)
+                Refresh all balances
               </button>
 
               {balLastRefresh ? (
                 <div style={{ opacity: 0.85 }}>
                   Last refresh: <b>{Number(balLastRefresh.refreshed || 0)}</b> refreshed •{" "}
                   <b>{Array.isArray(balLastRefresh.errors) ? balLastRefresh.errors.length : 0}</b> errors
+                  {balLastRefresh?.hydration_live?.attempted ? (
+                    <span>
+                      {" "}• Hydration live: <b>{Number(balLastRefresh.hydration_live.refreshed || 0)}</b> wallets / <b>{Number(balLastRefresh.hydration_live.rows || 0)}</b> assets
+                    </span>
+                  ) : null}
                 </div>
               ) : (
-                <div style={{ opacity: 0.75 }}>Explorer refresh may take time per address.</div>
+                <div style={{ opacity: 0.75 }}>
+                  Explorer refresh may take time per address. Hydration/SubWallet <code>ALL</code> rows use the live Polkadot-Hydration balance endpoint instead of the legacy explorer snapshot path.
+                </div>
               )}
             </div>
 
@@ -724,7 +1214,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               <table style={{ borderCollapse: "collapse", width: "100%" }}>
                 <thead>
                   <tr>
-                    {["id", "asset", "network", "address", "label", "balance", "usd_price", "usd_value", "fetched_at"].map((h) => (
+                    {["id", "asset", "network", "address", "label", "balance", "usd_price", "usd_value", "usd_source_symbol", "fetched_at"].map((h) => (
                       <th key={h} style={{ textAlign: "left", borderBottom: "1px solid #ccc", padding: 6 }}>
                         {h}
                       </th>
@@ -742,6 +1232,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
                       <td style={{ padding: 6, borderBottom: "1px solid #eee" }}>{String(b.balance ?? "")}</td>
                       <td style={{ padding: 6, borderBottom: "1px solid #eee" }}>{String(b.usd_price ?? "")}</td>
                       <td style={{ padding: 6, borderBottom: "1px solid #eee" }}>{String(b.usd_value ?? "")}</td>
+                      <td style={{ padding: 6, borderBottom: "1px solid #eee" }}>{String(b.usd_source_symbol ?? b.usd_source ?? b.price_source ?? "")}</td>
                       <td style={{ padding: 6, borderBottom: "1px solid #eee" }}>{b.fetched_at || ""}</td>
                     </tr>
                   ))}

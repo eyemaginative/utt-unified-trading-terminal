@@ -62,6 +62,9 @@ const LS_AO_LEDGER_SYNC_DRY_RUN_KEY = "utt_ao_ledger_sync_dry_run_v1";
 // NEW: Theme / palette
 const LS_THEME_KEY = "utt_tables_theme_v1";
 
+// Shared Hydration USD-price cache used by balances / Spread-Bridge safe pricing.
+const LS_HYDRATION_USD_PRICES_KEY = "utt_hydration_usd_prices_v1";
+
 // NEW: Custom theme palette payload
 const LS_THEME_CUSTOM_KEY = "utt_tables_theme_custom_v1";
 
@@ -757,6 +760,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       balSortKey,
       balSortDir,
       portfolioTotalUsd,
+      portfolioTotalUsdAllVenues,
       fmtUsd,
       fmtPxUsd,
 
@@ -950,6 +954,26 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   const isSolanaVenue = String(venue || "").toLowerCase().startsWith("solana");
   const [showSolanaOnchainDetails, setShowSolanaOnchainDetails] = useState(false);
 
+  // ─────────────────────────────────────────────────────────────
+  // Polkadot / Hydration on-chain balances — separate DEX path
+  // Uses the Wallet Addresses registry row (Asset = ALL, wallet_id/venue = polkadot_hydration, network = hydration)
+  // and then calls the existing backend Hydration balance endpoint.
+  // ─────────────────────────────────────────────────────────────
+  const isPolkadotHydrationVenue = (() => {
+    const v = String(venue || "").trim().toLowerCase();
+    return v === "polkadot_hydration" || v === "hydration" || v.includes("hydration");
+  })();
+
+  const [hydrationOnchain, setHydrationOnchain] = useState(() => ({
+    address: "",
+    items: [], // [{ asset, amount, asset_id, symbol, free, reserved, total }]
+    loading: false,
+    err: "",
+    fetchedAt: null,
+    source: "",
+  }));
+  const [showHydrationOnchainDetails, setShowHydrationOnchainDetails] = useState(false);
+
 
     function getSolanaUsdPriceForMint(mint) {
       const m = String(mint || "").trim();
@@ -976,6 +1000,425 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         return Number.isFinite(f) ? f : null;
       }
       return null;
+    }
+
+    function asFiniteNumberOrNull(v) {
+      if (v === null || v === undefined || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function shortenMiddle(v, left = 7, right = 5) {
+      const s = String(v || "").trim();
+      if (!s) return "";
+      if (s.length <= left + right + 1) return s;
+      return `${s.slice(0, left)}…${s.slice(-right)}`;
+    }
+
+    function canonicalHydrationSymbol(symbol, assetId) {
+      const s = String(symbol || "").trim();
+      const id = String(assetId || "").trim();
+      const key = (s || id).toLowerCase();
+      const byId = {
+        "0": "HDX",
+        native: "HDX",
+        hdx: "HDX",
+        "5": "DOT",
+        dot: "DOT",
+        "10": "USDT",
+        usdt: "USDT",
+        "222": "HOLLAR",
+        hollar: "HOLLAR",
+        "1001331": "UTTT",
+        uttt: "UTTT",
+      };
+      return byId[key] || s || id;
+    }
+
+    function getHydrationUsdPriceFromData(data, symbol, assetId, item = null) {
+      const direct = asFiniteNumberOrNull(
+        item?.px_usd ??
+        item?.price_usd ??
+        item?.priceUsd ??
+        item?.usd_price ??
+        item?.usdPrice ??
+        item?.priceUSD ??
+        item?.usd
+      );
+      if (direct !== null) return direct;
+
+      const sym = String(symbol || "").trim().toUpperCase();
+      const id = String(assetId || "").trim();
+      if (sym === "USDT" || sym === "USDC" || sym === "HOLLAR") return 1;
+
+      const maps = [
+        data?.prices_usd,
+        data?.pricesUsd,
+        data?.usd_prices,
+        data?.usdPrices,
+        data?.prices,
+        data?.price_map,
+        data?.priceMap,
+        data?.usd,
+      ];
+      const keys = [sym, sym.toLowerCase(), id, id.toLowerCase()].filter(Boolean);
+      for (const m of maps) {
+        if (!m || typeof m !== "object") continue;
+        for (const k of keys) {
+          const entry = m?.[k];
+          const val = asFiniteNumberOrNull(
+            typeof entry === "object"
+              ? entry?.px_usd ?? entry?.price_usd ?? entry?.priceUsd ?? entry?.usd_price ?? entry?.usdPrice ?? entry?.price ?? entry?.usd
+              : entry
+          );
+          if (val !== null) return val;
+        }
+      }
+
+      const topLevel = asFiniteNumberOrNull(
+        sym === "HDX" ? (data?.hdx_usd ?? data?.hdxUsd ?? data?.hdx_price_usd ?? data?.hdxPriceUsd) :
+        sym === "DOT" ? (data?.dot_usd ?? data?.dotUsd ?? data?.dot_price_usd ?? data?.dotPriceUsd) :
+        sym === "UTTT" ? (data?.uttt_usd ?? data?.utttUsd ?? data?.uttt_price_usd ?? data?.utttPriceUsd) :
+        null
+      );
+      return topLevel;
+    }
+
+    function firstHydrationOrderbookPrice(levels) {
+      const arr = Array.isArray(levels) ? levels : [];
+      for (const lvl of arr) {
+        const px = Array.isArray(lvl)
+          ? asFiniteNumberOrNull(lvl?.[0] ?? lvl?.price)
+          : asFiniteNumberOrNull(lvl?.price ?? lvl?.px ?? lvl?.rate ?? lvl?.limit ?? lvl?.p);
+        if (px !== null && px > 0) return px;
+      }
+      return null;
+    }
+
+    function hydrationOrderbookMid(data) {
+      const direct = asFiniteNumberOrNull(
+        data?.mid ??
+        data?.midPrice ??
+        data?.mid_price ??
+        data?.price ??
+        data?.markPrice ??
+        data?.mark_price ??
+        data?.spotPrice ??
+        data?.spot_price ??
+        data?.pool?.spotPrice ??
+        data?.pool?.spot_price
+      );
+      if (direct !== null && direct > 0) return direct;
+
+      const bid = asFiniteNumberOrNull(data?.bestBid ?? data?.best_bid ?? data?.bid ?? data?.bids?.[0]?.price) ?? firstHydrationOrderbookPrice(data?.bids);
+      const ask = asFiniteNumberOrNull(data?.bestAsk ?? data?.best_ask ?? data?.ask ?? data?.asks?.[0]?.price) ?? firstHydrationOrderbookPrice(data?.asks);
+      if (bid !== null && ask !== null && bid > 0 && ask > 0) return (bid + ask) / 2;
+      if (bid !== null && bid > 0) return bid;
+      if (ask !== null && ask > 0) return ask;
+      return null;
+    }
+
+    async function fetchHydrationOrderbookMid(symbol) {
+      const sym = String(symbol || "").trim().toUpperCase();
+      // Keep frontend pricing on the safe manual route only. Generic Hydration
+      // USD pairs are owned by /hydration/prices and must not be called from
+      // the balances UI while router quotes are disabled.
+      if (sym !== "UTTT-HDX") return null;
+      try {
+        const data = await fetchJSONMaybe(`/api/polkadot_dex/hydration/orderbook?symbol=${encodeURIComponent(sym)}&depth=5&route_mode=manual_xyk`);
+        if (data?.ok === false) return null;
+        const mid = hydrationOrderbookMid(data);
+        return mid !== null && mid > 0 ? mid : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function readHydrationUsdPriceCache() {
+      try {
+        const raw = localStorage.getItem(LS_HYDRATION_USD_PRICES_KEY);
+        const parsed = safeParseJson(raw || "");
+        if (!parsed || typeof parsed !== "object") return { prices: {}, sources: {} };
+        const rawPrices = parsed.prices && typeof parsed.prices === "object" ? parsed.prices : parsed;
+        const rawSources = parsed.sources && typeof parsed.sources === "object" ? parsed.sources : {};
+        const prices = {};
+        const sources = {};
+        for (const [k, v] of Object.entries(rawPrices || {})) {
+          const sym = String(k || "").trim().toUpperCase();
+          const px = asFiniteNumberOrNull(v && typeof v === "object" ? (v.px_usd ?? v.price_usd ?? v.priceUsd ?? v.usd_price ?? v.usdPrice ?? v.price ?? v.usd) : v);
+          if (sym && px !== null && px > 0) {
+            prices[sym] = px;
+            sources[sym] = rawSources?.[sym] || rawSources?.[String(k)] || "cache";
+          }
+        }
+        return { prices, sources, updatedAt: parsed.updatedAt || parsed.ts || null };
+      } catch {
+        return { prices: {}, sources: {} };
+      }
+    }
+
+    function writeHydrationUsdPriceCache(derived) {
+      try {
+        const existing = readHydrationUsdPriceCache();
+        const prices = derived?.prices || {};
+        const sources = derived?.sources || {};
+        const keep = { ...(existing?.prices || {}) };
+        const keepSources = { ...(existing?.sources || {}) };
+        for (const [k, v] of Object.entries(prices)) {
+          const sym = String(k || "").trim().toUpperCase();
+          const px = asFiniteNumberOrNull(v);
+          if (sym && px !== null && px > 0) {
+            keep[sym] = px;
+            keepSources[sym] = sources?.[sym] || keepSources?.[sym] || "cache";
+          }
+        }
+        localStorage.setItem(LS_HYDRATION_USD_PRICES_KEY, JSON.stringify({ prices: keep, sources: keepSources, updatedAt: Date.now() }));
+      } catch {
+        // ignore storage errors
+      }
+    }
+
+    async function fetchHydrationDerivedUsdPrices() {
+      const out = {
+        prices: { USDT: 1, USDC: 1, HOLLAR: 1 },
+        sources: { USDT: "stable", USDC: "stable", HOLLAR: "stable" },
+      };
+
+      // Frontend must not call generic Hydration orderbook pairs directly.
+      // The backend /hydration/prices endpoint owns the controlled SDK cache
+      // with TTL/backoff/singleflight safeguards.
+      try {
+        const data = await fetchJSONMaybe("/api/polkadot_dex/hydration/prices?assets=HDX,DOT,USDT,UTTT,HOLLAR&refresh=true");
+        const rawPrices = data?.prices_usd || data?.usd_prices || data?.prices || {};
+        const rawSources = data?.priceSources || data?.price_sources || data?.sources || {};
+        for (const [k, v] of Object.entries(rawPrices || {})) {
+          const sym = String(k || "").trim().toUpperCase();
+          const px = asFiniteNumberOrNull(v && typeof v === "object" ? (v.px_usd ?? v.usd_price ?? v.price ?? v.usd) : v);
+          if (sym && px !== null && px > 0) {
+            out.prices[sym] = px;
+            out.sources[sym] = rawSources?.[sym] || rawSources?.[k] || data?.status || "hydration:price-cache";
+          }
+        }
+      } catch {
+        // fall back to local cache below
+      }
+
+      const cached = readHydrationUsdPriceCache();
+      for (const sym of ["DOT", "HDX", "UTTT"]) {
+        if (asFiniteNumberOrNull(out.prices?.[sym]) !== null) continue;
+        const px = asFiniteNumberOrNull(cached?.prices?.[sym]);
+        if (px !== null && px > 0) {
+          out.prices[sym] = px;
+          out.sources[sym] = cached?.sources?.[sym] || "cache";
+        }
+      }
+
+      const hdxUsd = asFiniteNumberOrNull(out.prices.HDX);
+      if (hdxUsd !== null && hdxUsd > 0 && asFiniteNumberOrNull(out.prices.UTTT) === null) {
+        const utttHdx = await fetchHydrationOrderbookMid("UTTT-HDX");
+        if (utttHdx !== null) {
+          out.prices.UTTT = utttHdx * hdxUsd;
+          out.sources.UTTT = "derived:UTTT-HDX";
+        }
+      }
+
+      writeHydrationUsdPriceCache(out);
+      return out;
+    }
+
+    function applyHydrationDerivedUsdPrices(items, derived) {
+      const prices = derived?.prices || {};
+      const sources = derived?.sources || {};
+      return (items || []).map((it) => {
+        const sym = String(it?.symbol || it?.asset || "").trim().toUpperCase();
+        const total = asFiniteNumberOrNull(it?.total) ?? 0;
+        const existingPx = asFiniteNumberOrNull(it?.px_usd);
+        const existingTotalUsd = asFiniteNumberOrNull(it?.total_usd);
+        const derivedPx = asFiniteNumberOrNull(prices?.[sym]);
+        const px = existingPx !== null ? existingPx : derivedPx;
+        const totalUsd = existingTotalUsd !== null
+          ? existingTotalUsd
+          : (px !== null ? total * px : null);
+
+        return {
+          ...it,
+          px_usd: px !== null ? px : null,
+          total_usd: totalUsd !== null ? totalUsd : null,
+          usd_source_symbol: it?.usd_source_symbol && it.usd_source_symbol !== "—"
+            ? it.usd_source_symbol
+            : (px !== null ? (sources?.[sym] || "derived") : "—"),
+        };
+      });
+    }
+
+    function appendHydrationNativeHdxItem(rawItems, data) {
+      const rows = Array.isArray(rawItems) ? [...rawItems] : [];
+      const hasNative = rows.some((it) => {
+        const sym = canonicalHydrationSymbol(
+          it?.symbol ?? it?.asset ?? it?.ticker ?? it?.currency ?? it?.assetSymbol ?? it?.asset_symbol,
+          it?.asset_id ?? it?.assetId ?? it?.id ?? it?.token_id ?? it?.tokenId
+        );
+        return String(sym || "").toUpperCase() === "HDX";
+      });
+      if (hasNative) return rows;
+
+      const nativeObj =
+        (data?.native && typeof data.native === "object" ? data.native : null) ||
+        (data?.native_balance && typeof data.native_balance === "object" ? data.native_balance : null) ||
+        (data?.nativeBalance && typeof data.nativeBalance === "object" ? data.nativeBalance : null) ||
+        (data?.hdx && typeof data.hdx === "object" ? data.hdx : null) ||
+        (data?.hdx_balance && typeof data.hdx_balance === "object" ? data.hdx_balance : null) ||
+        (data?.hdxBalance && typeof data.hdxBalance === "object" ? data.hdxBalance : null) ||
+        null;
+
+      const nativeNumber = asFiniteNumberOrNull(
+        data?.hdx_ui ??
+        data?.hdxUi ??
+        data?.hdx_balance_ui ??
+        data?.hdxBalanceUi ??
+        data?.native_ui ??
+        data?.nativeUi ??
+        data?.native_balance_ui ??
+        data?.nativeBalanceUi ??
+        data?.hdx_balance ??
+        data?.hdxBalance ??
+        data?.native_balance ??
+        data?.nativeBalance
+      );
+
+      const candidate = nativeObj
+        ? { asset: "HDX", symbol: "HDX", asset_id: "native", ...nativeObj }
+        : nativeNumber !== null
+          ? { asset: "HDX", symbol: "HDX", asset_id: "native", total: nativeNumber, available: nativeNumber }
+          : null;
+
+      if (candidate) rows.unshift(candidate);
+      return rows;
+    }
+
+    function normalizeHydrationBalanceItems(data) {
+      let rawItems = Array.isArray(data?.items)
+        ? data.items
+        : Array.isArray(data?.balances)
+          ? data.balances
+          : Array.isArray(data?.tokens)
+            ? data.tokens
+            : Array.isArray(data?.assets)
+              ? data.assets
+              : data?.balances && typeof data.balances === "object"
+                ? Object.entries(data.balances).map(([asset, value]) => ({ asset, ...(value && typeof value === "object" ? value : { total: value }) }))
+                : data?.items && typeof data.items === "object"
+                  ? Object.entries(data.items).map(([asset, value]) => ({ asset, ...(value && typeof value === "object" ? value : { total: value }) }))
+                  : [];
+
+      rawItems = appendHydrationNativeHdxItem(rawItems, data);
+
+      const out = [];
+      for (const it of rawItems || []) {
+        const rawSymbol = String(
+          it?.symbol ??
+          it?.asset ??
+          it?.ticker ??
+          it?.currency ??
+          it?.assetSymbol ??
+          it?.asset_symbol ??
+          ""
+        ).trim();
+
+        const assetId = String(
+          it?.asset_id ??
+          it?.assetId ??
+          it?.id ??
+          it?.token_id ??
+          it?.tokenId ??
+          it?.currency_id ??
+          ""
+        ).trim();
+
+        const symbol = canonicalHydrationSymbol(rawSymbol, assetId);
+
+        const free = asFiniteNumberOrNull(
+          it?.free_ui ??
+          it?.freeUi ??
+          it?.available_ui ??
+          it?.availableUi ??
+          it?.available ??
+          it?.free ??
+          it?.spendable ??
+          it?.amount_ui ??
+          it?.amountUi ??
+          it?.uiAmount ??
+          it?.ui_amount
+        );
+
+        const holdExplicit = asFiniteNumberOrNull(
+          it?.reserved_ui ??
+          it?.reservedUi ??
+          it?.hold_ui ??
+          it?.holdUi ??
+          it?.staked_ui ??
+          it?.stakedUi ??
+          it?.staking_ui ??
+          it?.stakingUi ??
+          it?.bonded_ui ??
+          it?.bondedUi ??
+          it?.locked_ui ??
+          it?.lockedUi ??
+          it?.frozen_ui ??
+          it?.frozenUi ??
+          it?.reserved ??
+          it?.hold ??
+          it?.staked ??
+          it?.staking ??
+          it?.bonded ??
+          it?.locked ??
+          it?.frozen ??
+          it?.miscFrozen ??
+          it?.misc_frozen ??
+          it?.feeFrozen ??
+          it?.fee_frozen
+        );
+
+        const totalExplicit = asFiniteNumberOrNull(
+          it?.total_ui ??
+          it?.totalUi ??
+          it?.balance_ui ??
+          it?.balanceUi ??
+          it?.total ??
+          it?.balance ??
+          it?.amount
+        );
+
+        const total = totalExplicit ?? ((free ?? 0) + (holdExplicit ?? 0));
+        const inferredHold =
+          totalExplicit !== null &&
+          free !== null &&
+          total > free &&
+          (holdExplicit === null || holdExplicit <= 0)
+            ? total - free
+            : holdExplicit;
+        const hold = Math.max(0, inferredHold ?? 0);
+        const px = getHydrationUsdPriceFromData(data, symbol, assetId, it);
+        const totalUsd = asFiniteNumberOrNull(it?.total_usd ?? it?.usd_value ?? it?.usdValue ?? it?.value_usd ?? it?.valueUsd) ??
+          (typeof px === "number" ? total * px : null);
+
+        const label = symbol || assetId || String(it?.name || "").trim();
+        if (!label && !Number.isFinite(total)) continue;
+
+        out.push({
+          asset: label || "Hydration",
+          symbol: symbol || label || "",
+          asset_id: assetId || null,
+          total,
+          available: free ?? total,
+          hold,
+          px_usd: typeof px === "number" ? px : null,
+          total_usd: typeof totalUsd === "number" ? totalUsd : null,
+          usd_source_symbol: it?.usd_source_symbol || it?.usdSourceSymbol || it?.price_source || it?.priceSource || "—",
+        });
+      }
+
+      return out;
     }
 
     const balancesFiltered = useMemo(() => {
@@ -1008,6 +1451,19 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
             usd_source_symbol: "USDC",
           };
         });
+      } else if (isPolkadotHydrationVenue) {
+        rows = (hydrationOnchain?.items || []).map((it) => ({
+          venue: venue || "polkadot_hydration",
+          asset: it?.asset || it?.symbol || it?.asset_id || "—",
+          symbol: it?.symbol || null,
+          asset_id: it?.asset_id || null,
+          total: Number(it?.total ?? 0),
+          available: Number(it?.available ?? it?.total ?? 0),
+          hold: Number(it?.hold ?? 0),
+          px_usd: typeof it?.px_usd === "number" ? it.px_usd : null,
+          total_usd: typeof it?.total_usd === "number" ? it.total_usd : null,
+          usd_source_symbol: it?.usd_source_symbol || "—",
+        }));
       }
       const q = String(balancesSymbolQuery || "")
         .trim()
@@ -1020,7 +1476,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         const a = String(b?.asset || "").trim().toUpperCase();
         return a.includes(q);
       });
-    }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, solanaOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
+    }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, isPolkadotHydrationVenue, solanaOnchain, hydrationOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
 
   const solanaPortfolioTotalUsd = useMemo(() => {
     if (!isSolanaVenue) return null;
@@ -1034,6 +1490,21 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     }
     return sum;
   }, [isSolanaVenue, solanaOnchain, solanaPrices]);
+
+  const hydrationPortfolioTotalUsd = useMemo(() => {
+    if (!isPolkadotHydrationVenue) return null;
+    const items = hydrationOnchain?.items || [];
+    let sum = 0;
+    let hasUsd = false;
+    for (const t of items) {
+      const v = Number(t?.total_usd);
+      if (Number.isFinite(v)) {
+        sum += v;
+        hasUsd = true;
+      }
+    }
+    return hasUsd ? sum : null;
+  }, [isPolkadotHydrationVenue, hydrationOnchain]);
 
     // Status visuals derived from palette
     const statusVisualMap = useMemo(() => {
@@ -1130,6 +1601,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     // ─────────────────────────────────────────────────────────────
     const balancesRefreshRef = useRef({ inFlight: false, seq: 0 });
     const solanaRefreshRef = useRef({ inFlight: false, lastAt: 0 });
+    const hydrationRefreshRef = useRef({ inFlight: false, lastAt: 0 });
     const balancesBannerTimerRef = useRef(null);
 
     const [balancesRefreshingLocal, setBalancesRefreshingLocal] = useState(false);
@@ -1177,16 +1649,56 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
 
     
   
+  function isBlockedGenericHydrationOrderbookUrl(url) {
+    try {
+      const u = new URL(String(url || ""), window.location.origin);
+      if (!u.pathname.includes("/api/polkadot_dex/hydration/orderbook")) return false;
+      const sym = String(u.searchParams.get("symbol") || "").trim().toUpperCase();
+      const routeMode = String(u.searchParams.get("route_mode") || "").trim().toLowerCase();
+      // Only the configured UTTT-HDX manual/live route is safe while broad
+      // Hydration router quotes are disabled.  Generic USD pairs must use
+      // /hydration/prices instead of orderbook sampling.
+      return !(sym === "UTTT-HDX" && routeMode === "manual_xyk");
+    } catch {
+      return false;
+    }
+  }
+
+  function sanitizeHydrationBalancesUrl(url) {
+    try {
+      const u = new URL(String(url || ""), window.location.origin);
+      if (u.pathname.includes("/api/polkadot_dex/balances")) {
+        // Price enrichment is now handled by /hydration/prices and the local
+        // non-blocking enrichment pass.  Do not let this table ask balances to
+        // perform backend price work as part of the balance request.
+        u.searchParams.delete("with_prices");
+        return `${u.pathname}${u.search}`;
+      }
+    } catch {
+      // leave original url alone
+    }
+    return url;
+  }
+
   async function fetchJSONMaybe(url) {
+    const safeUrl = sanitizeHydrationBalancesUrl(url);
+    if (isBlockedGenericHydrationOrderbookUrl(safeUrl)) {
+      return {
+        ok: false,
+        error: "blocked_generic_hydration_orderbook_frontend",
+        message: "TerminalTablesWidget blocked a generic Hydration orderbook pricing call. Use /api/polkadot_dex/hydration/prices for USD pricing; only UTTT-HDX manual_xyk is allowed here.",
+      };
+    }
+
     // Prefer App-provided/global fetchJSON when available.
-    if (typeof fetchJSON === "function") return await fetchJSON(url);
+    if (typeof fetchJSON === "function") return await fetchJSON(safeUrl);
 
     // Fallback: direct fetch with optional auth token (mirrors token-registry behavior)
     const headers = { "Content-Type": "application/json" };
     const tok = (typeof getAuthToken === "function") ? getAuthToken() : null;
     if (tok) headers["Authorization"] = `Bearer ${tok}`;
 
-    const resp = await fetch(url, { headers });
+    const resp = await fetch(safeUrl, { headers });
     let js = {};
     try { js = await resp.json(); } catch (e) { js = {}; }
 
@@ -1263,6 +1775,152 @@ async function loadSolanaTokenRegistryMap() {
 
     return map;
   }
+
+  async function loadHydrationWalletAddressFromRegistry() {
+    const urls = [
+      "/api/wallet_addresses?network=hydration&limit=500",
+      "/api/wallet_addresses?asset=ALL&network=hydration&limit=500",
+      "/api/wallet_addresses?limit=500",
+    ];
+
+    let rows = [];
+    let lastErr = null;
+
+    for (const u of urls) {
+      try {
+        const js = await fetchJSONMaybe(u);
+        rows = Array.isArray(js)
+          ? js
+          : Array.isArray(js?.items)
+            ? js.items
+            : Array.isArray(js?.rows)
+              ? js.rows
+              : Array.isArray(js?.addresses)
+                ? js.addresses
+                : Array.isArray(js?.data)
+                  ? js.data
+                  : [];
+        if (rows.length) break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    const norm = (v) => String(v || "").trim().toLowerCase();
+    const hydrationRows = (rows || []).filter((r) => {
+      const address = String(r?.address || r?.wallet_address || r?.walletAddress || "").trim();
+      if (!address) return false;
+
+      const network = norm(r?.network || r?.chain || r?.network_name);
+      const walletId = norm(r?.wallet_id || r?.walletId || r?.venue || r?.venue_override);
+
+      const hydrationNetwork = network === "hydration" || network === "polkadot_hydration" || network.includes("hydration");
+      const hydrationWallet = walletId === "polkadot_hydration" || walletId === "hydration" || walletId.includes("hydration");
+
+      return hydrationNetwork || hydrationWallet;
+    });
+
+    const candidates = hydrationRows.filter((r) => {
+      const asset = norm(r?.asset || r?.symbol || r?.scope);
+      return !asset || asset === "all" || asset === "*" || asset === "wallet";
+    });
+
+    // Prefer the new account-level ALL row, but tolerate an older per-asset Hydration row
+    // if that is the only stored address. The balances endpoint scans the account address anyway.
+    const row = candidates[0] || hydrationRows[0] || null;
+    if (row) {
+      return {
+        address: String(row?.address || row?.wallet_address || row?.walletAddress || "").trim(),
+        row,
+      };
+    }
+
+    if (lastErr && (!rows || rows.length === 0)) {
+      throw lastErr;
+    }
+
+    throw new Error("No Hydration wallet address found. Add one in Wallet Addresses with Venue polkadot_hydration, Network hydration, and Asset ALL.");
+  }
+
+  async function refreshHydrationOnchainBalances() {
+    if (!isPolkadotHydrationVenue) return;
+
+    if (hydrationRefreshRef?.current?.inFlight) return;
+    const now = Date.now();
+    const lastAt = Number(hydrationRefreshRef?.current?.lastAt || 0);
+    if (now - lastAt < 750) return;
+    hydrationRefreshRef.current.inFlight = true;
+    hydrationRefreshRef.current.lastAt = now;
+
+    setHydrationOnchain((p) => ({ ...p, loading: true, err: "" }));
+
+    try {
+      const found = await loadHydrationWalletAddressFromRegistry();
+      const address = String(found?.address || "").trim();
+      if (!address) throw new Error("Hydration wallet row did not include an address.");
+
+      const data = await fetchJSONMaybe(`/api/polkadot_dex/balances?address=${encodeURIComponent(address)}`);
+      if (data?.ok === false) {
+        throw new Error(data?.detail || data?.error || "Hydration balances failed");
+      }
+
+      const normalizedItems = normalizeHydrationBalanceItems(data);
+      let items = normalizedItems;
+      try {
+        const directDerived = {
+          prices: { USDT: 1, USDC: 1, HOLLAR: 1 },
+          sources: { USDT: "stable", USDC: "stable", HOLLAR: "stable" },
+        };
+        for (const it of normalizedItems || []) {
+          const sym = String(it?.symbol || it?.asset || "").trim().toUpperCase();
+          const px = asFiniteNumberOrNull(it?.px_usd);
+          if (sym && px !== null && px > 0) {
+            directDerived.prices[sym] = px;
+            directDerived.sources[sym] = it?.usd_source_symbol && it.usd_source_symbol !== "—" ? it.usd_source_symbol : "backend";
+          }
+        }
+        writeHydrationUsdPriceCache(directDerived);
+      } catch {
+        // ignore cache enrichment failures
+      }
+      setHydrationOnchain({
+        address,
+        items,
+        loading: false,
+        err: "",
+        fetchedAt: Date.now(),
+        source: data?.source || data?.venue || "polkadot_dex/balances",
+      });
+
+      // Do not block the balance table on Hydration SDK price discovery.
+      // Quantities should render immediately; cached USD prices are applied
+      // afterward if the backend already has them.
+      fetchHydrationDerivedUsdPrices()
+        .then((derived) => {
+          const pricedItems = applyHydrationDerivedUsdPrices(normalizedItems, derived);
+          setHydrationOnchain((prev) => {
+            if (String(prev?.address || "") !== address) return prev;
+            return {
+              ...prev,
+              items: pricedItems,
+              fetchedAt: Date.now(),
+            };
+          });
+        })
+        .catch(() => {
+          // keep unpriced quantities visible
+        });
+    } catch (e) {
+      setHydrationOnchain((p) => ({
+        ...p,
+        loading: false,
+        err: String(e?.message || e || "Failed to load Hydration balances"),
+      }));
+    } finally {
+      try { hydrationRefreshRef.current.inFlight = false; } catch { /* ignore */ }
+    }
+  }
+
 
   // ─────────────────────────────────────────────────────────────
   // Auto-load Solana token registry for All Orders whenever either:
@@ -1447,6 +2105,11 @@ async function refreshSolanaOnchainBalances() {
       // Instead we use the on-chain RPC-backed endpoint via /api/solana_dex/balances.
       if (isSolanaVenue) {
         await refreshSolanaOnchainBalances();
+        return;
+      }
+
+      if (isPolkadotHydrationVenue) {
+        await refreshHydrationOnchainBalances();
         return;
       }
 
@@ -2913,8 +3576,13 @@ async function refreshSolanaOnchainBalances() {
   async function runRefreshBalances(venueMaybe) {
     const ven = String(venueMaybe || "").trim();
     // For Solana venues, skip CEX balances refresh (it 422s) and refresh on-chain balances instead.
-    if (String(ven || venue || "").toLowerCase().startsWith("solana")) {
+    const runVenLower = String(ven || venue || "").toLowerCase();
+    if (runVenLower.startsWith("solana")) {
       await refreshSolanaOnchainBalances();
+      return;
+    }
+    if (runVenLower === "polkadot_hydration" || runVenLower === "hydration" || runVenLower.includes("hydration")) {
+      await refreshHydrationOnchainBalances();
       return;
     }
 
@@ -4634,10 +5302,26 @@ function parsePctInput(v) {
   return Number.isFinite(n) ? clamp(n, 0, 100) : 0;
 }
 
+function isHydrationConfirmedSwap(o) {
+  const source = String(o?.source ?? "").trim().toUpperCase();
+  const venue = String(o?.venue ?? "").trim().toLowerCase();
+  const type = String(o?.type ?? o?.order_type ?? o?.orderType ?? "").trim().toLowerCase();
+  const status = normalizeStatusLower(o?.status ?? o?.order_status ?? o?.state ?? "");
+
+  return (
+    source === "SWAP" &&
+    venue === "polkadot_hydration" &&
+    type === "swap" &&
+    status === "confirmed"
+  );
+}
+
 function isFilledSellOrder(o) {
   const sideRaw = o?.side ?? o?.order_side ?? o?.orderSide ?? "";
   const side = String(sideRaw || "").trim().toLowerCase();
   if (side !== "sell") return false;
+
+  if (isHydrationConfirmedSwap(o)) return true;
 
   const stLower = normalizeStatusLower(pickOrderStatus(o));
   const kind = classifyStatusKind(stLower, "");
@@ -4705,7 +5389,7 @@ const pushFillToastFromOrder = useCallback(
     ].filter(Boolean);
 
     pushFillToast({
-      title: "Order filled",
+      title: isHydrationConfirmedSwap(o) ? "Swap confirmed" : "Order filled",
       lines,
       kind: side === "sell" ? "sell" : side === "buy" ? "buy" : "info",
     });
@@ -4896,6 +5580,7 @@ function renderFillToasts() {
   }
 
   function isFilledOrder(o) {
+    if (isHydrationConfirmedSwap(o)) return true;
     const stLower = normalizeStatusLower(o?.status ?? o?.order_status ?? o?.state ?? "");
     const kind = classifyStatusKind(stLower, "");
     return kind === "filled";
@@ -5005,6 +5690,7 @@ function renderFillToasts() {
 
   function renderBalances() {
     const row = { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" };
+    const balancesBusy = !!loadingBalances || !!balancesRefreshingLocal || (isSolanaVenue && !!solanaOnchain.loading) || (isPolkadotHydrationVenue && !!hydrationOnchain.loading);
 
     return (
       <>
@@ -5014,14 +5700,14 @@ function renderFillToasts() {
                     <button
             data-no-drag="1"
             style={
-              btn?.(loadingBalances || balancesRefreshingLocal) ??
-              smallBtn(loadingBalances || balancesRefreshingLocal)
+              btn?.(balancesBusy) ??
+              smallBtn(balancesBusy)
             }
-            disabled={!!loadingBalances || !!balancesRefreshingLocal}
+            disabled={balancesBusy}
             onClick={() => safeRefreshBalancesFromUI()}
             title="Refresh balances and USD valuations"
           >
-            {(loadingBalances || balancesRefreshingLocal) ? "Refreshing…" : "Refresh"}
+            {balancesBusy ? "Refreshing…" : "Refresh"}
           </button>
 
           <label data-no-drag="1" style={sx.pill} title="Hide balances table view">
@@ -5062,13 +5748,23 @@ function renderFillToasts() {
               ${
                 hideTableDataGlobal
                   ? "••••"
-                  : isSolanaVenue
+                  : venue === ALL_VENUES_VALUE
+                    ? portfolioTotalUsdAllVenues === null || portfolioTotalUsdAllVenues === undefined
+                      ? portfolioTotalUsd === null
+                        ? "—"
+                        : fmtUsd?.(portfolioTotalUsd)
+                      : fmtUsd?.(portfolioTotalUsdAllVenues)
+                    : isSolanaVenue
                       ? solanaPortfolioTotalUsd === null
                         ? "—"
                         : fmtUsd?.(solanaPortfolioTotalUsd)
-                      : portfolioTotalUsd === null
-                        ? "—"
-                        : fmtUsd?.(portfolioTotalUsd)
+                      : isPolkadotHydrationVenue
+                        ? hydrationPortfolioTotalUsd === null
+                          ? "—"
+                          : fmtUsd?.(hydrationPortfolioTotalUsd)
+                        : portfolioTotalUsd === null
+                          ? "—"
+                          : fmtUsd?.(portfolioTotalUsd)
               }
             </b>
           </div>
@@ -5150,7 +5846,28 @@ function renderFillToasts() {
 
                   <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.px_usd === null ? "—" : fmtPxUsd?.(b.px_usd)}</td>
                   <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.total_usd === null ? "—" : fmtUsd?.(b.total_usd)}</td>
-                  <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.usd_source_symbol || "—"}</td>
+                  <td
+                    style={{
+                      ...sx.td,
+                      width: 220,
+                      maxWidth: 220,
+                      minWidth: 120,
+                    }}
+                    title={hideTableDataGlobal ? "" : String(b.usd_source_symbol || "—")}
+                  >
+                    <span
+                      style={{
+                        display: "inline-block",
+                        maxWidth: "100%",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                        verticalAlign: "bottom",
+                      }}
+                    >
+                      {hideTableDataGlobal ? "••••" : b.usd_source_symbol || "—"}
+                    </span>
+                  </td>
                 </tr>
               ))}
 
@@ -5158,7 +5875,7 @@ function renderFillToasts() {
                 <tr>
                   <td style={sx.td} colSpan={balancesColSpan || 7}>
                     <span style={sx.muted}>
-                      {loadingBalances
+                      {balancesBusy
                         ? "Loading…"
                         : (balancesSymbolQuery || "").trim()
                         ? "No balances match that symbol filter."
@@ -5227,6 +5944,82 @@ function renderFillToasts() {
                       <tr>
                         <td style={sx.td} colSpan={3}>
                           <span style={sx.muted}>{solanaOnchain.loading ? "Loading…" : "No on-chain balances loaded."}</span>
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+        )}
+
+        {isPolkadotHydrationVenue && (
+          <div style={{ marginTop: 12, borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: 10 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <div style={{ fontWeight: 800 }}>On-chain (Hydration)</div>
+              <span style={{ ...sx.muted, fontSize: 12 }}>Source: Wallet Addresses → Hydration RPC</span>
+              <button
+                data-no-drag="1"
+                style={btn?.(hydrationOnchain.loading) ?? smallBtn(hydrationOnchain.loading)}
+                disabled={hydrationOnchain.loading}
+                onClick={() => refreshHydrationOnchainBalances()}
+              >
+                {hydrationOnchain.loading ? "Loading…" : hydrationOnchain.address ? "Refresh on-chain" : "Load Hydration wallet"}
+              </button>
+
+              <button
+                data-no-drag="1"
+                style={btn?.(false) ?? smallBtn(false)}
+                onClick={() => setShowHydrationOnchainDetails((v) => !v)}
+              >
+                {showHydrationOnchainDetails ? "Hide details" : "Show details"}
+              </button>
+
+              {hydrationOnchain.address && (
+                <span style={{ ...sx.muted, fontSize: 12 }} title={hydrationOnchain.address}>
+                  {shortenMiddle(hydrationOnchain.address, 7, 5)}
+                </span>
+              )}
+
+              {hydrationOnchain.source && (
+                <span style={{ ...sx.muted, fontSize: 12 }}>
+                  {hideTableDataGlobal ? "••••" : hydrationOnchain.source}
+                </span>
+              )}
+
+              {hydrationOnchain.err && <span style={{ ...sx.badge, background: "rgba(255,80,80,0.18)" }}>{hydrationOnchain.err}</span>}
+            </div>
+
+            {showHydrationOnchainDetails ? (
+              <div style={{ marginTop: 8 }}>
+                <table style={{ ...sx.table, fontSize: 13 }}>
+                  <thead>
+                    <tr>
+                      <th style={sx.th}>Asset</th>
+                      <th style={sx.th}>Asset ID</th>
+                      <th style={sx.thRight}>Available</th>
+                      <th style={sx.thRight}>Hold</th>
+                      <th style={sx.thRight}>Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(hydrationOnchain.items || [])
+                      .filter((it) => (hideZeroBalances ? Number(it?.total || 0) !== 0 : true))
+                      .map((it, idx) => (
+                        <tr key={it.asset_id || it.symbol || it.asset || idx}>
+                          <td style={sx.td}>{it.symbol || it.asset || "—"}</td>
+                          <td style={sx.td}>{hideTableDataGlobal ? "••••" : (it.asset_id || "—")}</td>
+                          <td style={sx.tdRight}>{hideTableDataGlobal ? "••••" : fmtBal(it.available)}</td>
+                          <td style={sx.tdRight}>{hideTableDataGlobal ? "••••" : fmtBal(it.hold)}</td>
+                          <td style={sx.tdRight}>{hideTableDataGlobal ? "••••" : fmtBal(it.total)}</td>
+                        </tr>
+                      ))}
+
+                    {(hydrationOnchain.items || []).length === 0 && (
+                      <tr>
+                        <td style={sx.td} colSpan={5}>
+                          <span style={sx.muted}>{hydrationOnchain.loading ? "Loading…" : "No Hydration balances loaded. Add a Hydration wallet in Wallet Addresses, then click Load Hydration wallet."}</span>
                         </td>
                       </tr>
                     )}

@@ -1,0 +1,13 @@
+{
+  "name": "utt-backend-js-helpers",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "hydration:quote": "node app/services/hydration_quote.mjs"
+  },
+  "dependencies": {
+    "@galacticcouncil/sdk-next": "^1.0.1",
+    "polkadot-api": "^2.1.0"
+  }
+}

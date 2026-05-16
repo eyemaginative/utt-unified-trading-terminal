@@ -1,5 +1,6 @@
 // frontend/src/components/AppHeader.jsx
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ArbChip from "../ArbChip";
 import TopGainersWindow from "../features/scanners/TopGainersWindow";
 import uttBanner from "../assets/utt-banner.jpg";
@@ -57,6 +58,15 @@ const LS_DONATE_HIDE_ADDRS_KEY = "utt_donate_hide_addrs_v1";
 // Header media player (user-local)
 const LS_MEDIA_URL_KEY = "utt_header_media_url_v1";
 const LS_MEDIA_VOL_KEY = "utt_header_media_vol_v1";
+
+// Header total portfolio privacy toggle (independent from Hide table data)
+const LS_HEADER_PORTFOLIO_HIDE_KEY = "utt_header_portfolio_total_hidden_v1";
+
+const BUY_UTTT_ROUTES = Object.freeze([
+  { key: "solana-usdc", label: "Solana / USDC", venue: "solana_jupiter", symbol: "UTTT-USDC", note: "Buy UTTT with USDC on Solana/Jupiter" },
+  { key: "solana-sol", label: "Solana / SOL", venue: "solana_jupiter", symbol: "UTTT-SOL", note: "Buy UTTT with SOL on Solana/Jupiter" },
+  { key: "hydration-hdx", label: "Hydration / HDX", venue: "polkadot_hydration", symbol: "UTTT-HDX", note: "Buy UTTT with HDX on Polkadot-Hydration" },
+]);
 
 // Optional auth UI (local-only unless wired to backend)
 const LS_AUTH_TOKEN_KEY = "utt_auth_token_v1";
@@ -1117,6 +1127,7 @@ function ToolChip({
   onClick,
   showStatus = true,
   showSubLabel = true,
+  minWidth,
 }) {
   const base = {
     display: "inline-flex",
@@ -1131,7 +1142,9 @@ function ToolChip({
     color: "inherit",
     cursor: "pointer",
     userSelect: "none",
-    minWidth: 140,
+    minWidth: minWidth ?? (showStatus || showSubLabel ? 124 : 104),
+    maxWidth: 164,
+    flexShrink: 1,
   };
 
   const open = {
@@ -1144,14 +1157,864 @@ function ToolChip({
 	  return (
 	    <button type="button" onClick={onClick} style={isOpen ? open : base} title={`${title} window`}>
 	      <div style={{ display: "flex", alignItems: "baseline", gap: 8, lineHeight: 1.1 }}>
-	        <span style={{ fontWeight: 800, fontSize: 13 }}>{title}</span>
+	        <span style={{ fontWeight: 800, fontSize: 13, whiteSpace: "nowrap" }}>{title}</span>
 	        {showStatus ? (
 	          <span style={{ fontSize: 11, opacity: 0.75 }}>{isOpen ? "Open" : "Closed"}</span>
 	        ) : null}
 	      </div>
-	      {showSubLabel ? <div style={{ fontSize: 11, opacity: 0.75 }}>{subLabel || "—"}</div> : null}
+	      {showSubLabel ? <div style={{ fontSize: 11, opacity: 0.75, maxWidth: "100%", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{subLabel || "—"}</div> : null}
 	    </button>
 	  );
+}
+
+
+// ---------------------------
+// UTTT Solana ↔ Hydration spread chip
+// ---------------------------
+const SPREAD_CACHE_KEY = "utt_cross_chain_spread_uttt_v1";
+
+function spreadTrimApiBase(base) {
+  return String(base || "").replace(/\/+$/, "");
+}
+
+function spreadNum(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function spreadFmtUsd(v, max = 8) {
+  const n = spreadNum(v);
+  if (n === null) return "—";
+  if (n === 0) return "$0";
+  if (Math.abs(n) < 0.0001) return `$${n.toFixed(max)}`;
+  if (Math.abs(n) < 1) return `$${n.toFixed(6)}`;
+  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 4 })}`;
+}
+
+function spreadFmtPct(v) {
+  const n = spreadNum(v);
+  if (n === null) return "—";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(2)}%`;
+}
+
+function spreadReadCache() {
+  try {
+    const raw = localStorage.getItem(SPREAD_CACHE_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function spreadWriteCache(v) {
+  try {
+    localStorage.setItem(SPREAD_CACHE_KEY, JSON.stringify(v || {}));
+  } catch {
+    // ignore
+  }
+}
+
+function spreadIsBlockedGenericHydrationOrderbookPath(path) {
+  try {
+    const u = new URL(String(path || ""), "http://utt.local");
+    if (!u.pathname.includes("/api/polkadot_dex/hydration/orderbook")) return false;
+    const sym = String(u.searchParams.get("symbol") || "").trim().toUpperCase();
+    const routeMode = String(u.searchParams.get("route_mode") || "").trim().toLowerCase();
+    // Spread / Bridge may use only the safe UTTT-HDX manual/live route here.
+    // Generic Hydration USD pairs are owned by /hydration/prices.
+    return !(sym === "UTTT-HDX" && routeMode === "manual_xyk");
+  } catch {
+    return false;
+  }
+}
+
+async function spreadFetchJson(base, path, signal, ttlMs = 2500) {
+  if (spreadIsBlockedGenericHydrationOrderbookPath(path)) {
+    return {
+      ok: false,
+      error: "blocked_generic_hydration_orderbook_frontend",
+      message: "AppHeader Spread / Bridge blocked a generic Hydration orderbook pricing call. Use /api/polkadot_dex/hydration/prices for USD pricing; only UTTT-HDX manual_xyk is allowed here.",
+    };
+  }
+  const root = spreadTrimApiBase(base);
+  const url = `${root}${path}`;
+  return await sharedFetchJSON(url, { signal, ttlMs });
+}
+
+function spreadFirstLevelPrice(levels) {
+  const arr = Array.isArray(levels) ? levels : [];
+  for (const lvl of arr) {
+    const px = Array.isArray(lvl)
+      ? spreadNum(lvl?.[0] ?? lvl?.price)
+      : spreadNum(lvl?.price ?? lvl?.px ?? lvl?.rate ?? lvl?.limit ?? lvl?.p);
+    if (px !== null && px > 0) return px;
+  }
+  return null;
+}
+
+function spreadOrderbookMid(data) {
+  const direct = spreadNum(
+    data?.mid ??
+      data?.midPrice ??
+      data?.mid_price ??
+      data?.price ??
+      data?.markPrice ??
+      data?.mark_price ??
+      data?.spotPrice ??
+      data?.spot_price ??
+      data?.pool?.spotPrice ??
+      data?.pool?.spot_price
+  );
+  if (direct !== null && direct > 0) return direct;
+
+  const bid = spreadNum(data?.bestBid ?? data?.best_bid ?? data?.bid ?? data?.bids?.[0]?.price) ?? spreadFirstLevelPrice(data?.bids);
+  const ask = spreadNum(data?.bestAsk ?? data?.best_ask ?? data?.ask ?? data?.asks?.[0]?.price) ?? spreadFirstLevelPrice(data?.asks);
+  if (bid !== null && ask !== null && bid > 0 && ask > 0) return (bid + ask) / 2;
+  if (bid !== null && bid > 0) return bid;
+  if (ask !== null && ask > 0) return ask;
+  return null;
+}
+
+function spreadPriceFromJupiterResponse(data, id) {
+  const key = String(id || "").trim();
+  const maps = [data?.items, data?.data, data?.prices, data?.results, data && typeof data === "object" ? data : null];
+  for (const m of maps) {
+    if (!m || typeof m !== "object") continue;
+    const entry = m?.[key] || m?.[key.toLowerCase?.() || key];
+    const val = spreadNum(
+      typeof entry === "object"
+        ? entry?.price ?? entry?.priceUsd ?? entry?.usdPrice ?? entry?.usd_price ?? entry?.value ?? entry?.usd
+        : entry
+    );
+    if (val !== null && val > 0) return val;
+  }
+  return null;
+}
+
+async function spreadResolveSolanaUtttMint(base, signal) {
+  try {
+    const r = await spreadFetchJson(base, "/api/solana_dex/resolve?asset=UTTT", signal, 10_000);
+    const mint = String(r?.mint || r?.address || r?.token || r?.tokenMint || "").trim();
+    if (mint) return mint;
+  } catch {
+    // fall through
+  }
+
+  const urls = ["/api/token_registry?chain=solana", "/api/token_registry?network=solana", "/api/token_registry"];
+  for (const u of urls) {
+    try {
+      const data = await spreadFetchJson(base, u, signal, 10_000);
+      const items = Array.isArray(data) ? data : data?.items || data?.mappings || data?.tokens || [];
+      for (const it of items || []) {
+        const sym = String(it?.symbol || it?.asset || it?.ticker || "").trim().toUpperCase();
+        const venue = String(it?.venue || it?.venue_override || it?.venueOverride || "").trim().toLowerCase();
+        const chain = String(it?.chain || it?.network || "").trim().toLowerCase();
+        if (sym !== "UTTT") continue;
+        if (venue && !venue.startsWith("solana")) continue;
+        if (chain && chain !== "solana") continue;
+        const mint = String(it?.mint || it?.address || it?.mint_address || it?.mintAddress || it?.addr || "").trim();
+        if (mint) return mint;
+      }
+    } catch {
+      // keep trying
+    }
+  }
+  return "";
+}
+
+async function spreadFetchSolanaUtttUsd(base, signal) {
+  const mint = await spreadResolveSolanaUtttMint(base, signal);
+  if (!mint) return { price: null, source: "solana:missing-mint", mint: "" };
+  try {
+    const data = await spreadFetchJson(base, `/api/solana_dex/jupiter/prices?ids=${encodeURIComponent(mint)}`, signal, 5000);
+    const price = spreadPriceFromJupiterResponse(data, mint);
+    return { price, source: price ? "solana:jupiter" : "solana:jupiter:no-price", mint };
+  } catch (e) {
+    return { price: null, source: "solana:jupiter:error", mint, error: String(e?.message || e) };
+  }
+}
+
+async function spreadFetchHydrationMid(base, symbol, signal) {
+  const sym = String(symbol || "").trim().toUpperCase();
+  // Spread/Bridge only needs the safe manual UTTT-HDX pool route here. Do not
+  // use this helper for generic Hydration USD pairs while SDK router quotes are
+  // disabled.
+  if (sym !== "UTTT-HDX") return { mid: null, data: null, skipped: "non-manual-hydration-pair" };
+  try {
+    const data = await spreadFetchJson(
+      base,
+      `/api/polkadot_dex/hydration/orderbook?symbol=${encodeURIComponent(sym)}&depth=5&route_mode=manual_xyk`,
+      signal,
+      5000
+    );
+    if (data?.ok === false) return { mid: null, data };
+    return { mid: spreadOrderbookMid(data), data };
+  } catch (e) {
+    return { mid: null, data: null, error: String(e?.message || e) };
+  }
+}
+
+
+async function spreadFetchHydrationUsdPrices(base, signal, refresh = true) {
+  const suffix = refresh ? "&refresh=true" : "";
+  try {
+    const data = await spreadFetchJson(
+      base,
+      `/api/polkadot_dex/hydration/prices?assets=HDX,DOT,USDT,UTTT,HOLLAR${suffix}`,
+      signal,
+      9000
+    );
+    const rawPrices = data?.prices_usd || data?.usd_prices || data?.prices || data?.priceMap || data?.price_map || {};
+    const rawSources = data?.priceSources || data?.price_sources || data?.sources || {};
+    const prices = {};
+    const sources = {};
+    for (const [k, v] of Object.entries(rawPrices || {})) {
+      const sym = String(k || "").trim().toUpperCase();
+      const px = spreadNum(v && typeof v === "object" ? (v.px_usd ?? v.usd_price ?? v.priceUsd ?? v.usdPrice ?? v.price ?? v.usd) : v);
+      if (sym && px !== null && px > 0) {
+        prices[sym] = px;
+        sources[sym] = rawSources?.[sym] || rawSources?.[k] || data?.status || "hydration:price-cache";
+      }
+    }
+    return { prices, sources, data };
+  } catch (e) {
+    return { prices: {}, sources: {}, data: null, error: String(e?.message || e) };
+  }
+}
+
+async function spreadFetchHydrationUtttUsd(base, signal) {
+  // Do not call generic Hydration orderbook pairs such as HDX-USDT here.
+  // The backend /hydration/prices endpoint owns controlled SDK pricing with TTL/backoff guards.
+  const priceData = await spreadFetchHydrationUsdPrices(base, signal, true);
+  const hdxUsd = spreadNum(priceData?.prices?.HDX);
+  const cachedUtttUsd = spreadNum(priceData?.prices?.UTTT);
+  const hdxSource = priceData?.sources?.HDX || "hydration:price-cache:HDX";
+
+  const utttHdx = await spreadFetchHydrationMid(base, "UTTT-HDX", signal);
+  const utttHdxPx = utttHdx.mid;
+  const derivedUtttUsd = hdxUsd > 0 && utttHdxPx > 0 ? utttHdxPx * hdxUsd : null;
+  const price = cachedUtttUsd > 0 ? cachedUtttUsd : derivedUtttUsd;
+
+  const pool = utttHdx.data?.pool || utttHdx.data?.meta?.pool || {};
+  const baseReserve = spreadNum(pool?.baseReserve ?? pool?.base_reserve ?? pool?.base?.reserve ?? pool?.reserves?.base);
+  const quoteReserve = spreadNum(pool?.quoteReserve ?? pool?.quote_reserve ?? pool?.quote?.reserve ?? pool?.reserves?.quote);
+  const poolSource = String(pool?.source || utttHdx.data?.source || "").trim();
+  const poolAccount = String(pool?.poolAccount || pool?.pool_account || pool?.account || "").trim();
+  const tvlUsd = price > 0 && hdxUsd > 0 && baseReserve !== null && quoteReserve !== null
+    ? baseReserve * price + quoteReserve * hdxUsd
+    : null;
+
+  return {
+    price,
+    source: price ? (priceData?.sources?.UTTT || "hydration:UTTT-HDX×HDX-USD") : "hydration:missing-price",
+    hdxUsd,
+    hdxSource,
+    utttHdx: utttHdxPx,
+    priceCacheStatus: priceData?.data?.status || null,
+    priceCacheError: priceData?.error || priceData?.data?.cache?.last_error || null,
+    poolSource,
+    poolAccount,
+    baseReserve,
+    quoteReserve,
+    tvlUsd,
+  };
+}
+
+async function spreadFetchSnapshot(apiBase, signal) {
+  const [sol, hyd] = await Promise.all([
+    spreadFetchSolanaUtttUsd(apiBase, signal),
+    spreadFetchHydrationUtttUsd(apiBase, signal),
+  ]);
+
+  const solPrice = spreadNum(sol?.price);
+  const hydPrice = spreadNum(hyd?.price);
+  const spreadPct = solPrice > 0 && hydPrice > 0 ? ((hydPrice - solPrice) / solPrice) * 100 : null;
+  const absSpreadUsd = solPrice !== null && hydPrice !== null ? hydPrice - solPrice : null;
+  const lowTvl = hyd?.tvlUsd !== null && hyd?.tvlUsd !== undefined ? Number(hyd.tvlUsd) < 10_000 : false;
+
+  return {
+    ok: solPrice > 0 && hydPrice > 0,
+    sol,
+    hyd,
+    solPrice,
+    hydPrice,
+    spreadPct,
+    absSpreadUsd,
+    lowTvl,
+    at: new Date().toISOString(),
+  };
+}
+
+function UtttSpreadChip({ apiBase, hideTableData = false }) {
+  const cached = useMemo(() => (typeof window === "undefined" ? null : spreadReadCache()), []);
+  const [open, setOpen] = useState(false);
+  const [snap, setSnap] = useState(() => cached || null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const abortRef = useRef(null);
+
+  const refresh = async () => {
+    const base = spreadTrimApiBase(apiBase);
+    if (!base || busy) return;
+    try {
+      abortRef.current?.abort?.();
+    } catch {
+      // ignore
+    }
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(true);
+    setErr("");
+    try {
+      const next = await spreadFetchSnapshot(base, controller.signal);
+      setSnap(next);
+      spreadWriteCache(next);
+      if (!next?.ok) setErr("Spread unavailable until both Solana and Hydration prices resolve.");
+    } catch (e) {
+      if (controller.signal?.aborted) return;
+      setErr(String(e?.message || e || "Spread refresh failed"));
+    } finally {
+      if (!controller.signal?.aborted) setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    refresh();
+    const timer = setInterval(() => refresh(), 60_000);
+    return () => {
+      clearInterval(timer);
+      try { abortRef.current?.abort?.(); } catch { /* ignore */ }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiBase]);
+
+  const sub = hideTableData
+    ? "••••"
+    : busy && !snap
+      ? "loading…"
+      : snap?.spreadPct !== null && snap?.spreadPct !== undefined
+        ? `Hyd-Sol ${spreadFmtPct(snap.spreadPct)}`
+        : "Sol ↔ Hydration";
+
+  const rowStyle = { display: "grid", gridTemplateColumns: "150px 1fr", gap: 10, alignItems: "baseline", fontSize: 12, lineHeight: 1.45 };
+  const labelStyle = { opacity: 0.68 };
+  const valueStyle = { fontWeight: 800, fontVariantNumeric: "tabular-nums" };
+
+  return (
+    <div style={{ position: "relative", display: "inline-block" }}>
+      <ToolChip
+        title="UTTT Spread"
+        subLabel={sub}
+        isOpen={open}
+        onClick={() => setOpen((v) => !v)}
+        showStatus={true}
+        showSubLabel={true}
+        minWidth={150}
+      />
+      {open ? (
+        <div
+          style={{
+            position: "absolute",
+            top: "calc(100% + 8px)",
+            left: 0,
+            width: 390,
+            zIndex: 90,
+            padding: 12,
+            borderRadius: 14,
+            border: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.14))",
+            background: "var(--utt-hdr-bg, rgba(10,14,20,0.96))",
+            color: "var(--utt-hdr-fg, #e8eef8)",
+            boxShadow: "0 18px 50px rgba(0,0,0,0.45)",
+            maxHeight: "min(78vh, 620px)",
+            overflowY: "auto",
+            overscrollBehavior: "contain",
+            paddingRight: 10,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10 }}>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 900 }}>UTTT Solana ↔ Hydration Spread</div>
+              <div style={{ fontSize: 11, opacity: 0.68 }}>Hydration price minus Solana price</div>
+            </div>
+            <button type="button" onClick={refresh} disabled={busy} style={donateSmallBtnStyle}>
+              {busy ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div style={{ display: "grid", gap: 6 }}>
+            <div style={rowStyle}><span style={labelStyle}>Solana UTTT/USD</span><span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(snap?.solPrice)}</span></div>
+            <div style={rowStyle}><span style={labelStyle}>Hydration implied</span><span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(snap?.hydPrice)}</span></div>
+            <div style={rowStyle}><span style={labelStyle}>Spread</span><span style={valueStyle}>{hideTableData ? "••••" : spreadFmtPct(snap?.spreadPct)}</span></div>
+            <div style={rowStyle}><span style={labelStyle}>Abs spread</span><span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(snap?.absSpreadUsd, 10)}</span></div>
+            <div style={rowStyle}><span style={labelStyle}>HDX/USD source</span><span>{snap?.hyd?.hdxSource || "—"}</span></div>
+            <div style={rowStyle}><span style={labelStyle}>Hydration route</span><span>{snap?.hyd?.source || "—"}</span></div>
+            <div style={rowStyle}><span style={labelStyle}>Pool TVL</span><span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(snap?.hyd?.tvlUsd, 4)}</span></div>
+            <div style={rowStyle}><span style={labelStyle}>Liquidity</span><span style={{ ...valueStyle, color: snap?.lowTvl ? "var(--utt-warn, #f7b955)" : "var(--utt-good, #55e38c)" }}>{snap?.lowTvl ? "LOW" : snap?.hyd?.tvlUsd ? "OK" : "—"}</span></div>
+            <div style={rowStyle}><span style={labelStyle}>Last refresh</span><span>{snap?.at ? new Date(snap.at).toLocaleTimeString() : "—"}</span></div>
+          </div>
+
+          {snap?.lowTvl ? (
+            <div style={{ marginTop: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(247,185,85,0.35)", background: "rgba(247,185,85,0.10)", fontSize: 12 }}>
+              Low-liquidity isolated pool. SDK spot quotes may be unavailable below the Hydration threshold, but UTT manual XYK routing can still estimate/trade.
+            </div>
+          ) : null}
+
+          {err ? (
+            <div style={{ marginTop: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(255,107,107,0.35)", background: "rgba(255,107,107,0.10)", fontSize: 12 }}>
+              {err}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+
+}
+
+// ---------------------------
+// Bridge / transfer dashboard chip (planning-only)
+// ---------------------------
+const BRIDGE_DASH_CACHE_KEY = "utt_bridge_transfer_dashboard_v1";
+const BRIDGE_DASH_POS_KEY = "utt_bridge_transfer_dashboard_pos_v1";
+
+function bridgeReadPanelPos() {
+  try {
+    const raw = localStorage.getItem(BRIDGE_DASH_POS_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    const x = Number(v?.x);
+    const y = Number(v?.y);
+    const w = Number(v?.w);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return { x, y, w: Number.isFinite(w) && w > 0 ? w : 620 };
+  } catch {
+    return null;
+  }
+}
+
+function bridgeWritePanelPos(v) {
+  try {
+    if (!v || typeof v !== "object") return;
+    localStorage.setItem(BRIDGE_DASH_POS_KEY, JSON.stringify({ x: v.x, y: v.y, w: v.w }));
+  } catch {
+    // ignore
+  }
+}
+
+function bridgeShortAddress(v, left = 6, right = 5) {
+  const s = String(v || "").trim();
+  if (!s) return "—";
+  if (s.length <= left + right + 3) return s;
+  return `${s.slice(0, left)}…${s.slice(-right)}`;
+}
+
+function bridgeReadDraft() {
+  try {
+    const raw = localStorage.getItem(BRIDGE_DASH_CACHE_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function bridgeWriteDraft(v) {
+  try {
+    localStorage.setItem(BRIDGE_DASH_CACHE_KEY, JSON.stringify(v || {}));
+  } catch {
+    // ignore
+  }
+}
+
+async function bridgeFetchWalletAddresses(base, signal) {
+  const tryUrls = [
+    "/api/wallet_addresses?limit=500",
+    "/api/wallet_addresses?asset=&network=&limit=500",
+  ];
+
+  for (const u of tryUrls) {
+    try {
+      const data = await spreadFetchJson(base, u, signal, 10_000);
+      const items = Array.isArray(data)
+        ? data
+        : data?.items || data?.rows || data?.wallet_addresses || data?.addresses || data?.data || [];
+      if (Array.isArray(items)) return items;
+    } catch {
+      // try next shape
+    }
+  }
+  return [];
+}
+
+function bridgeIsHydrationAddressRow(row) {
+  const venue = String(row?.venue || row?.wallet_id || row?.walletId || row?.source || "").trim().toLowerCase();
+  const network = String(row?.network || row?.chain || row?.chain_id || row?.chainId || "").trim().toLowerCase();
+  return venue === "polkadot_hydration" || venue === "hydration" || network === "hydration";
+}
+
+function bridgeIsSolanaAddressRow(row) {
+  const venue = String(row?.venue || row?.wallet_id || row?.walletId || row?.source || "").trim().toLowerCase();
+  const network = String(row?.network || row?.chain || row?.chain_id || row?.chainId || "").trim().toLowerCase();
+  return venue.startsWith("solana") || network === "solana";
+}
+
+function bridgePickAddress(rows, kind) {
+  const arr = Array.isArray(rows) ? rows : [];
+  const matches = arr.filter((row) => (kind === "hydration" ? bridgeIsHydrationAddressRow(row) : bridgeIsSolanaAddressRow(row)));
+  const preferred = matches.find((row) => String(row?.asset || row?.symbol || "").trim().toUpperCase() === "ALL") || matches[0];
+  const address = String(preferred?.address || preferred?.wallet_address || preferred?.pubkey || preferred?.owner || "").trim();
+  return {
+    row: preferred || null,
+    address,
+    label: String(preferred?.label || preferred?.name || "").trim(),
+    count: matches.length,
+  };
+}
+
+function BridgeTransferChip({ apiBase, hideTableData = false }) {
+  const draft = useMemo(() => (typeof window === "undefined" ? null : bridgeReadDraft()), []);
+  const [open, setOpen] = useState(false);
+  const [direction, setDirection] = useState(() => draft?.direction || "sol_to_hyd");
+  const [asset, setAsset] = useState(() => draft?.asset || "UTTT");
+  const [amount, setAmount] = useState(() => draft?.amount || "");
+  const [snap, setSnap] = useState(null);
+  const [addresses, setAddresses] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const abortRef = useRef(null);
+  const chipRef = useRef(null);
+  const panelRef = useRef(null);
+  const dragRef = useRef(null);
+  const [panelPos, setPanelPos] = useState(() => (typeof window === "undefined" ? null : bridgeReadPanelPos()));
+
+  useEffect(() => {
+    bridgeWriteDraft({ direction, asset, amount });
+  }, [direction, asset, amount]);
+
+  const refresh = async () => {
+    const base = spreadTrimApiBase(apiBase);
+    if (!base || busy) return;
+    try {
+      abortRef.current?.abort?.();
+    } catch {
+      // ignore
+    }
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(true);
+    setErr("");
+    try {
+      const [nextSnap, rows] = await Promise.all([
+        spreadFetchSnapshot(base, controller.signal).catch((e) => ({ ok: false, error: String(e?.message || e) })),
+        bridgeFetchWalletAddresses(base, controller.signal),
+      ]);
+      setSnap(nextSnap);
+      setAddresses(rows);
+      if (nextSnap?.error) setErr(nextSnap.error);
+    } catch (e) {
+      if (controller.signal?.aborted) return;
+      setErr(String(e?.message || e || "Bridge dashboard refresh failed"));
+    } finally {
+      if (!controller.signal?.aborted) setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return undefined;
+    refresh();
+    return () => {
+      try { abortRef.current?.abort?.(); } catch { /* ignore */ }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, apiBase]);
+
+  const bridgeClampPanelPos = (next) => {
+    if (typeof window === "undefined") return next || { x: POP_MARGIN, y: 120, w: 620 };
+    const vw = Math.max(320, window.innerWidth || 0);
+    const vh = Math.max(320, window.innerHeight || 0);
+    const w = clamp(Number(next?.w) || 620, 360, Math.max(360, vw - POP_MARGIN * 2));
+    const maxX = Math.max(POP_MARGIN, vw - w - POP_MARGIN);
+    const maxY = Math.max(POP_MARGIN, vh - 80);
+    return {
+      x: clamp(Number(next?.x) || POP_MARGIN, POP_MARGIN, maxX),
+      y: clamp(Number(next?.y) || 120, POP_MARGIN, maxY),
+      w,
+    };
+  };
+
+  const placeBridgeNearChip = () => {
+    if (typeof window === "undefined") return;
+    const btn = chipRef.current;
+    const vw = Math.max(320, window.innerWidth || 0);
+    const w = Math.min(620, Math.max(360, vw - POP_MARGIN * 2));
+    const rect = btn?.getBoundingClientRect?.();
+    const x = rect ? rect.left : POP_MARGIN;
+    const y = rect ? rect.bottom + 10 : 120;
+    setPanelPos((prev) => {
+      const next = bridgeClampPanelPos({ x, y, w: prev?.w || w });
+      bridgeWritePanelPos(next);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!open) return undefined;
+    if (!panelPos) placeBridgeNearChip();
+
+    const onResize = () => {
+      setPanelPos((prev) => {
+        const next = bridgeClampPanelPos(prev || bridgeReadPanelPos() || { x: POP_MARGIN, y: 120, w: 620 });
+        bridgeWritePanelPos(next);
+        return next;
+      });
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+
+    window.addEventListener("resize", onResize);
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      document.removeEventListener("keydown", onKey, true);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, panelPos]);
+
+  const startBridgeDrag = (e) => {
+    if (e.button !== 0) return;
+    const t = e.target;
+    const interactive = t?.closest?.("button, a, input, select, textarea, label");
+    if (interactive) return;
+
+    const current = panelPos || bridgeClampPanelPos(bridgeReadPanelPos() || { x: POP_MARGIN, y: 120, w: 620 });
+    dragRef.current = { mx: e.clientX, my: e.clientY, x: current.x, y: current.y, w: current.w };
+
+    const prevUserSelect = document.body.style.userSelect;
+    const prevCursor = document.body.style.cursor;
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "grabbing";
+
+    const onMove = (ev) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const next = bridgeClampPanelPos({ x: d.x + ev.clientX - d.mx, y: d.y + ev.clientY - d.my, w: d.w });
+      setPanelPos(next);
+    };
+
+    const onUp = () => {
+      const d = dragRef.current;
+      dragRef.current = null;
+      document.body.style.userSelect = prevUserSelect;
+      document.body.style.cursor = prevCursor;
+      setPanelPos((prev) => {
+        const next = bridgeClampPanelPos(prev || d || { x: POP_MARGIN, y: 120, w: 620 });
+        bridgeWritePanelPos(next);
+        return next;
+      });
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("mouseup", onUp, true);
+    };
+
+    window.addEventListener("mousemove", onMove, true);
+    window.addEventListener("mouseup", onUp, true);
+  };
+
+  const solWallet = useMemo(() => bridgePickAddress(addresses, "solana"), [addresses]);
+  const hydWallet = useMemo(() => bridgePickAddress(addresses, "hydration"), [addresses]);
+  const source = direction === "sol_to_hyd" ? solWallet : hydWallet;
+  const dest = direction === "sol_to_hyd" ? hydWallet : solWallet;
+  const sourceLabel = direction === "sol_to_hyd" ? "Solana" : "Hydration";
+  const destLabel = direction === "sol_to_hyd" ? "Hydration" : "Solana";
+  const qty = spreadNum(amount);
+  const solUsd = snap?.solPrice;
+  const hydUsd = snap?.hydPrice;
+  const sourcePx = direction === "sol_to_hyd" ? solUsd : hydUsd;
+  const destPx = direction === "sol_to_hyd" ? hydUsd : solUsd;
+  const sourceValue = qty !== null && sourcePx > 0 ? qty * sourcePx : null;
+  const destValue = qty !== null && destPx > 0 ? qty * destPx : null;
+  const hasBothAddresses = !!source?.address && !!dest?.address;
+  const sub = hideTableData
+    ? "••••"
+    : snap?.spreadPct !== null && snap?.spreadPct !== undefined
+      ? `Hyd-Sol ${spreadFmtPct(snap.spreadPct)}`
+      : hasBothAddresses
+        ? `${sourceLabel} → ${destLabel}`
+        : "Sol ↔ Hydration";
+
+  const rowStyle = { display: "grid", gridTemplateColumns: "150px 1fr", gap: 10, alignItems: "baseline", fontSize: 12, lineHeight: 1.45 };
+  const labelStyle = { opacity: 0.68 };
+  const valueStyle = { fontWeight: 800, fontVariantNumeric: "tabular-nums" };
+  const inputStyle = {
+    width: "100%",
+    padding: "8px 9px",
+    borderRadius: 10,
+    border: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.14))",
+    background: "rgba(0,0,0,0.42)",
+    color: "var(--utt-hdr-fg, #e8eef8)",
+    fontWeight: 800,
+    outline: "none",
+    colorScheme: "dark",
+  };
+  const optionStyle = {
+    background: "var(--utt-hdr-bg, #0d1117)",
+    color: "var(--utt-hdr-fg, #e8eef8)",
+  };
+
+  return (
+    <div ref={chipRef} style={{ position: "relative", display: "inline-block" }}>
+      <ToolChip
+        title="Spread / Bridge"
+        subLabel={sub}
+        isOpen={open}
+        onClick={() => setOpen((v) => !v)}
+        showStatus={true}
+        showSubLabel={true}
+        minWidth={150}
+      />
+      {open ? (
+        <div
+          ref={panelRef}
+          style={{
+            position: "fixed",
+            top: panelPos?.y ?? 120,
+            left: panelPos?.x ?? POP_MARGIN,
+            width: panelPos?.w ?? 620,
+            maxWidth: "calc(100vw - 16px)",
+            maxHeight: "min(680px, calc(100vh - 32px))",
+            zIndex: 9999,
+            padding: 0,
+            borderRadius: 14,
+            border: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.14))",
+            background: "var(--utt-hdr-bg, rgba(10,14,20,0.98))",
+            color: "var(--utt-hdr-fg, #e8eef8)",
+            boxShadow: "0 18px 50px rgba(0,0,0,0.55)",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            onMouseDown={startBridgeDrag}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              padding: "10px 12px",
+              borderBottom: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.12))",
+              cursor: "grab",
+              userSelect: "none",
+            }}
+            title="Drag to move"
+          >
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 900 }}>Spread / Bridge Dashboard</div>
+              <div style={{ fontSize: 11, opacity: 0.68 }}>Unified cross-chain spread context plus transfer planning — no automated bridge execution is wired yet.</div>
+            </div>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <button type="button" onClick={refresh} disabled={busy} style={donateSmallBtnStyle}>
+                {busy ? "Refreshing…" : "Refresh"}
+              </button>
+              <button type="button" onClick={() => setOpen(false)} style={donateSmallBtnStyle}>
+                Close
+              </button>
+            </div>
+          </div>
+
+          <div
+            style={{
+              padding: 12,
+              maxHeight: "calc(min(680px, calc(100vh - 32px)) - 58px)",
+              overflowY: "auto",
+              overflowX: "hidden",
+              overscrollBehavior: "contain",
+              scrollbarWidth: "thin",
+            }}
+          >
+            <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 8, marginBottom: 10 }}>
+              <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                Direction
+                <select value={direction} onChange={(e) => setDirection(e.target.value)} style={inputStyle}>
+                  <option value="sol_to_hyd" style={optionStyle}>Solana → Hydration</option>
+                  <option value="hyd_to_sol" style={optionStyle}>Hydration → Solana</option>
+                </select>
+              </label>
+              <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                Asset
+                <select value={asset} onChange={(e) => setAsset(e.target.value)} style={inputStyle}>
+                  <option value="UTTT" style={optionStyle}>UTTT</option>
+                </select>
+              </label>
+            </div>
+
+            <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88, marginBottom: 10 }}>
+              Amount
+              <input
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                placeholder="optional planning amount"
+                inputMode="decimal"
+                style={inputStyle}
+              />
+            </label>
+
+            <div style={{ display: "grid", gap: 6 }}>
+              <div style={rowStyle}>
+                <span style={labelStyle}>Source</span>
+                <span style={valueStyle}>{sourceLabel} · {hideTableData ? "••••" : bridgeShortAddress(source?.address)} {source?.label ? `· ${source.label}` : ""}</span>
+              </div>
+              <div style={rowStyle}>
+                <span style={labelStyle}>Destination</span>
+                <span style={valueStyle}>{destLabel} · {hideTableData ? "••••" : bridgeShortAddress(dest?.address)} {dest?.label ? `· ${dest.label}` : ""}</span>
+              </div>
+              <div style={rowStyle}>
+                <span style={labelStyle}>Source UTTT/USD</span>
+                <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(sourcePx)}</span>
+              </div>
+              <div style={rowStyle}>
+                <span style={labelStyle}>Destination UTTT/USD</span>
+                <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(destPx)}</span>
+              </div>
+              <div style={rowStyle}>
+                <span style={labelStyle}>Spread</span>
+                <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtPct(snap?.spreadPct)}</span>
+              </div>
+              <div style={rowStyle}>
+                <span style={labelStyle}>Source value</span>
+                <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(sourceValue)}</span>
+              </div>
+              <div style={rowStyle}>
+                <span style={labelStyle}>Destination value</span>
+                <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(destValue)}</span>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(247,185,85,0.35)", background: "rgba(247,185,85,0.10)", fontSize: 12 }}>
+              Execution is intentionally disabled here. Next backend work should choose the mechanism: treasury-mediated burn/mint, lock/release, XCM-style transfer, or external bridge integration.
+            </div>
+
+            <div style={{ marginTop: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(255,255,255,0.04)", fontSize: 12 }}>
+              <div style={{ fontWeight: 900, marginBottom: 6 }}>Readiness checklist</div>
+              <div>• Source wallet registered: {source?.address ? "yes" : "missing"}</div>
+              <div>• Destination wallet registered: {dest?.address ? "yes" : "missing"}</div>
+              <div>• UTTT price context: {snap?.ok ? "ready" : "partial"}</div>
+              <div>• Transfer execution: not wired</div>
+            </div>
+
+            {err ? (
+              <div style={{ marginTop: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(255,107,107,0.35)", background: "rgba(255,107,107,0.10)", fontSize: 12 }}>
+                {err}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 // ---------------------------
@@ -1433,6 +2296,26 @@ addDexAccount,
     if (typeof window === "undefined") return {};
     return readCustomThemeFromStorage();
   });
+  const [hideHeaderPortfolioTotal, setHideHeaderPortfolioTotal] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return localStorage.getItem(LS_HEADER_PORTFOLIO_HIDE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleHeaderPortfolioTotalHidden = () => {
+    setHideHeaderPortfolioTotal((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(LS_HEADER_PORTFOLIO_HIDE_KEY, next ? "1" : "0");
+      } catch {
+        // ignore localStorage failures
+      }
+      return next;
+    });
+  };
 
   const [banner, setBanner] = useState(() => {
     if (typeof window === "undefined") return null;
@@ -2341,11 +3224,61 @@ addDexAccount,
 
   const [buyHover, setBuyHover] = useState(false);
   const [buyDown, setBuyDown] = useState(false);
+  const [buyUtttOpen, setBuyUtttOpen] = useState(false);
+  const buyUtttBtnRef = useRef(null);
+  const buyUtttMenuRef = useRef(null);
+  const [buyUtttMenuPos, setBuyUtttMenuPos] = useState(null);
   const [airHover, setAirHover] = useState(false);
   const [airDown, setAirDown] = useState(false);
 
   const authBtnRef = useRef(null);
   const authPopRef = useRef(null);
+
+  const placeBuyUtttMenuNearButton = () => {
+    if (typeof window === "undefined") return;
+    const btn = buyUtttBtnRef.current;
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
+    const margin = 10;
+    const gap = 8;
+    const vw = Math.max(320, window.innerWidth || 0);
+    const vh = Math.max(320, window.innerHeight || 0);
+    const w = Math.min(280, vw - margin * 2);
+    const estimatedH = 210;
+    const desiredX = rect.right - w;
+    let desiredY = rect.bottom + gap;
+    if (desiredY + estimatedH > vh - margin && rect.top - estimatedH - gap > margin) {
+      desiredY = rect.top - estimatedH - gap;
+    }
+    setBuyUtttMenuPos({
+      x: clamp(desiredX, margin, Math.max(margin, vw - w - margin)),
+      y: clamp(desiredY, margin, Math.max(margin, vh - margin - 60)),
+      w,
+    });
+  };
+
+  useEffect(() => {
+    if (!buyUtttOpen || typeof document === "undefined") return undefined;
+    placeBuyUtttMenuNearButton();
+    const onPointerDown = (ev) => {
+      try {
+        if (buyUtttMenuRef.current && buyUtttMenuRef.current.contains(ev.target)) return;
+        if (buyUtttBtnRef.current && buyUtttBtnRef.current.contains(ev.target)) return;
+      } catch {
+        // ignore
+      }
+      setBuyUtttOpen(false);
+    };
+    const onLayout = () => placeBuyUtttMenuNearButton();
+    document.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("resize", onLayout, true);
+    window.addEventListener("scroll", onLayout, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("resize", onLayout, true);
+      window.removeEventListener("scroll", onLayout, true);
+    };
+  }, [buyUtttOpen]);
 
   // Venue enable/disable manager (UI-local overrides)
   const [venueMgrOpen, setVenueMgrOpen] = useState(false);
@@ -2479,7 +3412,7 @@ addDexAccount,
     display: "flex",
     alignItems: "center",
     justifyContent: "flex-end",
-    gap: 10,
+    gap: 8,
     flexWrap: "wrap",
   };
 
@@ -4316,6 +5249,55 @@ const autoFitBanner = async () => {
     };
   }, [tgPos]);
 
+  const applyBuyUtttRoute = (route) => {
+    const targetVenue = String(route?.venue || "").trim();
+    const targetSymbol = String(route?.symbol || "").trim().toUpperCase();
+    if (!targetVenue || !targetSymbol) return;
+
+    try {
+      setVenue?.(targetVenue);
+      setApplyMarketToTab?.(true);
+
+      const runApply = () => {
+        try {
+          setMarketInput?.(targetSymbol);
+          applyMarketSymbol?.(targetSymbol);
+        } catch {
+          // ignore
+        }
+      };
+
+      // The venue switch can trigger a later state sync that restores the
+      // previous market. Re-assert the chosen BUY UTTT route across settled
+      // UI ticks so the explicit target wins.
+      const scheduleApply = (delayMs) => {
+        window.setTimeout(() => {
+          if (typeof window.requestAnimationFrame === "function") {
+            window.requestAnimationFrame(runApply);
+          } else {
+            runApply();
+          }
+        }, delayMs);
+      };
+
+      window.clearTimeout(window.__utt_buy_apply_to_0);
+      window.clearTimeout(window.__utt_buy_apply_to_1);
+      window.clearTimeout(window.__utt_buy_apply_to_2);
+
+      runApply();
+      window.__utt_buy_apply_to_0 = window.setTimeout(() => scheduleApply(0), 40);
+      window.__utt_buy_apply_to_1 = window.setTimeout(() => scheduleApply(0), 140);
+      window.__utt_buy_apply_to_2 = window.setTimeout(() => scheduleApply(0), 320);
+
+      setBuyUtttOpen(false);
+      setBuyUtttMsg(`BUY UTTT ready: ${targetVenue} • ${targetSymbol}`);
+    } catch {
+      setBuyUtttMsg("BUY UTTT shortcut failed to initialize.");
+    }
+    window.clearTimeout(window.__utt_buy_msg_to);
+    window.__utt_buy_msg_to = window.setTimeout(() => setBuyUtttMsg(""), 4000);
+  };
+
   return (
     <div ref={headerRef} style={headerStyles.headerWrap}>
       <div style={{ margin: "4px 0 8px 0", position: "relative" }}>
@@ -4568,71 +5550,88 @@ const autoFitBanner = async () => {
 
 
 
-            <button
-              type="button"
-              style={{
-                ...buyUtttBtnStyle,
-                ...(buyHover ? buyUtttBtnHoverStyle : null),
-                ...(buyDown ? buyUtttBtnActiveStyle : null),
-              }}
-              onMouseEnter={() => setBuyHover(true)}
-              onMouseLeave={() => {
-                setBuyHover(false);
-                setBuyDown(false);
-              }}
-              onMouseDown={() => setBuyDown(true)}
-              onMouseUp={() => setBuyDown(false)}
-              onClick={() => {
-                try {
-                  const targetVenue = "solana_jupiter";
-                  const targetSymbol = "UTTT-USDC";
-                  setVenue?.(targetVenue);
-                  setApplyMarketToTab?.(true);
+            <div style={{ position: "relative", display: "inline-flex" }}>
+              <button
+                type="button"
+                style={{
+                  ...buyUtttBtnStyle,
+                  ...(buyHover ? buyUtttBtnHoverStyle : null),
+                  ...(buyDown ? buyUtttBtnActiveStyle : null),
+                }}
+                onMouseEnter={() => setBuyHover(true)}
+                onMouseLeave={() => {
+                  setBuyHover(false);
+                  setBuyDown(false);
+                }}
+                onMouseDown={() => setBuyDown(true)}
+                onMouseUp={() => setBuyDown(false)}
+                ref={buyUtttBtnRef}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const next = !buyUtttOpen;
+                  setBuyUtttOpen(next);
+                  if (next) setTimeout(() => placeBuyUtttMenuNearButton(), 0);
+                }}
+                title="Choose a UTTT buy route: Solana/Jupiter or Polkadot-Hydration"
+                aria-label="Buy UTTT"
+                aria-expanded={buyUtttOpen ? "true" : "false"}
+              >
+                <BuyUtttIcon size={14} />
+                <span>BUY UTTT</span>
+              </button>
 
-                  const runApply = () => {
-                    try {
-                      setMarketInput?.(targetSymbol);
-                      applyMarketSymbol?.(targetSymbol);
-                    } catch {
-                      // ignore
-                    }
-                  };
-
-                  // The venue switch appears to trigger a later state sync that can restore the
-                  // previous market. Re-assert the intended market a few times across the next
-                  // settled UI ticks so the explicit BUY UTTT target wins.
-                  const scheduleApply = (delayMs) => {
-                    window.setTimeout(() => {
-                      if (typeof window.requestAnimationFrame === "function") {
-                        window.requestAnimationFrame(runApply);
-                      } else {
-                        runApply();
-                      }
-                    }, delayMs);
-                  };
-
-                  window.clearTimeout(window.__utt_buy_apply_to_0);
-                  window.clearTimeout(window.__utt_buy_apply_to_1);
-                  window.clearTimeout(window.__utt_buy_apply_to_2);
-
-                  runApply();
-                  window.__utt_buy_apply_to_0 = window.setTimeout(() => scheduleApply(0), 40);
-                  window.__utt_buy_apply_to_1 = window.setTimeout(() => scheduleApply(0), 140);
-                  window.__utt_buy_apply_to_2 = window.setTimeout(() => scheduleApply(0), 320);
-
-                  setBuyUtttMsg(`BUY UTTT ready: ${targetVenue} • ${targetSymbol}`);
-                } catch {
-                  setBuyUtttMsg("BUY UTTT shortcut failed to initialize.");
-                }
-                window.clearTimeout(window.__utt_buy_msg_to);
-                window.__utt_buy_msg_to = window.setTimeout(() => setBuyUtttMsg(""), 4000);
-              }}
-              title="Buy UTTT via Solana/Jupiter using UTTT-USDC"
-              aria-label="Buy UTTT"
-            >
-              <BuyUtttIcon size={14} />
-              <span>BUY UTTT</span>
-            </button>
+              {buyUtttOpen && typeof document !== "undefined" ? createPortal(
+                <div
+                  ref={buyUtttMenuRef}
+                  style={{
+                    position: "fixed",
+                    left: buyUtttMenuPos?.x ?? 10,
+                    top: buyUtttMenuPos?.y ?? 120,
+                    zIndex: 50000,
+                    width: buyUtttMenuPos?.w ?? 280,
+                    maxWidth: "calc(100vw - 20px)",
+                    padding: 8,
+                    borderRadius: 12,
+                    border: "1px solid var(--utt-hdr-border, rgba(255,255,255,0.14))",
+                    background: "var(--utt-hdr-pop-bg, #090d14)",
+                    color: "var(--utt-hdr-fg, #e8eef8)",
+                    boxShadow: "0 18px 44px rgba(0,0,0,0.72), 0 0 0 1px rgba(78,240,255,0.08) inset",
+                  }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                >
+                  <div style={{ fontSize: 11, opacity: 0.72, margin: "2px 6px 8px" }}>
+                    Choose route
+                  </div>
+                  {BUY_UTTT_ROUTES.map((route) => (
+                    <button
+                      key={route.key}
+                      type="button"
+                      style={{
+                        width: "100%",
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "flex-start",
+                        gap: 3,
+                        padding: "9px 10px",
+                        borderRadius: 10,
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        background: "rgba(255,255,255,0.035)",
+                        color: "inherit",
+                        cursor: "pointer",
+                        textAlign: "left",
+                        marginTop: 6,
+                      }}
+                      onClick={() => applyBuyUtttRoute(route)}
+                      title={route.note}
+                    >
+                      <span style={{ fontSize: 12, fontWeight: 900 }}>{route.label}</span>
+                      <span style={{ fontSize: 11, opacity: 0.72 }}>{route.venue} • {route.symbol}</span>
+                    </button>
+                  ))}
+                </div>,
+                document.body
+              ) : null}
+            </div>
 
             <button
               type="button"
@@ -6047,8 +7046,28 @@ const autoFitBanner = async () => {
             )}
           </button>
 
-          <div style={{ ...headerStyles.mutedSmall, fontSize: 12, whiteSpace: "nowrap" }}>
-            Total Portfolio (All Venues): <b>${headerAllVenuesTotalText}</b>
+          <div
+            style={{ ...headerStyles.mutedSmall, fontSize: 12, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 6 }}
+            title={hideHeaderPortfolioTotal ? "Total Portfolio is hidden by the header privacy toggle." : "Total Portfolio is visible. This toggle is independent from Hide table data."}
+          >
+            <span>
+              Total Portfolio (All Venues): <b>${hideHeaderPortfolioTotal ? "••••" : headerAllVenuesTotalText}</b>
+            </span>
+            <button
+              type="button"
+              style={{
+                ...btnHeader(false),
+                padding: "3px 7px",
+                fontSize: 11,
+                lineHeight: 1.2,
+                minHeight: 0,
+              }}
+              onClick={toggleHeaderPortfolioTotalHidden}
+              title={hideHeaderPortfolioTotal ? "Show Total Portfolio balance" : "Hide Total Portfolio balance"}
+              aria-label={hideHeaderPortfolioTotal ? "Show Total Portfolio balance" : "Hide Total Portfolio balance"}
+            >
+              {hideHeaderPortfolioTotal ? "Show" : "Hide"}
+            </button>
           </div>
 
           <div style={{ ...headerStyles.mutedSmall, fontSize: 12 }}>
@@ -6074,6 +7093,8 @@ const autoFitBanner = async () => {
           chipVariant="tooltab"
           chipTitle="Arbitrage"
         />
+
+        <BridgeTransferChip apiBase={API_BASE} hideTableData={hideTableDataGlobal} />
 
         <div style={{ position: "relative" }}>
           <span ref={tgBtnRef} style={{ display: "inline-block" }}>
@@ -6124,6 +7145,7 @@ const autoFitBanner = async () => {
 	            subLabel={isLedger ? null : isWalletAddresses ? (hideTableDataGlobal ? "••••" : "On-chain") : "—"}
 	            showStatus={!isLedger}
 	            showSubLabel={!isLedger}
+	            minWidth={isLedger ? 104 : undefined}
 	            isOpen={!!w.isOpen || !!w.open}
 	            onClick={() => toggleToolWindow?.(w.id)}
 	          />

@@ -10,7 +10,7 @@ At a high level, UTT provides one place to:
 - submit and track orders across venues
 - monitor scanners, discovery tools, and wallet activity
 - work with local ledger and tax-related state
-- integrate Solana DEX routing and wallet-based execution alongside traditional exchange adapters
+- integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
 
 ---
 
@@ -18,7 +18,7 @@ At a high level, UTT provides one place to:
 
 UTT is a desktop-style browser application today, but architecturally it functions as a local trading workstation:
 
-- **Backend:** FastAPI application providing venue adapters, market/order routes, auth/profile endpoints, wallet and ledger tooling, and Solana DEX routing
+- **Backend:** FastAPI application providing venue adapters, market/order routes, auth/profile endpoints, wallet and ledger tooling, Solana DEX routing, and Polkadot / Hydration routing
 - **Frontend:** React interface providing a modular multi-window trading terminal UI
 - **Storage / local state:** local database and runtime state kept outside of public source control
 - **Secrets model:** local or external environment loading for runtime config, plus profile-managed encrypted credential storage for exchange API keys
@@ -55,6 +55,26 @@ Current architecture in this repository includes support for:
 - Solana wallet-aware order ticket behavior
 - wallet selection and wallet-manager integration in the frontend
 - token resolution, mint lookup, token registry support, and balance helpers
+
+### Polkadot / Hydration DEX workflow
+
+UTT includes a Polkadot / Hydration integration path focused on routing UTTT-HDX activity through the same terminal workflow as CEX and Solana DEX activity.
+
+Current architecture in this repository includes support for:
+
+- **Polkadot-Hydration** venue routing
+- Hydration RPC access through profile-managed API keys
+- Token Registry-managed Hydration asset metadata
+- Token Registry-managed external price metadata
+- Hydration Route Registry support for manual/live pool routes
+- UTTT-HDX manual XYK orderbook generation from live pool reserves
+- Hydration order-ticket execution plumbing for UTTT-HDX
+- Hydration balances in terminal tables and wallet-address views
+- external USD price enrichment for HDX and DOT
+- UTTT/USD derivation from UTTT-HDX live route pricing and HDX/USD
+- Hydration swap recording into the unified all-orders flow through `swap_orders`
+
+The pre-push safe path avoids generic Hydration SDK quote polling for pricing. Broad SDK router quotes are disabled by default while the UTTT-HDX route uses registry-backed manual/live pool metadata. Future SDK work should use a persistent stateful Hydration SDK cache/service rather than per-pair or per-refresh polling.
 
 ### Operator UI / terminal behavior
 
@@ -202,6 +222,10 @@ The exact state of each venue may evolve over time, but the repository currently
 - Solana DEX flows
   - Jupiter
   - Raydium
+- Polkadot / Hydration DEX flows
+  - Hydration UTTT-HDX manual/live route
+  - Token Registry asset and price metadata
+  - Route Registry live pool reserves
 
 Supporting routes and tooling also include:
 
@@ -248,6 +272,7 @@ Recommended baseline:
 - **Node.js 18+** and npm
 - Windows PowerShell for the Windows-oriented commands below
 - a local Solana wallet extension if using Solana DEX features
+- a Polkadot/Substrate wallet extension such as SubWallet if using Polkadot / Hydration flows
 - venue access and any required API credentials for the venues you plan to test
 
 ### 1) Clone the repository
@@ -275,6 +300,37 @@ UTT_ENV_PATH=C:\path\to\your\private\backend.env
 
 The private `backend.env` file lives outside the repo and contains local-only runtime configuration.
 
+For Polkadot / Hydration work, keep the real RPC/API key out of the repository. The recommended pattern is to save the Dwellir/Hydration key through **Profile → API Keys** using the Hydration venue key, while the private env keeps only non-secret runtime toggles and templates.
+
+A safe local Hydration configuration uses placeholder/template values such as:
+
+```env
+UTT_HYDRATION_RPC_PROVIDER=dwellir
+UTT_HYDRATION_RPC_URL_TEMPLATE=https://api-hydration.n.dwellir.com/{api_key}
+UTT_HYDRATION_WS_URL_TEMPLATE=wss://api-hydration.n.dwellir.com/{api_key}
+UTT_HYDRATION_RPC_URL=
+
+UTT_HYDRATION_ENABLE_ROUTER_QUOTES=0
+UTT_HYDRATION_ENABLE_SWAP_TX=1
+UTT_HYDRATION_ENABLE_EXACT_BUY=1
+
+UTT_HYDRATION_ENABLE_MANUAL_POOL_FALLBACK=1
+UTT_HYDRATION_MANUAL_POOL_LIVE_RESERVES=1
+
+UTT_HYDRATION_ENABLE_EXTERNAL_USD_PRICES=1
+UTT_HYDRATION_EXTERNAL_USD_PRICE_SOURCE=coingecko
+UTT_HYDRATION_ENABLE_SDK_PRICE_CACHE=1
+UTT_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK=0
+UTT_HYDRATION_PRICE_CACHE_TTL_S=300
+UTT_HYDRATION_PRICE_CACHE_ERROR_BACKOFF_S=600
+UTT_HYDRATION_EXTERNAL_USD_PRICE_TIMEOUT_S=5
+
+UTT_HYDRATION_HELPER_STEP_TIMEOUT_S=30
+```
+
+Hydration asset IDs, decimals, external price IDs, and route/pool metadata are intended to be managed through the Token Registry and Route Registry rather than hardcoded into tracked env files.
+
+
 ### 3) Create and activate a backend virtual environment
 
 ```powershell
@@ -292,6 +348,15 @@ pip install -r requirements.txt
 ```
 
 If the repo uses `pyproject.toml`, install according to that project file instead.
+
+The Hydration helper services also use Node-based backend dependencies. From the `backend` directory, install the backend JS helper dependencies when using Polkadot / Hydration features:
+
+```powershell
+npm install
+```
+
+These dependencies support helper-side Hydration tooling such as `hydration_quote.mjs` and `hydration_sidecar.mjs`.
+
 
 ### 5) Start the backend
 
@@ -413,6 +478,64 @@ A route succeeding in one wallet and failing in another does not necessarily ind
 
 ---
 
+## Polkadot / Hydration DEX notes
+
+The Polkadot / Hydration side of UTT is designed as an opt-in DEX venue path. It is intended to coexist with CEX and Solana DEX workflows without enabling broad SDK quote polling by default.
+
+### Current flow areas in the codebase
+
+- `polkadot_hydration` venue selection
+- Hydration chain/RPC diagnostics
+- Hydration balance retrieval
+- Token Registry-based Hydration asset resolution
+- Token Registry-based external price metadata
+- Route Registry-based UTTT-HDX pool metadata
+- live UTTT-HDX reserve lookup
+- manual XYK pseudo-orderbook construction
+- Hydration order-ticket pre-trade checks and execution path
+- Hydration swap recording into `swap_orders`
+- All Orders reflection for confirmed Hydration swaps
+- Spread / Bridge dashboard pricing based on Solana UTTT/USD versus Hydration-derived UTTT/USD
+
+### Token Registry requirements
+
+Hydration assets should be configured through Token Registry rows rather than tracked env JSON. For example:
+
+```text
+HDX    hydration native   decimals 12   price source coingecko   price id hydradx
+DOT    hydration 5        decimals 10   price source coingecko   price id polkadot
+USDT   hydration 10       decimals 6    price source stable      price id stable
+UTTT   hydration 1001331  decimals 6    price source derived     price id UTTT-HDX*HDX-USD
+```
+
+### Route Registry requirements
+
+The UTTT-HDX route should be configured through the Hydration Route Registry with the route type, fee bps, and live pool account metadata. The intended safe path is:
+
+```text
+UTTT-HDX manual/live route
+→ live pool reserves
+→ manual XYK pseudo-orderbook
+→ order ticket execution
+→ record_submit
+→ swap_orders
+→ All Orders
+```
+
+### Pricing model
+
+The pre-push stable pricing path uses:
+
+```text
+HDX/USD  = external price source from Token Registry
+DOT/USD  = external price source from Token Registry
+USDT/USD = stable
+UTTT/HDX = UTTT-HDX live route
+UTTT/USD = UTTT/HDX × HDX/USD
+```
+
+Generic Hydration SDK router quotes are disabled by default for the public-safe configuration. If revisited later, SDK pricing should be implemented as a persistent stateful SDK cache/service, not as repeated per-pair UI-driven polling.
+
 ## Auth, profile, and local credential handling
 
 The codebase includes auth, profile, and local credential-management work. In practical terms, that means UTT is intended to be an operator workstation, not just a stateless public dashboard.
@@ -435,7 +558,9 @@ The repository includes token-registry-related backend and frontend work. This s
 - symbol and mint resolution
 - display-friendly token labeling
 - registry-managed token metadata
+- registry-managed external price source and price ID metadata
 - Solana token tooling inside the operator UI
+- Hydration asset ID, decimals, and external price metadata
 
 There is also wallet-address handling in the backend, which supports broader local wallet and workflow integration.
 
@@ -451,6 +576,7 @@ Current work includes:
 
 - venue-aware order book display
 - pseudo-orderbook behavior for DEX routes
+- manual/live Hydration UTTT-HDX orderbook generation
 - right-lane terminal tile integration
 
 ### Order ticket
@@ -506,6 +632,19 @@ Check:
 - whether that address has the required input token balance
 - whether that address has the required token account for the mint being used
 - which router is selected (Metis, Ultra, or Raydium)
+
+### Hydration balances or UTTT-HDX orderbook do not load
+
+Check:
+
+- the Dwellir/Hydration key is saved through **Profile → API Keys**
+- Hydration Token Registry rows exist for HDX, DOT, USDT, and UTTT
+- HDX and DOT have valid external price IDs
+- the UTTT-HDX Route Registry row has live pool-account metadata
+- broad router quotes are disabled unless intentionally debugging SDK behavior
+- backend logs are not showing generic Hydration orderbook calls for pricing pairs such as `HDX-USDT`, `DOT-USDT`, or `UTTT-USDT`
+
+The normal safe-path pricing flow should use `/api/polkadot_dex/hydration/prices` and the UTTT-HDX manual/live route, not generic Hydration orderbook requests for USD pricing.
 
 ### UI layout looks wrong
 
@@ -570,6 +709,7 @@ UTT is an actively evolving trading terminal codebase with ongoing work across:
 
 - UI and layout refinement
 - Solana wallet and router integration
+- Polkadot / Hydration UTTT-HDX routing
 - registry and tool windows
 - auth, profile, and API-key handling
 - venue adapter coverage

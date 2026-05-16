@@ -13,6 +13,7 @@
     "@jup-ag/wallet-adapter": "^0.2.6",
     "@solana/web3.js": "^1.98.4",
     "axios": "^1.13.2",
+    "polkadot-api": "^2.1.1",
     "qrcode": "^1.5.4",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

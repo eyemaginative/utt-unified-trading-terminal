@@ -15,6 +15,9 @@ function getAuthToken() {
 
 const LS_OT_SOL_WALLET = "utt_ot_sol_wallet_v1";
 const LS_OT_SOL_ROUTER = "utt_ot_sol_router_v1";
+const LS_OT_DOT_WALLET = "utt_ot_dot_wallet_v1";
+const LS_OT_HYDRATION_ROUTE = "utt_ot_hydration_route_mode_v1";
+const POLKADOT_APP_NAME = "UTT Unified Trading Terminal";
 
 function getPreferredSolanaWalletKey() {
   try { return localStorage.getItem(LS_OT_SOL_WALLET) || "solflare"; } catch { return "solflare"; }
@@ -36,6 +39,594 @@ function setPreferredSolanaRouterMode(v) {
     const next = String(v || "auto").toLowerCase().trim();
     localStorage.setItem(LS_OT_SOL_ROUTER, next === "ultra" || next === "metis" || next === "raydium" ? next : "auto");
   } catch {}
+}
+
+function normalizeHydrationRouteMode(v) {
+  const raw = String(v || "auto").toLowerCase().trim();
+  if (raw === "managed" || raw === "managed_sdk" || raw === "sdk_router" || raw === "sidecar") return "sdk";
+  if (raw === "isolated" || raw === "helper") return "isolated_helper";
+  if (raw === "manual" || raw === "xyk") return "manual_xyk";
+  return raw === "sdk" || raw === "isolated_helper" || raw === "manual_xyk" ? raw : "auto";
+}
+
+function getPreferredHydrationRouteMode() {
+  try { return normalizeHydrationRouteMode(localStorage.getItem(LS_OT_HYDRATION_ROUTE) || "auto"); } catch { return "auto"; }
+}
+function setPreferredHydrationRouteMode(v) {
+  try { localStorage.setItem(LS_OT_HYDRATION_ROUTE, normalizeHydrationRouteMode(v)); } catch {}
+}
+function hydrationRouteModeLabel(v) {
+  const mode = normalizeHydrationRouteMode(v);
+  if (mode === "sdk") return "SDK";
+  if (mode === "isolated_helper") return "Isolated";
+  if (mode === "manual_xyk") return "Manual XYK";
+  return "Auto";
+}
+
+const HYDRATION_LOW_TVL_USD = 10000;
+
+function firstFiniteNumber(...values) {
+  for (const v of values) {
+    if (v === null || v === undefined || v === "") continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function formatUsdCompact(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  if (Math.abs(n) >= 1000) return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+  if (Math.abs(n) >= 1) return `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 4 })}`;
+}
+
+function buildHydrationLowLiquidityWarning(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const pool = (p.pool && typeof p.pool === "object") ? p.pool : p;
+  const routerText = String(p.router || p.routeModeEffective || p.route_mode_effective || pool.router || "").toLowerCase();
+  const sourceText = String(pool.source || p.source || "").toLowerCase();
+  const tvlUsd = firstFiniteNumber(
+    pool.tvlUsd,
+    pool.tvl_usd,
+    pool.liquidityUsd,
+    pool.liquidity_usd,
+    pool.totalUsd,
+    pool.total_usd,
+    p.tvlUsd,
+    p.tvl_usd,
+    p.liquidityUsd,
+    p.liquidity_usd
+  );
+  const explicitLow =
+    pool.lowLiquidity === true ||
+    pool.low_liquidity === true ||
+    p.lowLiquidity === true ||
+    p.low_liquidity === true;
+  const manualOrIsolated =
+    sourceText.includes("live_pool_account") ||
+    sourceText.includes("route_registry") ||
+    sourceText.includes("manual") ||
+    sourceText.includes("isolated") ||
+    routerText.includes("manual_xyk") ||
+    routerText.includes("fallback") ||
+    routerText.includes("isolated");
+  const belowThreshold = tvlUsd !== null && tvlUsd < HYDRATION_LOW_TVL_USD;
+  if (!explicitLow && !belowThreshold && !manualOrIsolated) return null;
+  const label = belowThreshold
+    ? `Low TVL ${formatUsdCompact(tvlUsd)} < $10k`
+    : "Low-liquidity isolated pool";
+  return {
+    label,
+    tvlUsd,
+    thresholdUsd: HYDRATION_LOW_TVL_USD,
+    source: String(pool.source || p.source || "").trim(),
+    manualOrIsolated,
+    belowThreshold,
+    message: belowThreshold
+      ? "Hydration spot quotes may be unavailable below $10k TVL; UTT manual XYK routing can still trade when enabled."
+      : "Manual/live isolated pool: monitor TVL and price impact; Hydration SDK spot quotes may be unavailable below $10k TVL.",
+  };
+}
+
+function isHydrationManualRoutePayload(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const pool = (p.pool && typeof p.pool === "object") ? p.pool : {};
+  const routerText = String(p.router || p.routeModeEffective || p.route_mode_effective || pool.router || "").toLowerCase();
+  const routeModeText = String(p.routeModeEffective || p.route_mode_effective || p.orderbookConfig?.routeModeEffective || p.orderbook_config?.route_mode_effective || "").toLowerCase();
+  const sourceText = String(pool.source || p.source || "").toLowerCase();
+  return (
+    p.manualFallback === true ||
+    p.manual_fallback === true ||
+    routeModeText === "manual_xyk" ||
+    routerText.includes("manual_xyk") ||
+    routerText.includes("manual") ||
+    routerText.includes("fallback") ||
+    sourceText.includes("live_pool_account") ||
+    sourceText.includes("route_registry") ||
+    sourceText.includes("manual")
+  );
+}
+
+function getPreferredPolkadotWalletKey() {
+  try { return localStorage.getItem(LS_OT_DOT_WALLET) || "subwallet-js"; } catch { return "subwallet-js"; }
+}
+function setPreferredPolkadotWalletKey(v) {
+  try { localStorage.setItem(LS_OT_DOT_WALLET, String(v || "subwallet-js")); } catch {}
+}
+
+function normalizePolkadotExtensionKey(keyLike) {
+  try {
+    const s = String(keyLike || "").toLowerCase().trim();
+    if (!s) return null;
+    if (s === "subwallet" || s === "subwallet-js" || s.includes("subwallet")) return "subwallet-js";
+    if (s === "polkadot" || s === "polkadot-js" || s.includes("polkadot")) return "polkadot-js";
+    if (s === "talisman" || s.includes("talisman")) return "talisman";
+    return s;
+  } catch {
+    return null;
+  }
+}
+
+function getPolkadotWalletLabel(keyLike) {
+  const k = normalizePolkadotExtensionKey(keyLike);
+  if (k === "subwallet-js") return "SubWallet";
+  if (k === "talisman") return "Talisman";
+  if (k === "polkadot-js") return "Polkadot.js";
+  return keyLike ? String(keyLike) : "Polkadot Wallet";
+}
+
+const OT_POLKADOT_BALANCE_CACHE_TTL_MS = 2500;
+const OT_POLKADOT_BALANCE_INFLIGHT = new Map();
+const OT_POLKADOT_BALANCE_CACHE = new Map();
+
+function polkadotBalanceCacheKey(apiBase, venue, address) {
+  return [
+    String(apiBase || "").replace(/\/+$/, ""),
+    String(venue || "").toLowerCase().trim(),
+    String(address || "").trim(),
+  ].join("|");
+}
+
+async function fetchPolkadotDexBalancesCached({ apiBase, venue, address, force = false }) {
+  const base = String(apiBase || "").replace(/\/+$/, "");
+  const v = String(venue || "").toLowerCase().trim();
+  const addr = String(address || "").trim();
+  if (!base) throw new Error("apiBase not set");
+  if (!v) throw new Error("Hydration venue missing for balance request.");
+  if (!addr) throw new Error("Connect SubWallet to load Polkadot balances.");
+
+  const key = polkadotBalanceCacheKey(base, v, addr);
+  const now = Date.now();
+  const cached = OT_POLKADOT_BALANCE_CACHE.get(key);
+  if (!force && cached && now - Number(cached.ts || 0) < OT_POLKADOT_BALANCE_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const pending = OT_POLKADOT_BALANCE_INFLIGHT.get(key);
+  if (!force && pending) return pending;
+
+  const promise = (async () => {
+    const url = new URL(`${base}/api/polkadot_dex/balances`);
+    url.searchParams.set("venue", v);
+    url.searchParams.set("address", addr);
+    url.searchParams.set("_ts", String(Date.now()));
+
+    const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(txt || `HTTP ${r.status}`);
+    }
+
+    const data = await r.json();
+    OT_POLKADOT_BALANCE_CACHE.set(key, { ts: Date.now(), data });
+    return data;
+  })();
+
+  OT_POLKADOT_BALANCE_INFLIGHT.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    const cur = OT_POLKADOT_BALANCE_INFLIGHT.get(key);
+    if (cur === promise) OT_POLKADOT_BALANCE_INFLIGHT.delete(key);
+  }
+}
+
+function getInjectedPolkadotWalletOptions() {
+  try {
+    const w = typeof window !== "undefined" ? window : null;
+    const injected = w?.injectedWeb3 && typeof w.injectedWeb3 === "object" ? w.injectedWeb3 : {};
+    const priority = ["subwallet-js", "talisman", "polkadot-js"];
+    const seen = new Set();
+    const out = [];
+
+    for (const key of priority) {
+      if (!injected?.[key]) continue;
+      seen.add(key);
+      out.push({ key, label: getPolkadotWalletLabel(key), installed: true });
+    }
+
+    for (const rawKey of Object.keys(injected || {})) {
+      const key = normalizePolkadotExtensionKey(rawKey) || rawKey;
+      if (seen.has(key)) continue;
+      const ext = injected?.[rawKey];
+      if (!ext || typeof ext.enable !== "function") continue;
+      seen.add(key);
+      out.push({ key: rawKey, label: getPolkadotWalletLabel(rawKey), installed: true });
+    }
+
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+async function connectInjectedPolkadotWallet(preferredKey) {
+  const w = typeof window !== "undefined" ? window : null;
+  const injected = w?.injectedWeb3 && typeof w.injectedWeb3 === "object" ? w.injectedWeb3 : {};
+  const installed = getInjectedPolkadotWalletOptions();
+  const preferred = normalizePolkadotExtensionKey(preferredKey) || "subwallet-js";
+  const selected = installed.find((x) => normalizePolkadotExtensionKey(x?.key) === preferred) || installed[0] || null;
+  const key = selected?.key || preferred;
+  const provider = injected?.[key] || injected?.[preferred];
+
+  if (!provider || typeof provider.enable !== "function") {
+    throw new Error("Install or unlock SubWallet, then refresh/rescan Polkadot wallets.");
+  }
+
+  const extension = await provider.enable(POLKADOT_APP_NAME);
+  const rawAccounts =
+    typeof extension?.accounts?.get === "function"
+      ? await extension.accounts.get()
+      : Array.isArray(extension?.accounts)
+        ? extension.accounts
+        : [];
+
+  const accounts = (Array.isArray(rawAccounts) ? rawAccounts : [])
+    .map((acc) => ({
+      ...acc,
+      address: String(acc?.address || "").trim(),
+      name: String(acc?.meta?.name || acc?.name || "").trim(),
+      source: String(acc?.meta?.source || normalizePolkadotExtensionKey(key) || key || "").trim(),
+    }))
+    .filter((acc) => !!acc.address);
+
+  const sourceKey = normalizePolkadotExtensionKey(key);
+  const account = accounts.find((acc) => normalizePolkadotExtensionKey(acc?.source) === sourceKey) || accounts[0] || null;
+  if (!account?.address) {
+    throw new Error("No Polkadot accounts were shared by the selected wallet.");
+  }
+
+  return {
+    key: sourceKey || key,
+    label: getPolkadotWalletLabel(sourceKey || key),
+    extension,
+    accounts,
+    address: account.address,
+    accountName: account.name || "",
+    source: account.source || sourceKey || key,
+  };
+}
+
+
+const POLKADOT_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const POLKADOT_BASE58_MAP = (() => {
+  const m = new Map();
+  for (let i = 0; i < POLKADOT_BASE58_ALPHABET.length; i += 1) m.set(POLKADOT_BASE58_ALPHABET[i], i);
+  return m;
+})();
+
+function hexToU8a(hexLike) {
+  let h = String(hexLike || "").trim();
+  if (!h) return new Uint8Array();
+  if (h.startsWith("0x")) h = h.slice(2);
+  if (h.length % 2) h = `0${h}`;
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i += 1) out[i] = Number.parseInt(h.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+function u8aToHex(u8a) {
+  try {
+    const arr = u8a instanceof Uint8Array ? u8a : new Uint8Array(u8a || []);
+    return `0x${Array.from(arr).map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+  } catch {
+    return "0x";
+  }
+}
+
+function normalizeHexValue(v) {
+  const s = String(v || "").trim();
+  if (!s) return "";
+  return s.startsWith("0x") ? s : `0x${s}`;
+}
+
+function polkadotBase58DecodeRaw(address) {
+  const s = String(address || "").trim();
+  if (!s) throw new Error("Empty Substrate address.");
+  let n = 0n;
+  for (const ch of s) {
+    const v = POLKADOT_BASE58_MAP.get(ch);
+    if (v == null) throw new Error(`Invalid SS58 address character: ${ch}`);
+    n = n * 58n + BigInt(v);
+  }
+  const bytes = [];
+  while (n > 0n) {
+    bytes.push(Number(n & 0xffn));
+    n >>= 8n;
+  }
+  bytes.reverse();
+  let leading = 0;
+  for (const ch of s) {
+    if (ch === "1") leading += 1;
+    else break;
+  }
+  return new Uint8Array([...new Array(leading).fill(0), ...bytes]);
+}
+
+function ss58PublicKeyFromAddress(address) {
+  const raw = polkadotBase58DecodeRaw(address);
+  if (![35, 36, 37, 38].includes(raw.length)) {
+    throw new Error(`Unsupported SS58 address length: ${raw.length}`);
+  }
+  const prefixLen = raw[0] < 64 ? 1 : 2;
+  const account = raw.slice(prefixLen, prefixLen + 32);
+  if (account.length !== 32) throw new Error("Could not extract 32-byte public key from SS58 address.");
+  return account;
+}
+
+function normalizePolkadotKeyType(rawType) {
+  const t = String(rawType || "").toLowerCase().trim();
+  if (t === "ecdsa") return "Ecdsa";
+  if (t === "ed25519") return "Ed25519";
+  return "Sr25519";
+}
+
+function toPlainJson(value, seen = new WeakSet()) {
+  if (value == null) return value;
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (value instanceof Uint8Array) return u8aToHex(value);
+  if (Array.isArray(value)) return value.slice(0, 50).map((x) => toPlainJson(x, seen));
+  if (typeof value === "object") {
+    if (seen.has(value)) return "[Circular]";
+    seen.add(value);
+    if (typeof value.toString === "function") {
+      try {
+        const s = value.toString();
+        if (s && s !== "[object Object]") return s;
+      } catch {}
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(value).slice(0, 80)) {
+      if (typeof v === "function") continue;
+      out[k] = toPlainJson(v, seen);
+    }
+    return out;
+  }
+  return String(value);
+}
+
+function extractPolkadotTxHash(result) {
+  try {
+    const candidates = [
+      result?.txHash,
+      result?.hash,
+      result?.transactionHash,
+      result?.value?.txHash,
+      result?.value?.hash,
+      result?.events?.txHash,
+    ];
+    for (const c of candidates) {
+      const s = String(c || "").trim();
+      if (s.startsWith("0x")) return s;
+    }
+  } catch {}
+  return null;
+}
+
+
+function extractPolkadotDispatchFailure(result) {
+  try {
+    const events = Array.isArray(result?.events) ? result.events : [];
+    for (const ev of events) {
+      const event = ev?.event || ev;
+      const section = String(event?.type || event?.section || "").trim();
+      const variant = String(event?.value?.type || event?.method || "").trim();
+      if (section === "System" && variant === "ExtrinsicFailed") {
+        const value = event?.value?.value || {};
+        const dispatchError = value?.dispatch_error || value?.dispatchError || result?.dispatchError || null;
+        const dispatchInfo = value?.dispatch_info || value?.dispatchInfo || null;
+        return {
+          event: "System.ExtrinsicFailed",
+          dispatchError: toPlainJson(dispatchError),
+          dispatchInfo: toPlainJson(dispatchInfo),
+          phase: toPlainJson(ev?.phase || null),
+        };
+      }
+    }
+
+    if (result?.dispatchError && String(result.dispatchError) !== "[Circular]") {
+      return {
+        event: "dispatchError",
+        dispatchError: toPlainJson(result.dispatchError),
+        dispatchInfo: null,
+        phase: null,
+      };
+    }
+  } catch {}
+  return null;
+}
+
+function summarizePolkadotDispatchFailure(failure) {
+  try {
+    const err = failure?.dispatchError;
+    const parts = [];
+    const walk = (value, depth = 0) => {
+      if (value == null || depth > 6) return;
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        const s = String(value).trim();
+        if (s && s !== "[Circular]" && !parts.includes(s)) parts.push(s);
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.slice(0, 10).forEach((x) => walk(x, depth + 1));
+        return;
+      }
+      if (typeof value === "object") {
+        for (const key of ["type", "section", "name", "method", "error", "value"]) {
+          if (Object.prototype.hasOwnProperty.call(value, key)) walk(value[key], depth + 1);
+        }
+      }
+    };
+    walk(err);
+    const joined = parts.filter(Boolean).join(".");
+    return joined || failure?.event || "ExtrinsicFailed";
+  } catch {
+    return "ExtrinsicFailed";
+  }
+}
+
+async function importPolkadotPapiRuntime() {
+  try {
+    const papi = await import("polkadot-api");
+    const pjsSignerPkg = await import("polkadot-api/pjs-signer");
+
+    // Vite cannot pre-bundle a bare package subpath when the subpath is
+    // hidden behind import(spec). In that case the browser receives the raw
+    // bare specifier and throws: Failed to resolve module specifier
+    // "polkadot-api/ws". Use a literal dynamic import so Vite can analyze
+    // and rewrite it during dependency optimization.
+    const wsPkg = await import("polkadot-api/ws");
+    const wsProviderImport = "polkadot-api/ws";
+
+    if (typeof wsPkg?.getWsProvider !== "function") {
+      throw new Error("polkadot-api/ws did not export getWsProvider.");
+    }
+    if (typeof pjsSignerPkg?.connectInjectedExtension !== "function") {
+      throw new Error("polkadot-api/pjs-signer did not export connectInjectedExtension.");
+    }
+    return { papi, pjsSignerPkg, wsPkg, wsProviderImport };
+  } catch (e) {
+    const msg = e?.message || String(e);
+    throw new Error(`Polkadot signing dependencies are missing or failed to load. From the frontend folder run: npm install polkadot-api. Detail: ${msg}`);
+  }
+}
+
+async function resolvePapiInjectedPolkadotSigner({ pjsSignerPkg, walletKey, address, accounts }) {
+  const wantedAddress = String(address || "").trim();
+  if (!wantedAddress) throw new Error("Missing SubWallet address for PAPI extension signer lookup.");
+
+  const installed = typeof pjsSignerPkg?.getInjectedExtensions === "function"
+    ? pjsSignerPkg.getInjectedExtensions()
+    : [];
+  const installedList = Array.isArray(installed) ? installed.map((x) => String(x || "").trim()).filter(Boolean) : [];
+  const preferred = normalizePolkadotExtensionKey(walletKey) || normalizePolkadotExtensionKey(accounts?.[0]?.source) || "subwallet-js";
+  const preferredCandidates = [
+    preferred,
+    walletKey,
+    "subwallet-js",
+    "subwallet",
+    ...installedList,
+  ].map((x) => String(x || "").trim()).filter(Boolean);
+
+  const seen = new Set();
+  const candidates = preferredCandidates.filter((x) => {
+    const k = x.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  const errors = [];
+  for (const extName of candidates) {
+    const installedMatch = installedList.find((name) => normalizePolkadotExtensionKey(name) === normalizePolkadotExtensionKey(extName));
+    const connectName = installedMatch || extName;
+    try {
+      const injected = await pjsSignerPkg.connectInjectedExtension(connectName);
+      const accountListRaw = typeof injected?.getAccounts === "function" ? await injected.getAccounts() : [];
+      const accountList = Array.isArray(accountListRaw) ? accountListRaw : [];
+      const account = accountList.find((a) => String(a?.address || "") === wantedAddress) || null;
+      if (account?.polkadotSigner) {
+        return {
+          signer: account.polkadotSigner,
+          extensionName: connectName,
+          account: toPlainJson({
+            address: account.address,
+            name: account.name,
+            type: account.type,
+            genesisHash: account.genesisHash,
+          }),
+        };
+      }
+      errors.push(`${connectName}: selected address not shared by extension`);
+      try { injected?.disconnect?.(); } catch {}
+    } catch (e) {
+      errors.push(`${connectName}: ${e?.message || String(e)}`);
+    }
+  }
+
+  throw new Error(`Could not get a PAPI PolkadotSigner for ${shortenWalletAddress(wantedAddress)}. Reconnect SubWallet and make sure this account is shared. Tried: ${candidates.join(", ")}. ${errors.slice(0, 5).join(" | ")}`);
+}
+
+function hydrationFrontendWsUrl(status) {
+  const fromStatus = String(status?.sidecar?.wsUrl || "").trim();
+  if (fromStatus && !fromStatus.includes("***")) return fromStatus;
+  return "wss://hydration-rpc.n.dwellir.com";
+}
+
+async function signAndSubmitHydrationCallData({ encodedCallData, address, walletKey, accounts, wsUrl, onProgress }) {
+  const encodedHex = normalizeHexValue(encodedCallData);
+  if (!encodedHex) throw new Error("Missing Hydration encoded call data.");
+  if (!address) throw new Error("Missing SubWallet address for signing.");
+
+  const progress = (stage) => {
+    try {
+      if (typeof onProgress === "function") onProgress(stage);
+    } catch {}
+  };
+
+  progress("wallet");
+  const { papi, pjsSignerPkg, wsPkg, wsProviderImport } = await importPolkadotPapiRuntime();
+  progress("wallet");
+  const { signer, extensionName, account } = await resolvePapiInjectedPolkadotSigner({
+    pjsSignerPkg,
+    walletKey,
+    address,
+    accounts,
+  });
+
+  const client = papi.createClient(wsPkg.getWsProvider(wsUrl));
+  try {
+    const unsafeApi = client.getUnsafeApi();
+    const callBinary = papi.Binary.fromHex(encodedHex);
+    const tx = await unsafeApi.txFromCallData(callBinary);
+    progress("finality");
+    const result = await tx.signAndSubmit(signer);
+    const plainResult = toPlainJson(result);
+    const dispatchFailure = extractPolkadotDispatchFailure(plainResult);
+    const chainOk = plainResult?.ok !== false && !dispatchFailure;
+    return {
+      ok: chainOk,
+      signed: true,
+      submitted: true,
+      finalized: true,
+      wsUrl,
+      wsProviderImport,
+      signerSource: "polkadot-api/pjs-signer",
+      signerExtension: extensionName,
+      signerAccount: account,
+      address,
+      encodedCallData: encodedHex,
+      txHash: extractPolkadotTxHash(plainResult),
+      submitResult: plainResult,
+      dispatchFailure: dispatchFailure || null,
+      dispatchErrorSummary: dispatchFailure ? summarizePolkadotDispatchFailure(dispatchFailure) : null,
+    };
+  } finally {
+    try { client?.destroy?.(); } catch {}
+  }
 }
 
 function solanaProviderPubkeyBase58(provider) {
@@ -859,13 +1450,53 @@ export default function OrderTicketWidget({
     const v = String(effectiveVenue || "").toLowerCase().trim();
     return v === "solana_jupiter";
   }, [effectiveVenue]);
+  const isPolkadotDexVenue = useMemo(() => {
+    const v = String(effectiveVenue || "").toLowerCase().trim();
+    return v === "polkadot_hydration" || v === "hydration" || v === "polkadot_dex" || v.startsWith("polkadot_");
+  }, [effectiveVenue]);
+  const isDexSwapVenue = isSolanaDexVenue || isPolkadotDexVenue;
   const isSolanaLimitMode = isSolanaJupiterVenue && solanaOrderMode === "limit";
   const [preferredSolanaWallet, setPreferredSolanaWallet] = useState(() => getPreferredSolanaWalletKey());
   const [preferredSolanaRouterMode, setPreferredSolanaRouterModeState] = useState(() => getPreferredSolanaRouterMode());
   const [walletStandardWallets, setWalletStandardWallets] = useState(() => getWalletStandardWallets());
   const [walletKitPendingConnectName, setWalletKitPendingConnectName] = useState("");
+  const [preferredHydrationRouteMode, setPreferredHydrationRouteModeState] = useState(() => getPreferredHydrationRouteMode());
+  const [polkadotSettingsOpen, setPolkadotSettingsOpen] = useState(false);
+  const [preferredPolkadotWallet, setPreferredPolkadotWallet] = useState(() => getPreferredPolkadotWalletKey());
+  const [polkadotWalletScanNonce, setPolkadotWalletScanNonce] = useState(0);
+  const [polkadotWalletState, setPolkadotWalletState] = useState(() => ({
+    key: getPreferredPolkadotWalletKey(),
+    label: getPolkadotWalletLabel(getPreferredPolkadotWalletKey()),
+    connected: false,
+    address: null,
+    accountName: "",
+    accounts: [],
+    extension: null,
+    error: null,
+  }));
+  const [polkadotHydrationStatus, setPolkadotHydrationStatus] = useState(null);
+  const [polkadotHydrationStatusLoading, setPolkadotHydrationStatusLoading] = useState(false);
+  const [polkadotHydrationStatusError, setPolkadotHydrationStatusError] = useState(null);
+  const [polkadotLiquidityWarning, setPolkadotLiquidityWarning] = useState(null);
+  const [polkadotManualRouteAvailable, setPolkadotManualRouteAvailable] = useState(false);
+  const polkadotHydrationStatusReqRef = useRef(0);
+  const polkadotLiquidityReqRef = useRef(0);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
+  useEffect(() => { setPreferredHydrationRouteMode(preferredHydrationRouteMode); }, [preferredHydrationRouteMode]);
+  useEffect(() => { setPreferredPolkadotWalletKey(preferredPolkadotWallet); }, [preferredPolkadotWallet]);
+  useEffect(() => {
+    if (!isPolkadotDexVenue) return;
+    const bump = () => setPolkadotWalletScanNonce((x) => x + 1);
+    bump();
+    if (typeof window === "undefined") return undefined;
+    window.addEventListener("focus", bump);
+    const t = window.setTimeout(bump, 650);
+    return () => {
+      window.removeEventListener("focus", bump);
+      window.clearTimeout(t);
+    };
+  }, [isPolkadotDexVenue]);
   useEffect(() => {
     if (!isSolanaDexVenue) return;
     const unsub = subscribeWalletStandardWallets((wallets) => setWalletStandardWallets(Array.isArray(wallets) ? wallets : []));
@@ -968,6 +1599,38 @@ export default function OrderTicketWidget({
   }, [isSolanaDexVenue, preferredSolanaWallet, resolveInjectedSolanaProvider]);
   const solanaWalletLabel = solanaWalletState.label;
   const solanaWalletConnected = solanaWalletState.connected;
+
+  const installedPolkadotWallets = useMemo(() => {
+    if (!isPolkadotDexVenue) return [];
+    return getInjectedPolkadotWalletOptions();
+  }, [isPolkadotDexVenue, polkadotWalletScanNonce]);
+
+  useEffect(() => {
+    if (!isPolkadotDexVenue) return;
+    const preferredNorm = normalizePolkadotExtensionKey(preferredPolkadotWallet);
+    const selected = installedPolkadotWallets.find((x) => normalizePolkadotExtensionKey(x?.key) === preferredNorm) || installedPolkadotWallets[0] || null;
+    if (selected?.key && normalizePolkadotExtensionKey(selected.key) !== preferredNorm) {
+      setPreferredPolkadotWallet(selected.key);
+    }
+    setPolkadotWalletState((prev) => {
+      if (prev?.connected && prev?.address) return prev;
+      const key = selected?.key || preferredPolkadotWallet || "subwallet-js";
+      return {
+        ...prev,
+        key,
+        label: getPolkadotWalletLabel(key),
+        connected: false,
+        address: null,
+        accountName: "",
+        accounts: [],
+        extension: null,
+        error: installedPolkadotWallets.length ? null : "SubWallet not detected",
+      };
+    });
+  }, [isPolkadotDexVenue, installedPolkadotWallets, preferredPolkadotWallet]);
+
+  const polkadotWalletConnected = !!polkadotWalletState?.connected && !!polkadotWalletState?.address;
+  const polkadotWalletLabel = polkadotWalletState?.label || getPolkadotWalletLabel(preferredPolkadotWallet);
 
 
   const [inlineMode, setInlineMode] = useState(true);
@@ -1255,6 +1918,132 @@ export default function OrderTicketWidget({
 
   const totalQuoteDecimals = useMemo(() => (quoteIsUsdLike ? 2 : 8), [quoteIsUsdLike]);
 
+  const polkadotQuoteStatus = polkadotHydrationStatus?.quoteStatus || null;
+  const polkadotQuotesAvailable = polkadotQuoteStatus?.available === true && polkadotHydrationStatus?.liveQuotesEnabled === true;
+  const polkadotSwapTxAvailable = polkadotQuotesAvailable && (
+    polkadotQuoteStatus?.swapTxEnabled === true ||
+    polkadotQuoteStatus?.liveSwapsRecommended === true ||
+    polkadotHydrationStatus?.swapTxEnabled === true ||
+    polkadotHydrationStatus?.liveSwapsRecommended === true
+  );
+  const polkadotLiveSwapsRecommended = polkadotSwapTxAvailable;
+  const polkadotExactBuyEnabled = Boolean(
+    polkadotQuoteStatus?.exactBuyEnabled === true ||
+    polkadotHydrationStatus?.exactBuyEnabled === true ||
+    polkadotQuoteStatus?.liveExactBuyRecommended === true ||
+    polkadotHydrationStatus?.liveExactBuyRecommended === true
+  );
+  const polkadotStatusDetail = String(
+    polkadotQuoteStatus?.reason ||
+    polkadotHydrationStatusError ||
+    "Hydration live quotes/swaps are disabled until a non-router quote source is selected."
+  ).trim();
+  const polkadotStatusReason = polkadotQuotesAvailable
+    ? polkadotLiveSwapsRecommended
+      ? polkadotExactBuyEnabled
+        ? "Hydration live quotes and SubWallet swap signing/submission are enabled for controlled BUY and SELL testing."
+        : "Hydration live quotes and SELL swap signing/submission are enabled. BUY remains disabled until UTT_HYDRATION_ENABLE_EXACT_BUY=1."
+      : "Hydration live quotes are enabled. Unsigned swap transaction building remains disabled until slippage handling and SubWallet signing are verified."
+    : "Hydration quotes/swaps are temporarily disabled. Asset resolution and balances are available. Waiting on a non-router quote source before live trading is enabled.";
+  const polkadotManualSwapAvailable = isPolkadotDexVenue && polkadotManualRouteAvailable;
+  const polkadotEffectiveQuotesAvailable = polkadotQuotesAvailable || polkadotManualSwapAvailable;
+  const polkadotEffectiveLiveSwapsRecommended = polkadotLiveSwapsRecommended || polkadotManualSwapAvailable;
+  const polkadotEffectiveExactBuyEnabled = polkadotExactBuyEnabled || polkadotManualSwapAvailable;
+  const polkadotEffectiveStatusReason = polkadotManualSwapAvailable && !polkadotQuotesAvailable
+    ? "Hydration generic SDK quotes are disabled, but this pair has a backend manual XYK/live-pool route available."
+    : polkadotStatusReason;
+
+  useEffect(() => {
+    const sym = String(otSymbol || "").trim().toUpperCase();
+    if (!isPolkadotDexVenue || !apiBase || !sym || !sym.includes("-")) {
+      setPolkadotHydrationStatus(null);
+      setPolkadotHydrationStatusError(null);
+      setPolkadotHydrationStatusLoading(false);
+      return;
+    }
+
+    const reqId = ++polkadotHydrationStatusReqRef.current;
+    let cancelled = false;
+
+    const t = setTimeout(async () => {
+      try {
+        setPolkadotHydrationStatusLoading(true);
+        setPolkadotHydrationStatusError(null);
+
+        const url = new URL(`${apiBase}/api/polkadot_dex/hydration/status`);
+        url.searchParams.set("symbol", sym);
+        url.searchParams.set("_ts", String(Date.now()));
+
+        const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+        if (!r.ok) {
+          const txt = await r.text().catch(() => "");
+          throw new Error(txt || `Hydration status HTTP ${r.status}`);
+        }
+
+        const data = await r.json();
+        if (cancelled || polkadotHydrationStatusReqRef.current !== reqId) return;
+        setPolkadotHydrationStatus(data || null);
+      } catch (e) {
+        if (cancelled || polkadotHydrationStatusReqRef.current !== reqId) return;
+        setPolkadotHydrationStatus(null);
+        setPolkadotHydrationStatusError(e?.message || "Failed to load Hydration status.");
+      } finally {
+        if (!cancelled && polkadotHydrationStatusReqRef.current === reqId) setPolkadotHydrationStatusLoading(false);
+      }
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [isPolkadotDexVenue, apiBase, otSymbol]);
+
+  useEffect(() => {
+    const sym = String(otSymbol || "").trim().toUpperCase();
+    if (!isPolkadotDexVenue || !apiBase || !sym || !sym.includes("-")) {
+      setPolkadotLiquidityWarning(null);
+      setPolkadotManualRouteAvailable(false);
+      return;
+    }
+
+    const reqId = ++polkadotLiquidityReqRef.current;
+    let cancelled = false;
+
+    const t = setTimeout(async () => {
+      try {
+        const url = new URL(`${apiBase}/api/polkadot_dex/hydration/orderbook`);
+        url.searchParams.set("symbol", sym);
+        url.searchParams.set("depth", "3");
+        url.searchParams.set("route_mode", normalizeHydrationRouteMode(preferredHydrationRouteMode));
+        url.searchParams.set("_ts", String(Date.now()));
+
+        const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+        if (!r.ok) {
+          if (!cancelled && polkadotLiquidityReqRef.current === reqId) {
+            setPolkadotLiquidityWarning(null);
+            setPolkadotManualRouteAvailable(false);
+          }
+          return;
+        }
+
+        const data = await r.json().catch(() => null);
+        if (cancelled || polkadotLiquidityReqRef.current !== reqId) return;
+        setPolkadotLiquidityWarning(buildHydrationLowLiquidityWarning(data));
+        setPolkadotManualRouteAvailable(isHydrationManualRoutePayload(data));
+      } catch {
+        if (!cancelled && polkadotLiquidityReqRef.current === reqId) {
+          setPolkadotLiquidityWarning(null);
+          setPolkadotManualRouteAvailable(false);
+        }
+      }
+    }, 450);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [isPolkadotDexVenue, apiBase, otSymbol, preferredHydrationRouteMode]);
+
   // Null-safe number parsing (prevents null → 0 bugs via Number(null))
   const toFiniteOrNull = (x) => {
     if (x === null || x === undefined) return null;
@@ -1300,6 +2089,7 @@ export default function OrderTicketWidget({
         // override with sane defaults so ticket math + validation behaves like CEX precision-wise.
         const vLower = String(v || "").trim().toLowerCase();
         const isSol = vLower === "solana_jupiter" || vLower === "solana-dex" || vLower.startsWith("solana_");
+        const isDot = vLower === "polkadot_hydration" || vLower === "hydration" || vLower === "polkadot_dex" || vLower.startsWith("polkadot_");
         const warns = Array.isArray(data?.warnings) ? data.warnings.map((x) => String(x || "")) : [];
         const warnText = warns.join(" ").toLowerCase();
 
@@ -1322,6 +2112,31 @@ export default function OrderTicketWidget({
             qty_decimals: 6,
             price_increment: 0.000000001,
             qty_increment: 0.000001,
+            min_qty: Number(data?.min_qty ?? 0) || 0,
+            min_notional: Number(data?.min_notional ?? 0) || 0,
+            errors: [],
+            warnings: [],
+          });
+          setRulesErr(null);
+        } else if (
+          isDot &&
+          (
+            data == null ||
+            Number(data?.price_decimals ?? 0) <= 0 ||
+            Number(data?.qty_decimals ?? 0) <= 0 ||
+            warnText.includes("does not implement get_order_rules") ||
+            warnText.includes("constraints unknown")
+          )
+        ) {
+          setRules({
+            ...(data || {}),
+            venue: vLower,
+            symbol: s,
+            type: "swap",
+            price_decimals: 12,
+            qty_decimals: 12,
+            price_increment: 0.000000000001,
+            qty_increment: 0.000000000001,
             min_qty: Number(data?.min_qty ?? 0) || 0,
             min_notional: Number(data?.min_notional ?? 0) || 0,
             errors: [],
@@ -1371,6 +2186,29 @@ export default function OrderTicketWidget({
             qty_decimals: 6,
             price_increment: 0.000000001,
             qty_increment: 0.000001,
+            min_qty: 0,
+            min_notional: 0,
+            errors: [],
+          });
+          setRulesErr(null);
+        } else if (
+          (vLower === "polkadot_hydration" || vLower === "hydration" || vLower === "polkadot_dex" || vLower.startsWith("polkadot_")) &&
+          typeof errMsg === "string" &&
+          (
+            errMsg.toLowerCase().includes("does not implement get_order_rules") ||
+            errMsg.toLowerCase().includes("constraints unknown") ||
+            errMsg.toLowerCase().includes("404")
+          )
+        ) {
+          setRules({
+            venue: vLower,
+            symbol: s,
+            type: "swap",
+            // Conservative defaults for DOT/Asset Hub/Hydration-style precision.
+            price_decimals: 12,
+            qty_decimals: 12,
+            price_increment: 0.000000000001,
+            qty_increment: 0.000000000001,
             min_qty: 0,
             min_notional: 0,
             errors: [],
@@ -1647,7 +2485,7 @@ export default function OrderTicketWidget({
 
     // DEX (Solana) venues: limit price is informational for swap-style flows.
     // Do NOT clamp/round it using CEX-style venue rules (which may be unknown and default to 0 decimals).
-    if (isSolanaDexVenue) return;
+    if (isDexSwapVenue) return;
 
     const lp = String(limitPrice ?? "");
     if (!lp) return;
@@ -1708,6 +2546,7 @@ export default function OrderTicketWidget({
   }, [rules, limitPxNumForMin, isCryptoCom]);
 
   const rulesBanner = useMemo(() => {
+    if (isPolkadotDexVenue) return null;
     if (rulesLoading) return { kind: "info", lines: ["Rules: loading…"] };
 
     if (rulesErr) {
@@ -1747,7 +2586,7 @@ export default function OrderTicketWidget({
 
     if (lines.length === 0) return null;
     return { kind: errs.length > 0 ? "error" : "warn", lines };
-  }, [rulesLoading, rulesErr, rules, hideTableData, uiMinQty]);
+  }, [rulesLoading, rulesErr, rules, hideTableData, uiMinQty, isPolkadotDexVenue]);
 
   const rulesBannerStyle = useMemo(() => {
     if (!rulesBanner) return null;
@@ -1764,8 +2603,8 @@ export default function OrderTicketWidget({
   const [balErr, setBalErr] = useState(null);
 
   useEffect(() => {
-    if (!isSolanaDexVenue) setBalErr(null);
-  }, [isSolanaDexVenue]);
+    if (!isDexSwapVenue) setBalErr(null);
+  }, [isDexSwapVenue]);
 
   useEffect(() => {
     if (!isSolanaJupiterVenue) setSolanaOrderMode("swap");
@@ -1949,6 +2788,36 @@ export default function OrderTicketWidget({
     }
   }
 
+  async function ensurePolkadotWalletConnected() {
+    try {
+      if (polkadotWalletState?.connected && polkadotWalletState?.address) return polkadotWalletState.address;
+      const next = await connectInjectedPolkadotWallet(preferredPolkadotWallet);
+      setPreferredPolkadotWallet(next.key || "subwallet-js");
+      setPolkadotWalletState({
+        key: next.key || "subwallet-js",
+        label: next.label || getPolkadotWalletLabel(next.key),
+        connected: true,
+        address: next.address,
+        accountName: next.accountName || "",
+        accounts: Array.isArray(next.accounts) ? next.accounts : [],
+        extension: next.extension || null,
+        error: null,
+      });
+      return next.address || null;
+    } catch (e) {
+      const msg = e?.message || "Failed to connect Polkadot wallet.";
+      setPolkadotWalletState((prev) => ({
+        ...(prev || {}),
+        key: preferredPolkadotWallet || "subwallet-js",
+        label: getPolkadotWalletLabel(preferredPolkadotWallet),
+        connected: false,
+        address: null,
+        error: msg,
+      }));
+      throw e;
+    }
+  }
+
   async function solanaResolveAsset(asset) {
     const a = String(asset || "").trim();
     if (!a) return null;
@@ -1980,7 +2849,7 @@ export default function OrderTicketWidget({
   }
 
   async function loadAvailBalances(opts = {}) {
-    const { silent = false, venueOverride = null, focusAssets = null } = opts;
+    const { silent = false, venueOverride = null, focusAssets = null, force = false } = opts;
 
     const v = String(venueOverride || effectiveVenue || "").toLowerCase().trim();
     if (!v) return { avail: balAvail, hash: computeBalHash(balAvail), focusHash: "" };
@@ -2085,6 +2954,60 @@ export default function OrderTicketWidget({
         return { avail: nextAvail, hash: nextHash, focusHash: nextFocusHash };
       }
 
+      if (isPolkadotDexVenue) {
+        let address = polkadotWalletState?.address || null;
+        if (!address) address = await ensurePolkadotWalletConnected();
+        if (!address) throw new Error("Connect SubWallet to load Polkadot balances.");
+
+        const j = await fetchPolkadotDexBalancesCached({
+          apiBase,
+          venue: v,
+          address,
+          force: !!force,
+        });
+        const rawItems = Array.isArray(j?.items) ? j.items : Array.isArray(j?.balances) ? j.balances : Array.isArray(j?.tokens) ? j.tokens : [];
+        const items = rawItems.map((b) => ({
+          ...b,
+          asset: b?.asset || b?.symbol || b?.token || b?.ticker,
+        }));
+        const nextAvail = normalizeBalItems(items, v);
+
+        const native = j?.native && typeof j.native === "object" ? j.native : null;
+        const nativeSym = String(native?.symbol || "HDX").trim().toUpperCase();
+        const nativeFreeRaw = toFiniteOrNull(native?.free ?? native?.free_ui ?? native?.freeUi);
+        const nativeTotal = toFiniteOrNull(native?.total ?? native?.total_ui ?? native?.totalUi);
+        const nativeFrozen = toFiniteOrNull(native?.frozen ?? native?.hold ?? native?.locked);
+        const nativeBackendAvailable = toFiniteOrNull(
+          native?.available ??
+          native?.transferable ??
+          native?.spendable ??
+          native?.available_ui ??
+          native?.availableUi ??
+          native?.transferable_ui ??
+          native?.transferableUi ??
+          native?.spendable_ui ??
+          native?.spendableUi
+        );
+        const nativeComputedAvailable =
+          nativeFreeRaw !== null && nativeFrozen !== null
+            ? Math.max(nativeFreeRaw - nativeFrozen, 0)
+            : nativeFreeRaw;
+        const nativeAvailable = nativeBackendAvailable !== null ? nativeBackendAvailable : nativeComputedAvailable;
+        if (nativeSym && nativeAvailable !== null) {
+          nextAvail[nativeSym] = {
+            available: nativeAvailable,
+            total: nativeTotal !== null ? nativeTotal : nativeFreeRaw !== null ? nativeFreeRaw : nativeAvailable,
+            hold: nativeFrozen,
+          };
+        }
+
+        const nextHash = computeBalHash(nextAvail);
+        const nextFocusHash = focusAssets ? computeFocusHash(nextAvail, focusAssets) : "";
+
+        setBalAvail(nextAvail);
+        return { avail: nextAvail, hash: nextHash, focusHash: nextFocusHash };
+      }
+
       const url = new URL(`${apiBase}/api/balances/latest`);
       url.searchParams.set("venue", v);
       url.searchParams.set("sort", "asset:asc");
@@ -2130,8 +3053,8 @@ export default function OrderTicketWidget({
     const v = String(venueOverride || effectiveVenue || "").toLowerCase().trim();
     if (!v) return false;
 
-    // DEX-only: Solana venues don't have a refresh adapter path; just re-load wallet balances.
-    if (isSolanaDexVenue) {
+    // DEX-only: Solana/Polkadot venues don't have a CEX adapter refresh path; just re-load wallet balances.
+    if (isDexSwapVenue) {
       const beforeFullHash = computeBalHash(balAvail);
       const beforeFocusHash = focusAssets ? computeFocusHash(balAvail, focusAssets) : "";
 
@@ -2142,12 +3065,13 @@ export default function OrderTicketWidget({
           silent: true,
           venueOverride: v,
           focusAssets,
+          force: !!force,
         });
 
         if (focusAssets) return !!afterFocusHash && afterFocusHash !== beforeFocusHash;
         return !!afterFullHash && afterFullHash !== beforeFullHash;
       } catch (e) {
-        setBalErr(e?.message || "Failed loading Solana balances");
+        setBalErr(e?.message || (isPolkadotDexVenue ? "Failed loading Polkadot balances" : "Failed loading Solana balances"));
         return false;
       } finally {
         setBalLoading(false);
@@ -2238,13 +3162,13 @@ export default function OrderTicketWidget({
   }
 
   useEffect(() => {
-    if (isSolanaDexVenue) {
+    if (isDexSwapVenue) {
       setBalAvail({});
       setBalErr(null);
     }
     loadAvailBalances();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveVenue, apiBase, baseAsset, quoteAsset, isSolanaDexVenue, walletKitConnected, walletKitSelectedKey, solanaWalletState?.address]);
+  }, [effectiveVenue, apiBase, baseAsset, quoteAsset, isSolanaDexVenue, isPolkadotDexVenue, isDexSwapVenue, walletKitConnected, walletKitSelectedKey, solanaWalletState?.address, polkadotWalletState?.address]);
 
   const baseBal = useMemo(() => (baseAsset ? (balAvail?.[baseAsset] ?? null) : null), [balAvail, baseAsset]);
   const quoteBal = useMemo(() => (quoteAsset ? (balAvail?.[quoteAsset] ?? null) : null), [balAvail, quoteAsset]);
@@ -2458,6 +3382,53 @@ export default function OrderTicketWidget({
       return { status: "fail", title: "Pre-trade checks: FAIL (blocked)", lines, block: true };
     }
 
+    if (isPolkadotDexVenue) {
+      if (side === "buy") {
+        if (qtyNum === null) {
+          lines.push(`Qty ${baseAsset || "base"} missing/invalid. BUY uses Qty as the exact base amount to receive.`);
+          fails.push("qty_missing");
+        }
+        if (!polkadotEffectiveExactBuyEnabled) {
+          lines.push("Hydration BUY swaps are disabled until UTT_HYDRATION_ENABLE_EXACT_BUY=1. SELL swaps remain available.");
+          fails.push("hydration_buy_swaps_disabled");
+        }
+      } else if (qtyNum === null) {
+        lines.push("Qty missing/invalid.");
+        fails.push("qty_missing");
+      }
+
+      if (polkadotHydrationStatusLoading) {
+        lines.push("Hydration status loading…");
+        fails.push("hydration_status_loading");
+      } else if (polkadotHydrationStatusError) {
+        lines.push(hideTableData ? "Hydration status unavailable." : `Hydration status unavailable: ${polkadotHydrationStatusError}`);
+        fails.push("hydration_status_error");
+      } else if (!polkadotHydrationStatus) {
+        lines.push("Hydration status unavailable.");
+        fails.push("hydration_status_missing");
+      } else if (!polkadotEffectiveQuotesAvailable) {
+        lines.push(hideTableData ? "Live Hydration quotes/swaps are disabled." : polkadotEffectiveStatusReason);
+        fails.push("hydration_quotes_disabled");
+      } else if (!polkadotEffectiveLiveSwapsRecommended) {
+        lines.push(hideTableData ? "Live Hydration swaps are disabled." : polkadotEffectiveStatusReason);
+        fails.push("hydration_swaps_disabled");
+      } else if (polkadotManualSwapAvailable && !polkadotQuotesAvailable) {
+        lines.push("Manual XYK/live-pool route available for this pair while generic SDK router quotes remain disabled.");
+      }
+
+      if (polkadotLiquidityWarning) {
+        lines.push(hideTableData ? "Low-liquidity isolated pool warning." : `${polkadotLiquidityWarning.label}. ${polkadotLiquidityWarning.message}`);
+      }
+
+      if (fails.length === 0) {
+        if (polkadotLiquidityWarning) {
+          return { status: "warn", title: "Pre-trade checks: WARNING · Low-liquidity isolated pool", lines, block: false };
+        }
+        return { status: "ok", title: "Pre-trade checks: OK", lines, block: false };
+      }
+      return { status: "fail", title: "Pre-trade checks: Hydration swap blocked", lines, block: true, message: lines.join(" ") };
+    }
+
     if (rulesErr || !rules) {
       return {
         status: "neutral",
@@ -2574,16 +3545,33 @@ export default function OrderTicketWidget({
     notional,
     hideTableData,
     isSolanaLimitMode,
+    isPolkadotDexVenue,
+    totalQuoteNum,
+    quoteAsset,
     jupiterFrontendInputUsdValue,
     jupiterMinFrontendEnforceable,
     side,
     solanaExpiryPreset,
     solanaExpiredAt,
+    polkadotHydrationStatus,
+    polkadotHydrationStatusLoading,
+    polkadotHydrationStatusError,
+    polkadotQuotesAvailable,
+    polkadotLiveSwapsRecommended,
+    polkadotExactBuyEnabled,
+    polkadotEffectiveQuotesAvailable,
+    polkadotEffectiveLiveSwapsRecommended,
+    polkadotEffectiveExactBuyEnabled,
+    polkadotManualSwapAvailable,
+    polkadotEffectiveStatusReason,
+    polkadotStatusReason,
+    polkadotLiquidityWarning,
   ]);
 
   const preTradeStyle = useMemo(() => {
     if (!preTrade) return null;
     if (preTrade.status === "ok") return { border: "1px solid #203a20", background: "#0f1a0f", color: "#cdeccd" };
+    if (preTrade.status === "warn") return { border: "1px solid rgba(245, 158, 11, 0.55)", background: "rgba(120, 72, 16, 0.18)", color: "#ffe2a6" };
     if (preTrade.status === "fail") return { border: "1px solid #4a1f1f", background: "#160b0b", color: "#ffd2d2" };
     return { border: "1px solid #2a2a2a", background: "#101010", color: "#cfcfcf" };
   }, [preTrade]);
@@ -2598,7 +3586,7 @@ export default function OrderTicketWidget({
     // - BUY uses Total (quote spend)
     // - SELL uses Qty (base spend)
     // Limit price is not required.
-    if (isSolanaDexVenue) {
+    if (isDexSwapVenue) {
       if (isSolanaLimitMode) return qtyNum !== null && pxNum !== null;
       if (side === "buy") return totalQuoteNum !== null;
       return qtyNum !== null;
@@ -2606,7 +3594,7 @@ export default function OrderTicketWidget({
 
     // CEX-style limit order
     return qtyNum !== null && pxNum !== null;
-  }, [effectiveVenue, otSymbol, side, isSolanaDexVenue, qtyNum, pxNum, totalQuoteNum]);
+  }, [effectiveVenue, otSymbol, side, isDexSwapVenue, isSolanaLimitMode, qtyNum, pxNum, totalQuoteNum]);
 
   const canSubmit = useMemo(() => {
     if (!canSubmitBase) return false;
@@ -2618,7 +3606,7 @@ export default function OrderTicketWidget({
     if (side !== "buy") return null;
 
     // Solana DEX BUY spends quote = Total field
-    if (isSolanaDexVenue) {
+    if (isDexSwapVenue) {
       return totalQuoteNum === null ? null : totalQuoteNum;
     }
 
@@ -2626,7 +3614,7 @@ export default function OrderTicketWidget({
     if (qtyNum === null || pxNum === null) return null;
     const spend = qtyNum * pxNum;
     return Number.isFinite(spend) ? spend : null;
-  }, [side, isSolanaDexVenue, qtyNum, pxNum, totalQuoteNum]);
+  }, [side, isDexSwapVenue, qtyNum, pxNum, totalQuoteNum]);
 
   const buySpendCapacityQuote = useMemo(() => {
     if (side !== "buy") return null;
@@ -2694,6 +3682,47 @@ export default function OrderTicketWidget({
       }
     }
 
+    setShowSubmitResult(true);
+  }
+
+  // Hydration progress modal helper. BUY exact-out can be slower because it
+  // intentionally uses an isolated helper process before the SubWallet signing
+  // step, so keep the modal alive and update it at each visible milestone.
+  function hydrationSubmitProgressText(stage, tradeSide = side) {
+    const s = String(stage || "build").trim().toLowerCase();
+    const isBuy = String(tradeSide || side || "").trim().toLowerCase() === "buy";
+    const steps = [
+      { key: "build", label: isBuy ? "Building exact BUY route..." : "Building exact SELL route..." },
+      { key: "wallet", label: "Waiting for SubWallet..." },
+      { key: "finality", label: "Waiting for finality..." },
+      { key: "record", label: "Recording swap..." },
+    ];
+    const idx = Math.max(0, steps.findIndex((x) => x.key === s));
+    const lines = steps.map((x, i) => {
+      const prefix = i < idx ? "✓" : i === idx ? "→" : "•";
+      return `${prefix} ${x.label}`;
+    });
+    if (isBuy) {
+      lines.push("", "Exact BUY uses an isolated helper first, so this path can take longer than SELL.");
+    }
+    return lines.join("\n");
+  }
+
+  function hydrationSubmitProgressTitle(stage, tradeSide = side) {
+    const s = String(stage || "build").trim().toLowerCase();
+    const isBuy = String(tradeSide || side || "").trim().toLowerCase() === "buy";
+    if (s === "wallet") return "Waiting for SubWallet";
+    if (s === "finality") return "Waiting for Hydration Finality";
+    if (s === "record") return "Recording Hydration Swap";
+    return isBuy ? "Building exact BUY route" : "Building Hydration SELL route";
+  }
+
+  function openHydrationSubmitProgress(stage, tradeSide = side) {
+    const safeStage = String(stage || "build").trim().toLowerCase() || "build";
+    setSubmitResultKind("info");
+    setSubmitResultPayload({ ok: true, venue: "polkadot_hydration", stage: safeStage, side: tradeSide });
+    setSubmitResultTitle(hydrationSubmitProgressTitle(safeStage, tradeSide));
+    setSubmitResultText(hydrationSubmitProgressText(safeStage, tradeSide));
     setShowSubmitResult(true);
   }
 
@@ -3104,6 +4133,230 @@ async function submitSolanaTriggerLimitOrder() {
     }
   }
 
+async function submitPolkadotSwapOrder() {
+  if (!apiBase) {
+    const msg = "apiBase not set";
+    openSubmitResultModal("error", msg, "Hydration Swap Submit Failed");
+    return;
+  }
+
+  if (!polkadotEffectiveQuotesAvailable || !polkadotEffectiveLiveSwapsRecommended) {
+    const reason = polkadotEffectiveStatusReason || "Hydration swap transaction building is disabled.";
+    onToast?.({ kind: "warn", msg: reason });
+    openSubmitResultModal("error", {
+      ok: false,
+      venue: String(effectiveVenue || "polkadot_hydration").toLowerCase().trim(),
+      status_endpoint: "/api/polkadot_dex/hydration/status",
+      next_endpoint: "/api/polkadot_dex/hydration/swap_tx",
+      quoteStatus: polkadotHydrationStatus?.quoteStatus || null,
+      quoteStatusDetail: polkadotStatusDetail,
+      swapTxBuildAvailable: !!polkadotEffectiveLiveSwapsRecommended,
+      manualRouteAvailable: !!polkadotManualSwapAvailable,
+      message: reason,
+    }, "Hydration Swap Submit Disabled");
+    return;
+  }
+
+  if (side === "buy" && !polkadotEffectiveExactBuyEnabled) {
+    const reason = "Hydration BUY swaps are disabled until UTT_HYDRATION_ENABLE_EXACT_BUY=1. SELL swaps remain available.";
+    onToast?.({ kind: "warn", msg: reason });
+    openSubmitResultModal("error", {
+      ok: false,
+      venue: String(effectiveVenue || "polkadot_hydration").toLowerCase().trim(),
+      status_endpoint: "/api/polkadot_dex/hydration/status",
+      next_endpoint: "/api/polkadot_dex/hydration/swap_tx",
+      quoteStatus: polkadotHydrationStatus?.quoteStatus || null,
+      quoteStatusDetail: polkadotStatusDetail,
+      swapTxBuildAvailable: !!polkadotEffectiveLiveSwapsRecommended,
+      manualRouteAvailable: !!polkadotManualSwapAvailable,
+      exactBuyEnabled: !!polkadotEffectiveExactBuyEnabled,
+      side,
+      message: reason,
+    }, "Hydration BUY Swap Disabled");
+    return;
+  }
+
+  let address = polkadotWalletState?.address || null;
+  if (!address) address = await ensurePolkadotWalletConnected();
+  if (!address) {
+    const msg = "Connect SubWallet to sign and submit a Hydration swap.";
+    onToast?.({ kind: "warn", msg });
+    openSubmitResultModal("error", msg, "Hydration Wallet Required");
+    return;
+  }
+
+  // Hydration SELL remains exact-in. Hydration BUY is exact-out and uses Qty
+  // as the exact BASE amount to receive, gated by UTT_HYDRATION_ENABLE_EXACT_BUY=1.
+  const amountMode = side === "buy" ? "exact_out" : "exact_in";
+  const amount = Number(qtyNum);
+  const quoteSpendEstimate = Number(totalQuoteNum);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    const msg = side === "buy" ? "Enter a valid Qty amount to buy." : "Enter a valid Qty amount to sell.";
+    openSubmitResultModal("error", msg, "Hydration Swap Submit Failed");
+    return;
+  }
+
+  setSubmitting(true);
+  setSubmitError(null);
+  setSubmitOk(null);
+  openHydrationSubmitProgress("build", side);
+
+  try {
+    const base = String(apiBase || "").replace(/\/+$/, "");
+    const url = `${base}/api/polkadot_dex/hydration/swap_tx`;
+    const tok = getAuthToken();
+    const headers = { "Content-Type": "application/json" };
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+
+    const payload = {
+      symbol: String(otSymbol || "").trim(),
+      side,
+      amount,
+      amount_mode: amountMode,
+      quote_spend_estimate: Number.isFinite(quoteSpendEstimate) ? quoteSpendEstimate : null,
+      route_mode: normalizeHydrationRouteMode(preferredHydrationRouteMode),
+      slippage_bps: 100,
+      user_pubkey: address,
+    };
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(txt || `HTTP ${r.status}`);
+    }
+
+    const j = await r.json();
+    const encoded = j?.tx?.encodedCallData || j?.tx?.transactionData || j?.encodedCallData || j?.transactionData || null;
+    if (!encoded) throw new Error("Hydration swap builder did not return encoded transaction data.");
+
+    openHydrationSubmitProgress("wallet", side);
+
+    let walletSnapshot = polkadotWalletState || {};
+    if (!walletSnapshot?.extension?.signer) {
+      const next = await connectInjectedPolkadotWallet(preferredPolkadotWallet);
+      setPreferredPolkadotWallet(next.key || "subwallet-js");
+      walletSnapshot = {
+        key: next.key || "subwallet-js",
+        label: next.label || getPolkadotWalletLabel(next.key),
+        connected: true,
+        address: next.address,
+        accountName: next.accountName || "",
+        accounts: Array.isArray(next.accounts) ? next.accounts : [],
+        extension: next.extension || null,
+        error: null,
+      };
+      setPolkadotWalletState(walletSnapshot);
+      address = walletSnapshot.address || address;
+    }
+
+    const wsUrl = hydrationFrontendWsUrl(polkadotHydrationStatus);
+
+    onToast?.({ kind: "warn", msg: "SubWallet signing prompt opening… review the transaction before approving." });
+
+    const submit = await signAndSubmitHydrationCallData({
+      encodedCallData: encoded,
+      address,
+      walletKey: walletSnapshot?.key || preferredPolkadotWallet || "subwallet-js",
+      accounts: walletSnapshot?.accounts || [],
+      wsUrl,
+      onProgress: (stage) => openHydrationSubmitProgress(stage, side),
+    });
+
+    if (submit?.ok === false) {
+      const failSummary = submit?.dispatchErrorSummary || "ExtrinsicFailed";
+      const failedPayload = {
+        ...j,
+        signed: true,
+        submitted: true,
+        finalized: !!submit?.finalized,
+        txHash: submit?.txHash || null,
+        submit,
+        onChainOk: false,
+        message: submit?.txHash
+          ? `Hydration swap finalized but failed on-chain (${failSummary}): ${submit.txHash}`
+          : `Hydration swap finalized but failed on-chain (${failSummary}).`,
+      };
+      setSubmitError(failedPayload.message);
+      openSubmitResultModal("error", failedPayload, "Hydration Swap Failed On-Chain");
+      onToast?.({ kind: "warn", msg: failedPayload.message });
+      refreshBalancesAfterSubmit({ venueKey: effectiveVenue, focusBase: baseAsset, focusQuote: quoteAsset });
+      return;
+    }
+
+    const okPayload = {
+      ...j,
+      signed: true,
+      submitted: true,
+      finalized: !!submit?.finalized,
+      txHash: submit?.txHash || null,
+      submit,
+      onChainOk: true,
+      wallet_address: address,
+      user_pubkey: address,
+      message: submit?.txHash
+        ? `Hydration swap submitted/finalized: ${submit.txHash}`
+        : "Hydration swap signed and submitted/finalized.",
+    };
+
+    try {
+      openHydrationSubmitProgress("record", side);
+      const recUrl = `${base}/api/polkadot_dex/hydration/record_submit`;
+      const recPayload = {
+        ...okPayload,
+        symbol: String(otSymbol || "").trim(),
+        rawSymbol: okPayload?.rawSymbol || String(otSymbol || "").trim(),
+        resolvedSymbol: okPayload?.resolvedSymbol || String(otSymbol || "").trim(),
+        side,
+        wallet_address: address,
+        user_pubkey: address,
+      };
+      const recHeaders = { "Content-Type": "application/json" };
+      if (tok) recHeaders.Authorization = `Bearer ${tok}`;
+      const recResp = await fetch(recUrl, {
+        method: "POST",
+        headers: recHeaders,
+        body: JSON.stringify(recPayload),
+      });
+      const recText = await recResp.text();
+      let recJson = null;
+      try { recJson = recText ? JSON.parse(recText) : null; } catch { recJson = { raw: recText }; }
+      okPayload.recordSubmit = recJson || { ok: recResp.ok };
+      okPayload.recorded = !!recResp.ok && !!(recJson?.ok ?? true);
+      if (!okPayload.recorded) {
+        onToast?.({ kind: "warn", msg: "Hydration swap submitted, but local All Orders recording failed." });
+      }
+    } catch (recErr) {
+      okPayload.recordSubmit = { ok: false, error: recErr?.message || String(recErr) };
+      okPayload.recorded = false;
+      onToast?.({ kind: "warn", msg: "Hydration swap submitted, but local All Orders recording failed." });
+    }
+
+    setSubmitOk(okPayload);
+    openSubmitResultModal("ok", okPayload, okPayload.recorded === false ? "Hydration Swap Submitted — Record Failed" : "Hydration Swap Submitted");
+    onToast?.({
+      kind: "ok",
+      msg: submit?.txHash
+        ? `Hydration swap submitted${okPayload.recorded === false ? " (record failed)" : " + recorded"}: ${submit.txHash}`
+        : `Hydration swap submitted${okPayload.recorded === false ? " (record failed)" : " + recorded"}.`,
+    });
+
+    // Refresh spendable balances after on-chain submission/finalization.
+    refreshBalancesAfterSubmit({ venueKey: effectiveVenue, focusBase: baseAsset, focusQuote: quoteAsset });
+  } catch (e) {
+    const msg = e?.message || "Failed to sign/submit Hydration swap";
+    setSubmitError(msg);
+    openSubmitResultModal("error", msg, "Hydration Swap Submit Failed");
+  } finally {
+    setSubmitting(false);
+  }
+}
+
+
 async function submitLimitOrder() {
   const tok = getAuthToken();
 
@@ -3209,19 +4462,25 @@ async function submitLimitOrder() {
     }
     setShowConfirm(false);
     // Surface immediate feedback and never allow a silent no-op.
-    openSubmitResultModal("info", "Submitting…", "Submitting");
+    if (isPolkadotDexVenue) {
+      openHydrationSubmitProgress("build", side);
+    } else {
+      openSubmitResultModal("info", "Submitting…", "Submitting");
+    }
     void (
       isSolanaLimitMode
         ? submitSolanaTriggerLimitOrder()
         : isSolanaDexVenue
           ? submitSolanaSwapOrder()
-          : submitLimitOrder()
+          : isPolkadotDexVenue
+            ? submitPolkadotSwapOrder()
+            : submitLimitOrder()
     ).catch((e) => {
       const msg = e?.message || String(e);
       openSubmitResultModal(
         "error",
         msg,
-        isSolanaLimitMode ? "Jupiter Limit Submit Failed" : isSolanaDexVenue ? "Swap Submit Failed" : "Order Submit Failed"
+        isSolanaLimitMode ? "Jupiter Limit Submit Failed" : isSolanaDexVenue ? "Swap Submit Failed" : isPolkadotDexVenue ? "Polkadot Swap Submit Failed" : "Order Submit Failed"
       );
     });
   }
@@ -3517,7 +4776,13 @@ async function submitLimitOrder() {
     [submitResultPayload, submitResultKind]
   );
 
-  const solanaSubmitEndpointLabel = useMemo(() => {
+  const submitEndpointLabel = useMemo(() => {
+    if (isPolkadotDexVenue) {
+      if (!polkadotEffectiveQuotesAvailable) return "/api/polkadot_dex/hydration/status (quotes disabled)";
+      if (!polkadotEffectiveLiveSwapsRecommended) return "/api/polkadot_dex/hydration/swap_tx (build disabled)";
+      if (side === "buy" && !polkadotEffectiveExactBuyEnabled) return "/api/polkadot_dex/hydration/swap_tx (BUY disabled; SELL enabled)";
+      return `/api/polkadot_dex/hydration/swap_tx (${hydrationRouteModeLabel(preferredHydrationRouteMode)}) → SubWallet sign/send`;
+    }
     if (!isSolanaDexVenue) return "/api/trade/order";
     if (isSolanaLimitMode) return "/api/solana_dex/jupiter/trigger/create_order";
     const v = String(effectiveVenue || "").toLowerCase().trim();
@@ -3526,7 +4791,7 @@ async function submitLimitOrder() {
     if (routerMode === "ultra") return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute";
     if (routerMode === "metis") return "/api/solana_dex/jupiter/swap_tx";
     return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute → fallback /api/solana_dex/jupiter/swap_tx → fallback /api/solana_dex/raydium/swap_tx";
-  }, [isSolanaDexVenue, isSolanaLimitMode, effectiveVenue, preferredSolanaRouterMode]);
+  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
 
   async function copySubmitResultToClipboard() {
     try {
@@ -3561,7 +4826,8 @@ async function submitLimitOrder() {
       { k: "Venue", v: hideVenueNames ? "••••" : v },
       { k: "Symbol", v: hideTableData ? "••••" : sym },
       { k: "Side", v: side.toUpperCase() },
-      { k: "Type", v: isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "LIMIT" : "SWAP") : "LIMIT" },
+      { k: "Type", v: isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "LIMIT" : "SWAP") : isPolkadotDexVenue ? "SWAP" : "LIMIT" },
+      ...(isPolkadotDexVenue ? [{ k: "Route", v: hydrationRouteModeLabel(preferredHydrationRouteMode) }] : []),
       { k: "Qty", v: hideTableData ? "••••" : qStr },
       { k: "Limit", v: hideTableData ? "••••" : pxStr },
       { k: `Total (${totalLabel})`, v: hideTableData ? "••••" : totStr },
@@ -3590,6 +4856,8 @@ async function submitLimitOrder() {
     hideVenueNames,
     autoCalc,
     isSolanaJupiterVenue,
+    isPolkadotDexVenue,
+    preferredHydrationRouteMode,
     isSolanaLimitMode,
     solanaOrderMode,
     solanaExpiryLabel,
@@ -3844,7 +5112,7 @@ async function submitLimitOrder() {
                 const cleaned = sanitizeDecimalInput(e.target.value);
 
                 // Solana DEX venues: keep the user-picked decimal price as-is; do not CEX-normalize.
-                if (isSolanaDexVenue) {
+                if (isDexSwapVenue) {
                   setLimitPrice(cleaned);
                   return;
                 }
@@ -3872,7 +5140,7 @@ async function submitLimitOrder() {
                 if (!limitPrice) return;
 
                 // Solana DEX venues: do not clamp/round limit price on blur.
-                if (isSolanaDexVenue) return;
+                if (isDexSwapVenue) return;
 
                 const normalized = normalizeLimitPriceStr(limitPrice, rules, side);
                 if (normalized && normalized !== String(limitPrice)) setLimitPrice(normalized);
@@ -3892,7 +5160,7 @@ async function submitLimitOrder() {
                 setTotalQuote(cleaned);
 
                 // DEX-only: ensure Total→Qty auto-calc works even when venue rules are unavailable.
-                if (isSolanaDexVenue && autoCalc) {
+                if (isDexSwapVenue && autoCalc) {
                   const t = Number(cleaned);
                   const p = Number(expandExponential(limitPrice));
                   if (Number.isFinite(t) && t > 0 && Number.isFinite(p) && p > 0) {
@@ -3947,7 +5215,7 @@ async function submitLimitOrder() {
 
             <button
               style={{ ...safeButton, padding: "5px 8px", lineHeight: 1.05 }}
-              onClick={() => refreshAvailBalances({ maxPolls: 2, pollBackoffMs: [800, 1200] })}
+              onClick={() => refreshAvailBalances({ force: true, maxPolls: 2, pollBackoffMs: [800, 1200] })}
               disabled={balLoading}
               title="Refresh balances from venue"
             >
@@ -4157,7 +5425,131 @@ async function submitLimitOrder() {
             </div>
           )}
 
-          {balErr && (isSolanaDexVenue || !String(balErr).includes("429")) && (
+          {isPolkadotDexVenue && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+                marginTop: 6,
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.02)",
+                fontSize: 12,
+                opacity: 0.95,
+              }}
+            >
+              <span style={{ opacity: 0.9, fontWeight: 700 }}>Polkadot</span>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap" }}>
+                <span style={{ opacity: 0.82 }}>Wallet</span>
+                <select
+                  style={{ ...darkSelectStyle, minWidth: 118 }}
+                  value={preferredPolkadotWallet || "subwallet-js"}
+                  onChange={(e) => {
+                    setPreferredPolkadotWallet(e.target.value);
+                    setPolkadotWalletState((prev) => ({
+                      ...(prev || {}),
+                      key: e.target.value,
+                      label: getPolkadotWalletLabel(e.target.value),
+                      connected: false,
+                      address: null,
+                      accountName: "",
+                      extension: null,
+                      error: null,
+                    }));
+                  }}
+                  title="Select Polkadot injected wallet"
+                >
+                  {installedPolkadotWallets.length === 0 ? (
+                    <option value="subwallet-js" style={darkOptionStyle}>SubWallet</option>
+                  ) : null}
+                  {installedPolkadotWallets.map((opt) => (
+                    <option key={opt.key} value={opt.key} style={darkOptionStyle}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                style={{ ...safeButton, padding: "6px 8px", fontWeight: 800 }}
+                onClick={() => setPolkadotSettingsOpen(true)}
+                title={`Polkadot DEX settings. Route: ${hydrationRouteModeLabel(preferredHydrationRouteMode)}`}
+              >
+                ⚙ Settings
+              </button>
+              <span style={{ ...safeMuted, fontSize: 11, lineHeight: 1.1 }}>
+                {polkadotWalletConnected
+                  ? `${hideTableData ? "••••" : (polkadotWalletLabel || "Wallet")}: ${hideTableData ? "••••" : shortenWalletAddress(polkadotWalletState.address)}`
+                  : polkadotWalletState?.error
+                    ? (hideTableData ? "Wallet not connected" : polkadotWalletState.error)
+                    : "Connect SubWallet for Polkadot DEX"}
+              </span>
+              <button
+                type="button"
+                style={{ ...safeButton, padding: "6px 8px", marginLeft: "auto", fontWeight: 800 }}
+                onClick={() => {
+                  void ensurePolkadotWalletConnected().catch((e) => {
+                    const msg = e?.message || "Failed to connect Polkadot wallet.";
+                    onToast?.({ kind: "warn", msg });
+                    openSubmitResultModal("error", msg, "Polkadot Wallet Connect Failed");
+                  });
+                }}
+                title={polkadotWalletConnected && polkadotWalletState?.address && !hideTableData ? polkadotWalletState.address : "Connect Polkadot wallet"}
+              >
+                {polkadotWalletConnected ? "Connected" : "Connect"}
+              </button>
+              <button
+                type="button"
+                style={{ ...safeButton, padding: "6px 8px" }}
+                onClick={() => setPolkadotWalletScanNonce((x) => x + 1)}
+                title="Rescan injected Polkadot wallets"
+              >
+                Rescan
+              </button>
+            </div>
+          )}
+
+
+          {isPolkadotDexVenue && polkadotSettingsOpen ? (
+            <div
+              style={{
+                marginTop: 6,
+                padding: "8px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.12)",
+                background: "rgba(14,17,22,0.98)",
+                boxShadow: "0 10px 26px rgba(0,0,0,0.35)",
+                fontSize: 12,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
+                <b>Polkadot DEX Settings</b>
+                <button type="button" style={{ ...safeButton, padding: "5px 8px" }} onClick={() => setPolkadotSettingsOpen(false)}>Close</button>
+              </div>
+              <label style={{ display: "grid", gridTemplateColumns: "88px minmax(0, 1fr)", alignItems: "center", gap: 8 }}>
+                <span style={{ opacity: 0.82 }}>Route</span>
+                <select
+                  style={{ ...darkSelectStyle, width: "100%" }}
+                  value={preferredHydrationRouteMode}
+                  onChange={(e) => setPreferredHydrationRouteModeState(normalizeHydrationRouteMode(e.target.value))}
+                  title="Hydration swap route source. Auto uses manual XYK for configured custom pairs and SDK/sidecar for normal pairs."
+                >
+                  <option value="auto" style={darkOptionStyle}>Auto</option>
+                  <option value="sdk" style={darkOptionStyle}>SDK</option>
+                  <option value="isolated_helper" style={darkOptionStyle}>Isolated</option>
+                  <option value="manual_xyk" style={darkOptionStyle}>Manual XYK</option>
+                </select>
+              </label>
+              <div style={{ ...safeMuted, marginTop: 8, fontSize: 11, lineHeight: 1.25 }}>
+                Current route: <b>{hydrationRouteModeLabel(preferredHydrationRouteMode)}</b>. Auto uses manual XYK for configured custom pairs and SDK/sidecar for normal pairs.
+              </div>
+            </div>
+          ) : null}
+
+          {balErr && (isDexSwapVenue || !String(balErr).includes("429")) && (
             <div style={{ ...safeMuted, fontSize: 11, color: "#ff6b6b", lineHeight: 1.1 }}>
               Bal: {hideTableData ? "Hidden" : balErr}
             </div>
@@ -4239,7 +5631,7 @@ async function submitLimitOrder() {
         </div>
 
         <div style={{ marginTop: 6, ...safeMuted, fontSize: 12, lineHeight: 1.15 }}>
-          Type: <b>{isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : "Limit"}</b>
+          Type: <b>{isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
           {isSolanaLimitMode ? <> • Expiry: <b>{hideTableData ? "••••" : solanaExpiryLabel}</b></> : null}
           {" "}• Est. Total ({totalLabel}): <b>{notional === null ? "—" : fmtNum ? fmtNum(notional) : String(notional)}</b>
         </div>
@@ -4256,7 +5648,7 @@ async function submitLimitOrder() {
             onClick={openConfirm}
             title={
               !canSubmitBase
-                ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isSolanaDexVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
+                ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isDexSwapVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
                 : preTrade?.block
                   ? "Blocked by pre-trade checks"
                   : "Review and confirm order"
@@ -4266,13 +5658,15 @@ async function submitLimitOrder() {
               ? "Submitting…"
               : isSolanaLimitMode
                 ? side === "buy" ? "Place Buy Limit" : "Place Sell Limit"
-                : isSolanaDexVenue
-                  ? side === "buy" ? "Swap Buy" : "Swap Sell"
+                : isDexSwapVenue
+                  ? isPolkadotDexVenue
+                    ? side === "buy" ? "Sign Swap Buy" : "Sign Swap Sell"
+                    : side === "buy" ? "Swap Buy" : "Swap Sell"
                   : side === "buy" ? "Place Buy Limit" : "Place Sell Limit"}
           </button>
 
           <span style={{ ...safeMuted, fontSize: 11, lineHeight: 1.1 }}>
-            Endpoint: <code>{solanaSubmitEndpointLabel}</code>
+            Endpoint: <code>{submitEndpointLabel}</code>
           </span>
 
           {hasLastSubmitResult && (
@@ -4345,7 +5739,7 @@ async function submitLimitOrder() {
             >
               <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
                 <div style={{ fontSize: 14, fontWeight: 900 }}>
-                  Confirm {side === "buy" ? "BUY" : "SELL"} {isSolanaLimitMode ? "Jupiter Limit Order" : isSolanaDexVenue ? "Swap" : "Limit Order"}
+                  Confirm {side === "buy" ? "BUY" : "SELL"} {isSolanaLimitMode ? "Jupiter Limit Order" : isDexSwapVenue ? "Swap" : "Limit Order"}
                 </div>
                 <button
                   type="button"
@@ -4413,14 +5807,24 @@ async function submitLimitOrder() {
                     boxShadow: `0 0 0 1px ${sideAccent} inset`,
                   }}
                 >
-                  {submitting ? "Submitting…" : "Confirm & Submit"}
+                  {submitting ? "Submitting…" : isPolkadotDexVenue ? "Confirm & Sign" : "Confirm & Submit"}
                 </button>
               </div>
 
               <div style={{ marginTop: 10, fontSize: 11, color: "#a9a9a9", lineHeight: 1.25 }}>
-                Confirm submits immediately via{" "}
-                <code>{solanaSubmitEndpointLabel}</code>.
-                {" "}Cancel returns you to the form without submitting.
+                {isPolkadotDexVenue ? (
+                  <>
+                    Confirm builds the Hydration swap payload, opens SubWallet for signing, and submits/finalizes through{" "}
+                    <code>{submitEndpointLabel}</code>.
+                    {" "}Cancel returns you to the form without signing.
+                  </>
+                ) : (
+                  <>
+                    Confirm submits immediately via{" "}
+                    <code>{submitEndpointLabel}</code>.
+                    {" "}Cancel returns you to the form without submitting.
+                  </>
+                )}
               </div>
             </div>
           </div>

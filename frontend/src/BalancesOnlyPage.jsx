@@ -81,9 +81,13 @@ export default function BalancesOnlyPage() {
   }
 
   async function loadWalletBalancesLatest() {
+    // Do not request wallet-address backend price enrichment here.
+    // Hydration prices are now owned by /api/polkadot_dex/hydration/prices
+    // and the main balances table; requesting with_prices=1 from this
+    // legacy/standalone page can re-trigger old generic Hydration price paths.
     const url = `${API_BASE}/api/wallet_addresses/balances/latest?owner_scope=${encodeURIComponent(
       waOwnerScope
-    )}&with_prices=1`;
+    )}&with_prices=0`;
     const r = await fetch(url);
     if (!r.ok) throw new Error(`wallet balances latest failed: ${r.status}`);
     const j = await r.json();

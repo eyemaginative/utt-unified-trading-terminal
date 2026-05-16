@@ -55,6 +55,13 @@ except Exception as e:
     print("solana_dex router import failed:", repr(e))
     solana_dex_router = None
 
+# NEW: polkadot dex router (/api/polkadot_dex/*)
+try:
+    from .routers.polkadot_dex import router as polkadot_dex_router
+except Exception as e:
+    print("polkadot_dex router import failed:", repr(e))
+    polkadot_dex_router = None
+
 
 # NEW: token registry router (/api/token_registry/*)
 try:
@@ -113,6 +120,10 @@ def create_app() -> FastAPI:
     # Solana DEX (reads first)
     if solana_dex_router is not None:
         app.include_router(solana_dex_router)
+
+    # Polkadot DEX / Hydration (reads first)
+    if polkadot_dex_router is not None:
+        app.include_router(polkadot_dex_router)
 
     # Airdrop registration / status
     if airdrop_router is not None:

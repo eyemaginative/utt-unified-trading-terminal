@@ -50,7 +50,10 @@ ALLOWED_SORT_FIELDS = {
     # Note: can_cancel/cancel_ref intentionally not sortable until explicitly added.
 }
 
-_TERMINAL = {"filled", "canceled", "cancelled", "rejected", "done", "closed", "expired", "failed"}
+# Include DEX swap terminal statuses here too.  The All Orders loader fetches
+# open and terminal buckets separately, so a confirmed swap must be selected by
+# the terminal SQL filter before _to_unified_swap can normalize it.
+_TERMINAL = {"filled", "canceled", "cancelled", "rejected", "done", "closed", "expired", "failed", "confirmed"}
 _OPENISH = {"new", "open", "routed", "acked", "partial", "live", "pending"}
 
 
@@ -87,10 +90,29 @@ def _to_unified_swap(mp: dict) -> Dict[str, Any]:
     price = mp.get('price')
     fee = mp.get('fee_quote')
 
-    status_bucket = 'terminal' if status in ('confirmed', 'failed') else _status_bucket(status)
+    status_bucket = _status_bucket(status)
 
     def _f(x):
-        return float(x) if isinstance(x, (int, float)) else None
+        try:
+            if x is None:
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    quote_qty_f = _f(quote_qty)
+    fee_f = _f(fee)
+    # For swap rows, quote_qty is the quote-leg value:
+    #   - SELL: quote received
+    #   - BUY: quote spent
+    # Keep total_after_fee populated for both sides so All Orders does not show
+    # BUY swaps as zero-net rows.  If a fee is stored in the quote asset, subtract
+    # it; otherwise show the quote-leg value as the best available net/cost.
+    total_after_fee = (
+        (quote_qty_f - fee_f)
+        if (quote_qty_f is not None and fee_f is not None)
+        else quote_qty_f
+    )
 
     return {
         'id': str(mp.get('signature') or ''),
@@ -108,8 +130,8 @@ def _to_unified_swap(mp: dict) -> Dict[str, Any]:
         'filled_qty': _f(base_qty),
         'limit_price': None,
         'avg_fill_price': _f(price),
-        'fee': _f(fee),
-        'total_after_fee': (_f(quote_qty) - _f(fee)) if (side == 'sell' and _f(quote_qty) is not None and _f(fee) is not None) else (_f(quote_qty) if side == 'sell' else None),
+        'fee': fee_f,
+        'total_after_fee': total_after_fee,
         'client_order_id': None,
         'venue_order_id': str(mp.get('signature') or ''),
         'can_cancel': False,
@@ -570,7 +592,7 @@ def _dedupe_and_enrich_local_with_venue(combined: List[Dict[str, Any]]) -> List[
     def _is_terminal(item: Dict[str, Any]) -> bool:
         st = (item.get("status") or "").lower()
         b = (item.get("bucket") or "").lower()
-        return b == "terminal" or st in ("canceled", "cancelled", "filled", "rejected", "expired", "closed", "done")
+        return b == "terminal" or st in ("canceled", "cancelled", "filled", "rejected", "expired", "closed", "done", "confirmed")
 
     def _score(item: Dict[str, Any]) -> Tuple[int, str, str]:
         # Prefer terminal rows, then prefer rows with a closed_at, then updated_at.

@@ -310,6 +310,44 @@ class Settings(BaseSettings):
 
         return None
 
+    def _vault_latest_bundle_any_username(self, venue: str) -> Optional[dict]:
+        """Single-user desktop fallback: read the latest secret bundle for a venue.
+
+        Normal credential readers should prefer _vault_latest_bundle(), which
+        respects username / UTT_VAULT_USERNAME / local.  This fallback is used
+        only by infrastructure-style keys that are app-level rather than
+        exchange-account-level, such as Hydration RPC provider keys.
+        """
+        v = (venue or "").strip()
+        if not v:
+            return None
+
+        db_path = (self.sqlite_path or "").strip()
+        if not db_path:
+            db_path = (os.getenv("SQLITE_PATH") or "").strip()
+        if not db_path:
+            db_path = (os.getenv("UTT_DB_PATH") or os.getenv("UTT_AUTH_DB_PATH") or os.getenv("UTT_DB") or "").strip()
+        if not db_path:
+            db_path = str(Path(__file__).resolve().parents[1] / "utt.sqlite")
+
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT secret_enc FROM utt_api_keys WHERE venue=? ORDER BY created_at DESC LIMIT 1",
+                    (v,),
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    return None
+                bundle = self._vault_decrypt(str(row[0]))
+                return bundle if isinstance(bundle, dict) else None
+            finally:
+                conn.close()
+        except Exception:
+            return None
+
 
     def _normalize_pem(self, s: str) -> str:
         """Normalize PEM-ish text coming from env/vault.
@@ -504,6 +542,28 @@ class Settings(BaseSettings):
         if not token or not secret:
             return None
         return (token, secret)
+
+    def polkadot_hydration_rpc_api_key(self):
+        """Optional callable for Hydration RPC: returns a Dwellir API key from DB vault.
+
+        Preferred Profile → API Keys row:
+          - venue='polkadot_hydration'
+          - api_key='<Dwellir key>'
+          - api_secret/passphrase blank
+
+        Compatibility aliases are checked so local installs can use provider-
+        specific or older venue names without another code patch.
+        """
+        for venue in ("polkadot_hydration", "dwellir_hydration", "hydration", "dwellir"):
+            bundle = self._vault_latest_bundle(venue)
+            if not bundle:
+                bundle = self._vault_latest_bundle_any_username(venue)
+            if not bundle:
+                continue
+            api_key = (bundle.get("api_key") or "").strip()
+            if api_key:
+                return api_key
+        return None
 
 
 

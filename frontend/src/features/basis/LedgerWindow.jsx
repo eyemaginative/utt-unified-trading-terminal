@@ -180,7 +180,25 @@ const DEFAULT_XFER_VENUES = [
   "dex-trade",
   "crypto.com",
   "uphold",
+  "solana_dex",
+  "solana_jupiter",
+  "polkadot_hydration",
 ];
+
+function mergeXferVenueOptions(...lists) {
+  const out = [];
+  const seen = new Set();
+  for (const list of lists) {
+    for (const raw of Array.isArray(list) ? list : []) {
+      const s = String(raw || "").trim();
+      const k = s.toLowerCase();
+      if (!s || seen.has(k)) continue;
+      seen.add(k);
+      out.push(s);
+    }
+  }
+  return out;
+}
 
 // Supports simple "venue:coinbase" (and also plain "coinbase" when it is the only token)
 function parseVenueScopedQuery(rawQ, knownVenues = []) {
@@ -1342,9 +1360,7 @@ const [xferLookbackDays, setXferLookbackDays] = useState(() => {
           const venues = extractVenueKeysFromPayload(r);
           if (venues && venues.length) {
             const cur = String(xferVenue || "").trim();
-            const curKey = cur.toLowerCase();
-            const hasCur = cur && venues.some((v) => String(v).trim().toLowerCase() === curKey);
-            const next = hasCur ? venues.slice() : venues.concat([cur]).filter(Boolean);
+            const next = mergeXferVenueOptions(venues, DEFAULT_XFER_VENUES, [cur]);
             if (alive) setXferVenueOptions(next);
             return;
           }
@@ -1355,10 +1371,7 @@ const [xferLookbackDays, setXferLookbackDays] = useState(() => {
 
       // Fallback: keep defaults (but ensure current selection stays present)
       const cur = String(xferVenue || "").trim();
-      const curKey = cur.toLowerCase();
-      const baseList = DEFAULT_XFER_VENUES.slice();
-      const hasCur = cur && baseList.some((v) => String(v).trim().toLowerCase() === curKey);
-      const next = hasCur ? baseList : baseList.concat([cur]).filter(Boolean);
+      const next = mergeXferVenueOptions(DEFAULT_XFER_VENUES, [cur]);
       if (alive) setXferVenueOptions(next);
     })();
 
@@ -3373,7 +3386,7 @@ async function onUnlinkWithdrawalRow(wdwRow) {
   value={xferVenue}
   onChange={(e) => setXferVenue(e.target.value)}
   style={{ ...ui.ctl, width: 140, marginLeft: 10 }}
-  title="Venue for transfer ingest"
+  title="Venue for transfer ingest (includes polkadot_hydration when backend support is available)"
   aria-disabled={xferRunning}
 >
   {xferVenueOptions.map((v) => (

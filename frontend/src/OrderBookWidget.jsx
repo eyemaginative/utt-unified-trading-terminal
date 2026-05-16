@@ -7,6 +7,7 @@ const LS_OB_LOCK = "utt_ob_lock_v2";
 const LS_OB_AUTO = "utt_ob_auto_v1";
 const LS_OB_SEC = "utt_ob_sec_v1";
 const LS_OB_SOL_ROUTER = "utt_ob_sol_router_v1";
+const LS_OB_HYDRATION_ROUTE = "utt_ob_hydration_route_mode_v1";
 
 function safeNum(v) {
   const n = Number(v);
@@ -31,6 +32,111 @@ function decimalsFromIncrement(inc) {
 function clamp(n, lo, hi) {
   if (!Number.isFinite(n)) return lo;
   return Math.max(lo, Math.min(hi, n));
+}
+
+function isPolkadotHydrationVenueKey(v) {
+  const key = String(v || "").toLowerCase().trim();
+  return key === "polkadot_hydration" || key === "hydration" || key === "polkadot_dex" || key.startsWith("polkadot_");
+}
+
+function normalizeHydrationRouteMode(v) {
+  const raw = String(v || "auto").toLowerCase().trim();
+  if (raw === "managed" || raw === "managed_sdk" || raw === "sdk_router" || raw === "sidecar") return "sdk";
+  if (raw === "isolated" || raw === "helper") return "isolated_helper";
+  if (raw === "manual" || raw === "xyk") return "manual_xyk";
+  return raw === "sdk" || raw === "isolated_helper" || raw === "manual_xyk" ? raw : "auto";
+}
+
+function hydrationRouteModeLabel(v) {
+  const mode = normalizeHydrationRouteMode(v);
+  if (mode === "sdk") return "SDK";
+  if (mode === "isolated_helper") return "Isolated";
+  if (mode === "manual_xyk") return "Manual XYK";
+  return "Auto";
+}
+
+const HYDRATION_LOW_TVL_USD = 10000;
+
+function firstFiniteNumber(...values) {
+  for (const v of values) {
+    if (v === null || v === undefined || v === "") continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function formatUsdCompact(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  if (Math.abs(n) >= 1000) return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+  if (Math.abs(n) >= 1) return `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 4 })}`;
+}
+
+function buildHydrationLowLiquidityWarning(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const pool = (p.pool && typeof p.pool === "object") ? p.pool : p;
+  const routerText = String(p.router || p.routeModeEffective || p.route_mode_effective || pool.router || "").toLowerCase();
+  const sourceText = String(pool.source || p.source || "").toLowerCase();
+  const tvlUsd = firstFiniteNumber(
+    pool.tvlUsd,
+    pool.tvl_usd,
+    pool.liquidityUsd,
+    pool.liquidity_usd,
+    pool.totalUsd,
+    pool.total_usd,
+    p.tvlUsd,
+    p.tvl_usd,
+    p.liquidityUsd,
+    p.liquidity_usd
+  );
+  const explicitLow =
+    pool.lowLiquidity === true ||
+    pool.low_liquidity === true ||
+    p.lowLiquidity === true ||
+    p.low_liquidity === true;
+  const manualOrIsolated =
+    sourceText.includes("live_pool_account") ||
+    sourceText.includes("route_registry") ||
+    sourceText.includes("manual") ||
+    sourceText.includes("isolated") ||
+    routerText.includes("manual_xyk") ||
+    routerText.includes("fallback") ||
+    routerText.includes("isolated");
+  const belowThreshold = tvlUsd !== null && tvlUsd < HYDRATION_LOW_TVL_USD;
+  if (!explicitLow && !belowThreshold && !manualOrIsolated) return null;
+  const label = belowThreshold
+    ? `Low TVL ${formatUsdCompact(tvlUsd)} < $10k`
+    : "Low-liquidity isolated pool";
+  return {
+    label,
+    tvlUsd,
+    thresholdUsd: HYDRATION_LOW_TVL_USD,
+    source: String(pool.source || p.source || "").trim(),
+    manualOrIsolated,
+    belowThreshold,
+    message: belowThreshold
+      ? "Hydration spot quotes may be unavailable below $10k TVL; UTT manual XYK routing can still trade when enabled."
+      : "Manual/live isolated pool: monitor TVL and price impact; Hydration SDK spot quotes may be unavailable below $10k TVL.",
+  };
+}
+
+function isHydrationQuoteAvailable(statusPayload) {
+  const qs = statusPayload?.quoteStatus || statusPayload?.detail?.quoteStatus || null;
+  return qs?.available === true && (statusPayload?.liveQuotesEnabled === true || qs?.enabled === true);
+}
+
+function formatHydrationQuoteStatus(statusPayload) {
+  if (isHydrationQuoteAvailable(statusPayload)) {
+    return "Hydration live quotes are enabled for controlled testing. Live swaps remain disabled.";
+  }
+  return "Hydration quotes/swaps are temporarily disabled. Asset resolution is available. Waiting on a non-router quote source before live trading is enabled.";
+}
+
+function formatHydrationQuoteStatusDetail(statusPayload) {
+  const qs = statusPayload?.quoteStatus || statusPayload?.detail?.quoteStatus || null;
+  return String(qs?.reason || statusPayload?.message || "").trim();
 }
 
 /**
@@ -201,7 +307,17 @@ export default function OrderBookWidget({
       return "auto";
     }
   });
+  const [obHydrationRouteMode, setObHydrationRouteMode] = useState(() => {
+    try {
+      return normalizeHydrationRouteMode(localStorage.getItem(LS_OB_HYDRATION_ROUTE) || "auto");
+    } catch {
+      return "auto";
+    }
+  });
+  const [obSettingsOpen, setObSettingsOpen] = useState(false);
   const [obActiveRouter, setObActiveRouter] = useState(null);
+  const [hydrationStatus, setHydrationStatus] = useState(null);
+  const [hydrationLiquidityWarning, setHydrationLiquidityWarning] = useState(null);
 
   const inFlightRef = useRef(false);
   const abortRef = useRef(null);
@@ -270,6 +386,14 @@ export default function OrderBookWidget({
     }
   }, [obSolanaRouterMode]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_OB_HYDRATION_ROUTE, normalizeHydrationRouteMode(obHydrationRouteMode));
+    } catch {
+      // ignore
+    }
+  }, [obHydrationRouteMode]);
+
   // Keep draft in sync when parent sets obSymbol (e.g. from clicks elsewhere)
   useEffect(() => {
     setSymbolDraft(String(obSymbol || ""));
@@ -277,11 +401,15 @@ export default function OrderBookWidget({
     pairNotFoundRef.current = false;
     cooldownUntilRef.current = 0;
     cooldownPowRef.current = 0;
+    setHydrationStatus(null);
+    setHydrationLiquidityWarning(null);
   }, [obSymbol]);
 
   const isSolJupVenue = useMemo(() => {
     return String(effectiveVenue || "").toLowerCase().trim() === "solana_jupiter";
   }, [effectiveVenue]);
+
+  const isPolkadotDexVenue = useMemo(() => isPolkadotHydrationVenueKey(effectiveVenue), [effectiveVenue]);
 
   // Reset gating when venue changes
   useEffect(() => {
@@ -289,10 +417,12 @@ export default function OrderBookWidget({
     cooldownUntilRef.current = 0;
     cooldownPowRef.current = 0;
     setObActiveRouter(null);
+    setHydrationStatus(null);
+    setHydrationLiquidityWarning(null);
 
-    // Prevent Solana/Jupiter decimals from leaking into other venues' size formatting.
-    if (!isSolJupVenue) setSizeDecimals(null);
-  }, [effectiveVenue, isSolJupVenue]);
+    // Prevent DEX-specific decimals from leaking into regular CEX venues.
+    if (!isSolJupVenue && !isPolkadotDexVenue) setSizeDecimals(null);
+  }, [effectiveVenue, isSolJupVenue, isPolkadotDexVenue]);
 
   useEffect(() => {
     if (!isSolJupVenue) return;
@@ -301,6 +431,15 @@ export default function OrderBookWidget({
     cooldownPowRef.current = 0;
     setObActiveRouter(null);
   }, [obSolanaRouterMode, isSolJupVenue]);
+
+  useEffect(() => {
+    if (!isPolkadotDexVenue) return;
+    pairNotFoundRef.current = false;
+    cooldownUntilRef.current = 0;
+    cooldownPowRef.current = 0;
+    setObActiveRouter(null);
+    setHydrationLiquidityWarning(null);
+  }, [obHydrationRouteMode, isPolkadotDexVenue]);
 
 
   const lockedRef = useRef(locked);
@@ -481,6 +620,12 @@ function clampBox(next) {
       return;
     }
 
+    if (isPolkadotHydrationVenueKey(v)) {
+      setPriceDecimals(null);
+      setPriceIncrement(null);
+      return;
+    }
+
     try {
       const url = `${apiBase}/api/rules/order?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
         sym
@@ -540,8 +685,8 @@ function clampBox(next) {
   function fmtSizeCell(sz) {
     const v = Number(sz);
     if (!Number.isFinite(v)) return "—";
-    // IMPORTANT: sizeDecimals is a Solana/Jupiter-only hint. Never apply it to CEX venues.
-    if (isSolJupVenue && Number.isFinite(Number(sizeDecimals))) {
+    // IMPORTANT: sizeDecimals is a DEX-only hint. Never apply it to regular CEX venues.
+    if ((isSolJupVenue || isPolkadotDexVenue) && Number.isFinite(Number(sizeDecimals))) {
       const d = clamp(Number(sizeDecimals), 0, 18);
       return v.toFixed(d);
     }
@@ -577,6 +722,8 @@ function clampBox(next) {
       }
       const ac = new AbortController();
       abortRef.current = ac;
+      let requestTimedOut = false;
+      let requestTimeoutId = null;
 
       // IMPORTANT:
       // - _ts busts browser/proxy caches
@@ -585,8 +732,10 @@ function clampBox(next) {
 
       const isSolJup = v === "solana_jupiter";
       const isSolRay = v === "solana_raydium";
+      const isPolkadotHydration = isPolkadotHydrationVenueKey(v);
       const routerModeRaw = isSolJup ? String(obSolanaRouterMode || "auto").toLowerCase().trim() : "auto";
       const routerMode = routerModeRaw === "metis" ? "jupiter" : routerModeRaw;
+      const hydrationRouteMode = isPolkadotHydration ? normalizeHydrationRouteMode(obHydrationRouteMode) : "auto";
       const ultraUrl = `${apiBase}/api/solana_dex/jupiter/ultra_orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
         String(depth)
       )}${forceQ}&_ts=${Date.now()}`;
@@ -596,13 +745,40 @@ function clampBox(next) {
       const rayUrl = `${apiBase}/api/solana_dex/raydium/orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
         String(depth)
       )}${forceQ}&_ts=${Date.now()}`;
+      const hydrationStatusUrl = `${apiBase}/api/polkadot_dex/hydration/status?symbol=${encodeURIComponent(sym)}&_ts=${Date.now()}`;
+      const hydrationOrderbookUrl = `${apiBase}/api/polkadot_dex/hydration/orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
+        String(depth)
+      )}&route_mode=${encodeURIComponent(hydrationRouteMode)}${forceQ}&_ts=${Date.now()}`;
+
+      if (isPolkadotHydration) {
+        const sr = await fetch(hydrationStatusUrl, { signal: ac.signal, cache: "no-store" });
+        if (!sr.ok) {
+          const txt = await sr.text().catch(() => "");
+          throw new Error(txt || `Hydration status HTTP ${sr.status}`);
+        }
+        const statusData = await sr.json();
+        setHydrationStatus(statusData || null);
+
+        const quoteAvailable = isHydrationQuoteAvailable(statusData);
+
+        // Do not block the orderbook on broad Hydration quote status alone.
+        // UTTT-HDX can be served by the backend manual XYK/live-pool route even when
+        // generic SDK router quotes are disabled to protect RPC quota.
+        // Unsupported generic pairs will still be rejected by the orderbook endpoint below.
+        if (!quoteAvailable) {
+          setObActiveRouter(null);
+        }
+      }
+
       const url = isSolJup
         ? (routerMode === "raydium" ? rayUrl : (routerMode === "jupiter" ? jupUrl : (routerMode === "ultra" ? ultraUrl : ultraUrl)))
         : isSolRay
           ? rayUrl
-          : `${apiBase}/api/market/orderbook?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
-              sym
-            )}&depth=${encodeURIComponent(String(depth))}${forceQ}&_ts=${Date.now()}`;
+          : isPolkadotHydration
+            ? hydrationOrderbookUrl
+            : `${apiBase}/api/market/orderbook?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
+                sym
+              )}&depth=${encodeURIComponent(String(depth))}${forceQ}&_ts=${Date.now()}`;
 
       const shouldFallbackToRaydium = (txt) => {
         const low = String(txt || "").toLowerCase();
@@ -618,7 +794,18 @@ function clampBox(next) {
         );
       };
 
+      if (isPolkadotHydration) {
+        requestTimeoutId = window.setTimeout(() => {
+          requestTimedOut = true;
+          try { ac.abort(); } catch { /* ignore */ }
+        }, 45000);
+      }
+
       let r = await fetch(url, { signal: ac.signal });
+      if (requestTimeoutId) {
+        window.clearTimeout(requestTimeoutId);
+        requestTimeoutId = null;
+      }
       let usedVenue = v;
       let usedRouter = isSolJup
         ? (routerMode === "raydium" ? "raydium" : (routerMode === "jupiter" ? "jupiter" : "ultra"))
@@ -671,17 +858,20 @@ function clampBox(next) {
       cooldownUntilRef.current = 0;
 
       const data = await r.json();
+      setHydrationLiquidityWarning(isPolkadotHydration ? buildHydrationLowLiquidityWarning(data) : null);
       const responseRouter = String(data?.router || "").toLowerCase().trim();
       if (usedRouter === "ultra") {
         setObActiveRouter("ultra");
       } else if (responseRouter === "ultra" || responseRouter === "jupiter" || responseRouter === "metis" || responseRouter === "raydium") {
+        setObActiveRouter(responseRouter);
+      } else if (isPolkadotHydration && responseRouter) {
         setObActiveRouter(responseRouter);
       } else {
         setObActiveRouter(usedRouter);
       }
 
       // DEX-only formatting hints (opt-in by venue)
-      if (isSolJup || usedVenue === "solana_raydium" || isSolRay) {
+      if (isSolJup || usedVenue === "solana_raydium" || isSolRay || isPolkadotHydration) {
         const inferLevelDecimals = (levels) => {
           try {
             let best = 0;
@@ -714,16 +904,23 @@ function clampBox(next) {
       snapToCenterAnchors();
     } catch (e) {
       // ignore abort errors
+      if (requestTimeoutId) {
+        window.clearTimeout(requestTimeoutId);
+        requestTimeoutId = null;
+      }
       const msg = String(e?.message || "");
-      if (msg.toLowerCase().includes("aborted")) {
+      if (msg.toLowerCase().includes("aborted") && !requestTimedOut) {
         return;
       }
 
       setObAsks([]);
       setObBids([]);
+      setHydrationLiquidityWarning(null);
 
       setObActiveRouter(null);
-      const raw = e?.message || "Failed to load order book";
+      const raw = requestTimedOut
+        ? "Hydration orderbook request timed out after 45s. The backend may still be probing slow quote samples; try Refresh once, then test depth=1 from PowerShell if this repeats."
+        : (e?.message || "Failed to load order book");
       const pretty = formatOrderBookError(raw, venueLabel || effectiveVenue);
       setObError(pretty);
 
@@ -781,7 +978,7 @@ function clampBox(next) {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [obAutoRefresh, obAutoSeconds, effectiveVenue, obSymbol, obDepth, apiBase, obSolanaRouterMode]);
+  }, [obAutoRefresh, obAutoSeconds, effectiveVenue, obSymbol, obDepth, apiBase, obSolanaRouterMode, obHydrationRouteMode]);
 
   function onDragMouseDown(e) {
     if (inlineMode || locked) return;
@@ -873,6 +1070,8 @@ function clampBox(next) {
   const depthN = Math.max(1, Math.min(200, Number(obDepth) || 25));
   const asksView = asksSorted.slice(0, depthN);
   const bidsView = bidsSorted.slice(0, depthN);
+  const hasLiveBookRows = asksView.length > 0 || bidsView.length > 0;
+  const liveBookWrapMinHeight = hasLiveBookRows ? 96 : 44;
 
   const BOTTOM_SPACER = 0;
   const SHELL_PAD = 8;
@@ -896,6 +1095,7 @@ function clampBox(next) {
         minHeight: 0,
         minWidth: 0,
         boxSizing: "border-box",
+        position: "relative",
       }
     : {
         ...styles.orderBookDock,
@@ -909,6 +1109,7 @@ function clampBox(next) {
         flexDirection: "column",
         minHeight: 0,
         boxSizing: "border-box",
+        position: "relative",
       };
 
   const fixedWrapperStyle = inlineMode
@@ -936,21 +1137,21 @@ function clampBox(next) {
     ...styles.obTableWrap,
     maxHeight: "none",
     height: "100%",
-    minHeight: 0,
+    minHeight: liveBookWrapMinHeight,
     marginTop: 3,
     border: `1px solid ${ASK.border}`,
     background: ASK.bg,
     borderRadius: 10,
     boxSizing: "border-box",
     overflow: "auto",
-    flex: "1 1 0",
+    flex: hasLiveBookRows ? "1 0 96px" : "1 1 0",
   };
 
   const bidsWrapStyle = {
     ...styles.obTableWrap,
     maxHeight: "none",
     height: "100%",
-    minHeight: 0,
+    minHeight: liveBookWrapMinHeight,
     marginTop: 3,
     border: `1px solid ${BID.border}`,
     background: BID.bg,
@@ -958,7 +1159,7 @@ function clampBox(next) {
     paddingBottom: BIDS_INNER_PAD_BOTTOM,
     boxSizing: "border-box",
     overflow: "auto",
-    flex: "1 1 0",
+    flex: hasLiveBookRows ? "1 0 96px" : "1 1 0",
   };
 
   const obBodyWrapStyle = {
@@ -966,28 +1167,76 @@ function clampBox(next) {
     flexDirection: "column",
     flex: "1 1 auto",
     minHeight: 0,
-    overflow: "hidden",
+    overflow: "auto",
   };
 
   const obDepthStackStyle = {
     display: "grid",
-    gridTemplateRows: "minmax(0, 1fr) minmax(0, 1fr)",
+    gridTemplateRows: hasLiveBookRows ? "minmax(96px, 1fr) minmax(96px, 1fr)" : "minmax(0, 1fr) minmax(0, 1fr)",
     gap: 6,
     flex: "1 1 auto",
-    minHeight: 0,
-    overflow: "hidden",
+    minHeight: hasLiveBookRows ? 210 : 0,
+    overflow: "visible",
     paddingBottom: 0,
   };
 
   const obDepthPaneStyle = {
     display: "flex",
     flexDirection: "column",
-    minHeight: 0,
-    overflow: "hidden",
+    minHeight: hasLiveBookRows ? 100 : 0,
+    overflow: "visible",
   };
 
   const GAP = 6;
   const rowStyle = { display: "flex", gap: GAP, flexWrap: "wrap", alignItems: "center" };
+  const topControlsStyle = {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1fr) auto auto",
+    gap: 6,
+    alignItems: "center",
+    width: "100%",
+    minWidth: 0,
+  };
+
+  const settingsBackdropStyle = {
+    position: "absolute",
+    inset: 0,
+    zIndex: 8,
+    background: "rgba(0,0,0,0.18)",
+    borderRadius: 12,
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "flex-end",
+    padding: 8,
+    boxSizing: "border-box",
+  };
+
+  const settingsPanelStyle = {
+    width: "min(340px, calc(100% - 16px))",
+    maxHeight: "calc(100% - 16px)",
+    overflow: "auto",
+    border: "1px solid rgba(255,255,255,0.16)",
+    background: "rgba(14,17,22,0.98)",
+    borderRadius: 12,
+    boxShadow: "0 14px 40px rgba(0,0,0,0.55)",
+    padding: 10,
+    boxSizing: "border-box",
+  };
+
+  const settingsGridStyle = {
+    display: "grid",
+    gridTemplateColumns: "1fr",
+    gap: 8,
+    marginTop: 8,
+  };
+
+  const settingsFieldStyle = {
+    display: "grid",
+    gridTemplateColumns: "88px minmax(0, 1fr)",
+    gap: 8,
+    alignItems: "center",
+    fontSize: 12,
+  };
 
   const pillCompact = (extra = {}) => ({
     ...styles.pill,
@@ -1003,6 +1252,18 @@ function clampBox(next) {
     ...extra,
   });
 
+  const topPillCompact = (extra = {}) => pillCompact({
+    width: "100%",
+    minWidth: 0,
+    boxSizing: "border-box",
+    flexWrap: "nowrap",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    padding: "5px 7px",
+    fontSize: 12,
+    ...extra,
+  });
+
   const btnCompact = (extra = {}) => ({
     ...styles.button,
     padding: "6px 8px",
@@ -1011,8 +1272,9 @@ function clampBox(next) {
   });
   const darkSelectStyle = {
     ...styles.select,
-    minWidth: 110,
-    padding: "4px 6px",
+    minWidth: 0,
+    padding: "4px 5px",
+    fontSize: 12,
     background: "#101010",
     backgroundColor: "#101010",
     color: "#eaeaea",
@@ -1087,15 +1349,23 @@ function clampBox(next) {
                                 : String(obSolanaRouterMode || "auto").replace(/^./, (m) => m.toUpperCase()))))
                 }</b>
               </>
+            ) : isPolkadotDexVenue ? (
+              <>
+                {" "}• Route: <b>{
+                  obActiveRouter
+                    ? String(obActiveRouter).replace(/_/g, " ")
+                    : hydrationRouteModeLabel(obHydrationRouteMode)
+                }</b>
+              </>
             ) : null}
           </span>
         </div>
 
-        <div style={rowStyle}>
-          <div style={pillCompact()}>
+        <div style={topControlsStyle}>
+          <div style={topPillCompact()}>
             <span>Symbol</span>
             <input
-              style={inputCompact({ width: 140 })}
+              style={inputCompact({ width: "100%", minWidth: 0, flex: "1 1 0" })}
               value={symbolDraft}
               placeholder="e.g. BTC-USD"
               onChange={(e) => setSymbolDraft(e.target.value)}
@@ -1105,35 +1375,22 @@ function clampBox(next) {
             />
           </div>
 
-          <div style={pillCompact()}>
-            <span>Depth</span>
-            <input
-              style={inputCompact({ width: 70 })}
-              type="number"
-              min="1"
-              max="200"
-              value={obDepth}
-              onChange={(e) => setObDepth(e.target.value)}
-            />
-          </div>
+          <button
+            type="button"
+            style={btnCompact({ whiteSpace: "nowrap" })}
+            onClick={() => setObSettingsOpen(true)}
+            title="Order Book settings"
+          >
+            ⚙ Settings
+          </button>
 
-          {isSolJupVenue ? (
-            <div style={pillCompact()}>
-              <span>Router</span>
-              <select
-                style={{ ...darkSelectStyle, minWidth: 100 }}
-                value={obSolanaRouterMode}
-                onChange={(e) => setObSolanaRouterMode(e.target.value)}
-                title="Order book quote source"
-              >
-                <option value="auto" style={darkOptionStyle}>Auto</option>
-                <option value="ultra" style={darkOptionStyle}>Jupiter Ultra</option>
-                <option value="jupiter" style={darkOptionStyle}>Jupiter Metis</option>
-                <option value="raydium" style={darkOptionStyle}>Raydium</option>
-              </select>
-            </div>
-          ) : null}
-
+          <button
+            style={{ ...btnCompact(), ...(obLoading ? styles.buttonDisabled : {}) }}
+            disabled={obLoading}
+            onClick={() => commitSymbolAndRefresh(true)}
+          >
+            {obLoading ? "Loading…" : "Refresh"}
+          </button>
         </div>
 
         <div style={{ ...rowStyle, marginTop: 6 }}>
@@ -1164,33 +1421,98 @@ function clampBox(next) {
             <span>Lock</span>
           </label>
 
-          <label style={pillCompact()} title="Auto refresh order book on a timer (pauses when tab is hidden).">
-            <input type="checkbox" checked={obAutoRefresh} onChange={(e) => setObAutoRefresh(e.target.checked)} />
-            <span>Auto refresh</span>
-          </label>
-
-          <div style={pillCompact()} title="Refresh interval (seconds)">
-            <span>Every</span>
-            <input
-              style={inputCompact({ width: 70 })}
-              type="number"
-              min="30"
-              max="300"
-              value={obAutoSeconds}
-              disabled={!obAutoRefresh}
-              onChange={(e) => setObAutoSeconds(e.target.value)}
-            />
-            <span style={styles.muted}>sec</span>
-          </div>
-
-          <button
-            style={{ ...btnCompact(), ...(obLoading ? styles.buttonDisabled : {}) }}
-            disabled={obLoading}
-            onClick={() => commitSymbolAndRefresh(true)}
-          >
-            {obLoading ? "Loading…" : "Refresh"}
-          </button>
+          <span style={{ ...styles.muted, fontSize: 11, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            Depth <b>{obDepth}</b> • Auto <b>{obAutoRefresh ? `${obAutoSeconds}s` : "off"}</b>
+            {isSolJupVenue ? <> • Router <b>{String(obSolanaRouterMode || "auto")}</b></> : null}
+            {isPolkadotDexVenue ? <> • Route <b>{hydrationRouteModeLabel(obHydrationRouteMode)}</b></> : null}
+          </span>
         </div>
+
+
+        {obSettingsOpen ? (
+          <div style={settingsBackdropStyle} onMouseDown={(e) => { if (e.target === e.currentTarget) setObSettingsOpen(false); }}>
+            <div style={settingsPanelStyle} onMouseDown={(e) => e.stopPropagation()}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <b>Order Book Settings</b>
+                <button type="button" style={btnCompact()} onClick={() => setObSettingsOpen(false)}>Close</button>
+              </div>
+
+              <div style={settingsGridStyle}>
+                <label style={settingsFieldStyle}>
+                  <span>Depth</span>
+                  <input
+                    style={inputCompact({ width: "100%" })}
+                    type="number"
+                    min="1"
+                    max="200"
+                    value={obDepth}
+                    onChange={(e) => setObDepth(e.target.value)}
+                  />
+                </label>
+
+                <label style={settingsFieldStyle}>
+                  <span>Auto refresh</span>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                    <input type="checkbox" checked={obAutoRefresh} onChange={(e) => setObAutoRefresh(e.target.checked)} />
+                    <span>{obAutoRefresh ? "Enabled" : "Disabled"}</span>
+                  </span>
+                </label>
+
+                <label style={settingsFieldStyle}>
+                  <span>Every</span>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <input
+                      style={inputCompact({ width: 84 })}
+                      type="number"
+                      min="30"
+                      max="300"
+                      value={obAutoSeconds}
+                      disabled={!obAutoRefresh}
+                      onChange={(e) => setObAutoSeconds(e.target.value)}
+                    />
+                    <span style={styles.muted}>sec</span>
+                  </span>
+                </label>
+
+                {isSolJupVenue ? (
+                  <label style={settingsFieldStyle}>
+                    <span>Router</span>
+                    <select
+                      style={{ ...darkSelectStyle, width: "100%" }}
+                      value={obSolanaRouterMode}
+                      onChange={(e) => setObSolanaRouterMode(e.target.value)}
+                      title="Order book quote source"
+                    >
+                      <option value="auto" style={darkOptionStyle}>Auto</option>
+                      <option value="ultra" style={darkOptionStyle}>Jupiter Ultra</option>
+                      <option value="jupiter" style={darkOptionStyle}>Jupiter Metis</option>
+                      <option value="raydium" style={darkOptionStyle}>Raydium</option>
+                    </select>
+                  </label>
+                ) : null}
+
+                {isPolkadotDexVenue ? (
+                  <label style={settingsFieldStyle}>
+                    <span>Route</span>
+                    <select
+                      style={{ ...darkSelectStyle, width: "100%" }}
+                      value={obHydrationRouteMode}
+                      onChange={(e) => setObHydrationRouteMode(normalizeHydrationRouteMode(e.target.value))}
+                      title="Hydration quote source. Auto uses manual XYK for configured custom pairs and SDK/sidecar for normal pairs."
+                    >
+                      <option value="auto" style={darkOptionStyle}>Auto</option>
+                      <option value="sdk" style={darkOptionStyle}>SDK</option>
+                      <option value="isolated_helper" style={darkOptionStyle}>Isolated</option>
+                      <option value="manual_xyk" style={darkOptionStyle}>Manual XYK</option>
+                    </select>
+                  </label>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+
 
         {obError && <div style={{ ...styles.codeError, marginTop: 6, padding: 8 }}>{obError}</div>}
 

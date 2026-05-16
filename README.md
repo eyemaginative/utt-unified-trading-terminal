@@ -1,4 +1,4 @@
-# UTT — Unified Trading Terminal
+# UTT â€” Unified Trading Terminal
 
 UTT (Unified Trading Terminal) is a local-first, multi-venue crypto trading terminal built with **FastAPI** on the backend and **React** on the frontend. It is designed to unify centralized exchange (CEX) workflows and selected decentralized exchange (DEX) flows under a single operator-focused interface.
 
@@ -98,8 +98,8 @@ That includes:
 - external env-path loading for runtime configuration
 - keeping live backend secrets outside the repo
 - avoiding committed database and key files
-- using **Profile → API Keys** for venue credentials instead of tracked env files
-- storing user-entered venue keys in the app’s local encrypted credential store rather than plaintext repository files
+- using **Profile â†’ API Keys** for venue credentials instead of tracked env files
+- storing user-entered venue keys in the appâ€™s local encrypted credential store rather than plaintext repository files
 
 ---
 
@@ -109,38 +109,38 @@ A simplified view of the current repository structure:
 
 ```text
 .
-├── backend/
-│   ├── app/
-│   │   ├── adapters/
-│   │   ├── routers/
-│   │   ├── services/
-│   │   ├── venues/
-│   │   ├── config.py
-│   │   ├── main.py
-│   │   ├── models.py
-│   │   └── schemas.py
-│   ├── alembic/
-│   ├── data/
-│   └── keys/
-├── frontend/
-│   ├── public/
-│   └── src/
-│       ├── app/
-│       ├── components/
-│       ├── features/
-│       ├── hooks/
-│       ├── lib/
-│       ├── utils/
-│       ├── App.jsx
-│       ├── main.jsx
-│       ├── OrderBookWidget.jsx
-│       ├── OrderTicketWidget.jsx
-│       └── TerminalTablesWidget.jsx
-├── docs/
-│   └── screenshots/
-├── scripts/
-├── .env.example
-└── .gitignore
+â”œâ”€â”€ backend/
+â”‚   â”œâ”€â”€ app/
+â”‚   â”‚   â”œâ”€â”€ adapters/
+â”‚   â”‚   â”œâ”€â”€ routers/
+â”‚   â”‚   â”œâ”€â”€ services/
+â”‚   â”‚   â”œâ”€â”€ venues/
+â”‚   â”‚   â”œâ”€â”€ config.py
+â”‚   â”‚   â”œâ”€â”€ main.py
+â”‚   â”‚   â”œâ”€â”€ models.py
+â”‚   â”‚   â””â”€â”€ schemas.py
+â”‚   â”œâ”€â”€ alembic/
+â”‚   â”œâ”€â”€ data/
+â”‚   â””â”€â”€ keys/
+â”œâ”€â”€ frontend/
+â”‚   â”œâ”€â”€ public/
+â”‚   â””â”€â”€ src/
+â”‚       â”œâ”€â”€ app/
+â”‚       â”œâ”€â”€ components/
+â”‚       â”œâ”€â”€ features/
+â”‚       â”œâ”€â”€ hooks/
+â”‚       â”œâ”€â”€ lib/
+â”‚       â”œâ”€â”€ utils/
+â”‚       â”œâ”€â”€ App.jsx
+â”‚       â”œâ”€â”€ main.jsx
+â”‚       â”œâ”€â”€ OrderBookWidget.jsx
+â”‚       â”œâ”€â”€ OrderTicketWidget.jsx
+â”‚       â””â”€â”€ TerminalTablesWidget.jsx
+â”œâ”€â”€ docs/
+â”‚   â””â”€â”€ screenshots/
+â”œâ”€â”€ scripts/
+â”œâ”€â”€ backend.env.example
+â””â”€â”€ .gitignore
 ```
 
 ### Important directories
@@ -284,23 +284,30 @@ cd utt-unified-trading-terminal
 
 ### 2) Configure backend environment
 
-The backend environment is for runtime configuration and local pathing, **not** for storing exchange API keys.
+The repository uses `backend.env.example` as the public, sanitized backend runtime template. The backend environment is for runtime configuration and local pathing, **not** for storing exchange API keys.
 
 Relevant files:
 
-- `.env.example`
-- `backend/.env`
-- `backend/app/config.py`
+- `backend.env.example` â€” safe public template committed to this repo
+- `backend/.env` â€” local stub file that points the backend to your private env path
+- `backend/app/config.py` â€” backend configuration loader
 
-A typical pattern is:
+Recommended setup:
 
-```env
-UTT_ENV_PATH=C:\path\to\your\private\backend.env
+```powershell
+# Example only; choose your own private location outside the repo.
+Copy-Item backend.env.example C:\path\to\utt-secrets\backend.env
 ```
 
-The private `backend.env` file lives outside the repo and contains local-only runtime configuration.
+Then create or update `backend/.env` with only the external env pointer:
 
-For Polkadot / Hydration work, keep the real RPC/API key out of the repository. The recommended pattern is to save the Dwellir/Hydration key through **Profile → API Keys** using the Hydration venue key, while the private env keeps only non-secret runtime toggles and templates.
+```env
+UTT_ENV_PATH=C:\path\to\utt-secrets\backend.env
+```
+
+The private `backend.env` file lives outside the repo and contains local-only runtime configuration. Exchange API keys and RPC/API keys should be saved through **Profile â†’ API Keys** whenever the app supports that venue.
+
+For Polkadot / Hydration work, keep the real RPC/API key out of the repository. The recommended pattern is to save the Dwellir/Hydration key through **Profile â†’ API Keys** using the Hydration venue key, while the private env keeps only non-secret runtime toggles and templates.
 
 A safe local Hydration configuration uses placeholder/template values such as:
 
@@ -329,7 +336,6 @@ UTT_HYDRATION_HELPER_STEP_TIMEOUT_S=30
 ```
 
 Hydration asset IDs, decimals, external price IDs, and route/pool metadata are intended to be managed through the Token Registry and Route Registry rather than hardcoded into tracked env files.
-
 
 ### 3) Create and activate a backend virtual environment
 
@@ -425,7 +431,7 @@ UTT is intentionally structured so that public source code can live in git while
 
 - code
 - schema and model definitions
-- example env files
+- example env files such as `backend.env.example`
 - non-sensitive defaults
 - UI assets intended for publication
 - utility scripts that do not contain secrets
@@ -444,7 +450,7 @@ UTT is intentionally structured so that public source code can live in git while
 
 - keep private env files outside the repo
 - use tracked stub files only
-- add venue API credentials through **Profile → API Keys**
+- add venue API credentials through **Profile â†’ API Keys**
 - scan staged diffs before every push
 - keep wallet and account testing material separate from source control
 
@@ -514,12 +520,12 @@ The UTTT-HDX route should be configured through the Hydration Route Registry wit
 
 ```text
 UTTT-HDX manual/live route
-→ live pool reserves
-→ manual XYK pseudo-orderbook
-→ order ticket execution
-→ record_submit
-→ swap_orders
-→ All Orders
+â†’ live pool reserves
+â†’ manual XYK pseudo-orderbook
+â†’ order ticket execution
+â†’ record_submit
+â†’ swap_orders
+â†’ All Orders
 ```
 
 ### Pricing model
@@ -531,7 +537,7 @@ HDX/USD  = external price source from Token Registry
 DOT/USD  = external price source from Token Registry
 USDT/USD = stable
 UTTT/HDX = UTTT-HDX live route
-UTTT/USD = UTTT/HDX × HDX/USD
+UTTT/USD = UTTT/HDX Ã— HDX/USD
 ```
 
 Generic Hydration SDK router quotes are disabled by default for the public-safe configuration. If revisited later, SDK pricing should be implemented as a persistent stateful SDK cache/service, not as repeated per-pair UI-driven polling.
@@ -547,7 +553,7 @@ Examples of functionality reflected in the current repository include:
 - DB-backed and encrypted secret-bundle patterns in code
 - local runtime settings and operator preferences
 
-Venue API keys are added through the **Profile / API Keys** interface and stored in the application’s local credential store rather than being committed to backend files or repository env files.
+Venue API keys are added through the **Profile / API Keys** interface and stored in the applicationâ€™s local credential store rather than being committed to backend files or repository env files.
 
 ---
 
@@ -620,7 +626,7 @@ Check:
 Check:
 
 - local runtime env path is correct
-- the venue API key was actually added and saved in **Profile → API Keys**
+- the venue API key was actually added and saved in **Profile â†’ API Keys**
 - the correct venue was configured in the profile
 - no real credentials were placed into tracked files
 
@@ -637,7 +643,7 @@ Check:
 
 Check:
 
-- the Dwellir/Hydration key is saved through **Profile → API Keys**
+- the Dwellir/Hydration key is saved through **Profile â†’ API Keys**
 - Hydration Token Registry rows exist for HDX, DOT, USDT, and UTTT
 - HDX and DOT have valid external price IDs
 - the UTTT-HDX Route Registry row has live pool-account metadata

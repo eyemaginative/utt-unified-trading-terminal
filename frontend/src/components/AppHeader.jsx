@@ -3,6 +3,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import ArbChip from "../ArbChip";
 import TopGainersWindow from "../features/scanners/TopGainersWindow";
+import MarketCapWindow from "../features/scanners/MarketCapWindow";
+import VolumeWindow from "../features/scanners/VolumeWindow";
 import uttBanner from "../assets/utt-banner.jpg";
 import { sharedFetchJSON } from "../lib/sharedFetch";
 import QRCodeLib from "qrcode";
@@ -1165,6 +1167,244 @@ function ToolChip({
 	      {showSubLabel ? <div style={{ fontSize: 11, opacity: 0.75, maxWidth: "100%", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{subLabel || "—"}</div> : null}
 	    </button>
 	  );
+}
+
+
+function readFloatingToolPos(storageKey) {
+  if (typeof window === "undefined" || !storageKey) return null;
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    if (!v || typeof v !== "object") return null;
+    return {
+      x: Number(v.x),
+      y: Number(v.y),
+      w: Number(v.w),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeFloatingToolPos(storageKey, pos) {
+  if (typeof window === "undefined" || !storageKey || !pos) return;
+  try {
+    localStorage.setItem(
+      storageKey,
+      JSON.stringify({
+        x: Number(pos.x) || POP_MARGIN,
+        y: Number(pos.y) || 120,
+        w: Number(pos.w) || 860,
+      })
+    );
+  } catch {
+    // ignore localStorage failures
+  }
+}
+
+function FloatingMetricToolChip({
+  title,
+  subLabel,
+  minWidth = 132,
+  panelWidth = 860,
+  panelHeight = 620,
+  storageKey,
+  hideTableData = false,
+  children,
+}) {
+  const [open, setOpen] = useState(false);
+  const chipRef = useRef(null);
+  const panelRef = useRef(null);
+  const dragRef = useRef(null);
+  const [panelPos, setPanelPos] = useState(() => (typeof window === "undefined" ? null : readFloatingToolPos(storageKey)));
+
+  const clampPanelPos = (next) => {
+    if (typeof window === "undefined") {
+      return next || { x: POP_MARGIN, y: 120, w: panelWidth };
+    }
+
+    const vw = Math.max(320, window.innerWidth || 0);
+    const vh = Math.max(320, window.innerHeight || 0);
+    const maxAvailableW = Math.max(320, vw - POP_MARGIN * 2);
+    const w = clamp(Number(next?.w) || panelWidth, 320, Math.min(panelWidth, maxAvailableW));
+    const maxX = Math.max(POP_MARGIN, vw - w - POP_MARGIN);
+    const maxY = Math.max(POP_MARGIN, vh - 80);
+
+    return {
+      x: clamp(Number(next?.x) || POP_MARGIN, POP_MARGIN, maxX),
+      y: clamp(Number(next?.y) || 120, POP_MARGIN, maxY),
+      w,
+    };
+  };
+
+  const placeNearChip = () => {
+    if (typeof window === "undefined") return;
+    const rect = chipRef.current?.getBoundingClientRect?.();
+    const vw = Math.max(320, window.innerWidth || 0);
+    const w = Math.min(panelWidth, Math.max(320, vw - POP_MARGIN * 2));
+    const x = rect ? rect.left : POP_MARGIN;
+    const y = rect ? rect.bottom + 10 : 120;
+
+    setPanelPos((prev) => {
+      const next = clampPanelPos({ x, y, w: prev?.w || w });
+      writeFloatingToolPos(storageKey, next);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!open) return undefined;
+    if (!panelPos) placeNearChip();
+
+    const onResize = () => {
+      setPanelPos((prev) => {
+        const next = clampPanelPos(prev || readFloatingToolPos(storageKey) || { x: POP_MARGIN, y: 120, w: panelWidth });
+        writeFloatingToolPos(storageKey, next);
+        return next;
+      });
+    };
+
+    const onDown = (e) => {
+      const t = e?.target;
+      if (!t) return;
+      if (chipRef.current && chipRef.current.contains(t)) return;
+      if (panelRef.current && panelRef.current.contains(t)) return;
+      setOpen(false);
+    };
+
+    const onKey = (e) => {
+      if (String(e?.key || "").toLowerCase() === "escape") setOpen(false);
+    };
+
+    window.addEventListener("resize", onResize);
+    document.addEventListener("mousedown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      document.removeEventListener("mousedown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, panelPos, panelWidth, storageKey]);
+
+  const startDrag = (e) => {
+    if (e.button !== 0) return;
+    const t = e.target;
+    const interactive = t?.closest?.("button, a, input, select, textarea, label");
+    if (interactive) return;
+
+    const current = clampPanelPos(panelPos || readFloatingToolPos(storageKey) || { x: POP_MARGIN, y: 120, w: panelWidth });
+    dragRef.current = { mx: e.clientX, my: e.clientY, x: current.x, y: current.y, w: current.w };
+
+    const prevUserSelect = document.body.style.userSelect;
+    const prevCursor = document.body.style.cursor;
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "grabbing";
+
+    const onMove = (ev) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const next = clampPanelPos({ x: d.x + ev.clientX - d.mx, y: d.y + ev.clientY - d.my, w: d.w });
+      setPanelPos(next);
+    };
+
+    const onUp = () => {
+      const d = dragRef.current;
+      dragRef.current = null;
+      document.body.style.userSelect = prevUserSelect;
+      document.body.style.cursor = prevCursor;
+      setPanelPos((prev) => {
+        const next = clampPanelPos(prev || d || { x: POP_MARGIN, y: 120, w: panelWidth });
+        writeFloatingToolPos(storageKey, next);
+        return next;
+      });
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("mouseup", onUp, true);
+    };
+
+    window.addEventListener("mousemove", onMove, true);
+    window.addEventListener("mouseup", onUp, true);
+  };
+
+  const effectivePos = panelPos || { x: POP_MARGIN, y: 120, w: panelWidth };
+  const effectiveHeight =
+    typeof window === "undefined"
+      ? panelHeight
+      : Math.min(panelHeight, Math.max(360, (window.innerHeight || 720) - POP_MARGIN * 2));
+
+  return (
+    <div ref={chipRef} style={{ position: "relative", display: "inline-block" }}>
+      <ToolChip
+        title={title}
+        subLabel={hideTableData ? "••••" : subLabel}
+        isOpen={open}
+        onClick={() => {
+          const next = !open;
+          setOpen(next);
+          if (!open && next) setTimeout(() => placeNearChip(), 0);
+        }}
+        showStatus={true}
+        showSubLabel={true}
+        minWidth={minWidth}
+      />
+
+      {open ? (
+        <div
+          ref={panelRef}
+          style={{
+            position: "fixed",
+            top: effectivePos.y,
+            left: effectivePos.x,
+            width: effectivePos.w,
+            height: effectiveHeight,
+            maxWidth: "calc(100vw - 16px)",
+            maxHeight: "calc(100vh - 16px)",
+            zIndex: 9999,
+            filter: "drop-shadow(0 18px 40px rgba(0,0,0,0.55))",
+          }}
+        >
+          {typeof children === "function"
+            ? children({ close: () => setOpen(false), onDragHandleMouseDown: startDrag, height: effectiveHeight })
+            : children}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+
+function metricTrimApiBase(base) {
+  return String(base || "").replace(/\/+$/, "");
+}
+
+function metricToNum(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function metricFmtMoney(v) {
+  const n = metricToNum(v);
+  if (n === null) return "—";
+  if (Math.abs(n) >= 1_000_000_000_000) return `$${(n / 1_000_000_000_000).toFixed(2)}T`;
+  if (Math.abs(n) >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(2)}B`;
+  if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (Math.abs(n) >= 1_000) return `$${(n / 1_000).toFixed(2)}K`;
+  if (Math.abs(n) >= 1) return `$${n.toFixed(2)}`;
+  if (Math.abs(n) >= 0.000001) return `$${n.toFixed(8)}`;
+  return `$${n.toPrecision(4)}`;
+}
+
+function metricAssetFromSymbol(symbolLike) {
+  const raw = String(symbolLike || "").trim().toUpperCase();
+  if (!raw) return "";
+  const clean = raw.replace(/\s+/g, "").replace(/[\/_]/g, "-");
+  if (clean.includes("-")) return clean.split("-").filter(Boolean)[0] || "";
+  for (const suffix of ["USDT", "USDC", "USD", "HDX", "SOL", "DOT", "BTC", "ETH", "DOGE"]) {
+    if (clean.endsWith(suffix) && clean.length > suffix.length) return clean.slice(0, -suffix.length);
+  }
+  return clean;
 }
 
 
@@ -4245,6 +4485,18 @@ const autoFitBanner = async () => {
     return id === "top_gainers" || title === "top gainers" || title === "topgainers";
   };
 
+  const isMarketCapTool = (w) => {
+    const id = String(w?.id ?? "").trim().toLowerCase();
+    const title = String(w?.title ?? "").trim().toLowerCase();
+    return id === "market_cap" || id === "marketcap" || title === "market cap" || title === "marketcap";
+  };
+
+  const isVolumeTool = (w) => {
+    const id = String(w?.id ?? "").trim().toLowerCase();
+    const title = String(w?.title ?? "").trim().toLowerCase();
+    return id === "volume" || id === "volumes" || title === "volume" || title === "volumes";
+  };
+
   // FIX: stabilize enabled venues (sorting prevents dependency churn)
   const enabledVenuesForScanners = useMemo(() => (supportedVenues || []).map((v) => normalizeVenue(v)).filter(Boolean).sort(), [supportedVenues]);
 
@@ -4300,6 +4552,71 @@ const autoFitBanner = async () => {
     const found = (toolWindows || []).find((w) => isTopGainersTool(w));
     return found || { id: "top_gainers", title: "Top Gainers" };
   }, [toolWindows]);
+
+  const marketCapTool = useMemo(() => {
+    const found = (toolWindows || []).find((w) => isMarketCapTool(w));
+    return found || { id: "market_cap", title: "Market Cap" };
+  }, [toolWindows]);
+
+  const volumeTool = useMemo(() => {
+    const found = (toolWindows || []).find((w) => isVolumeTool(w));
+    return found || { id: "volume", title: "Volume" };
+  }, [toolWindows]);
+
+  const selectedMetricAsset = useMemo(() => metricAssetFromSymbol(obSymbol || marketInput), [obSymbol, marketInput]);
+  const [metricChipSummary, setMetricChipSummary] = useState({ asset: "", marketCapUsd: null, volume24hUsd: null, updatedAt: null });
+
+  useEffect(() => {
+    const base = metricTrimApiBase(API_BASE);
+    const asset = String(selectedMetricAsset || "").trim().toUpperCase();
+    if (!base || !asset) {
+      setMetricChipSummary({ asset: "", marketCapUsd: null, volume24hUsd: null, updatedAt: null });
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const loadSelectedMetricSummary = async () => {
+      try {
+        const p = new URLSearchParams();
+        p.set("assets", asset);
+        p.set("ttl_s", "300");
+        const res = await fetch(`${base}/api/market_metrics/summary?${p.toString()}`, {
+          cache: "no-store",
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        if (cancelled) return;
+        const rows = Array.isArray(json?.items) ? json.items : [];
+        const row = rows.find((r) => String(r?.asset || "").trim().toUpperCase() === asset) || rows[0] || null;
+        setMetricChipSummary({
+          asset,
+          marketCapUsd: metricToNum(row?.market_cap_usd ?? row?.fdv_usd),
+          volume24hUsd: metricToNum(row?.volume_24h_usd),
+          updatedAt: row?.updated_at || json?.updated_at || null,
+        });
+      } catch {
+        if (!cancelled) {
+          setMetricChipSummary((prev) => ({ ...prev, asset, marketCapUsd: null, volume24hUsd: null }));
+        }
+      }
+    };
+
+    loadSelectedMetricSummary();
+    return () => {
+      cancelled = true;
+    };
+  }, [API_BASE, selectedMetricAsset]);
+
+  const marketCapChipSubLabel = useMemo(() => {
+    if (!selectedMetricAsset) return "Global cap / FDV";
+    return `${selectedMetricAsset} cap ${metricFmtMoney(metricChipSummary.marketCapUsd)}`;
+  }, [selectedMetricAsset, metricChipSummary.marketCapUsd]);
+
+  const volumeChipSubLabel = useMemo(() => {
+    if (!selectedMetricAsset) return "Global 24h volume";
+    return `${selectedMetricAsset} vol ${metricFmtMoney(metricChipSummary.volume24hUsd)}`;
+  }, [selectedMetricAsset, metricChipSummary.volume24hUsd]);
 
   const [tgPopoverOpen, setTgPopoverOpen] = useState(false);
 
@@ -7131,21 +7448,69 @@ const autoFitBanner = async () => {
           )}
         </div>
 
+        <FloatingMetricToolChip
+          title={marketCapTool.title || "Market Cap"}
+          subLabel={marketCapChipSubLabel}
+          storageKey="utt_market_cap_tool_panel_pos_v1"
+          panelWidth={900}
+          panelHeight={620}
+          minWidth={140}
+          hideTableData={hideTableDataGlobal}
+        >
+          {({ close, onDragHandleMouseDown, height }) => (
+            <MarketCapWindow
+              apiBase={API_BASE}
+              selectedSymbol={obSymbol || marketInput}
+              hideTableData={hideTableDataGlobal}
+              onClose={close}
+              height={height}
+              onDragHandleMouseDown={onDragHandleMouseDown}
+            />
+          )}
+        </FloatingMetricToolChip>
+
+        <FloatingMetricToolChip
+          title={volumeTool.title || "Volume"}
+          subLabel={volumeChipSubLabel}
+          storageKey="utt_volume_tool_panel_pos_v1"
+          panelWidth={900}
+          panelHeight={620}
+          minWidth={132}
+          hideTableData={hideTableDataGlobal}
+        >
+          {({ close, onDragHandleMouseDown, height }) => (
+            <VolumeWindow
+              apiBase={API_BASE}
+              selectedSymbol={obSymbol || marketInput}
+              hideTableData={hideTableDataGlobal}
+              onClose={close}
+              height={height}
+              onDragHandleMouseDown={onDragHandleMouseDown}
+            />
+          )}
+        </FloatingMetricToolChip>
+
         {(toolWindows || [])
-          .filter((w) => !isArbTool(w) && !isTopGainersTool(w))
+          .filter((w) => !isArbTool(w) && !isTopGainersTool(w) && !isMarketCapTool(w) && !isVolumeTool(w))
 	      .map((w) => {
 	        const idLower = String(w?.id || "").toLowerCase();
 	        const titleLower = String(w?.title || "").toLowerCase();
 	        const isLedger = idLower === "ledger" || titleLower === "ledger";
 	        const isWalletAddresses = idLower === "wallet_addresses" || titleLower === "wallet addresses";
+	        const isTokenRegistry =
+	          idLower === "tokens" ||
+	          idLower === "token_registry" ||
+	          titleLower === "tokens" ||
+	          titleLower === "token registry";
+	        const cleanTitle = isTokenRegistry ? "Token Registry" : w.title;
 	        return (
 	          <ToolChip
 	            key={w.id}
-	            title={w.title}
-	            subLabel={isLedger ? null : isWalletAddresses ? (hideTableDataGlobal ? "••••" : "On-chain") : "—"}
-	            showStatus={!isLedger}
-	            showSubLabel={!isLedger}
-	            minWidth={isLedger ? 104 : undefined}
+	            title={cleanTitle}
+	            subLabel={isLedger || isTokenRegistry ? null : isWalletAddresses ? (hideTableDataGlobal ? "••••" : "On-chain") : "—"}
+	            showStatus={!isLedger && !isTokenRegistry}
+	            showSubLabel={!isLedger && !isTokenRegistry}
+	            minWidth={isLedger ? 104 : isTokenRegistry ? 134 : undefined}
 	            isOpen={!!w.isOpen || !!w.open}
 	            onClick={() => toggleToolWindow?.(w.id)}
 	          />

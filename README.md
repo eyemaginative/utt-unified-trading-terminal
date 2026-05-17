@@ -8,7 +8,7 @@ At a high level, UTT provides one place to:
 - inspect balances and portfolio state
 - view orderbooks and pseudo-orderbooks
 - submit and track orders across venues
-- monitor scanners, discovery tools, and wallet activity
+- monitor scanners, discovery tools, wallet activity, market-cap data, and volume data
 - work with local ledger and tax-related state
 - integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
 
@@ -75,6 +75,22 @@ Current architecture in this repository includes support for:
 - Hydration swap recording into the unified all-orders flow through `swap_orders`
 
 The pre-push safe path avoids generic Hydration SDK quote polling for pricing. Broad SDK router quotes are disabled by default while the UTTT-HDX route uses registry-backed manual/live pool metadata. Future SDK work should use a persistent stateful Hydration SDK cache/service rather than per-pair or per-refresh polling.
+
+### Market metrics workflow
+
+UTT includes backend-cached market metrics for operator tool windows and AppHeader summaries.
+
+Current architecture in this repository includes support for:
+
+- AppHeader **Market Cap** and **Volume** tool-tab windows
+- selected-asset market cap and volume summaries in the AppHeader tool tabs
+- backend-cached CoinGecko market data with TTL, stale-cache behavior, and rate-limit backoff
+- DB-owned / tracked asset discovery for market-metrics windows
+- Token Registry-managed external price IDs as the preferred market-data resolver
+- automatic CoinGecko symbol discovery for explicitly selected assets when no registry mapping exists
+- graceful unavailable / placeholder rows for unsupported or unresolved assets
+
+The frontend does not call CoinGecko directly. Market-cap and volume windows read normalized data from the backend market-metrics service, while the backend owns source selection, caching, rate-limit handling, and symbol-to-source resolution.
 
 ### Operator UI / terminal behavior
 
@@ -179,7 +195,8 @@ Current areas of focus include:
 - order book and order ticket integration
 - table, ledger, and order views
 - Solana wallet-manager integration for DEX flows
-- registry and tool windows
+- registry, scanner, Market Cap, and Volume tool windows
+- AppHeader portfolio totals that include cached wallet-address / self-custody balances
 
 In practical terms, the frontend favors:
 
@@ -201,6 +218,7 @@ It is responsible for:
 - order creation and cancellation support
 - unified order views
 - token and symbol resolution
+- backend-cached market metrics, external market-data resolution, and rate-limit-safe source caching
 - local auth and profile integration
 - Solana DEX route construction and transaction preparation
 - local environment and secret resolution patterns
@@ -233,7 +251,8 @@ Supporting routes and tooling also include:
 - token registry
 - wallet address handling
 - all-orders aggregation
-- scanner and discovery windows
+- scanner, discovery, Market Cap, and Volume windows
+- market-metrics routing, DB-owned asset discovery, and Token Registry price-source metadata
 - airdrop-related routing and tooling
 
 ---
@@ -565,10 +584,11 @@ The repository includes token-registry-related backend and frontend work. This s
 - display-friendly token labeling
 - registry-managed token metadata
 - registry-managed external price source and price ID metadata
+- market-metrics source resolution through Token Registry external price IDs
 - Solana token tooling inside the operator UI
 - Hydration asset ID, decimals, and external price metadata
 
-There is also wallet-address handling in the backend, which supports broader local wallet and workflow integration.
+There is also wallet-address handling in the backend, which supports broader local wallet and workflow integration. Cached wallet-address snapshots can contribute to AppHeader portfolio totals, so self-custody balances can be represented without requiring the balances table to be opened first.
 
 ---
 
@@ -652,6 +672,26 @@ Check:
 
 The normal safe-path pricing flow should use `/api/polkadot_dex/hydration/prices` and the UTTT-HDX manual/live route, not generic Hydration orderbook requests for USD pricing.
 
+### Market Cap or Volume windows show unavailable data
+
+Check:
+
+- backend is running and `/api/market_metrics/summary` is reachable
+- the asset exists in local balance / wallet / registry state, or is explicitly selected in the UI
+- Token Registry rows use `external_price_source` and `external_price_id` where deterministic mapping is needed
+- CoinGecko rate limits have not forced the backend into temporary backoff
+- backend cache files under `backend/data/` are local runtime data and should not be committed
+
+The normal path is:
+
+```text
+DB-owned/tracked asset
+→ Token Registry external price ID if configured
+→ env override if configured
+→ automatic CoinGecko symbol search for explicitly selected assets
+→ small hardcoded fallback map for bootstrap assets
+```
+
 ### UI layout looks wrong
 
 The terminal UI uses pane and window logic with multiple specialized widgets. Layout issues are usually related to dependencies, recent layout changes, or stale frontend state after major UI updates.
@@ -716,9 +756,10 @@ UTT is an actively evolving trading terminal codebase with ongoing work across:
 - UI and layout refinement
 - Solana wallet and router integration
 - Polkadot / Hydration UTTT-HDX routing
-- registry and tool windows
+- registry, scanner, Market Cap, and Volume tool windows
 - auth, profile, and API-key handling
 - venue adapter coverage
+- wallet-address and self-custody portfolio visibility
 - unified order and ledger workflows
 
 Expect active iteration rather than a frozen, final product.

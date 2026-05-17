@@ -844,16 +844,16 @@ function appSolanaUsdPriceFromMap(pricePayload, mint) {
   return val !== null && val > 0 ? val : null;
 }
 
-async function appFetchSolanaDexPortfolioTotalUsd() {
-  const address = appGetSolanaConnectedAddressNoPrompt();
-  if (!address) return null;
+async function appFetchSolanaAddressPortfolioTotalUsd(address) {
+  const addr = String(address || "").trim();
+  if (!addr) return null;
 
   try {
-    const data = await appFetchJson(`/api/solana_dex/balances?address=${encodeURIComponent(address)}`);
+    const data = await appFetchJson(`/api/solana_dex/balances?address=${encodeURIComponent(addr)}`);
     const items = [];
     const sol = appFiniteNumberOrNull(data?.sol ?? data?.sol_ui ?? data?.sol_balance);
     if (sol !== null) items.push({ amount: sol, mint: APP_SOL_MINT });
-    const lamports = appFiniteNumberOrNull(data?.sol_lamports);
+    const lamports = appFiniteNumberOrNull(data?.sol_lamports ?? data?.lamports);
     if (sol === null && lamports !== null) items.push({ amount: lamports / 1e9, mint: APP_SOL_MINT });
 
     const toks = Array.isArray(data?.tokens) ? data.tokens : [];
@@ -882,6 +882,178 @@ async function appFetchSolanaDexPortfolioTotalUsd() {
     return null;
   }
 }
+
+async function appFetchSolanaDexPortfolioTotalUsd() {
+  const address = appGetSolanaConnectedAddressNoPrompt();
+  if (!address) return null;
+  return appFetchSolanaAddressPortfolioTotalUsd(address);
+}
+
+async function appLoadSolanaWalletAddressesFromRegistry() {
+  const urls = [
+    "/api/wallet_addresses?network=solana&limit=500",
+    "/api/wallet_addresses?asset=SOL&limit=500",
+    "/api/wallet_addresses?limit=500",
+  ];
+
+  const seen = new Set();
+  const out = [];
+
+  for (const url of urls) {
+    try {
+      const js = await appFetchJson(url);
+      const rows = Array.isArray(js)
+        ? js
+        : Array.isArray(js?.items)
+          ? js.items
+          : Array.isArray(js?.rows)
+            ? js.rows
+            : Array.isArray(js?.addresses)
+              ? js.addresses
+              : Array.isArray(js?.data)
+                ? js.data
+                : [];
+
+      for (const r of rows || []) {
+        const address = String(r?.address || r?.wallet_address || r?.walletAddress || "").trim();
+        if (!address || seen.has(address)) continue;
+
+        const network = String(r?.network || r?.chain || r?.network_name || "").trim().toLowerCase();
+        const walletId = String(r?.wallet_id || r?.walletId || r?.venue || r?.venue_override || "").trim().toLowerCase();
+        const asset = String(r?.asset || r?.symbol || "").trim().toUpperCase();
+
+        const looksSolana =
+          network.includes("solana") ||
+          walletId.includes("solana") ||
+          asset === "SOL" ||
+          asset === "WSOL" ||
+          (asset === "ALL" && (network.includes("solana") || walletId.includes("solana")));
+
+        if (!looksSolana) continue;
+
+        seen.add(address);
+        out.push(address);
+      }
+
+      if (out.length) break;
+    } catch {
+      // try next URL shape
+    }
+  }
+
+  return out;
+}
+
+async function appFetchSolanaRegisteredWalletPortfolioTotalUsd() {
+  try {
+    const addrs = await appLoadSolanaWalletAddressesFromRegistry();
+    if (!addrs.length) return null;
+
+    // Keep this bounded so the header total cannot hammer public Solana RPC.
+    const limited = addrs.slice(0, 5);
+    const vals = await Promise.all(limited.map((addr) => appFetchSolanaAddressPortfolioTotalUsd(addr)));
+
+    let totalUsd = 0;
+    let hasAny = false;
+    for (const v of vals) {
+      const n = appFiniteNumberOrNull(v);
+      if (n !== null) {
+        totalUsd += n;
+        hasAny = true;
+      }
+    }
+    return hasAny ? totalUsd : null;
+  } catch {
+    return null;
+  }
+}
+
+function appWalletBalanceUsdValue(row) {
+  const direct = appFiniteNumberOrNull(
+    row?.usd_value ??
+    row?.total_usd ??
+    row?.value_usd ??
+    row?.totalUsd ??
+    row?.usdValue
+  );
+  if (direct !== null) return direct;
+
+  const qty = appFiniteNumberOrNull(row?.balance ?? row?.total ?? row?.amount ?? row?.qty ?? row?.balance_qty);
+  const px = appFiniteNumberOrNull(row?.usd_price ?? row?.price_usd ?? row?.px_usd ?? row?.priceUsd);
+  if (qty !== null && px !== null) return qty * px;
+  return null;
+}
+
+function appWalletBalanceBucket(row) {
+  const network = String(row?.network || row?.chain || "").trim().toLowerCase();
+  const walletId = String(row?.wallet_id || row?.walletId || row?.venue || "").trim().toLowerCase();
+  const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+
+  if (network.includes("solana") || walletId.includes("solana") || asset === "SOL" || asset === "WSOL") {
+    return "solana";
+  }
+
+  if (
+    network.includes("hydration") ||
+    network.includes("polkadot") ||
+    walletId.includes("hydration") ||
+    walletId.includes("polkadot") ||
+    asset === "HDX" ||
+    asset === "DOT" ||
+    asset === "UTTT"
+  ) {
+    return "hydration";
+  }
+
+  return "other";
+}
+
+async function appFetchWalletAddressSnapshotPortfolioTotalsUsd() {
+  try {
+    const data = await appFetchJson("/api/wallet_addresses/balances/latest?with_prices=1&limit=5000");
+    const rows = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.items)
+        ? data.items
+        : Array.isArray(data?.rows)
+          ? data.rows
+          : Array.isArray(data?.balances)
+            ? data.balances
+            : Array.isArray(data?.data)
+              ? data.data
+              : [];
+
+    const totals = {
+      solanaUsd: null,
+      hydrationUsd: null,
+      otherUsd: null,
+      totalUsd: null,
+      count: 0,
+    };
+
+    const add = (bucket, value) => {
+      const n = appFiniteNumberOrNull(value);
+      if (n === null) return;
+      totals[bucket] = (appFiniteNumberOrNull(totals[bucket]) || 0) + n;
+      totals.totalUsd = (appFiniteNumberOrNull(totals.totalUsd) || 0) + n;
+      totals.count += 1;
+    };
+
+    for (const row of rows || []) {
+      const usd = appWalletBalanceUsdValue(row);
+      if (usd === null) continue;
+      const bucket = appWalletBalanceBucket(row);
+      if (bucket === "solana") add("solanaUsd", usd);
+      else if (bucket === "hydration") add("hydrationUsd", usd);
+      else add("otherUsd", usd);
+    }
+
+    return totals.count > 0 ? totals : null;
+  } catch {
+    return null;
+  }
+}
+
 
 function appCanonicalHydrationSymbol(symbol, assetId) {
   const s = String(symbol || "").trim();
@@ -1169,22 +1341,53 @@ async function appFetchHydrationDexPortfolioTotalUsd() {
 }
 
 async function appFetchDexPortfolioTotalsUsd() {
-  const [solanaUsd, hydrationUsd] = await Promise.all([
+  const [connectedSolanaUsd, hydrationUsd, snapshotTotals] = await Promise.all([
     appFetchSolanaDexPortfolioTotalUsd(),
     appFetchHydrationDexPortfolioTotalUsd(),
+    appFetchWalletAddressSnapshotPortfolioTotalsUsd(),
   ]);
+
+  // Prefer live/explicit DEX lookups when available, but fall back to cached
+  // wallet-address snapshots so the AppHeader portfolio total does not depend on
+  // opening the Balances tab first.
+  const snapshotSolanaUsd = appFiniteNumberOrNull(snapshotTotals?.solanaUsd);
+  let registeredSolanaUsd = null;
+  let solanaUsd = appFiniteNumberOrNull(connectedSolanaUsd) ?? snapshotSolanaUsd;
+
+  // Last resort only: if there is no connected Solana wallet and no cached
+  // snapshot yet, use registered Solana wallet-address rows. This keeps the
+  // header from hammering Solana RPC on every normal portfolio refresh.
+  if (solanaUsd === null) {
+    registeredSolanaUsd = await appFetchSolanaRegisteredWalletPortfolioTotalUsd();
+    solanaUsd = appFiniteNumberOrNull(registeredSolanaUsd);
+  }
+
+  const hydrationLiveUsd = appFiniteNumberOrNull(hydrationUsd);
+  const hydrationFallbackUsd = appFiniteNumberOrNull(snapshotTotals?.hydrationUsd);
+  const hydrationResolvedUsd = hydrationLiveUsd ?? hydrationFallbackUsd;
+
+  const otherWalletUsd = appFiniteNumberOrNull(snapshotTotals?.otherUsd);
+
   let totalUsd = 0;
   let hasAny = false;
-  for (const v of [solanaUsd, hydrationUsd]) {
+  for (const v of [solanaUsd, hydrationResolvedUsd, otherWalletUsd]) {
     const n = appFiniteNumberOrNull(v);
     if (n !== null) {
       totalUsd += n;
       hasAny = true;
     }
   }
+
   return {
     solanaUsd: appFiniteNumberOrNull(solanaUsd),
-    hydrationUsd: appFiniteNumberOrNull(hydrationUsd),
+    solanaConnectedUsd: appFiniteNumberOrNull(connectedSolanaUsd),
+    solanaSnapshotUsd: snapshotSolanaUsd,
+    solanaRegisteredUsd: appFiniteNumberOrNull(registeredSolanaUsd),
+    hydrationUsd: appFiniteNumberOrNull(hydrationResolvedUsd),
+    hydrationLiveUsd,
+    hydrationSnapshotUsd: hydrationFallbackUsd,
+    walletSnapshotUsd: appFiniteNumberOrNull(snapshotTotals?.totalUsd),
+    walletSnapshotOtherUsd: otherWalletUsd,
     totalUsd: hasAny ? totalUsd : null,
   };
 }

@@ -31,6 +31,13 @@ from .routers.venues import router as venues_router
 from .routers import scanners
 from .routers.market_intel import router as market_intel_router
 
+# NEW: cached market metrics router (/api/market_metrics/*)
+try:
+    from .routers.market_metrics import router as market_metrics_router
+except Exception as e:
+    print("market_metrics router import failed:", repr(e))
+    market_metrics_router = None
+
 # NEW: rules router (/api/rules/order)
 from .routers.rules import router as rules_router
 
@@ -135,6 +142,8 @@ def create_app() -> FastAPI:
         app.include_router(token_registry_router)
     app.include_router(orders_router)
     app.include_router(market_router)
+    if market_metrics_router is not None:
+        app.include_router(market_metrics_router)
     app.include_router(arm_router)
     app.include_router(venue_orders_router)
     app.include_router(all_orders_router)

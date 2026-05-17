@@ -70,4 +70,3 @@ gen_robinhood_keys.py
 # allow committing keygen tool script (no secrets)
 !backend/keys/tools/
 !backend/keys/tools/gen_robinhood_keys.py
-.pids/

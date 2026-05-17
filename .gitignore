@@ -69,4 +69,7 @@ gen_robinhood_keys.py
 
 # allow committing keygen tool script (no secrets)
 !backend/keys/tools/
-!backend/keys/tools/gen_robinhood_keys.py
+!backend/keys/tools/gen_robinhood_keys.py# Local env examples intentionally not published; use backend.env.example only.
+.env.example
+backend/.env.example
+!backend.env.example

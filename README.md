@@ -73,6 +73,13 @@ Current architecture in this repository includes support for:
 - external USD price enrichment for HDX and DOT
 - UTTT/USD derivation from UTTT-HDX live route pricing and HDX/USD
 - Hydration swap recording into the unified all-orders flow through `swap_orders`
+- Hydration wallet-history ingestion through an optional Subscan-backed provider path
+- wallet-address transaction caching before deposit / withdrawal materialization
+- Hydration-derived deposit and withdrawal materialization with source provenance
+- missing-basis lot creation for detected deposits without inventing USD basis
+- transfer-link preview and metadata-only linkage for internal transfer candidates
+- explicit-only FIFO withdrawal lot-impact rebuilds with dry-run-first safety
+- LP / Omnipool special handling for 2-POOL-style rows that should not be forced through normal FIFO
 
 The pre-push safe path avoids generic Hydration SDK quote polling for pricing. Broad SDK router quotes are disabled by default while the UTTT-HDX route uses registry-backed manual/live pool metadata. Future SDK work should use a persistent stateful Hydration SDK cache/service rather than per-pair or per-refresh polling.
 
@@ -219,6 +226,8 @@ It is responsible for:
 - unified order views
 - token and symbol resolution
 - backend-cached market metrics, external market-data resolution, and rate-limit-safe source caching
+- wallet-address history ingestion, caching, and materialization workflows
+- deposit, withdrawal, missing-basis, transfer-link, and FIFO lot-impact workflows
 - local auth and profile integration
 - Solana DEX route construction and transaction preparation
 - local environment and secret resolution patterns
@@ -244,6 +253,9 @@ The exact state of each venue may evolve over time, but the repository currently
   - Hydration UTTT-HDX manual/live route
   - Token Registry asset and price metadata
   - Route Registry live pool reserves
+  - Hydration wallet-history ingestion and materialization
+  - deposit / withdrawal provenance and missing-basis lot workflows
+  - transfer-link diagnostics and explicit-only FIFO lot-impact handling
 
 Supporting routes and tooling also include:
 
@@ -251,8 +263,7 @@ Supporting routes and tooling also include:
 - token registry
 - wallet address handling
 - all-orders aggregation
-- scanner, discovery, Market Cap, and Volume windows
-- market-metrics routing, DB-owned asset discovery, and Token Registry price-source metadata
+- scanner and discovery windows
 - airdrop-related routing and tooling
 
 ---
@@ -561,6 +572,30 @@ UTTT/USD = UTTT/HDX × HDX/USD
 
 Generic Hydration SDK router quotes are disabled by default for the public-safe configuration. If revisited later, SDK pricing should be implemented as a persistent stateful SDK cache/service, not as repeated per-pair UI-driven polling.
 
+### Hydration wallet-history and ledger workflow
+
+UTT now includes a Hydration wallet-history ingestion path intended to bring self-custody Hydration activity into the same local ledger workflow as venue and wallet-address activity.
+
+Current Hydration history workflow areas include:
+
+- optional Subscan-backed Hydration history provider support
+- safe `provider=none` default behavior when no history provider is configured
+- dry-run-first ingestion and coverage diagnostics
+- page-windowed backfill controls for deeper history scans
+- wallet-address transaction caching before any deposit / withdrawal materialization
+- trusted amount parsing with `amount_v2` validation for integer-looking provider amounts
+- materialization of cached Hydration wallet transactions into `AssetDeposit` and `AssetWithdrawal` rows
+- raw provenance metadata such as provider, source type, source address, transaction hash, and network
+- missing-basis lot creation for detected deposits without assigning fake USD basis
+- transfer-link preview and metadata-only linking for likely internal transfers
+- a withdrawal-before-deposit safety gate for transfer-link candidates
+- explicit-only FIFO withdrawal lot-impact rebuilding
+- strict default handling for insufficient inventory rather than partial or forced consumption
+- opening-balance correction support for known missing historical inventory, with basis remaining unknown
+- LP / Omnipool special handling for 2-POOL-style rows so they remain visible but are not forced through normal FIFO
+
+This workflow is intentionally conservative. Normal eligible withdrawals can be applied to lots only through explicit dry-run / apply operations. Transfer-linked withdrawals are skipped by default, and LP / pool-token rows are classified for special handling instead of being consumed through normal inventory logic.
+
 ## Auth, profile, and local credential handling
 
 The codebase includes auth, profile, and local credential-management work. In practical terms, that means UTT is intended to be an operator workstation, not just a stateless public dashboard.
@@ -589,6 +624,8 @@ The repository includes token-registry-related backend and frontend work. This s
 - Hydration asset ID, decimals, and external price metadata
 
 There is also wallet-address handling in the backend, which supports broader local wallet and workflow integration. Cached wallet-address snapshots can contribute to AppHeader portfolio totals, so self-custody balances can be represented without requiring the balances table to be opened first.
+
+Hydration wallet-history ingestion extends this local wallet tooling by caching indexed wallet transactions, materializing them into local deposits and withdrawals, and linking them to the missing-basis and FIFO lot workflows without requiring live secrets or runtime database files to be committed.
 
 ---
 
@@ -671,6 +708,43 @@ Check:
 - backend logs are not showing generic Hydration orderbook calls for pricing pairs such as `HDX-USDT`, `DOT-USDT`, or `UTTT-USDT`
 
 The normal safe-path pricing flow should use `/api/polkadot_dex/hydration/prices` and the UTTT-HDX manual/live route, not generic Hydration orderbook requests for USD pricing.
+
+### Hydration wallet-history rows do not appear in deposits or withdrawals
+
+Check:
+
+- the Hydration history provider is configured intentionally, such as a Subscan API key saved through **Profile → API Keys** or a private env path
+- `/api/hydration_wallet_history/status` reports the expected provider and key availability
+- ingestion is first run with `dry_run=true`
+- page-windowed coverage diagnostics show expected assets before cache/materialization is applied
+- cached wallet-address transaction rows exist before materialization
+- materialization is run separately from the provider fetch
+- deposit rows that lack basis are rebuilt into missing-basis lots before withdrawal FIFO impact is applied
+
+The safe sequence is:
+
+```text
+coverage dry run
+→ cache trusted wallet tx rows
+→ preview materialization
+→ apply materialization
+→ rebuild missing-basis lots
+→ preview withdrawal lot impact
+→ apply only clean assets explicitly
+```
+
+### Hydration withdrawal FIFO shows insufficient inventory
+
+Check:
+
+- whether deposits exist for the same venue, wallet, and asset
+- whether missing-basis lots have been created for detected deposits
+- whether withdrawals predate available deposit lots
+- whether the asset needs an opening-balance correction for known historical inventory
+- whether the row is transfer-linked and intentionally skipped
+- whether the row is an LP / Omnipool-style asset such as 2-POOL and should be held for special handling
+
+The FIFO rebuild path is explicit-only. Do not use `allow_partial=true`, `force_rebuild=true`, or broad all-asset application unless you are intentionally performing a controlled ledger repair.
 
 ### Market Cap or Volume windows show unavailable data
 
@@ -756,6 +830,9 @@ UTT is an actively evolving trading terminal codebase with ongoing work across:
 - UI and layout refinement
 - Solana wallet and router integration
 - Polkadot / Hydration UTTT-HDX routing
+- Hydration wallet-history ingestion and ledger materialization
+- missing-basis lots, transfer-link previews, and explicit-only FIFO lot impact
+- LP / Omnipool special handling for pool-token activity
 - registry, scanner, Market Cap, and Volume tool windows
 - auth, profile, and API-key handling
 - venue adapter coverage

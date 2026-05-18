@@ -18,7 +18,11 @@ from ..schemas_deposits import (
     DepositOut,
     LotOut,
 )
-from ..services.lots_ledger import create_transfer_in_lots_from_withdrawal
+from ..services.lots_ledger import (
+    create_missing_basis_lots_from_deposits,
+    create_transfer_in_lots_from_withdrawal,
+    rebuild_transfer_links,
+)
 
 router = APIRouter(prefix="/api/deposits", tags=["deposits"])
 
@@ -327,6 +331,96 @@ def list_deposits(
     if needs_basis is not None:
         out = [x for x in out if bool(x.needs_basis) == bool(needs_basis)]
     return out
+
+
+@router.post("/rebuild_missing_basis_lots")
+def rebuild_missing_basis_lots(
+    db: Session = Depends(get_db),
+    venue: Optional[str] = Query(default=None),
+    wallet_id: Optional[str] = Query(default=None),
+    asset: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None, description="Optional status filter, e.g. DETECTED"),
+    source_contains: Optional[str] = Query(default=None, description="Optional source substring filter, e.g. WALLET_ADDR"),
+    limit: int = Query(default=500, ge=1, le=5000),
+    dry_run: bool = Query(default=True, description="Default true. Preview only unless false."),
+):
+    """
+    Rebuild/create missing-basis lots from deposit rows that do not already have
+    linked BasisLot rows.
+
+    Safe defaults:
+      - dry_run=true
+      - creates missing-basis lots only; never invents USD basis
+      - idempotent because deposits with existing lots are skipped
+    """
+    result = create_missing_basis_lots_from_deposits(
+        db,
+        venue=venue,
+        wallet_id=wallet_id,
+        asset=asset,
+        status=status,
+        source_contains=source_contains,
+        limit=limit,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        db.rollback()
+    else:
+        db.commit()
+    return result
+
+
+
+@router.post("/transfer_links/rebuild")
+def rebuild_deposit_withdrawal_transfer_links(
+    db: Session = Depends(get_db),
+    venue: Optional[str] = Query(default=None),
+    wallet_id: Optional[str] = Query(default=None),
+    asset: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default="DETECTED", description="Optional status filter, e.g. DETECTED"),
+    source_contains: Optional[str] = Query(default=None, description="Optional source substring filter, e.g. WALLET_ADDR"),
+    time_window_minutes: int = Query(default=1440, ge=1, le=43200),
+    amount_tolerance_abs: float = Query(default=1e-9, ge=0.0),
+    amount_tolerance_pct: float = Query(default=1e-9, ge=0.0),
+    limit_deposits: int = Query(default=1000, ge=1, le=5000),
+    limit_withdrawals: int = Query(default=1000, ge=1, le=5000),
+    apply_limit: int = Query(default=100, ge=1, le=1000),
+    require_withdrawal_before_deposit: bool = Query(
+        default=True,
+        description="Default true. Skip reverse-time matches where the deposit timestamp is before the withdrawal timestamp.",
+    ),
+    dry_run: bool = Query(default=True, description="Default true. Preview only unless false."),
+):
+    """
+    Preview/apply match-only transfer links between deposits and withdrawals.
+
+    Safe defaults:
+      - dry_run=true
+      - no FIFO consumption
+      - no transfer-in lot recreation
+      - only stores linkage metadata on deposit/withdrawal rows when dry_run=false
+    """
+    result = rebuild_transfer_links(
+        db,
+        venue=venue,
+        wallet_id=wallet_id,
+        asset=asset,
+        status=status,
+        source_contains=source_contains,
+        time_window_minutes=time_window_minutes,
+        amount_tolerance_abs=amount_tolerance_abs,
+        amount_tolerance_pct=amount_tolerance_pct,
+        limit_deposits=limit_deposits,
+        limit_withdrawals=limit_withdrawals,
+        apply_limit=apply_limit,
+        require_withdrawal_before_deposit=require_withdrawal_before_deposit,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        db.rollback()
+    else:
+        db.commit()
+    return result
 
 
 @router.post("", response_model=DepositOut)

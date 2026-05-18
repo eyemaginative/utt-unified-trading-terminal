@@ -38,6 +38,7 @@ except Exception as e:
     print("market_metrics router import failed:", repr(e))
     market_metrics_router = None
 
+
 # NEW: rules router (/api/rules/order)
 from .routers.rules import router as rules_router
 
@@ -69,6 +70,14 @@ except Exception as e:
     print("polkadot_dex router import failed:", repr(e))
     polkadot_dex_router = None
 
+
+
+# NEW: Hydration wallet-history ingestion skeleton (/api/hydration_wallet_history/*)
+try:
+    from .routers.hydration_wallet_history import router as hydration_wallet_history_router
+except Exception as e:
+    print("hydration_wallet_history router import failed:", repr(e))
+    hydration_wallet_history_router = None
 
 # NEW: token registry router (/api/token_registry/*)
 try:
@@ -135,6 +144,10 @@ def create_app() -> FastAPI:
     # Airdrop registration / status
     if airdrop_router is not None:
         app.include_router(airdrop_router)
+
+    # Hydration wallet-history ingestion skeleton
+    if hydration_wallet_history_router is not None:
+        app.include_router(hydration_wallet_history_router)
 
     
     # Token / Symbol Registry

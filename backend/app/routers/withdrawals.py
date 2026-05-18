@@ -12,7 +12,12 @@ from sqlalchemy import select, desc, update
 from ..db import get_db
 from ..models import AssetWithdrawal  # must exist in your chosen models.py
 from ..schemas_withdrawals import WithdrawalCreate, WithdrawalPatch, WithdrawalOut
-from ..services.lots_ledger import fifo_consume_transfer_out, impact_to_json
+from ..services.lots_ledger import (
+    fifo_consume_transfer_out,
+    impact_to_json,
+    rebuild_withdrawal_lot_impacts,
+    diagnose_withdrawal_inventory_gaps,
+)
 
 router = APIRouter(prefix="/api/withdrawals", tags=["withdrawals"])
 
@@ -212,6 +217,115 @@ def list_withdrawals(
     return [_emit(w) for w in items]
 
 
+@router.post("/rebuild_lot_impact")
+def rebuild_withdrawal_lot_impact(
+    db: Session = Depends(get_db),
+    venue: Optional[str] = Query(default=None),
+    wallet_id: Optional[str] = Query(default=None),
+    asset: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default="DETECTED", description="Optional status filter, e.g. DETECTED"),
+    source_contains: Optional[str] = Query(default=None, description="Optional source substring filter, e.g. WALLET_ADDR"),
+    limit: int = Query(default=500, ge=1, le=5000),
+    apply_limit: int = Query(default=100, ge=1, le=1000),
+    allow_partial: bool = Query(
+        default=False,
+        description="Default false. If false, skip withdrawals when inventory is insufficient for the full quantity.",
+    ),
+    include_transfer_linked: bool = Query(
+        default=False,
+        description="Default false. Skip withdrawals already linked to transfer-in deposits unless explicitly enabled.",
+    ),
+    include_lp_special: bool = Query(
+        default=False,
+        description="Default false. Skip LP / pool-token withdrawals such as 2-POOL unless explicitly enabled.",
+    ),
+    mark_lp_special: bool = Query(
+        default=False,
+        description="Default false. When true with dry_run=false, mark skipped LP/pool-token rows in raw metadata without applying FIFO.",
+    ),
+    force_rebuild: bool = Query(
+        default=False,
+        description="Default false. Skip rows that already have lot_impact_applied unless explicitly enabled.",
+    ),
+    dry_run: bool = Query(default=True, description="Default true. Preview only unless false."),
+):
+    """
+    Preview/apply FIFO TRANSFER_OUT lot impact for existing withdrawal rows.
+
+    Safe defaults:
+      - dry_run=true
+      - allow_partial=false
+      - include_transfer_linked=false
+      - include_lp_special=false
+      - mark_lp_special=false
+      - force_rebuild=false
+
+    This endpoint is intentionally explicit-only. It does not run from ingest,
+    deposit materialization, or transfer-link preview.
+    """
+    result = rebuild_withdrawal_lot_impacts(
+        db,
+        venue=venue,
+        wallet_id=wallet_id,
+        asset=asset,
+        status=status,
+        source_contains=source_contains,
+        limit=limit,
+        apply_limit=apply_limit,
+        allow_partial=allow_partial,
+        include_transfer_linked=include_transfer_linked,
+        include_lp_special=include_lp_special,
+        mark_lp_special=mark_lp_special,
+        force_rebuild=force_rebuild,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        db.rollback()
+    else:
+        db.commit()
+    return result
+
+
+@router.post("/inventory_gap_diagnostics")
+def withdrawal_inventory_gap_diagnostics(
+    db: Session = Depends(get_db),
+    venue: Optional[str] = Query(default=None),
+    wallet_id: Optional[str] = Query(default=None),
+    asset: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default="DETECTED", description="Optional status filter, e.g. DETECTED"),
+    source_contains: Optional[str] = Query(default=None, description="Optional source substring filter, e.g. WALLET_ADDR"),
+    limit: int = Query(default=500, ge=1, le=5000),
+    include_transfer_linked: bool = Query(
+        default=False,
+        description="Default false. Exclude transfer-linked withdrawals from inventory-gap diagnostics.",
+    ),
+    include_applied: bool = Query(
+        default=False,
+        description="Default false. Exclude withdrawals that already have lot impact applied.",
+    ),
+):
+    """
+    Dry inventory-gap diagnostic for withdrawal FIFO blockers.
+
+    This endpoint performs no writes. It summarizes current BasisLot inventory
+    versus remaining withdrawal rows so strict FIFO blockers can be investigated
+    before any allow_partial or force_rebuild action is considered.
+    """
+    result = diagnose_withdrawal_inventory_gaps(
+        db,
+        venue=venue,
+        wallet_id=wallet_id,
+        asset=asset,
+        status=status,
+        source_contains=source_contains,
+        limit=limit,
+        include_transfer_linked=include_transfer_linked,
+        include_applied=include_applied,
+    )
+    db.rollback()
+    return result
+
+
 @router.get("/{withdrawal_id}", response_model=WithdrawalOut)
 def get_withdrawal(withdrawal_id: str, db: Session = Depends(get_db)):
     """Fetch a single withdrawal by id.
@@ -229,7 +343,10 @@ def get_withdrawal(withdrawal_id: str, db: Session = Depends(get_db)):
 @router.post("", response_model=WithdrawalOut)
 def create_withdrawal(
     req: WithdrawalCreate,
-    apply_lot_impact: bool = Query(default=True),
+    apply_lot_impact: bool = Query(
+        default=False,
+        description="Default false. FIFO lot impact must be explicitly requested with apply_lot_impact=true.",
+    ),
     db: Session = Depends(get_db),
 ):
     wt = req.withdraw_time or datetime.utcnow()

@@ -76,6 +76,7 @@ Current architecture in this repository includes support for:
 - persistent Hydration sidecar quote-cache / singleflight / backoff protection for controlled SDK diagnostics
 - Hydration order-ticket execution plumbing for UTTT-HDX manual XYK sell/exact-in and buy/exact-out flows
 - generic Hydration SDK router quote and orderbook paths blocked by default unless explicitly enabled
+- compact Hydration UI price-status indicators in Order Book and Order Ticket using status-only backend polling
 - Hydration swap recording into the unified all-orders flow through `swap_orders`
 - Hydration wallet-history ingestion through an optional Subscan-backed provider path
 - wallet-address transaction caching before deposit / withdrawal materialization
@@ -207,6 +208,7 @@ Current areas of focus include:
 - table, ledger, and order views
 - Solana wallet-manager integration for DEX flows
 - registry, scanner, Market Cap, and Volume tool windows
+- compact Hydration price-status UI that avoids triggering backend refresh or SDK quote paths
 - AppHeader portfolio totals that include cached wallet-address / self-custody balances
 
 In practical terms, the frontend favors:
@@ -260,6 +262,7 @@ The exact state of each venue may evolve over time, but the repository currently
   - Hydration price-cache status and external USD pricing
   - persistent sidecar quote-cache diagnostics / backoff protection
   - manual UTTT-HDX orderbook and swap transaction preparation
+  - inline Order Book and Order Ticket Hydration price-status UI
   - Hydration wallet-history ingestion and materialization
   - deposit / withdrawal provenance and missing-basis lot workflows
   - transfer-link diagnostics and explicit-only FIFO lot-impact handling
@@ -549,6 +552,7 @@ The Polkadot / Hydration side of UTT is designed as an opt-in DEX venue path. It
 - live UTTT-HDX reserve lookup
 - manual XYK pseudo-orderbook construction
 - manual UTTT-HDX order-ticket transaction preparation for sell/exact-in and buy/exact-out flows
+- compact Order Book and Order Ticket Hydration price-status UI driven by refresh-free status endpoints
 - generic SDK router quotes blocked by default for non-manual pairs
 - Hydration order-ticket pre-trade checks and execution path
 - Hydration swap recording into `swap_orders`
@@ -609,6 +613,8 @@ GET /api/polkadot_dex/hydration/prices?refresh=false
 GET /api/polkadot_dex/hydration/prices?refresh=true
   -> controlled backend refresh using external USD prices and the UTTT-HDX manual/live route
 ```
+
+The Order Book and Order Ticket use the status-only endpoint for UI status display. The Order Book keeps Hydration price status inline with the existing depth / auto / route row so switching venues does not resize the widget or push the asks/bids area downward. The Order Ticket shows the same pricing state as a compact `Prices` pill in the Polkadot controls area.
 
 The price response includes `statusDetail` and cache classification fields such as:
 
@@ -692,6 +698,7 @@ Current work includes:
 - venue-aware order book display
 - pseudo-orderbook behavior for DEX routes
 - manual/live Hydration UTTT-HDX orderbook generation
+- inline Hydration price-cache status display that does not create an extra notification row
 - router-quote safety gating for generic Hydration SDK pairs
 - right-lane terminal tile integration
 
@@ -703,8 +710,10 @@ Current work includes:
 - Solana wallet-manager integration
 - Jupiter and Raydium route selection for DEX paths
 - Hydration manual UTTT-HDX sell/exact-in and buy/exact-out transaction preparation
+- compact Hydration `Prices` status pill using refresh-free backend status polling
 - blocked generic Hydration swap-tx path when router quotes are disabled
 - operator status and preflight behavior
+- simplified widget controls with redundant Lock buttons and the Order Ticket top-left resize handle removed
 
 ---
 
@@ -769,6 +778,7 @@ The normal safe-path pricing flow should use `/api/polkadot_dex/hydration/prices
 Check:
 
 - `/api/polkadot_dex/hydration/prices/status` is reachable and reports `safe_for_ui_polling=true`
+- Order Book / Order Ticket status indicators are using the status endpoint rather than triggering `refresh=true`
 - `/api/polkadot_dex/hydration/prices?refresh=false` is being used for cache-only reads
 - `/api/polkadot_dex/hydration/prices?refresh=true` is used only for controlled backend refreshes
 - `statusDetail.classification` is inspected before treating missing prices as failures
@@ -860,6 +870,10 @@ DB-owned/tracked asset
 
 The terminal UI uses pane and window logic with multiple specialized widgets. Layout issues are usually related to dependencies, recent layout changes, or stale frontend state after major UI updates.
 
+For Hydration specifically, the Order Book price-cache indicator is intentionally inline with the existing depth / auto / route status row. It should not add a standalone notification row or change widget height when switching between CEX venues and `polkadot_hydration`.
+
+The Order Book and Order Ticket no longer depend on visible Lock controls for normal operation. If old local UI state behaves oddly after upgrading, clear local widget state or reload the app so the current unlocked widget behavior is applied.
+
 ---
 
 ## Security notes
@@ -923,6 +937,7 @@ UTT is an actively evolving trading terminal codebase with ongoing work across:
 - Hydration price-cache status, external USD pricing, and UTTT/USD derivation
 - Hydration sidecar quote-cache / singleflight / backoff safety
 - manual UTTT-HDX orderbook and buy/sell transaction preparation
+- compact Hydration UI status indicators for Order Book and Order Ticket
 - Hydration wallet-history ingestion and ledger materialization
 - missing-basis lots, transfer-link previews, and explicit-only FIFO lot impact
 - LP / Omnipool special handling for pool-token activity

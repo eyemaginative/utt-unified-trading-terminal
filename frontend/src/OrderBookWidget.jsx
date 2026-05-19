@@ -139,6 +139,86 @@ function formatHydrationQuoteStatusDetail(statusPayload) {
   return String(qs?.reason || statusPayload?.message || "").trim();
 }
 
+const HYDRATION_PRICE_STATUS_DEFAULT_ASSETS = ["HDX", "DOT", "USDT", "USDC", "UTTT", "HOLLAR"];
+
+function hydrationPriceStatusAssetsForSymbol(sym) {
+  const out = new Set(HYDRATION_PRICE_STATUS_DEFAULT_ASSETS);
+  try {
+    const s = String(sym || "").trim().toUpperCase();
+    const parts = s.includes("-") ? s.split("-") : s.includes("/") ? s.split("/") : [];
+    for (const p of parts) {
+      const v = String(p || "").trim().toUpperCase();
+      if (v) out.add(v);
+    }
+  } catch {
+    // ignore
+  }
+  return Array.from(out);
+}
+
+function hydrationPriceStatusView(payload, err) {
+  if (!payload && !err) {
+    return {
+      label: "Price status loading…",
+      title: "Waiting for Hydration price/status endpoint. This status-only request does not refresh prices, start the sidecar, or call SDK router quotes.",
+      tone: "warn",
+    };
+  }
+
+  if (err) {
+    return {
+      label: "Price status unavailable",
+      title: String(err || "Hydration price status unavailable."),
+      tone: "warn",
+    };
+  }
+
+  const p = payload && typeof payload === "object" ? payload : {};
+  const d = (p.statusDetail && typeof p.statusDetail === "object") ? p.statusDetail : {};
+  const c = (p.cache && typeof p.cache === "object") ? p.cache : {};
+  const classification = String(d.classification || c.classification || p.status || "unknown").trim();
+  const sourceState = String(d.source_state || c.source_state || p.status || "status_only").trim();
+  const missingRaw = Array.isArray(d.missing_prices)
+    ? d.missing_prices
+    : Array.isArray(c.missing_prices)
+      ? c.missing_prices
+      : Array.isArray(p.missingPrices)
+        ? p.missingPrices
+        : [];
+  const missing = missingRaw.map((x) => String(x || "").trim()).filter(Boolean);
+  const stale = d.stale === true || c.stale === true;
+  const inBackoff = d.in_error_backoff === true || c.in_error_backoff === true;
+  const hasAll = d.has_all_requested === true || c.has_all_requested === true || (missing.length === 0 && !!payload);
+  const ttl = Number(d.seconds_until_expiry ?? c.seconds_until_expiry ?? 0);
+  const retry = Number(d.seconds_until_retry ?? c.seconds_until_retry ?? 0);
+
+  let label = classification || "status_only";
+  if (classification === "status_only" && hasAll && !stale) label = "price cache fresh";
+  else if (classification === "cache_only_fresh") label = "price cache fresh";
+  else if (classification === "cache_only_partial_stale") label = "price cache partial/stale";
+  else if (classification === "cache_only_stale") label = "price cache stale";
+  else if (classification === "cache_only_partial") label = "price cache partial";
+  else if (classification === "live_fresh") label = "prices live/fresh";
+  else if (classification === "partial_stale") label = "prices partial/stale";
+  else if (classification === "error_backoff") label = "price refresh backoff";
+  else if (classification === "refresh_failed_stale") label = "refresh failed; stale cache";
+
+  const pieces = [`Hydration ${label}`];
+  if (missing.length) pieces.push(`missing ${missing.join(", ")}`);
+  if (Number.isFinite(ttl) && ttl > 0 && !stale) pieces.push(`${Math.floor(ttl)}s TTL`);
+  if (Number.isFinite(retry) && retry > 0) pieces.push(`${Math.floor(retry)}s retry`);
+
+  const tone = inBackoff || stale || missing.length ? "warn" : "ok";
+  const title = [
+    "Hydration price/status endpoint. This is status-only UI polish; it does not refresh prices, start the sidecar, or call SDK router quotes.",
+    `classification=${classification || "unknown"}`,
+    `source_state=${sourceState || "unknown"}`,
+    missing.length ? `missing=${missing.join(",")}` : "missing=none",
+  ].join(" ");
+
+  return { label: pieces.join(" • "), title, tone };
+}
+
 /**
  * Best-effort floor to increment using integer math at inferred decimals.
  * Example: value=0.15130102, inc=0.000001 -> 0.151301
@@ -318,6 +398,9 @@ export default function OrderBookWidget({
   const [obActiveRouter, setObActiveRouter] = useState(null);
   const [hydrationStatus, setHydrationStatus] = useState(null);
   const [hydrationLiquidityWarning, setHydrationLiquidityWarning] = useState(null);
+  const [hydrationPriceStatus, setHydrationPriceStatus] = useState(null);
+  const [hydrationPriceStatusError, setHydrationPriceStatusError] = useState(null);
+  const hydrationPriceStatusReqRef = useRef(0);
 
   const inFlightRef = useRef(false);
   const abortRef = useRef(null);
@@ -342,10 +425,9 @@ export default function OrderBookWidget({
   const MAX_W = 900;
   const MAX_H = Math.max(260, Math.floor(window?.innerHeight ? window.innerHeight * 0.9 : 800));
 
-  const [locked, setLocked] = useState(() => {
-    const v = localStorage.getItem(LS_OB_LOCK);
-    return v === "1";
-  });
+  // The dedicated Order Book lock control was removed in 8.5B.
+  // Keep the widget unlocked so old localStorage state cannot leave it stuck.
+  const [locked] = useState(false);
 
   const [box, setBox] = useState(() => {
     const saved = (() => {
@@ -362,8 +444,12 @@ export default function OrderBookWidget({
   });
 
   useEffect(() => {
-    localStorage.setItem(LS_OB_LOCK, locked ? "1" : "0");
-  }, [locked]);
+    try {
+      localStorage.setItem(LS_OB_LOCK, "0");
+    } catch {
+      // ignore
+    }
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(LS_OB_BOX, JSON.stringify(box));
@@ -403,6 +489,8 @@ export default function OrderBookWidget({
     cooldownPowRef.current = 0;
     setHydrationStatus(null);
     setHydrationLiquidityWarning(null);
+    setHydrationPriceStatus(null);
+    setHydrationPriceStatusError(null);
   }, [obSymbol]);
 
   const isSolJupVenue = useMemo(() => {
@@ -419,6 +507,8 @@ export default function OrderBookWidget({
     setObActiveRouter(null);
     setHydrationStatus(null);
     setHydrationLiquidityWarning(null);
+    setHydrationPriceStatus(null);
+    setHydrationPriceStatusError(null);
 
     // Prevent DEX-specific decimals from leaking into regular CEX venues.
     if (!isSolJupVenue && !isPolkadotDexVenue) setSizeDecimals(null);
@@ -440,6 +530,48 @@ export default function OrderBookWidget({
     setObActiveRouter(null);
     setHydrationLiquidityWarning(null);
   }, [obHydrationRouteMode, isPolkadotDexVenue]);
+
+
+  useEffect(() => {
+    const sym = String(obSymbol || "").trim().toUpperCase();
+    if (!isPolkadotDexVenue || !apiBase || !sym || !sym.includes("-")) {
+      setHydrationPriceStatus(null);
+      setHydrationPriceStatusError(null);
+      return;
+    }
+
+    const reqId = ++hydrationPriceStatusReqRef.current;
+    let cancelled = false;
+
+    const t = setTimeout(async () => {
+      try {
+        const url = new URL(`${apiBase}/api/polkadot_dex/hydration/prices/status`);
+        url.searchParams.set("assets", hydrationPriceStatusAssetsForSymbol(sym).join(","));
+        url.searchParams.set("symbol", sym);
+        url.searchParams.set("_ts", String(Date.now()));
+
+        const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+        if (!r.ok) {
+          const txt = await r.text().catch(() => "");
+          throw new Error(txt || `Hydration price status HTTP ${r.status}`);
+        }
+
+        const data = await r.json();
+        if (cancelled || hydrationPriceStatusReqRef.current !== reqId) return;
+        setHydrationPriceStatus(data || null);
+        setHydrationPriceStatusError(null);
+      } catch (e) {
+        if (cancelled || hydrationPriceStatusReqRef.current !== reqId) return;
+        setHydrationPriceStatus(null);
+        setHydrationPriceStatusError(e?.message || "Failed to load Hydration price status.");
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [isPolkadotDexVenue, apiBase, obSymbol]);
 
 
   const lockedRef = useRef(locked);
@@ -1294,6 +1426,11 @@ function clampBox(next) {
   const asksTitleStyle = { ...styles.obSectionTitle, marginTop: 8, fontSize: 11, color: OB_TEXT };
   const bidsTitleStyle = { ...styles.obSectionTitle, marginTop: 8, fontSize: 11, color: OB_TEXT };
 
+  const hydrationPriceStatusDisplay = hydrationPriceStatusView(hydrationPriceStatus, hydrationPriceStatusError);
+  const hydrationPriceStatusStyle = hydrationPriceStatusDisplay.tone === "ok"
+    ? { border: "1px solid rgba(46,204,113,0.20)", background: "rgba(46,204,113,0.06)", color: "#c9f7d7" }
+    : { border: "1px solid rgba(241,196,15,0.20)", background: "rgba(241,196,15,0.06)", color: "#f7e8b0" };
+
   function commitSymbolAndRefresh(force = false) {
     const next = String(symbolDraft || "").trim();
     if (!next) return;
@@ -1393,39 +1530,32 @@ function clampBox(next) {
           </button>
         </div>
 
-        <div style={{ ...rowStyle, marginTop: 6 }}>
-          <label style={pillCompact()} title="Lock position + size">
-            <input type="checkbox" checked={locked} onChange={(e) => {
-              const next = !!e.target.checked;
-              setLocked(next);
-              if (next) {
-                // Capture anchor offsets so viewport resize (DevTools) doesn't shove the widget.
-                setBox((prev) => {
-                  const vw = window.innerWidth;
-                  const vh = window.innerHeight;
-                  const w = prev.w || DEFAULT_W;
-                  const h = prev.h || DEFAULT_H;
-                  const b = getGutterBounds();
-                  const x = Number.isFinite(prev.x) ? prev.x : b.minX;
-                  const y = Number.isFinite(prev.y) ? prev.y : b.minY;
-                  const left = x - b.minX;
-                  const top = y - b.minY;
-                  const right = vw - (x + w);
-                  const bottom = vh - (y + h);
-                  const anchorX = left <= right ? "left" : "right";
-                  const anchorY = top <= bottom ? "top" : "bottom";
-                  return { ...prev, left, top, right, bottom, anchorX, anchorY };
-                });
-              }
-            }} />
-            <span>Lock</span>
-          </label>
-
-          <span style={{ ...styles.muted, fontSize: 11, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <div style={{ ...rowStyle, marginTop: 6, gap: 8, flexWrap: "nowrap", minWidth: 0, overflow: "hidden" }}>
+          <span style={{ ...styles.muted, fontSize: 11, flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             Depth <b>{obDepth}</b> • Auto <b>{obAutoRefresh ? `${obAutoSeconds}s` : "off"}</b>
             {isSolJupVenue ? <> • Router <b>{String(obSolanaRouterMode || "auto")}</b></> : null}
             {isPolkadotDexVenue ? <> • Route <b>{hydrationRouteModeLabel(obHydrationRouteMode)}</b></> : null}
           </span>
+          {isPolkadotDexVenue ? (
+            <span
+              title={hydrationPriceStatusDisplay.title}
+              style={{
+                ...hydrationPriceStatusStyle,
+                flex: "0 1 auto",
+                minWidth: 0,
+                maxWidth: "54%",
+                padding: "2px 8px",
+                borderRadius: 999,
+                fontSize: 10,
+                lineHeight: 1.15,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              <b>Prices</b> {hydrationPriceStatusDisplay.label}
+            </span>
+          ) : null}
         </div>
 
 
@@ -1498,7 +1628,7 @@ function clampBox(next) {
                       style={{ ...darkSelectStyle, width: "100%" }}
                       value={obHydrationRouteMode}
                       onChange={(e) => setObHydrationRouteMode(normalizeHydrationRouteMode(e.target.value))}
-                      title="Hydration quote source. Auto uses manual XYK for configured custom pairs and SDK/sidecar for normal pairs."
+                      title="Hydration route source. Auto uses manual XYK for configured custom pairs; generic SDK pairs stay blocked unless the backend explicitly enables router quotes."
                     >
                       <option value="auto" style={darkOptionStyle}>Auto</option>
                       <option value="sdk" style={darkOptionStyle}>SDK</option>

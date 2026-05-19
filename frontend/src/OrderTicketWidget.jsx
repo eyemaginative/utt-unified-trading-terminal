@@ -149,6 +149,86 @@ function isHydrationManualRoutePayload(payload) {
   );
 }
 
+const HYDRATION_PRICE_STATUS_DEFAULT_ASSETS = ["HDX", "DOT", "USDT", "USDC", "UTTT", "HOLLAR"];
+
+function hydrationPriceStatusAssetsForSymbol(sym) {
+  const out = new Set(HYDRATION_PRICE_STATUS_DEFAULT_ASSETS);
+  try {
+    const s = String(sym || "").trim().toUpperCase();
+    const parts = s.includes("-") ? s.split("-") : s.includes("/") ? s.split("/") : [];
+    for (const p of parts) {
+      const v = String(p || "").trim().toUpperCase();
+      if (v) out.add(v);
+    }
+  } catch {
+    // ignore
+  }
+  return Array.from(out);
+}
+
+function hydrationPriceStatusView(payload, err) {
+  if (!payload && !err) {
+    return {
+      label: "Price status loading…",
+      title: "Waiting for Hydration price/status endpoint. This status-only request does not refresh prices, start the sidecar, or call SDK router quotes.",
+      tone: "warn",
+    };
+  }
+
+  if (err) {
+    return {
+      label: "Price status unavailable",
+      title: String(err || "Hydration price status unavailable."),
+      tone: "warn",
+    };
+  }
+
+  const p = payload && typeof payload === "object" ? payload : {};
+  const d = (p.statusDetail && typeof p.statusDetail === "object") ? p.statusDetail : {};
+  const c = (p.cache && typeof p.cache === "object") ? p.cache : {};
+  const classification = String(d.classification || c.classification || p.status || "unknown").trim();
+  const sourceState = String(d.source_state || c.source_state || p.status || "status_only").trim();
+  const missingRaw = Array.isArray(d.missing_prices)
+    ? d.missing_prices
+    : Array.isArray(c.missing_prices)
+      ? c.missing_prices
+      : Array.isArray(p.missingPrices)
+        ? p.missingPrices
+        : [];
+  const missing = missingRaw.map((x) => String(x || "").trim()).filter(Boolean);
+  const stale = d.stale === true || c.stale === true;
+  const inBackoff = d.in_error_backoff === true || c.in_error_backoff === true;
+  const hasAll = d.has_all_requested === true || c.has_all_requested === true || (missing.length === 0 && !!payload);
+  const ttl = Number(d.seconds_until_expiry ?? c.seconds_until_expiry ?? 0);
+  const retry = Number(d.seconds_until_retry ?? c.seconds_until_retry ?? 0);
+
+  let label = classification || "status_only";
+  if (classification === "status_only" && hasAll && !stale) label = "price cache fresh";
+  else if (classification === "cache_only_fresh") label = "price cache fresh";
+  else if (classification === "cache_only_partial_stale") label = "price cache partial/stale";
+  else if (classification === "cache_only_stale") label = "price cache stale";
+  else if (classification === "cache_only_partial") label = "price cache partial";
+  else if (classification === "live_fresh") label = "prices live/fresh";
+  else if (classification === "partial_stale") label = "prices partial/stale";
+  else if (classification === "error_backoff") label = "price refresh backoff";
+  else if (classification === "refresh_failed_stale") label = "refresh failed; stale cache";
+
+  const pieces = [`Hydration ${label}`];
+  if (missing.length) pieces.push(`missing ${missing.join(", ")}`);
+  if (Number.isFinite(ttl) && ttl > 0 && !stale) pieces.push(`${Math.floor(ttl)}s TTL`);
+  if (Number.isFinite(retry) && retry > 0) pieces.push(`${Math.floor(retry)}s retry`);
+
+  const tone = inBackoff || stale || missing.length ? "warn" : "ok";
+  const title = [
+    "Hydration price/status endpoint. This is status-only UI polish; it does not refresh prices, start the sidecar, or call SDK router quotes.",
+    `classification=${classification || "unknown"}`,
+    `source_state=${sourceState || "unknown"}`,
+    missing.length ? `missing=${missing.join(",")}` : "missing=none",
+  ].join(" ");
+
+  return { label: pieces.join(" • "), title, tone };
+}
+
 function getPreferredPolkadotWalletKey() {
   try { return localStorage.getItem(LS_OT_DOT_WALLET) || "subwallet-js"; } catch { return "subwallet-js"; }
 }
@@ -1477,9 +1557,12 @@ export default function OrderTicketWidget({
   const [polkadotHydrationStatus, setPolkadotHydrationStatus] = useState(null);
   const [polkadotHydrationStatusLoading, setPolkadotHydrationStatusLoading] = useState(false);
   const [polkadotHydrationStatusError, setPolkadotHydrationStatusError] = useState(null);
+  const [polkadotPriceStatus, setPolkadotPriceStatus] = useState(null);
+  const [polkadotPriceStatusError, setPolkadotPriceStatusError] = useState(null);
   const [polkadotLiquidityWarning, setPolkadotLiquidityWarning] = useState(null);
   const [polkadotManualRouteAvailable, setPolkadotManualRouteAvailable] = useState(false);
   const polkadotHydrationStatusReqRef = useRef(0);
+  const polkadotPriceStatusReqRef = useRef(0);
   const polkadotLiquidityReqRef = useRef(0);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
@@ -1650,7 +1733,9 @@ export default function OrderTicketWidget({
     return Math.max(250, Math.floor(vh * 0.85));
   }, []);
 
-  const [locked, setLocked] = useState(() => lsGet(LS_OT_LOCK, "0") === "1");
+  // 8.5C: Order Ticket lock control removed. Keep the widget explicitly unlocked so
+  // older localStorage values cannot leave the tile invisibly locked.
+  const locked = false;
 
   const [box, setBox] = useState(() => {
     const saved = safeJsonParse(lsGet(LS_OT_BOX, "null"), null);
@@ -1671,7 +1756,7 @@ export default function OrderTicketWidget({
   useEffect(() => lsSet(LS_OT_TOTAL_USD, String(totalQuote ?? "")), [totalQuote]);
   useEffect(() => lsSet(LS_OT_AUTOQTY, autoCalc ? "1" : "0"), [autoCalc]);
 
-  useEffect(() => lsSet(LS_OT_LOCK, locked ? "1" : "0"), [locked]);
+  useEffect(() => lsSet(LS_OT_LOCK, "0"), []);
   useEffect(() => lsSet(LS_OT_BOX, JSON.stringify(box)), [box]);
 
 
@@ -1952,6 +2037,7 @@ export default function OrderTicketWidget({
   const polkadotEffectiveStatusReason = polkadotManualSwapAvailable && !polkadotQuotesAvailable
     ? "Hydration generic SDK quotes are disabled, but this pair has a backend manual XYK/live-pool route available."
     : polkadotStatusReason;
+  const polkadotPriceStatusDisplay = hydrationPriceStatusView(polkadotPriceStatus, polkadotPriceStatusError);
 
   useEffect(() => {
     const sym = String(otSymbol || "").trim().toUpperCase();
@@ -1991,6 +2077,47 @@ export default function OrderTicketWidget({
         if (!cancelled && polkadotHydrationStatusReqRef.current === reqId) setPolkadotHydrationStatusLoading(false);
       }
     }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [isPolkadotDexVenue, apiBase, otSymbol]);
+
+  useEffect(() => {
+    const sym = String(otSymbol || "").trim().toUpperCase();
+    if (!isPolkadotDexVenue || !apiBase || !sym || !sym.includes("-")) {
+      setPolkadotPriceStatus(null);
+      setPolkadotPriceStatusError(null);
+      return;
+    }
+
+    const reqId = ++polkadotPriceStatusReqRef.current;
+    let cancelled = false;
+
+    const t = setTimeout(async () => {
+      try {
+        const url = new URL(`${apiBase}/api/polkadot_dex/hydration/prices/status`);
+        url.searchParams.set("assets", hydrationPriceStatusAssetsForSymbol(sym).join(","));
+        url.searchParams.set("symbol", sym);
+        url.searchParams.set("_ts", String(Date.now()));
+
+        const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+        if (!r.ok) {
+          const txt = await r.text().catch(() => "");
+          throw new Error(txt || `Hydration price status HTTP ${r.status}`);
+        }
+
+        const data = await r.json();
+        if (cancelled || polkadotPriceStatusReqRef.current !== reqId) return;
+        setPolkadotPriceStatus(data || null);
+        setPolkadotPriceStatusError(null);
+      } catch (e) {
+        if (cancelled || polkadotPriceStatusReqRef.current !== reqId) return;
+        setPolkadotPriceStatus(null);
+        setPolkadotPriceStatusError(e?.message || "Failed to load Hydration price status.");
+      }
+    }, 350);
 
     return () => {
       cancelled = true;
@@ -4985,32 +5112,6 @@ async function submitLimitOrder() {
             </div>
           )}
 
-          <label style={safePill} title="Lock position + size">
-            <input type="checkbox" checked={locked} onChange={(e) => {
-              const next = !!e.target.checked;
-              setLocked(next);
-              if (next) {
-                // Capture anchor offsets so viewport resize (DevTools) doesn't shove the widget.
-                setBox((prev) => {
-                  const vw = window.innerWidth;
-                  const vh = window.innerHeight;
-                  const b = getGutterBounds();
-                  const w = prev.w || DEFAULT_W;
-                  const h = prev.h || DEFAULT_H;
-                  const x = Number.isFinite(prev.x) ? prev.x : b.minX;
-                  const y = Number.isFinite(prev.y) ? prev.y : b.minY;
-                  const left = x - b.minX;
-                  const top = y - b.minY;
-                  const right = vw - (x + w);
-                  const bottom = vh - (y + h);
-                  const anchorX = left <= right ? "left" : "right";
-                  const anchorY = top <= bottom ? "top" : "bottom";
-                  return { ...prev, left, top, right, bottom, anchorX, anchorY };
-                });
-              }
-            }} />
-            <span>Lock</span>
-          </label>
         </div>
 
         {rulesBanner && (
@@ -5487,6 +5588,30 @@ async function submitLimitOrder() {
                     ? (hideTableData ? "Wallet not connected" : polkadotWalletState.error)
                     : "Connect SubWallet for Polkadot DEX"}
               </span>
+              <span
+                title={polkadotPriceStatusDisplay.title}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "4px 7px",
+                  borderRadius: 999,
+                  border: polkadotPriceStatusDisplay.tone === "ok" ? "1px solid rgba(46,204,113,0.20)" : "1px solid rgba(241,196,15,0.20)",
+                  background: polkadotPriceStatusDisplay.tone === "ok" ? "rgba(46,204,113,0.06)" : "rgba(241,196,15,0.06)",
+                  color: polkadotPriceStatusDisplay.tone === "ok" ? "#c9f7d7" : "#f7e8b0",
+                  fontSize: 11,
+                  lineHeight: 1.1,
+                  maxWidth: 280,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                <b>Prices</b>
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {hideTableData ? "status ready" : polkadotPriceStatusDisplay.label}
+                </span>
+              </span>
               <button
                 type="button"
                 style={{ ...safeButton, padding: "6px 8px", marginLeft: "auto", fontWeight: 800 }}
@@ -5535,7 +5660,7 @@ async function submitLimitOrder() {
                   style={{ ...darkSelectStyle, width: "100%" }}
                   value={preferredHydrationRouteMode}
                   onChange={(e) => setPreferredHydrationRouteModeState(normalizeHydrationRouteMode(e.target.value))}
-                  title="Hydration swap route source. Auto uses manual XYK for configured custom pairs and SDK/sidecar for normal pairs."
+                  title="Hydration route source. Auto uses manual XYK for configured custom pairs; generic SDK pairs stay blocked unless the backend explicitly enables router quotes."
                 >
                   <option value="auto" style={darkOptionStyle}>Auto</option>
                   <option value="sdk" style={darkOptionStyle}>SDK</option>
@@ -5544,7 +5669,7 @@ async function submitLimitOrder() {
                 </select>
               </label>
               <div style={{ ...safeMuted, marginTop: 8, fontSize: 11, lineHeight: 1.25 }}>
-                Current route: <b>{hydrationRouteModeLabel(preferredHydrationRouteMode)}</b>. Auto uses manual XYK for configured custom pairs and SDK/sidecar for normal pairs.
+                Current route: <b>{hydrationRouteModeLabel(preferredHydrationRouteMode)}</b>. Auto uses manual XYK for configured custom pairs; generic SDK pairs stay blocked unless the backend explicitly enables router quotes.
               </div>
             </div>
           ) : null}
@@ -5688,26 +5813,6 @@ async function submitLimitOrder() {
         </div>
 
         </div>
-
-        {(forceTileMode || !inlineMode) && (
-          <div
-            onMouseDown={onResizeMouseDown}
-            title={locked ? "Locked" : "Resize from top-left"}
-            style={{
-              position: "absolute",
-              left: 6,
-              top: 6,
-              width: 18,
-              height: 18,
-              borderRadius: 6,
-              border: "1px solid #2a2a2a",
-              background: "#151515",
-              cursor: locked ? "default" : "nwse-resize",
-              zIndex: 5,
-              opacity: locked ? 0.4 : 1,
-            }}
-          />
-        )}
 
         {/* Confirm submit modal (existing) */}
         {showConfirm && (

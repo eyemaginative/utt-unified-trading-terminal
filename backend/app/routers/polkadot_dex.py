@@ -1268,20 +1268,144 @@ def _hydration_price_cache_requested_symbols(raw: Optional[str]) -> List[str]:
     return out or ["HDX", "DOT", "USDT", "UTTT", "HOLLAR"]
 
 
+_HYDRATION_STABLE_USD_SYMBOLS = {"USDT", "USDC", "HOLLAR"}
+
+
+def _hydration_price_cache_missing_symbols(
+    *,
+    requested: List[str],
+    prices: Dict[str, Any],
+) -> List[str]:
+    missing: List[str] = []
+    for sym_raw in requested or []:
+        sym = str(sym_raw or "").strip().upper()
+        if not sym or sym in _HYDRATION_STABLE_USD_SYMBOLS:
+            continue
+        if _float_or_none((prices or {}).get(sym)) is None:
+            missing.append(sym)
+    return missing
+
+
+def _hydration_price_cache_status_detail(
+    *,
+    status: str,
+    requested: List[str],
+    prices: Dict[str, Any],
+) -> Dict[str, Any]:
+    now = time.monotonic()
+    expires_at = float(_hydration_usd_price_cache.get("expires_at") or 0)
+    error_until = float(_hydration_usd_price_cache.get("error_until") or 0)
+    missing = _hydration_price_cache_missing_symbols(requested=requested, prices=prices)
+    stale = bool(expires_at <= now)
+    in_error_backoff = bool(error_until > now)
+    status_raw = str(status or "").strip().lower()
+
+    if status_raw == "status_only":
+        classification = "status_only"
+        source_state = "status_only_no_refresh"
+    elif status_raw == "cache_only":
+        if missing and stale:
+            classification = "cache_only_partial_stale"
+        elif missing:
+            classification = "cache_only_partial"
+        elif stale:
+            classification = "cache_only_stale"
+        else:
+            classification = "cache_only_fresh"
+        source_state = "cache_only"
+    elif status_raw in {"fresh", "refreshed", "refreshed_external"}:
+        classification = "live_fresh" if status_raw != "fresh" else "cache_fresh"
+        source_state = "external_refresh" if status_raw == "refreshed_external" else status_raw
+    elif "backoff" in status_raw:
+        classification = "error_backoff"
+        source_state = "error_backoff"
+    elif "failed" in status_raw:
+        classification = "refresh_failed_stale"
+        source_state = "refresh_failed"
+    elif "partial" in status_raw:
+        classification = "partial_stale"
+        source_state = "partial"
+    else:
+        classification = status_raw or "unknown"
+        source_state = status_raw or "unknown"
+
+    return {
+        "classification": classification,
+        "source_state": source_state,
+        "missing_prices": missing,
+        "has_all_requested": len(missing) == 0,
+        "stale": stale,
+        "in_error_backoff": in_error_backoff,
+        "seconds_until_expiry": max(0.0, expires_at - now) if expires_at else 0.0,
+        "seconds_until_retry": max(0.0, error_until - now) if error_until else 0.0,
+        "sdk_fallback_enabled": bool(_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK),
+        "external_usd_prices_enabled": bool(_HYDRATION_ENABLE_EXTERNAL_USD_PRICES),
+    }
+
+
+def _hydration_price_cache_failure_mode(
+    *,
+    errors: List[Dict[str, Any]],
+    sdk_fallback_attempted: bool,
+    external_attempted: bool,
+) -> str:
+    try:
+        joined = json.dumps(errors or [], default=str).lower()
+    except Exception:
+        joined = str(errors or "").lower()
+
+    if sdk_fallback_attempted:
+        if "hydration_sidecar_quote_backoff" in joined or "quote_backoff" in joined:
+            return "sdk_fallback_backoff"
+        if "timeout" in joined or "timed out" in joined:
+            return "sdk_fallback_timeout"
+        if "sidecar_not_available" in joined or "sidecar_not" in joined:
+            return "sdk_fallback_unavailable"
+        return "sdk_fallback_unavailable"
+
+    if external_attempted:
+        if "timeout" in joined or "timed out" in joined:
+            return "external_price_timeout"
+        if "http_error" in joined or "request" in joined:
+            return "external_price_unavailable"
+        return "external_price_unavailable"
+
+    return "price_source_unavailable"
+
+
+def _hydration_price_cache_failure_message(*, failure_mode: str) -> str:
+    if str(failure_mode or "").startswith("sdk_fallback"):
+        return (
+            "One or more Hydration USD prices could not be resolved from the SDK fallback price path. "
+            "Returning cached/stable prices and backing off before the next refresh attempt."
+        )
+    if str(failure_mode or "").startswith("external_price"):
+        return (
+            "One or more Hydration USD prices could not be resolved from the external USD price source. "
+            "Returning cached/stable prices and backing off before the next refresh attempt."
+        )
+    return (
+        "One or more Hydration USD prices could not be resolved from the configured price sources. "
+        "Returning cached/stable prices and backing off before the next refresh attempt."
+    )
+
+
 def _hydration_price_cache_payload(*, status: str, requested: List[str]) -> Dict[str, Any]:
     prices = dict(_hydration_usd_price_cache.get("prices") or {})
     sources = dict(_hydration_usd_price_cache.get("sources") or {})
     errors = list(_hydration_usd_price_cache.get("errors") or [])
     now = time.monotonic()
+    status_detail = _hydration_price_cache_status_detail(status=status, requested=requested, prices=prices)
     return {
         "ok": True,
         "venue": "polkadot_hydration",
         "network": "hydration",
         "status": status,
+        "statusDetail": status_detail,
         "requested": requested,
-        "prices_usd": {k: v for k, v in prices.items() if k in requested or k in {"USDT", "USDC", "HOLLAR"}},
-        "usd_prices": {k: v for k, v in prices.items() if k in requested or k in {"USDT", "USDC", "HOLLAR"}},
-        "priceSources": {k: v for k, v in sources.items() if k in requested or k in {"USDT", "USDC", "HOLLAR"}},
+        "prices_usd": {k: v for k, v in prices.items() if k in requested or k in _HYDRATION_STABLE_USD_SYMBOLS},
+        "usd_prices": {k: v for k, v in prices.items() if k in requested or k in _HYDRATION_STABLE_USD_SYMBOLS},
+        "priceSources": {k: v for k, v in sources.items() if k in requested or k in _HYDRATION_STABLE_USD_SYMBOLS},
         "errors": errors[-12:],
         "cache": {
             "enabled": bool(_HYDRATION_ENABLE_SDK_PRICE_CACHE),
@@ -1304,6 +1428,13 @@ def _hydration_price_cache_payload(*, status: str, requested: List[str]) -> Dict
             "error_until": _hydration_usd_price_cache.get("error_until"),
             "now": now,
             "stale": bool(float(_hydration_usd_price_cache.get("expires_at") or 0) <= now),
+            "classification": status_detail.get("classification"),
+            "source_state": status_detail.get("source_state"),
+            "in_error_backoff": bool(status_detail.get("in_error_backoff")),
+            "seconds_until_expiry": status_detail.get("seconds_until_expiry"),
+            "seconds_until_retry": status_detail.get("seconds_until_retry"),
+            "has_all_requested": bool(status_detail.get("has_all_requested")),
+            "missing_prices": status_detail.get("missing_prices"),
             "last_error": _hydration_usd_price_cache.get("last_error"),
         },
     }
@@ -1766,7 +1897,7 @@ async def _hydration_refresh_usd_price_cache(
                 prices["UTTT"] = float(spot * hdx_usd)
                 src = str((cfg or {}).get("source") or "manual_xyk")
                 hdx_src = str(sources.get("HDX") or "HDX-USD")
-                sources["UTTT"] = f"derived:UTTT-HDX×HDX-USD:{src}:{hdx_src}"
+                sources["UTTT"] = f"derived:UTTT-HDXxHDX-USD:{src}:{hdx_src}"
         except Exception as e:
             errors.append({"pair": "UTTT-HDX", "error": type(e).__name__, "message": str(e), "detail": getattr(e, "detail", None)})
 
@@ -1796,6 +1927,8 @@ async def _hydration_refresh_usd_price_cache(
         prices = dict(_hydration_usd_price_cache.get("prices") or {})
         sources = dict(_hydration_usd_price_cache.get("sources") or {})
         errors: List[Dict[str, Any]] = []
+        sdk_fallback_attempted = False
+        external_attempted = bool(_HYDRATION_ENABLE_EXTERNAL_USD_PRICES)
         for stable in ("USDT", "USDC", "HOLLAR"):
             prices[stable] = 1.0
             sources[stable] = "stable"
@@ -1818,6 +1951,7 @@ async def _hydration_refresh_usd_price_cache(
             # explicit local diagnostics, but the UI price cache should not
             # reopen sdk-next/PAPI quote polling during normal refreshes.
             if missing_requested and _HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK and _HYDRATION_ENABLE_SDK_PRICE_CACHE:
+                sdk_fallback_attempted = True
                 need_dot_direct = "DOT" in missing_requested
                 need_hdx = "HDX" in missing_requested or "UTTT" in missing_requested
 
@@ -1838,7 +1972,7 @@ async def _hydration_refresh_usd_price_cache(
                                 hdx_dot, detail = await _hydration_sdk_pair_price(db=db, pair="HDX-DOT", amount_in_ui=100.0)
                                 if hdx_dot is not None:
                                     hdx_px = hdx_dot * dot_usd
-                                    hdx_src = "sdk:HDX-DOT×DOT-USD"
+                                    hdx_src = "sdk:HDX-DOTxDOT-USD"
                                 else:
                                     errors.append({"pair": "HDX-DOT", "error": "empty_quote", "detail": detail})
                             except Exception as e:
@@ -1858,11 +1992,20 @@ async def _hydration_refresh_usd_price_cache(
             else:
                 status = "partial_prices_stale"
                 error_until = now + max(30.0, float(_HYDRATION_PRICE_CACHE_ERROR_BACKOFF_S))
+                failure_mode = _hydration_price_cache_failure_mode(
+                    errors=errors,
+                    sdk_fallback_attempted=sdk_fallback_attempted,
+                    external_attempted=external_attempted,
+                )
                 last_error = {
                     "error": "hydration_usd_price_cache_partial",
-                    "message": "One or more Hydration USD prices could not be resolved from the live non-SDK price source. Returning cached/stable prices and backing off before the next refresh attempt.",
+                    "message": _hydration_price_cache_failure_message(failure_mode=failure_mode),
+                    "failureMode": failure_mode,
+                    "classification": "partial_stale",
                     "missing": missing_requested,
                     "sdkFallbackEnabled": bool(_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK),
+                    "sdkFallbackAttempted": bool(sdk_fallback_attempted),
+                    "externalUsdPricesEnabled": bool(_HYDRATION_ENABLE_EXTERNAL_USD_PRICES),
                     "externalSource": _HYDRATION_EXTERNAL_USD_PRICE_SOURCE,
                 }
 
@@ -1877,10 +2020,24 @@ async def _hydration_refresh_usd_price_cache(
             })
             return _hydration_price_cache_payload(status=status, requested=requested)
         except Exception as e:
+            failure_mode = _hydration_price_cache_failure_mode(
+                errors=errors + [{"error": type(e).__name__, "message": str(e), "detail": getattr(e, "detail", None)}],
+                sdk_fallback_attempted=bool(_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK and _HYDRATION_ENABLE_SDK_PRICE_CACHE),
+                external_attempted=bool(_HYDRATION_ENABLE_EXTERNAL_USD_PRICES),
+            )
             _hydration_usd_price_cache.update({
                 "errors": errors[-12:],
                 "error_until": now + max(30.0, float(_HYDRATION_PRICE_CACHE_ERROR_BACKOFF_S)),
-                "last_error": {"error": type(e).__name__, "message": str(e), "detail": getattr(e, "detail", None)},
+                "last_error": {
+                    "error": type(e).__name__,
+                    "message": str(e),
+                    "detail": getattr(e, "detail", None),
+                    "failureMode": failure_mode,
+                    "classification": "refresh_failed_stale",
+                    "sdkFallbackEnabled": bool(_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK),
+                    "externalUsdPricesEnabled": bool(_HYDRATION_ENABLE_EXTERNAL_USD_PRICES),
+                    "externalSource": _HYDRATION_EXTERNAL_USD_PRICE_SOURCE,
+                },
             })
             return _hydration_price_cache_payload(status="refresh_failed_stale", requested=requested)
 
@@ -4224,6 +4381,153 @@ async def hydration_balances(
     return response
 
 
+@router.get("/hydration/prices/status")
+async def hydration_usd_prices_status(
+    assets: Optional[str] = Query("HDX,DOT,USDT,UTTT,HOLLAR", description="Comma-separated Hydration assets to inspect in the USD price cache."),
+    symbol: Optional[str] = Query("HDX-DOT", description="Optional pair used only for router-quote safety diagnostics."),
+    include_sidecar_health: bool = Query(False, description="If true, performs only a lightweight GET /health against the local sidecar. It does not autostart the sidecar."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return Hydration price-cache/router safety state without refreshing prices.
+
+    This endpoint is intentionally status-only:
+      - no SDK router quote refresh
+      - no sidecar autostart
+      - no Dwellir/PAPI quote subscription work
+      - optional sidecar health check is a local HTTP /health probe only
+    """
+    requested = _hydration_price_cache_requested_symbols(assets)
+    cache_payload = _hydration_price_cache_payload(status="status_only", requested=requested)
+    cache_meta = dict(cache_payload.get("cache") or {})
+    prices = dict(cache_payload.get("prices_usd") or {})
+    usd_prices = dict(cache_payload.get("usd_prices") or {})
+    sources = dict(cache_payload.get("priceSources") or {})
+
+    # Keep this status endpoint refresh-free while still reporting deterministic
+    # stablecoin prices the same way /hydration/prices?refresh=false does.
+    # This does not call SDK/router quotes, does not call external price APIs,
+    # and does not autostart the sidecar.
+    for stable in ("USDT", "USDC", "HOLLAR"):
+        prices.setdefault(stable, 1.0)
+        usd_prices.setdefault(stable, 1.0)
+        sources.setdefault(stable, "stable")
+
+    resolved_prices: Dict[str, float] = {}
+    missing_prices: List[str] = []
+    for sym in requested:
+        val = _float_or_none(prices.get(sym))
+        if val is not None:
+            resolved_prices[sym] = float(val)
+        else:
+            missing_prices.append(sym)
+
+    router_status: Dict[str, Any]
+    resolved_symbol: Optional[str] = None
+    if symbol:
+        try:
+            base, quote = _parse_symbol(symbol)
+            base_meta = _resolve_asset(base, db=db)
+            quote_meta = _resolve_asset(quote, db=db)
+            resolved_symbol = f"{base}-{quote}"
+            router_status = _hydration_router_quote_status(
+                symbol=resolved_symbol,
+                base_meta=base_meta,
+                quote_meta=quote_meta,
+            )
+        except HTTPException as e:
+            router_status = {
+                "enabled": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+                "available": False,
+                "status": "symbol_diagnostic_failed",
+                "symbol": symbol,
+                "error": getattr(e, "detail", None),
+            }
+        except Exception as e:
+            router_status = {
+                "enabled": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+                "available": False,
+                "status": "symbol_diagnostic_failed",
+                "symbol": symbol,
+                "error": type(e).__name__,
+                "message": str(e),
+            }
+    else:
+        router_status = _hydration_router_quote_status(symbol=None)
+
+    sidecar_health = await _sidecar_health() if include_sidecar_health else {
+        "skipped": True,
+        "reason": "include_sidecar_health=false",
+        "autostart": False,
+        "note": "No sidecar health request was made, and this status endpoint never autostarts the sidecar.",
+    }
+
+    now = time.monotonic()
+    expires_at = float(cache_meta.get("expires_at") or 0)
+    error_until = float(cache_meta.get("error_until") or 0)
+    cache_stale = bool(expires_at <= now)
+    in_error_backoff = bool(error_until > now)
+
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "network": "hydration",
+        "status": "status_only",
+        "statusDetail": _hydration_price_cache_status_detail(status="status_only", requested=requested, prices=prices),
+        "requested": requested,
+        "rawAssets": assets,
+        "symbol": symbol,
+        "resolvedSymbol": resolved_symbol,
+        "prices_usd": prices,
+        "usd_prices": usd_prices or dict(prices),
+        "resolvedPrices": resolved_prices,
+        "missingPrices": missing_prices,
+        "priceSources": sources,
+        "errors": cache_payload.get("errors") or [],
+        "cache": {
+            **cache_meta,
+            "status_only": True,
+            "stale": cache_stale,
+            "in_error_backoff": in_error_backoff,
+            "seconds_until_expiry": max(0.0, expires_at - now) if expires_at else 0.0,
+            "seconds_until_retry": max(0.0, error_until - now) if error_until else 0.0,
+            "has_any_price": bool(resolved_prices),
+            "missing_count": len(missing_prices),
+        },
+        "routerQuotes": router_status,
+        "sidecar": {
+            "enabled": bool(_HYDRATION_USE_SIDECAR),
+            "url": _HYDRATION_SIDECAR_URL,
+            "url_redacted": _redact_url(_HYDRATION_SIDECAR_URL),
+            "managed_process_running": _sidecar_process_running(),
+            "autostart_for_router_quotes": bool(_hydration_effective_autostart_sidecar(price_cache=False)),
+            "autostart_for_price_cache": bool(_hydration_effective_autostart_sidecar(price_cache=True)),
+            "health": sidecar_health,
+        },
+        "safety": {
+            "status_endpoint_refreshes_prices": False,
+            "status_endpoint_autostarts_sidecar": False,
+            "include_sidecar_health_is_local_only": bool(include_sidecar_health),
+            "router_quotes_enabled": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+            "sdk_price_cache_enabled": bool(_HYDRATION_ENABLE_SDK_PRICE_CACHE),
+            "sdk_price_cache_fallback_enabled": bool(_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK),
+            "external_usd_prices_enabled": bool(_HYDRATION_ENABLE_EXTERNAL_USD_PRICES),
+            "external_usd_price_source": _HYDRATION_EXTERNAL_USD_PRICE_SOURCE,
+            "safe_for_ui_polling": True,
+        },
+        "endpoints": {
+            "status": "/api/polkadot_dex/hydration/prices/status",
+            "cache_only": "/api/polkadot_dex/hydration/prices?refresh=false",
+            "controlled_refresh": "/api/polkadot_dex/hydration/prices?refresh=true",
+            "force_refresh": "/api/polkadot_dex/hydration/prices?force_refresh=true",
+            "hydration_status": "/api/polkadot_dex/hydration/status",
+        },
+        "nextRequired": (
+            "Use this endpoint for UI/status polling. Use /hydration/prices?refresh=true only for controlled cache refreshes. "
+            "Keep UTT_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK=0 unless explicitly testing SDK fallback behavior."
+        ),
+    }
+
+
 @router.get("/hydration/prices")
 async def hydration_usd_prices(
     assets: Optional[str] = Query("HDX,DOT,USDT,UTTT,HOLLAR", description="Comma-separated Hydration assets to price in USD."),
@@ -5075,4 +5379,3 @@ async def hydration_record_submit(
         },
         "allOrdersSource": "swap_orders",
     }
-

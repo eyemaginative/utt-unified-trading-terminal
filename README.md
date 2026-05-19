@@ -72,6 +72,10 @@ Current architecture in this repository includes support for:
 - Hydration balances in terminal tables and wallet-address views
 - external USD price enrichment for HDX and DOT
 - UTTT/USD derivation from UTTT-HDX live route pricing and HDX/USD
+- Hydration price-cache status reporting with clear fresh, stale, partial, and unavailable classifications
+- persistent Hydration sidecar quote-cache / singleflight / backoff protection for controlled SDK diagnostics
+- Hydration order-ticket execution plumbing for UTTT-HDX manual XYK sell/exact-in and buy/exact-out flows
+- generic Hydration SDK router quote and orderbook paths blocked by default unless explicitly enabled
 - Hydration swap recording into the unified all-orders flow through `swap_orders`
 - Hydration wallet-history ingestion through an optional Subscan-backed provider path
 - wallet-address transaction caching before deposit / withdrawal materialization
@@ -81,7 +85,7 @@ Current architecture in this repository includes support for:
 - explicit-only FIFO withdrawal lot-impact rebuilds with dry-run-first safety
 - LP / Omnipool special handling for 2-POOL-style rows that should not be forced through normal FIFO
 
-The pre-push safe path avoids generic Hydration SDK quote polling for pricing. Broad SDK router quotes are disabled by default while the UTTT-HDX route uses registry-backed manual/live pool metadata. Future SDK work should use a persistent stateful Hydration SDK cache/service rather than per-pair or per-refresh polling.
+The public-safe Hydration path avoids generic SDK quote polling for pricing. Broad SDK router quotes are disabled by default while the UTTT-HDX route uses registry-backed manual/live pool metadata. External USD pricing and cache-only status endpoints are the normal price path; the persistent sidecar quote cache is used as a controlled diagnostic/protection layer, not as a UI polling loop.
 
 ### Market metrics workflow
 
@@ -253,6 +257,9 @@ The exact state of each venue may evolve over time, but the repository currently
   - Hydration UTTT-HDX manual/live route
   - Token Registry asset and price metadata
   - Route Registry live pool reserves
+  - Hydration price-cache status and external USD pricing
+  - persistent sidecar quote-cache diagnostics / backoff protection
+  - manual UTTT-HDX orderbook and swap transaction preparation
   - Hydration wallet-history ingestion and materialization
   - deposit / withdrawal provenance and missing-basis lot workflows
   - transfer-link diagnostics and explicit-only FIFO lot-impact handling
@@ -357,10 +364,23 @@ UTT_HYDRATION_MANUAL_POOL_LIVE_RESERVES=1
 UTT_HYDRATION_ENABLE_EXTERNAL_USD_PRICES=1
 UTT_HYDRATION_EXTERNAL_USD_PRICE_SOURCE=coingecko
 UTT_HYDRATION_ENABLE_SDK_PRICE_CACHE=1
+UTT_HYDRATION_PRICE_CACHE_USE_SIDECAR=1
 UTT_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK=0
 UTT_HYDRATION_PRICE_CACHE_TTL_S=300
 UTT_HYDRATION_PRICE_CACHE_ERROR_BACKOFF_S=600
 UTT_HYDRATION_EXTERNAL_USD_PRICE_TIMEOUT_S=5
+UTT_HYDRATION_PRICE_CACHE_STRATEGY=spot_then_sell
+UTT_HYDRATION_PRICE_CACHE_SPOT_IMPLEMENTATION=direct
+
+UTT_HYDRATION_USE_SIDECAR=1
+UTT_HYDRATION_SIDECAR_URL=http://127.0.0.1:8787
+UTT_HYDRATION_AUTOSTART_SIDECAR=0
+UTT_HYDRATION_PRICE_CACHE_AUTOSTART_SIDECAR=0
+UTT_HYDRATION_SIDECAR_QUOTE_CACHE=1
+UTT_HYDRATION_SIDECAR_QUOTE_CACHE_TTL_MS=30000
+UTT_HYDRATION_SIDECAR_QUOTE_CACHE_STALE_TTL_MS=300000
+UTT_HYDRATION_SIDECAR_QUOTE_BACKOFF_MS=120000
+UTT_HYDRATION_SIDECAR_QUOTE_CACHE_MAX_ENTRIES=100
 
 UTT_HYDRATION_HELPER_STEP_TIMEOUT_S=30
 ```
@@ -528,9 +548,14 @@ The Polkadot / Hydration side of UTT is designed as an opt-in DEX venue path. It
 - Route Registry-based UTTT-HDX pool metadata
 - live UTTT-HDX reserve lookup
 - manual XYK pseudo-orderbook construction
+- manual UTTT-HDX order-ticket transaction preparation for sell/exact-in and buy/exact-out flows
+- generic SDK router quotes blocked by default for non-manual pairs
 - Hydration order-ticket pre-trade checks and execution path
 - Hydration swap recording into `swap_orders`
 - All Orders reflection for confirmed Hydration swaps
+- price-cache status reporting for cache-only, live refresh, stale, partial, and error-backoff states
+- persistent Hydration sidecar quote-cache / singleflight / backoff diagnostics
+- Hydration wallet-history ingestion, materialization, missing-basis, transfer-link, and FIFO workflows
 - Spread / Bridge dashboard pricing based on Solana UTTT/USD versus Hydration-derived UTTT/USD
 
 ### Token Registry requirements
@@ -560,17 +585,43 @@ UTTT-HDX manual/live route
 
 ### Pricing model
 
-The pre-push stable pricing path uses:
+The public-safe Hydration pricing path uses:
 
 ```text
-HDX/USD  = external price source from Token Registry
-DOT/USD  = external price source from Token Registry
-USDT/USD = stable
-UTTT/HDX = UTTT-HDX live route
-UTTT/USD = UTTT/HDX × HDX/USD
+HDX/USD     = external price source from Token Registry, normally CoinGecko hydradx
+DOT/USD     = external price source from Token Registry, normally CoinGecko polkadot
+USDT/USD    = stable
+USDC/USD    = stable
+HOLLAR/USD  = stable
+UTTT/HDX    = UTTT-HDX live route reserve ratio
+UTTT/USD    = UTTT/HDX x HDX/USD
 ```
 
-Generic Hydration SDK router quotes are disabled by default for the public-safe configuration. If revisited later, SDK pricing should be implemented as a persistent stateful SDK cache/service, not as repeated per-pair UI-driven polling.
+Hydration pricing endpoints expose cache status explicitly so the UI can distinguish safe polling from live refresh behavior:
+
+```text
+GET /api/polkadot_dex/hydration/prices/status
+  -> status-only, refresh-free, sidecar-autostart-free, safe for UI polling
+
+GET /api/polkadot_dex/hydration/prices?refresh=false
+  -> cache-only response; may be fresh, stale, partial, or unavailable, but does not refresh
+
+GET /api/polkadot_dex/hydration/prices?refresh=true
+  -> controlled backend refresh using external USD prices and the UTTT-HDX manual/live route
+```
+
+The price response includes `statusDetail` and cache classification fields such as:
+
+```text
+cache_only_fresh
+cache_only_partial_stale
+live_fresh
+partial_stale
+error_backoff
+refresh_failed_stale
+```
+
+Generic Hydration SDK router quotes are disabled by default for the public-safe configuration. The persistent `hydration_sidecar.mjs` service includes quote-cache, singleflight, stale-serve, and per-key error-backoff protection for controlled SDK diagnostics, but SDK fallback remains disabled in the normal pricing path.
 
 ### Hydration wallet-history and ledger workflow
 
@@ -622,6 +673,7 @@ The repository includes token-registry-related backend and frontend work. This s
 - market-metrics source resolution through Token Registry external price IDs
 - Solana token tooling inside the operator UI
 - Hydration asset ID, decimals, and external price metadata
+- Hydration Route Registry metadata for manual/live UTTT-HDX pool routing
 
 There is also wallet-address handling in the backend, which supports broader local wallet and workflow integration. Cached wallet-address snapshots can contribute to AppHeader portfolio totals, so self-custody balances can be represented without requiring the balances table to be opened first.
 
@@ -640,6 +692,7 @@ Current work includes:
 - venue-aware order book display
 - pseudo-orderbook behavior for DEX routes
 - manual/live Hydration UTTT-HDX orderbook generation
+- router-quote safety gating for generic Hydration SDK pairs
 - right-lane terminal tile integration
 
 ### Order ticket
@@ -649,6 +702,8 @@ Current work includes:
 - venue-aware order entry
 - Solana wallet-manager integration
 - Jupiter and Raydium route selection for DEX paths
+- Hydration manual UTTT-HDX sell/exact-in and buy/exact-out transaction preparation
+- blocked generic Hydration swap-tx path when router quotes are disabled
 - operator status and preflight behavior
 
 ---
@@ -707,7 +762,42 @@ Check:
 - broad router quotes are disabled unless intentionally debugging SDK behavior
 - backend logs are not showing generic Hydration orderbook calls for pricing pairs such as `HDX-USDT`, `DOT-USDT`, or `UTTT-USDT`
 
-The normal safe-path pricing flow should use `/api/polkadot_dex/hydration/prices` and the UTTT-HDX manual/live route, not generic Hydration orderbook requests for USD pricing.
+The normal safe-path pricing flow should use `/api/polkadot_dex/hydration/prices`, `/api/polkadot_dex/hydration/prices/status`, and the UTTT-HDX manual/live route, not generic Hydration orderbook requests for USD pricing.
+
+### Hydration price cache or status looks stale
+
+Check:
+
+- `/api/polkadot_dex/hydration/prices/status` is reachable and reports `safe_for_ui_polling=true`
+- `/api/polkadot_dex/hydration/prices?refresh=false` is being used for cache-only reads
+- `/api/polkadot_dex/hydration/prices?refresh=true` is used only for controlled backend refreshes
+- `statusDetail.classification` is inspected before treating missing prices as failures
+- SDK fallback remains disabled unless intentionally testing the protected sidecar path
+- `UTT_HYDRATION_AUTOSTART_SIDECAR=0` and `UTT_HYDRATION_PRICE_CACHE_AUTOSTART_SIDECAR=0` are used for public-safe operation
+
+Expected safe states include:
+
+```text
+status_only
+cache_only_fresh
+cache_only_partial_stale
+live_fresh
+partial_stale
+error_backoff
+refresh_failed_stale
+```
+
+### Hydration generic orderbook or swap-tx requests are blocked
+
+This is usually expected. Generic SDK-routed pairs such as `DOT-USDT` are blocked by default when router quotes are disabled. The expected protective response includes:
+
+```text
+hydration_router_quotes_disabled
+hydration_swap_tx_requires_router_quotes
+quoteStatus.status = disabled
+```
+
+Manual/live routes such as `UTTT-HDX` can still build pseudo-orderbooks and unsigned transaction payloads through the manual XYK route. That path supports sell/exact-in and buy/exact-out transaction preparation without reopening generic SDK router quote polling.
 
 ### Hydration wallet-history rows do not appear in deposits or withdrawals
 
@@ -830,6 +920,9 @@ UTT is an actively evolving trading terminal codebase with ongoing work across:
 - UI and layout refinement
 - Solana wallet and router integration
 - Polkadot / Hydration UTTT-HDX routing
+- Hydration price-cache status, external USD pricing, and UTTT/USD derivation
+- Hydration sidecar quote-cache / singleflight / backoff safety
+- manual UTTT-HDX orderbook and buy/sell transaction preparation
 - Hydration wallet-history ingestion and ledger materialization
 - missing-basis lots, transfer-link previews, and explicit-only FIFO lot impact
 - LP / Omnipool special handling for pool-token activity

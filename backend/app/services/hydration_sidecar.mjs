@@ -348,6 +348,332 @@ let initPromise = null;
 let supportedAssetsCache = null;
 let initCount = 0;
 
+function envBool(name, defaultValue = false) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === '') return !!defaultValue;
+  const s = String(raw).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
+}
+
+function envNumber(name, defaultValue, { min = null, max = null } = {}) {
+  const raw = process.env[name];
+  const n = Number(raw);
+  let out = Number.isFinite(n) ? n : defaultValue;
+  if (min != null) out = Math.max(min, out);
+  if (max != null) out = Math.min(max, out);
+  return out;
+}
+
+// 8.2B: persistent-sidecar quote protection.  These guards are intentionally
+// local to SDK quote-style reads only.  They do not enable router quotes; the
+// existing enableRouterQuotes gate still blocks SDK router calls unless the
+// backend explicitly opts in.
+const quoteCacheEnabled = envBool('UTT_HYDRATION_SIDECAR_QUOTE_CACHE', true);
+const quoteCacheTtlMs = Math.trunc(envNumber('UTT_HYDRATION_SIDECAR_QUOTE_CACHE_TTL_MS', 30_000, { min: 1_000 }));
+const quoteCacheStaleTtlMs = Math.trunc(envNumber('UTT_HYDRATION_SIDECAR_QUOTE_CACHE_STALE_TTL_MS', 300_000, { min: quoteCacheTtlMs }));
+const quoteCacheBackoffMs = Math.trunc(envNumber('UTT_HYDRATION_SIDECAR_QUOTE_BACKOFF_MS', 120_000, { min: 1_000 }));
+const quoteCacheMaxEntries = Math.trunc(envNumber('UTT_HYDRATION_SIDECAR_QUOTE_CACHE_MAX_ENTRIES', 100, { min: 5, max: 2_000 }));
+
+const quoteCache = new Map();
+const quoteInflight = new Map();
+const quoteCacheStats = {
+  hits: 0,
+  misses: 0,
+  coalesced: 0,
+  stores: 0,
+  staleServes: 0,
+  backoffSkips: 0,
+  errors: 0,
+  evictions: 0,
+  bypasses: 0,
+};
+
+function hashString(value) {
+  const s = String(value || '');
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+function cloneJson(obj) {
+  return JSON.parse(JSON.stringify(obj, jsonReplacer));
+}
+
+function summarizeError(e) {
+  const detail = e?.detail || null;
+  return {
+    error: detail?.error || e?.code || e?.name || 'hydration_sidecar_quote_error',
+    message: String(detail?.message || e?.message || e).slice(0, 500),
+    status: Number(e?.status || detail?.status || 502),
+    stage: e?.stage || detail?.stage || null,
+  };
+}
+
+function quoteCacheModeEligible(req) {
+  if (!quoteCacheEnabled) return false;
+  if (manualCustomSwapReq(req)) return false;
+  const mode = String(req?.mode || '').trim();
+  return mode === 'price_spot' || mode === 'price_spot_direct' || mode === 'quote_sell';
+}
+
+function quoteCacheKey(req, parts = {}) {
+  const mode = String(req?.mode || '').trim();
+  const wsKey = hashString(String(parts.wsUrl || req?.wsUrl || currentWsUrl || ''));
+  const assetInId = parts.assetInId ?? '';
+  const assetOutId = parts.assetOutId ?? '';
+  const amountInAtomic = String(parts.amountInAtomic ?? req?.amountInAtomic ?? '').trim();
+  const amountOutAtomic = String(parts.amountOutAtomic ?? req?.amountOutAtomic ?? '').trim();
+  const rawSymbol = String(req?.rawSymbol || '').trim().toUpperCase();
+  const resolvedSymbol = String(req?.resolvedSymbol || '').trim().toUpperCase();
+  const label = [
+    mode || 'unknown',
+    resolvedSymbol || rawSymbol || `${assetInId}->${assetOutId}`,
+    `in:${assetInId}`,
+    `out:${assetOutId}`,
+    amountInAtomic ? `ain:${amountInAtomic}` : null,
+    amountOutAtomic ? `aout:${amountOutAtomic}` : null,
+  ].filter(Boolean).join('|');
+  const key = [
+    'v1',
+    mode,
+    `ws:${wsKey}`,
+    `in:${assetInId}`,
+    `out:${assetOutId}`,
+    `ain:${amountInAtomic}`,
+    `aout:${amountOutAtomic}`,
+    `direct:${mode === 'price_spot_direct' ? '1' : '0'}`,
+  ].join('|');
+  return { key, label };
+}
+
+function quoteCacheAnnotate(result, meta) {
+  const out = cloneJson(result || {});
+  const quoteCacheMeta = {
+    enabled: quoteCacheEnabled,
+    status: meta.status,
+    key: meta.label,
+    ttl_ms: quoteCacheTtlMs,
+    stale_ttl_ms: quoteCacheStaleTtlMs,
+    backoff_ms: quoteCacheBackoffMs,
+    created_at_ms: meta.createdAt ?? null,
+    expires_at_ms: meta.expiresAt ?? null,
+    stale_until_ms: meta.staleUntil ?? null,
+    error_until_ms: meta.errorUntil ?? null,
+    age_ms: meta.createdAt ? Math.max(0, Date.now() - Number(meta.createdAt)) : 0,
+    coalesced: !!meta.coalesced,
+  };
+  out.quoteCache = quoteCacheMeta;
+  if (out.sidecar && typeof out.sidecar === 'object') {
+    out.sidecar.quoteCache = quoteCacheMeta;
+  }
+  return out;
+}
+
+function quoteCachePrune() {
+  while (quoteCache.size > quoteCacheMaxEntries) {
+    let oldestKey = null;
+    let oldestAt = Infinity;
+    for (const [key, entry] of quoteCache.entries()) {
+      const at = Number(entry.lastAccessAt || entry.createdAt || 0);
+      if (at < oldestAt) {
+        oldestAt = at;
+        oldestKey = key;
+      }
+    }
+    if (!oldestKey) break;
+    quoteCache.delete(oldestKey);
+    quoteCacheStats.evictions += 1;
+  }
+}
+
+function quoteCacheBackoffError(entry) {
+  const err = new Error('Hydration sidecar quote key is in backoff after a previous error.');
+  err.status = 503;
+  err.detail = {
+    ok: false,
+    error: 'hydration_sidecar_quote_backoff',
+    message: err.message,
+    status: 503,
+    quoteCache: {
+      enabled: quoteCacheEnabled,
+      status: 'backoff',
+      key: entry?.label || null,
+      error_until_ms: entry?.errorUntil || 0,
+      backoff_ms: quoteCacheBackoffMs,
+      last_error: entry?.lastError || null,
+    },
+  };
+  return err;
+}
+
+async function quoteCacheRun(req, parts, fn) {
+  if (!quoteCacheModeEligible(req)) {
+    quoteCacheStats.bypasses += 1;
+    return await fn();
+  }
+
+  const { key, label } = quoteCacheKey(req, parts);
+  const now = Date.now();
+  const existing = quoteCache.get(key);
+
+  if (existing?.result && Number(existing.expiresAt || 0) > now) {
+    existing.hitCount = Number(existing.hitCount || 0) + 1;
+    existing.lastAccessAt = now;
+    quoteCacheStats.hits += 1;
+    return quoteCacheAnnotate(existing.result, { ...existing, status: 'hit' });
+  }
+
+  if (existing?.errorUntil && Number(existing.errorUntil) > now) {
+    if (existing?.result && Number(existing.staleUntil || 0) > now) {
+      existing.lastAccessAt = now;
+      quoteCacheStats.staleServes += 1;
+      return quoteCacheAnnotate(existing.result, { ...existing, status: 'stale_backoff' });
+    }
+    quoteCacheStats.backoffSkips += 1;
+    throw quoteCacheBackoffError(existing);
+  }
+
+  const inflight = quoteInflight.get(key);
+  if (inflight) {
+    quoteCacheStats.coalesced += 1;
+    const out = await inflight;
+    return quoteCacheAnnotate(out, {
+      key,
+      label,
+      status: 'coalesced',
+      coalesced: true,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + quoteCacheTtlMs,
+      staleUntil: Date.now() + quoteCacheStaleTtlMs,
+      errorUntil: existing?.errorUntil || 0,
+    });
+  }
+
+  quoteCacheStats.misses += 1;
+  const promise = (async () => {
+    try {
+      const result = await fn();
+      if (result && result.ok) {
+        const createdAt = Date.now();
+        const entry = {
+          key,
+          label,
+          mode: String(req?.mode || '').trim(),
+          result: cloneJson(result),
+          createdAt,
+          expiresAt: createdAt + quoteCacheTtlMs,
+          staleUntil: createdAt + quoteCacheStaleTtlMs,
+          errorUntil: 0,
+          lastError: null,
+          hitCount: 0,
+          lastAccessAt: createdAt,
+        };
+        quoteCache.set(key, entry);
+        quoteCacheStats.stores += 1;
+        quoteCachePrune();
+        return quoteCacheAnnotate(result, { ...entry, status: 'miss_store' });
+      }
+      return result;
+    } catch (e) {
+      quoteCacheStats.errors += 1;
+      if (e?.code === 'hydration_sidecar_stage_timeout') {
+        trace('sidecar_quote_cache_timeout_reset_start', { stage: e.stage || 'unknown', key: label });
+        try {
+          await destroyContext();
+          trace('sidecar_quote_cache_timeout_reset_done', { stage: e.stage || 'unknown', key: label });
+        } catch (resetError) {
+          trace('sidecar_quote_cache_timeout_reset_failed', {
+            stage: e.stage || 'unknown',
+            key: label,
+            message: String(resetError?.message || resetError).slice(0, 240),
+          });
+        }
+      }
+      const errorAt = Date.now();
+      const lastError = summarizeError(e);
+      const prior = quoteCache.get(key) || existing || {};
+      const entry = {
+        ...prior,
+        key,
+        label,
+        mode: String(req?.mode || '').trim(),
+        errorUntil: errorAt + quoteCacheBackoffMs,
+        lastError,
+        lastAccessAt: errorAt,
+      };
+      quoteCache.set(key, entry);
+      quoteCachePrune();
+      if (prior?.result && Number(prior.staleUntil || 0) > errorAt) {
+        quoteCacheStats.staleServes += 1;
+        return quoteCacheAnnotate(prior.result, { ...entry, status: 'stale_after_error' });
+      }
+      throw e;
+    } finally {
+      quoteInflight.delete(key);
+    }
+  })();
+
+  quoteInflight.set(key, promise);
+  return await promise;
+}
+
+function quoteCacheHealth() {
+  const now = Date.now();
+  const entries = [];
+  let fresh = 0;
+  let stale = 0;
+  let backoff = 0;
+
+  for (const entry of quoteCache.values()) {
+    const isFresh = !!(entry.result && Number(entry.expiresAt || 0) > now);
+    const isStale = !!(entry.result && !isFresh && Number(entry.staleUntil || 0) > now);
+    const isBackoff = Number(entry.errorUntil || 0) > now;
+    if (isFresh) fresh += 1;
+    if (isStale) stale += 1;
+    if (isBackoff) backoff += 1;
+    entries.push({
+      key: entry.label,
+      mode: entry.mode,
+      fresh: isFresh,
+      stale: isStale,
+      backoff: isBackoff,
+      age_ms: entry.createdAt ? Math.max(0, now - Number(entry.createdAt)) : null,
+      expires_in_ms: entry.expiresAt ? Math.max(0, Number(entry.expiresAt) - now) : 0,
+      stale_for_ms: entry.staleUntil ? Math.max(0, Number(entry.staleUntil) - now) : 0,
+      retry_in_ms: entry.errorUntil ? Math.max(0, Number(entry.errorUntil) - now) : 0,
+      hitCount: Number(entry.hitCount || 0),
+      lastError: entry.lastError || null,
+    });
+  }
+
+  entries.sort((a, b) => {
+    const ar = Number(a.retry_in_ms || 0);
+    const br = Number(b.retry_in_ms || 0);
+    if (br !== ar) return br - ar;
+    return String(a.key || '').localeCompare(String(b.key || ''));
+  });
+
+  return {
+    enabled: quoteCacheEnabled,
+    ttl_ms: quoteCacheTtlMs,
+    stale_ttl_ms: quoteCacheStaleTtlMs,
+    backoff_ms: quoteCacheBackoffMs,
+    max_entries: quoteCacheMaxEntries,
+    entries: quoteCache.size,
+    fresh,
+    stale,
+    backoff,
+    inflight: quoteInflight.size,
+    stats: { ...quoteCacheStats },
+    samples: entries.slice(0, 12),
+  };
+}
+
+
+
 async function loadPackages() {
   if (sdkPkg && papiPkg && papiWsProviderPkg) return;
   trace('sidecar_import_start');
@@ -888,48 +1214,54 @@ async function handlePriceSpot(req) {
   const assetOutId = await resolveSdkAssetId(sdkObj, req.assetOut);
   const quoteTimeoutMs = stageTimeoutMs(req);
 
-  trace('sidecar_get_spot_price_start', { assetInId, assetOutId, quoteTimeoutMs });
-  let spot;
-  try {
-    spot = await withStageTimeout(
-      sdkObj.api.router.getSpotPrice(assetInId, assetOutId),
-      quoteTimeoutMs,
-      'get_spot_price',
-      { assetInId, assetOutId },
-    );
-  } catch (e) {
-    throwUnsupportedSdkAssetError(e, {
-      assetInId,
-      assetOutId,
-      amountMode: 'spot',
-      amountInAtomic: null,
-      amountOutAtomic: null,
-      beneficiary: null,
-      slippageBps: null,
-      trade: null,
-      stage: 'get_spot_price',
-      priceCache: boolFromReq(req.priceCache),
-    });
-  }
-  trace('sidecar_get_spot_price_done', { spotKeys: Object.keys(spot || {}).slice(0, 30) });
+  return await quoteCacheRun(
+    req,
+    { assetInId, assetOutId, wsUrl: currentWsUrl || req.wsUrl },
+    async () => {
+      trace('sidecar_get_spot_price_start', { assetInId, assetOutId, quoteTimeoutMs });
+      let spot;
+      try {
+        spot = await withStageTimeout(
+          sdkObj.api.router.getSpotPrice(assetInId, assetOutId),
+          quoteTimeoutMs,
+          'get_spot_price',
+          { assetInId, assetOutId },
+        );
+      } catch (e) {
+        throwUnsupportedSdkAssetError(e, {
+          assetInId,
+          assetOutId,
+          amountMode: 'spot',
+          amountInAtomic: null,
+          amountOutAtomic: null,
+          beneficiary: null,
+          slippageBps: null,
+          trade: null,
+          stage: 'get_spot_price',
+          priceCache: boolFromReq(req.priceCache),
+        });
+      }
+      trace('sidecar_get_spot_price_done', { spotKeys: Object.keys(spot || {}).slice(0, 30) });
 
-  const human = safeToHuman(spot);
-  const spotPrice = pickSpotPrice(spot, human);
-  return {
-    ok: true,
-    mode: 'price_spot',
-    provider: 'galactic_sdk_next_sidecar',
-    priceCache: boolFromReq(req.priceCache),
-    wsUrl: redactWs(currentWsUrl),
-    wsProviderImport: papiWsProviderSpec,
-    sidecar: { reused, initCount, supportedAssetsCached: !!supportedAssetsCache },
-    assetInId,
-    assetOutId,
-    spotPrice,
-    price: spotPrice,
-    human,
-    raw: toSerializable(spot),
-  };
+      const human = safeToHuman(spot);
+      const spotPrice = pickSpotPrice(spot, human);
+      return {
+        ok: true,
+        mode: 'price_spot',
+        provider: 'galactic_sdk_next_sidecar',
+        priceCache: boolFromReq(req.priceCache),
+        wsUrl: redactWs(currentWsUrl),
+        wsProviderImport: papiWsProviderSpec,
+        sidecar: { reused, initCount, supportedAssetsCached: !!supportedAssetsCache },
+        assetInId,
+        assetOutId,
+        spotPrice,
+        price: spotPrice,
+        human,
+        raw: toSerializable(spot),
+      };
+    },
+  );
 }
 
 
@@ -949,32 +1281,40 @@ async function handlePriceSpotDirect(req) {
   const assetInId = directAssetIdFromMeta(req.assetIn);
   const assetOutId = directAssetIdFromMeta(req.assetOut);
   const quoteTimeoutMs = stageTimeoutMs(req);
-  try {
-    return await runDirectTradeRouterSpot({
-      sdkPkg,
-      papiPkg,
-      papiWsProviderPkg,
-      wsUrl,
-      assetInId,
-      assetOutId,
-      timeoutMs: quoteTimeoutMs,
-      priceCache: req.priceCache,
-    });
-  } catch (e) {
-    throwUnsupportedSdkAssetError(e, {
-      assetInId,
-      assetOutId,
-      amountMode: 'spot',
-      amountInAtomic: null,
-      amountOutAtomic: null,
-      beneficiary: null,
-      slippageBps: null,
-      trade: null,
-      stage: 'direct_get_spot_price',
-      priceCache: boolFromReq(req.priceCache),
-    });
-  }
+
+  return await quoteCacheRun(
+    req,
+    { assetInId, assetOutId, wsUrl },
+    async () => {
+      try {
+        return await runDirectTradeRouterSpot({
+          sdkPkg,
+          papiPkg,
+          papiWsProviderPkg,
+          wsUrl,
+          assetInId,
+          assetOutId,
+          timeoutMs: quoteTimeoutMs,
+          priceCache: req.priceCache,
+        });
+      } catch (e) {
+        throwUnsupportedSdkAssetError(e, {
+          assetInId,
+          assetOutId,
+          amountMode: 'spot',
+          amountInAtomic: null,
+          amountOutAtomic: null,
+          beneficiary: null,
+          slippageBps: null,
+          trade: null,
+          stage: 'direct_get_spot_price',
+          priceCache: boolFromReq(req.priceCache),
+        });
+      }
+    },
+  );
 }
+
 
 async function handleQuoteSell(req) {
   if (!manualCustomSwapReq(req) && !boolFromReq(req.enableRouterQuotes)) {
@@ -1030,64 +1370,71 @@ async function handleQuoteSell(req) {
   const amountInAtomicBigInt = parseAtomicBigInt(amountInAtomic);
   const quoteTimeoutMs = stageTimeoutMs(req);
 
-  trace('sidecar_get_best_sell_start', {
-    assetInId,
-    assetOutId,
-    amountInAtomic,
-    amountType: 'bigint',
-    quoteTimeoutMs,
-  });
-  let trade;
-  try {
-    trade = await withStageTimeout(
-      sdkObj.api.router.getBestSell(assetInId, assetOutId, amountInAtomicBigInt),
-      quoteTimeoutMs,
-      'get_best_sell',
-      { assetInId, assetOutId, amountInAtomic },
-    );
-  } catch (e) {
-    throwUnsupportedSdkAssetError(e, {
-      assetInId,
-      assetOutId,
-      amountMode: 'exact_in',
-      amountInAtomic,
-      amountOutAtomic: null,
-      beneficiary: null,
-      slippageBps: null,
-      trade: null,
-      stage: 'get_best_sell',
-    });
-  }
-  trace('sidecar_get_best_sell_done', { tradeKeys: Object.keys(trade || {}).slice(0, 30) });
+  return await quoteCacheRun(
+    req,
+    { assetInId, assetOutId, amountInAtomic, wsUrl: currentWsUrl || req.wsUrl },
+    async () => {
+      trace('sidecar_get_best_sell_start', {
+        assetInId,
+        assetOutId,
+        amountInAtomic,
+        amountType: 'bigint',
+        quoteTimeoutMs,
+      });
+      let trade;
+      try {
+        trade = await withStageTimeout(
+          sdkObj.api.router.getBestSell(assetInId, assetOutId, amountInAtomicBigInt),
+          quoteTimeoutMs,
+          'get_best_sell',
+          { assetInId, assetOutId, amountInAtomic },
+        );
+      } catch (e) {
+        throwUnsupportedSdkAssetError(e, {
+          assetInId,
+          assetOutId,
+          amountMode: 'exact_in',
+          amountInAtomic,
+          amountOutAtomic: null,
+          beneficiary: null,
+          slippageBps: null,
+          trade: null,
+          stage: 'get_best_sell',
+        });
+      }
+      trace('sidecar_get_best_sell_done', { tradeKeys: Object.keys(trade || {}).slice(0, 30) });
 
-  const human = safeToHuman(trade);
-  const picked = pickAmountOut(trade, human);
+      const human = safeToHuman(trade);
+      const picked = pickAmountOut(trade, human);
 
-  let amountOutAtomic = null;
-  let amountOutUi = null;
-  if (typeof picked === 'string') {
-    amountOutAtomic = picked;
-  } else if (picked && typeof picked === 'object' && picked.human != null) {
-    amountOutUi = picked.human;
-  }
+      let amountOutAtomic = null;
+      let amountOutUi = null;
+      if (typeof picked === 'string') {
+        amountOutAtomic = picked;
+      } else if (picked && typeof picked === 'object' && picked.human != null) {
+        amountOutUi = picked.human;
+      }
 
-  return {
-    ok: true,
-    mode: 'quote_sell',
-    provider: 'galactic_sdk_next_sidecar',
-    wsUrl: redactWs(currentWsUrl),
-    wsProviderImport: papiWsProviderSpec,
-    sidecar: { reused, initCount, supportedAssetsCached: !!supportedAssetsCache },
-    assetInId,
-    assetOutId,
-    amountInAtomic,
-    amountInUi: req.amountInUi ?? null,
-    amountOutAtomic,
-    amountOutUi,
-    human,
-    raw: toSerializable(trade),
-  };
+      return {
+        ok: true,
+        mode: 'quote_sell',
+        provider: 'galactic_sdk_next_sidecar',
+        wsUrl: redactWs(currentWsUrl),
+        wsProviderImport: papiWsProviderSpec,
+        sidecar: { reused, initCount, supportedAssetsCached: !!supportedAssetsCache },
+        assetInId,
+        assetOutId,
+        amountInAtomic,
+        amountInUi: req.amountInUi ?? null,
+        amountOutAtomic,
+        amountOutUi,
+        human,
+        raw: toSerializable(trade),
+      };
+    },
+  );
 }
+
 
 async function handleSwapTx(req) {
   if (!manualCustomSwapReq(req) && !boolFromReq(req.enableRouterQuotes)) {
@@ -1366,6 +1713,7 @@ const server = http.createServer(async (req, res) => {
         wsUrl: redactWs(currentWsUrl),
         supportedAssetsCached: !!supportedAssetsCache,
         wsProviderImport: papiWsProviderSpec,
+        quoteCache: quoteCacheHealth(),
       });
       return;
     }

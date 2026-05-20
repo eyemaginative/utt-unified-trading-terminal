@@ -10,6 +10,7 @@ At a high level, UTT provides one place to:
 - submit and track orders across venues
 - monitor scanners, discovery tools, wallet activity, market-cap data, and volume data
 - work with local ledger and tax-related state
+- plan cross-chain UTTT movements with bridge-transfer records, canonical supply context, and read-only basis previews
 - integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
 
 ---
@@ -104,6 +105,27 @@ Current architecture in this repository includes support for:
 
 The frontend does not call CoinGecko directly. Market-cap and volume windows read normalized data from the backend market-metrics service, while the backend owns source selection, caching, rate-limit handling, and symbol-to-source resolution.
 
+### Spread / Bridge planning workflow
+
+UTT includes a Spread / Bridge dashboard for planning cross-chain UTTT movement without enabling bridge execution by default.
+
+Current architecture in this repository includes support for:
+
+- AppHeader-launched Spread / Bridge dashboard as a dedicated frontend feature component
+- Solana-to-Hydration and Hydration-to-Solana planning context
+- UTTT spread display using Solana UTTT/USD and Hydration-derived UTTT/USD
+- Total Canonical Supply display for multichain UTTT supply context
+- per-chain UTTT supply rows for Solana, Polkadot / Asset Hub, and Hydration route metadata
+- Hydration UTTT metadata shown without double-counting Asset Hub-side canonical supply
+- bridge transfer-record preview and local PLANNED record creation
+- source-side and destination-side evidence linking for bridge-transfer records
+- local transfer-record reconciliation without signing, submitting, or executing bridge transactions
+- read-only basis / tax-treatment preview for reconciled bridge-transfer records
+- read-only apply-basis-transfer preview that models future FIFO movement and inherited destination basis
+- actual bridge execution and actual basis mutation intentionally disabled until a real transfer test is ready
+
+The Spread / Bridge dashboard is a planning and accounting-safety surface. It does not execute bridge transfers, sign transactions, submit transactions, mutate deposits or withdrawals, consume FIFO lots, create inherited destination lots, or write lot-journal rows unless a future guarded apply endpoint is explicitly added and confirmed.
+
 ### Operator UI / terminal behavior
 
 The frontend is built as a workstation terminal with independently managed panes and specialized windows.
@@ -115,6 +137,7 @@ Representative components include:
 - `OrderBookWidget.jsx`
 - `OrderTicketWidget.jsx`
 - `TerminalTablesWidget.jsx`
+- `features/bridge/SpreadBridgeDashboardChip.jsx` for Spread / Bridge planning
 - feature windows such as token registry and scanner tooling
 
 ### Security / operational direction
@@ -149,7 +172,7 @@ A simplified view of the current repository structure:
 │   │   └── schemas.py
 │   ├── alembic/
 │   ├── data/
-│   └── keys/
+│   └── tools/
 ├── frontend/
 │   ├── public/
 │   └── src/
@@ -185,6 +208,9 @@ Shared service-layer logic such as aggregated order handling.
 #### `backend/app/venues/`
 Venue registration and integration mapping.
 
+#### `backend/tools/`
+Non-secret backend utility tooling. Generated keys, live credentials, and private key material should stay outside the repository.
+
 #### `frontend/src/`
 Main frontend application code, widgets, feature windows, hooks, and supporting libraries.
 
@@ -207,7 +233,7 @@ Current areas of focus include:
 - order book and order ticket integration
 - table, ledger, and order views
 - Solana wallet-manager integration for DEX flows
-- registry, scanner, Market Cap, and Volume tool windows
+- registry, scanner, Market Cap, Volume, and Spread / Bridge planning windows
 - compact Hydration price-status UI that avoids triggering backend refresh or SDK quote paths
 - AppHeader portfolio totals that include cached wallet-address / self-custody balances
 
@@ -234,6 +260,7 @@ It is responsible for:
 - backend-cached market metrics, external market-data resolution, and rate-limit-safe source caching
 - wallet-address history ingestion, caching, and materialization workflows
 - deposit, withdrawal, missing-basis, transfer-link, and FIFO lot-impact workflows
+- bridge transfer-record planning, reconciliation, and read-only basis/tax-treatment preview workflows
 - local auth and profile integration
 - Solana DEX route construction and transaction preparation
 - local environment and secret resolution patterns
@@ -266,6 +293,7 @@ The exact state of each venue may evolve over time, but the repository currently
   - Hydration wallet-history ingestion and materialization
   - deposit / withdrawal provenance and missing-basis lot workflows
   - transfer-link diagnostics and explicit-only FIFO lot-impact handling
+  - Spread / Bridge dashboard planning, canonical UTTT supply context, transfer-record reconciliation, and read-only basis preview
 
 Supporting routes and tooling also include:
 
@@ -367,7 +395,7 @@ UTT_HYDRATION_MANUAL_POOL_LIVE_RESERVES=1
 UTT_HYDRATION_ENABLE_EXTERNAL_USD_PRICES=1
 UTT_HYDRATION_EXTERNAL_USD_PRICE_SOURCE=coingecko
 UTT_HYDRATION_ENABLE_SDK_PRICE_CACHE=1
-UTT_HYDRATION_PRICE_CACHE_USE_SIDECAR=1
+UTT_HYDRATION_PRICE_CACHE_USE_SIDECAR=0
 UTT_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK=0
 UTT_HYDRATION_PRICE_CACHE_TTL_S=300
 UTT_HYDRATION_PRICE_CACHE_ERROR_BACKOFF_S=600
@@ -375,7 +403,7 @@ UTT_HYDRATION_EXTERNAL_USD_PRICE_TIMEOUT_S=5
 UTT_HYDRATION_PRICE_CACHE_STRATEGY=spot_then_sell
 UTT_HYDRATION_PRICE_CACHE_SPOT_IMPLEMENTATION=direct
 
-UTT_HYDRATION_USE_SIDECAR=1
+UTT_HYDRATION_USE_SIDECAR=0
 UTT_HYDRATION_SIDECAR_URL=http://127.0.0.1:8787
 UTT_HYDRATION_AUTOSTART_SIDECAR=0
 UTT_HYDRATION_PRICE_CACHE_AUTOSTART_SIDECAR=0
@@ -387,6 +415,17 @@ UTT_HYDRATION_SIDECAR_QUOTE_CACHE_MAX_ENTRIES=100
 
 UTT_HYDRATION_HELPER_STEP_TIMEOUT_S=30
 ```
+
+The persistent Hydration sidecar is optional and normally only needed for controlled SDK diagnostics. For the public-safe path, keep sidecar autostart disabled and leave sidecar usage off unless you intentionally start:
+
+```powershell
+cd backend
+$env:UTT_HYDRATION_SIDECAR_HOST="127.0.0.1"
+$env:UTT_HYDRATION_SIDECAR_PORT="8787"
+node app\services\hydration_sidecar.mjs
+```
+
+If sidecar diagnostics are intentionally enabled, set `UTT_HYDRATION_USE_SIDECAR=1` and/or `UTT_HYDRATION_PRICE_CACHE_USE_SIDECAR=1` in your private env for that local test only.
 
 Hydration asset IDs, decimals, external price IDs, and route/pool metadata are intended to be managed through the Token Registry and Route Registry rather than hardcoded into tracked env files.
 
@@ -561,6 +600,7 @@ The Polkadot / Hydration side of UTT is designed as an opt-in DEX venue path. It
 - persistent Hydration sidecar quote-cache / singleflight / backoff diagnostics
 - Hydration wallet-history ingestion, materialization, missing-basis, transfer-link, and FIFO workflows
 - Spread / Bridge dashboard pricing based on Solana UTTT/USD versus Hydration-derived UTTT/USD
+- bridge transfer-record preview, local PLANNED record creation, evidence linking, reconciliation, and read-only basis/apply previews
 
 ### Token Registry requirements
 
@@ -653,6 +693,24 @@ Current Hydration history workflow areas include:
 
 This workflow is intentionally conservative. Normal eligible withdrawals can be applied to lots only through explicit dry-run / apply operations. Transfer-linked withdrawals are skipped by default, and LP / pool-token rows are classified for special handling instead of being consumed through normal inventory logic.
 
+### Spread / Bridge transfer-record workflow
+
+The Spread / Bridge dashboard is intended to prepare cross-chain UTTT movement before any bridge execution path is enabled.
+
+Current safe sequence:
+
+```text
+preview transfer record
+→ create local PLANNED bridge-transfer record
+→ link source-side evidence
+→ link destination-side evidence
+→ reconcile the local record
+→ preview basis / tax treatment
+→ preview future apply-basis-transfer plan
+```
+
+This workflow is planning-only until the operator is ready for a real bridge test. It classifies source activity as a `TRANSFER_OUT` candidate and destination activity as a `TRANSFER_IN` candidate, but the actual basis-transfer apply endpoint remains intentionally absent. A future apply endpoint should require real linked `AssetWithdrawal` and `AssetDeposit` rows, reviewed basis availability, and explicit confirmation such as `confirm_apply_basis_transfer=true`.
+
 ## Auth, profile, and local credential handling
 
 The codebase includes auth, profile, and local credential-management work. In practical terms, that means UTT is intended to be an operator workstation, not just a stateless public dashboard.
@@ -683,7 +741,7 @@ The repository includes token-registry-related backend and frontend work. This s
 
 There is also wallet-address handling in the backend, which supports broader local wallet and workflow integration. Cached wallet-address snapshots can contribute to AppHeader portfolio totals, so self-custody balances can be represented without requiring the balances table to be opened first.
 
-Hydration wallet-history ingestion extends this local wallet tooling by caching indexed wallet transactions, materializing them into local deposits and withdrawals, and linking them to the missing-basis and FIFO lot workflows without requiring live secrets or runtime database files to be committed.
+Hydration wallet-history ingestion extends this local wallet tooling by caching indexed wallet transactions, materializing them into local deposits and withdrawals, and linking them to the missing-basis, FIFO lot, and bridge transfer-record workflows without requiring live secrets or runtime database files to be committed.
 
 ---
 
@@ -719,7 +777,7 @@ Current work includes:
 
 ## Data and runtime state
 
-You may see empty tracked directories such as `backend/data/` or `backend/keys/` that exist only to preserve folder structure.
+You may see empty tracked directories such as `backend/data/` that exist only to preserve folder structure. Non-secret backend helper scripts may live under `backend/tools/`.
 
 That does not mean the repository is intended to contain live runtime data.
 
@@ -727,6 +785,7 @@ In general:
 
 - keep runtime DB files out of source control
 - keep generated key material out of source control
+- keep tool scripts under `backend/tools/` only when they contain no secrets or generated private material
 - keep local backups out of source control
 - use `.gitignore` and external paths appropriately
 
@@ -774,6 +833,8 @@ Check:
 The normal safe-path pricing flow should use `/api/polkadot_dex/hydration/prices`, `/api/polkadot_dex/hydration/prices/status`, and the UTTT-HDX manual/live route, not generic Hydration orderbook requests for USD pricing.
 
 ### Hydration price cache or status looks stale
+
+The persistent sidecar does not need to stay open for normal UI polling. Keep it running only while intentionally testing protected SDK diagnostics or a private env configuration that explicitly enables sidecar usage.
 
 Check:
 
@@ -939,6 +1000,7 @@ UTT is an actively evolving trading terminal codebase with ongoing work across:
 - manual UTTT-HDX orderbook and buy/sell transaction preparation
 - compact Hydration UI status indicators for Order Book and Order Ticket
 - Hydration wallet-history ingestion and ledger materialization
+- Spread / Bridge transfer-record planning, canonical supply context, and read-only basis/apply previews
 - missing-basis lots, transfer-link previews, and explicit-only FIFO lot impact
 - LP / Omnipool special handling for pool-token activity
 - registry, scanner, Market Cap, and Volume tool windows

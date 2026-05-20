@@ -39,6 +39,14 @@ except Exception as e:
     market_metrics_router = None
 
 
+# NEW: Bridge / Spread planning dashboard router (/api/bridge/*)
+try:
+    from .routers.bridge import router as bridge_router
+except Exception as e:
+    print("bridge router import failed:", repr(e))
+    bridge_router = None
+
+
 # NEW: rules router (/api/rules/order)
 from .routers.rules import router as rules_router
 
@@ -157,6 +165,8 @@ def create_app() -> FastAPI:
     app.include_router(market_router)
     if market_metrics_router is not None:
         app.include_router(market_metrics_router)
+    if bridge_router is not None:
+        app.include_router(bridge_router)
     app.include_router(arm_router)
     app.include_router(venue_orders_router)
     app.include_router(all_orders_router)

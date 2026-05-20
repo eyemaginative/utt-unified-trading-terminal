@@ -550,3 +550,59 @@ class RuntimeSetting(Base):
 
 
 Index("ix_runtime_settings_updated_at", RuntimeSetting.updated_at)
+
+# =============================================================================
+# Bridge / Transfer Records (planning-only linkage)
+# =============================================================================
+
+class BridgeTransferRecord(Base):
+    """
+    Planning/linkage record for intentional cross-chain asset movement.
+
+    This table is intentionally diagnostic-first:
+      - it does not execute bridge transactions
+      - it does not mutate FIFO lots by itself
+      - it links source-side outflow evidence to destination-side inflow evidence
+        so a later reconciliation pass can preserve basis across chains.
+    """
+    __tablename__ = "bridge_transfer_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+
+    asset: Mapped[str] = mapped_column(String(16), nullable=False, default="UTTT")
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+
+    source_chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    destination_chain: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    source_wallet_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    destination_wallet_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    source_address: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    destination_address: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    source_txid: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    destination_txid: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # PLANNED / SOURCE_SENT / DESTINATION_RECEIVED / LINKED / RECONCILED / CANCELLED
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PLANNED")
+
+    # manual / treasury_mediated / burn_mint / lock_release / xcm_transfer / external_bridge
+    bridge_mechanism: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+
+    source_withdrawal_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    destination_deposit_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    note: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_bridge_transfer_asset_status", "asset", "status", "created_at"),
+        Index("ix_bridge_transfer_source", "source_chain", "source_txid"),
+        Index("ix_bridge_transfer_destination", "destination_chain", "destination_txid"),
+        Index("ix_bridge_transfer_link_refs", "source_withdrawal_id", "destination_deposit_id"),
+    )
+

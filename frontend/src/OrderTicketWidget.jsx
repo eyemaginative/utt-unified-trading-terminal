@@ -104,14 +104,19 @@ function buildHydrationLowLiquidityWarning(payload) {
     pool.low_liquidity === true ||
     p.lowLiquidity === true ||
     p.low_liquidity === true;
-  const manualOrIsolated =
+  const syntheticFallback =
+    p.syntheticFallback === true ||
+    p.synthetic_fallback === true ||
+    routerText.includes("synthetic_spot_fallback");
+  const manualOrIsolated = !syntheticFallback && (
     sourceText.includes("live_pool_account") ||
     sourceText.includes("route_registry") ||
     sourceText.includes("manual") ||
     sourceText.includes("isolated") ||
     routerText.includes("manual_xyk") ||
-    routerText.includes("fallback") ||
-    routerText.includes("isolated");
+    routerText.includes("manual_papi") ||
+    routerText.includes("isolated")
+  );
   const belowThreshold = tvlUsd !== null && tvlUsd < HYDRATION_LOW_TVL_USD;
   if (!explicitLow && !belowThreshold && !manualOrIsolated) return null;
   const label = belowThreshold
@@ -133,20 +138,179 @@ function buildHydrationLowLiquidityWarning(payload) {
 function isHydrationManualRoutePayload(payload) {
   const p = payload && typeof payload === "object" ? payload : {};
   const pool = (p.pool && typeof p.pool === "object") ? p.pool : {};
-  const routerText = String(p.router || p.routeModeEffective || p.route_mode_effective || pool.router || "").toLowerCase();
-  const routeModeText = String(p.routeModeEffective || p.route_mode_effective || p.orderbookConfig?.routeModeEffective || p.orderbook_config?.route_mode_effective || "").toLowerCase();
-  const sourceText = String(pool.source || p.source || "").toLowerCase();
+  const cfg = (p.orderbookConfig && typeof p.orderbookConfig === "object") ? p.orderbookConfig : {};
+  const cfgSnake = (p.orderbook_config && typeof p.orderbook_config === "object") ? p.orderbook_config : {};
+  const routerText = String(p.router || p.routeModeEffective || p.route_mode_effective || cfg.routeModeEffective || cfgSnake.route_mode_effective || pool.router || "").toLowerCase();
+  const routeModeText = String(p.routeModeEffective || p.route_mode_effective || cfg.routeModeEffective || cfgSnake.route_mode_effective || "").toLowerCase();
+  const sourceText = String(pool.source || p.source || cfg.source || cfgSnake.source || "").toLowerCase();
+  const syntheticFallback =
+    p.syntheticFallback === true ||
+    p.synthetic_fallback === true ||
+    routerText.includes("synthetic_spot_fallback") ||
+    routeModeText.includes("synthetic_spot_fallback");
+  if (syntheticFallback && !isHydrationManualRouterFallbackPayload(p)) return false;
   return (
+    isHydrationManualRouterFallbackPayload(p) ||
     p.manualFallback === true ||
     p.manual_fallback === true ||
     routeModeText === "manual_xyk" ||
     routerText.includes("manual_xyk") ||
-    routerText.includes("manual") ||
-    routerText.includes("fallback") ||
+    routerText.includes("manual_papi_router") ||
     sourceText.includes("live_pool_account") ||
     sourceText.includes("route_registry") ||
     sourceText.includes("manual")
   );
+}
+
+
+function isHydrationManualRouterFallbackBuildablePayload(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const manual = (p.manualCustomSwap && typeof p.manualCustomSwap === "object") ? p.manualCustomSwap : {};
+  const tx = (p.tx && typeof p.tx === "object") ? p.tx : {};
+  const txManual = (tx.manualCustomSwap && typeof tx.manualCustomSwap === "object") ? tx.manualCustomSwap : {};
+  const routeModeEffective = String(
+    p.routeModeEffective ||
+    p.route_mode_effective ||
+    manual.routeModeEffective ||
+    manual.route_mode_effective ||
+    tx.routeModeEffective ||
+    tx.route_mode_effective ||
+    txManual.routeModeEffective ||
+    txManual.route_mode_effective ||
+    ""
+  ).trim().toLowerCase();
+  const provider = String(p.provider || manual.provider || tx.provider || "").trim().toLowerCase();
+  return Boolean(
+    p.manualRouterFallback === true ||
+    p.manual_router_fallback === true ||
+    manual.manualRouterFallback === true ||
+    manual.manual_router_fallback === true ||
+    tx.manualRouterFallback === true ||
+    tx.manual_router_fallback === true ||
+    txManual.manualRouterFallback === true ||
+    txManual.manual_router_fallback === true ||
+    routeModeEffective === "manual_router" ||
+    (provider === "manual_papi_router" && (manual.enabled === true || p.manualCustomSwap === true || tx.manualCustomSwap === true))
+  );
+}
+
+function isHydrationExecutionConfirmedPayload(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const manual = (p.manualCustomSwap && typeof p.manualCustomSwap === "object") ? p.manualCustomSwap : {};
+  const tx = (p.tx && typeof p.tx === "object") ? p.tx : {};
+  const txManual = (tx.manualCustomSwap && typeof tx.manualCustomSwap === "object") ? tx.manualCustomSwap : {};
+  return Boolean(
+    p.executionConfirmed === true ||
+    p.execution_confirmed === true ||
+    manual.executionConfirmed === true ||
+    manual.execution_confirmed === true ||
+    tx.executionConfirmed === true ||
+    tx.execution_confirmed === true ||
+    txManual.executionConfirmed === true ||
+    txManual.execution_confirmed === true
+  );
+}
+
+function isHydrationManualRouterFallbackPayload(payload) {
+  return Boolean(
+    isHydrationManualRouterFallbackBuildablePayload(payload) &&
+    isHydrationExecutionConfirmedPayload(payload)
+  );
+}
+
+function hydrationRouteProbeView(payload, symbol) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const pool = (p.pool && typeof p.pool === "object") ? p.pool : {};
+  const cfg = (p.orderbookConfig && typeof p.orderbookConfig === "object") ? p.orderbookConfig : {};
+  const cfgSnake = (p.orderbook_config && typeof p.orderbook_config === "object") ? p.orderbook_config : {};
+  const resolvedSymbol = String(p.resolvedSymbol || p.resolved_symbol || symbol || "").trim().toUpperCase();
+  const routerText = String(p.router || p.routeModeEffective || p.route_mode_effective || cfg.routeModeEffective || cfgSnake.route_mode_effective || pool.router || "").toLowerCase();
+  const routeModeEffective = String(p.routeModeEffective || p.route_mode_effective || cfg.routeModeEffective || cfgSnake.route_mode_effective || "").trim();
+  const syntheticOnly = Boolean(
+    p.syntheticFallback === true ||
+    p.synthetic_fallback === true ||
+    routerText.includes("synthetic_spot_fallback") ||
+    String(routeModeEffective || "").toLowerCase().includes("synthetic_spot_fallback") ||
+    p.tradeRequiresRealRouterQuote === true ||
+    cfg.tradeRequiresRealRouterQuote === true ||
+    cfgSnake.trade_requires_real_router_quote === true
+  );
+  const manualRouterFallbackBuildable = isHydrationManualRouterFallbackBuildablePayload(p);
+  const executionConfirmed = isHydrationExecutionConfirmedPayload(p);
+  const manualRouterFallbackAvailable = Boolean(manualRouterFallbackBuildable && executionConfirmed);
+  const manualRouteAvailable = isHydrationManualRoutePayload(p);
+  const tradable = Boolean(
+    p.tradable === true ||
+    cfg.tradable === true ||
+    manualRouteAvailable
+  ) && (!syntheticOnly || manualRouterFallbackAvailable);
+  const reason = syntheticOnly && !manualRouteAvailable
+    ? `Synthetic price only — no executable manual route registered for ${resolvedSymbol || "this Hydration pair"}. Orderbook prices are external/cached context only.`
+    : manualRouterFallbackAvailable
+      ? `Manual Router/Omnipool fallback available for ${resolvedSymbol || "this Hydration pair"}; SDK router quotes remain disabled.`
+      : manualRouteAvailable
+        ? `Manual XYK/live-pool route available for ${resolvedSymbol || "this Hydration pair"}; generic SDK router quotes remain disabled.`
+        : String(p.syntheticFallbackReason || p.synthetic_fallback_reason || cfg.fallbackReason || cfgSnake.fallback_reason || "").trim();
+  return {
+    symbol: resolvedSymbol,
+    router: String(p.router || "").trim(),
+    routeModeEffective,
+    manualRouteAvailable,
+    manualRouterFallbackAvailable,
+    syntheticOnly,
+    tradable,
+    tradeRequiresRealRouterQuote: Boolean(p.tradeRequiresRealRouterQuote === true || cfg.tradeRequiresRealRouterQuote === true || cfgSnake.trade_requires_real_router_quote === true),
+    reason,
+  };
+}
+
+
+function hydrationSwapTxProbeView(payload, symbol) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const manual = (p.manualCustomSwap && typeof p.manualCustomSwap === "object") ? p.manualCustomSwap : {};
+  const tx = (p.tx && typeof p.tx === "object") ? p.tx : {};
+  const resolvedSymbol = String(p.resolvedSymbol || p.resolved_symbol || symbol || "").trim().toUpperCase();
+  const manualRouterFallbackBuildable = isHydrationManualRouterFallbackBuildablePayload(p);
+  const executionConfirmed = isHydrationExecutionConfirmedPayload(p);
+  const manualRouterFallbackAvailable = Boolean(manualRouterFallbackBuildable && executionConfirmed);
+  const routeModeEffective = String(
+    p.routeModeEffective ||
+    p.route_mode_effective ||
+    manual.routeModeEffective ||
+    manual.route_mode_effective ||
+    tx.routeMode ||
+    ""
+  ).trim();
+  const provider = String(p.provider || manual.provider || tx.provider || "").trim();
+  const estimatedOut = firstFiniteNumber(
+    manual.estimatedAmountOutUi,
+    manual.estimated_amount_out_ui,
+    tx.estimatedAmountOutUi,
+    tx.estimated_amount_out_ui
+  );
+  const minOut = firstFiniteNumber(
+    manual.minAmountOutUi,
+    manual.min_amount_out_ui,
+    tx.minAmountOutUi,
+    tx.min_amount_out_ui
+  );
+  const reason = manualRouterFallbackAvailable
+    ? `Controlled manual Router fallback is execution-confirmed for ${resolvedSymbol || "this Hydration pair"}; SDK router quotes remain disabled.`
+    : manualRouterFallbackBuildable
+      ? `Manual Router fallback is buildable for ${resolvedSymbol || "this Hydration pair"}, but it is not execution-confirmed yet. Signing is blocked until a real executable route is confirmed.`
+      : String(p.message || p.reason || "").trim();
+  return {
+    symbol: resolvedSymbol,
+    manualRouterFallbackAvailable,
+    manualRouterFallbackBuildable,
+    executionConfirmed,
+    routeModeEffective,
+    provider,
+    reason,
+    estimatedOut,
+    minOut,
+    payload: p,
+  };
 }
 
 const HYDRATION_PRICE_STATUS_DEFAULT_ASSETS = ["HDX", "DOT", "USDT", "USDC", "UTTT", "HOLLAR"];
@@ -1561,9 +1725,12 @@ export default function OrderTicketWidget({
   const [polkadotPriceStatusError, setPolkadotPriceStatusError] = useState(null);
   const [polkadotLiquidityWarning, setPolkadotLiquidityWarning] = useState(null);
   const [polkadotManualRouteAvailable, setPolkadotManualRouteAvailable] = useState(false);
+  const [polkadotHydrationRouteProbe, setPolkadotHydrationRouteProbe] = useState(null);
+  const [polkadotHydrationSwapTxProbe, setPolkadotHydrationSwapTxProbe] = useState(null);
   const polkadotHydrationStatusReqRef = useRef(0);
   const polkadotPriceStatusReqRef = useRef(0);
   const polkadotLiquidityReqRef = useRef(0);
+  const polkadotSwapTxProbeReqRef = useRef(0);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
   useEffect(() => { setPreferredHydrationRouteMode(preferredHydrationRouteMode); }, [preferredHydrationRouteMode]);
@@ -2030,13 +2197,30 @@ export default function OrderTicketWidget({
         : "Hydration live quotes and SELL swap signing/submission are enabled. BUY remains disabled until UTT_HYDRATION_ENABLE_EXACT_BUY=1."
       : "Hydration live quotes are enabled. Unsigned swap transaction building remains disabled until slippage handling and SubWallet signing are verified."
     : "Hydration quotes/swaps are temporarily disabled. Asset resolution and balances are available. Waiting on a non-router quote source before live trading is enabled.";
-  const polkadotManualSwapAvailable = isPolkadotDexVenue && polkadotManualRouteAvailable;
+  const polkadotManualRouterFallbackAvailable = Boolean(
+    isPolkadotDexVenue &&
+    polkadotHydrationSwapTxProbe?.manualRouterFallbackAvailable === true
+  );
+  const polkadotManualSwapAvailable = isPolkadotDexVenue && (polkadotManualRouteAvailable || polkadotManualRouterFallbackAvailable);
+  const polkadotSyntheticPriceOnly = Boolean(
+    isPolkadotDexVenue &&
+    !polkadotManualSwapAvailable &&
+    polkadotHydrationRouteProbe?.syntheticOnly === true
+  );
+  const polkadotSyntheticPriceOnlyReason = String(
+    polkadotHydrationRouteProbe?.reason ||
+    `Synthetic price only — no executable manual route registered for ${String(otSymbol || "this Hydration pair").trim().toUpperCase()}. Orderbook prices are external/cached context only.`
+  ).trim();
   const polkadotEffectiveQuotesAvailable = polkadotQuotesAvailable || polkadotManualSwapAvailable;
   const polkadotEffectiveLiveSwapsRecommended = polkadotLiveSwapsRecommended || polkadotManualSwapAvailable;
   const polkadotEffectiveExactBuyEnabled = polkadotExactBuyEnabled || polkadotManualSwapAvailable;
-  const polkadotEffectiveStatusReason = polkadotManualSwapAvailable && !polkadotQuotesAvailable
-    ? "Hydration generic SDK quotes are disabled, but this pair has a backend manual XYK/live-pool route available."
-    : polkadotStatusReason;
+  const polkadotEffectiveStatusReason = polkadotManualRouterFallbackAvailable && !polkadotQuotesAvailable
+    ? "Hydration generic SDK quotes are disabled, but this pair has a controlled manual Router fallback available."
+    : polkadotManualRouteAvailable && !polkadotQuotesAvailable
+      ? "Hydration generic SDK quotes are disabled, but this pair has a backend manual XYK/live-pool route available."
+      : polkadotSyntheticPriceOnly
+        ? polkadotSyntheticPriceOnlyReason
+        : polkadotStatusReason;
   const polkadotPriceStatusDisplay = hydrationPriceStatusView(polkadotPriceStatus, polkadotPriceStatusError);
 
   useEffect(() => {
@@ -2130,6 +2314,8 @@ export default function OrderTicketWidget({
     if (!isPolkadotDexVenue || !apiBase || !sym || !sym.includes("-")) {
       setPolkadotLiquidityWarning(null);
       setPolkadotManualRouteAvailable(false);
+      setPolkadotHydrationRouteProbe(null);
+      setPolkadotHydrationSwapTxProbe(null);
       return;
     }
 
@@ -2137,30 +2323,51 @@ export default function OrderTicketWidget({
     let cancelled = false;
 
     const t = setTimeout(async () => {
-      try {
-        const url = new URL(`${apiBase}/api/polkadot_dex/hydration/orderbook`);
-        url.searchParams.set("symbol", sym);
-        url.searchParams.set("depth", "3");
-        url.searchParams.set("route_mode", normalizeHydrationRouteMode(preferredHydrationRouteMode));
-        url.searchParams.set("_ts", String(Date.now()));
+      const preferredMode = normalizeHydrationRouteMode(preferredHydrationRouteMode);
+      const probeModes = preferredMode === "auto" ? ["auto"] : [preferredMode, "auto"];
+      let lastPayload = null;
 
-        const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
-        if (!r.ok) {
-          if (!cancelled && polkadotLiquidityReqRef.current === reqId) {
-            setPolkadotLiquidityWarning(null);
-            setPolkadotManualRouteAvailable(false);
+      try {
+        for (const mode of probeModes) {
+          const url = new URL(`${apiBase}/api/polkadot_dex/hydration/orderbook`);
+          url.searchParams.set("symbol", sym);
+          url.searchParams.set("depth", "3");
+          url.searchParams.set("route_mode", mode);
+          url.searchParams.set("force", "true");
+          url.searchParams.set("_ts", String(Date.now()));
+
+          const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+          if (!r.ok) {
+            lastPayload = await r.json().catch(() => null);
+            continue;
           }
+
+          const data = await r.json().catch(() => null);
+          if (!data || typeof data !== "object") continue;
+          lastPayload = data;
+          break;
+        }
+
+        if (cancelled || polkadotLiquidityReqRef.current !== reqId) return;
+
+        if (!lastPayload || lastPayload?.ok === false || lastPayload?.detail?.error) {
+          setPolkadotLiquidityWarning(null);
+          setPolkadotManualRouteAvailable(false);
+          setPolkadotHydrationRouteProbe(null);
+          setPolkadotHydrationSwapTxProbe(null);
           return;
         }
 
-        const data = await r.json().catch(() => null);
-        if (cancelled || polkadotLiquidityReqRef.current !== reqId) return;
-        setPolkadotLiquidityWarning(buildHydrationLowLiquidityWarning(data));
-        setPolkadotManualRouteAvailable(isHydrationManualRoutePayload(data));
+        const routeProbe = hydrationRouteProbeView(lastPayload, sym);
+        setPolkadotLiquidityWarning(buildHydrationLowLiquidityWarning(lastPayload));
+        setPolkadotManualRouteAvailable(routeProbe.manualRouteAvailable === true);
+        setPolkadotHydrationRouteProbe(routeProbe);
       } catch {
         if (!cancelled && polkadotLiquidityReqRef.current === reqId) {
           setPolkadotLiquidityWarning(null);
           setPolkadotManualRouteAvailable(false);
+          setPolkadotHydrationRouteProbe(null);
+          setPolkadotHydrationSwapTxProbe(null);
         }
       }
     }, 450);
@@ -2170,6 +2377,76 @@ export default function OrderTicketWidget({
       clearTimeout(t);
     };
   }, [isPolkadotDexVenue, apiBase, otSymbol, preferredHydrationRouteMode]);
+
+  useEffect(() => {
+    const sym = String(otSymbol || "").trim().toUpperCase();
+    // Keep this probe above the derived qtyNum declaration without tripping
+    // React's temporal-dead-zone rules. qtyNum is declared later in the file,
+    // so this early probe must parse the raw Qty field directly.
+    const amount = Number(qty);
+    const address = String(
+      polkadotWalletState?.address ||
+      polkadotWalletState?.accounts?.[0]?.address ||
+      ""
+    ).trim();
+
+    if (
+      !isPolkadotDexVenue ||
+      !apiBase ||
+      !sym ||
+      !sym.includes("-") ||
+      !(side === "buy" || side === "sell") ||
+      !Number.isFinite(amount) ||
+      amount <= 0 ||
+      !address
+    ) {
+      setPolkadotHydrationSwapTxProbe(null);
+      return;
+    }
+
+    const reqId = ++polkadotSwapTxProbeReqRef.current;
+    let cancelled = false;
+
+    const t = setTimeout(async () => {
+      try {
+        const base = String(apiBase || "").replace(/\/+$/, "");
+        const r = await fetch(`${base}/api/polkadot_dex/hydration/swap_tx`, {
+          method: "POST",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol: sym,
+            side,
+            amount,
+            amount_mode: side === "buy" ? "exact_out" : "exact_in",
+            route_mode: "auto",
+            slippage_bps: 100,
+            user_pubkey: address,
+          }),
+        });
+
+        const data = await r.json().catch(() => null);
+        if (cancelled || polkadotSwapTxProbeReqRef.current !== reqId) return;
+
+        if (!r.ok || !data || data?.ok === false) {
+          setPolkadotHydrationSwapTxProbe(null);
+          return;
+        }
+
+        const probe = hydrationSwapTxProbeView(data, sym);
+        setPolkadotHydrationSwapTxProbe(probe.manualRouterFallbackAvailable ? probe : null);
+      } catch {
+        if (!cancelled && polkadotSwapTxProbeReqRef.current === reqId) {
+          setPolkadotHydrationSwapTxProbe(null);
+        }
+      }
+    }, 650);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [isPolkadotDexVenue, apiBase, otSymbol, side, qty, polkadotWalletState?.address, polkadotWalletState?.accounts, preferredHydrationRouteMode]);
 
   // Null-safe number parsing (prevents null → 0 bugs via Number(null))
   const toFiniteOrNull = (x) => {
@@ -3515,10 +3792,6 @@ export default function OrderTicketWidget({
           lines.push(`Qty ${baseAsset || "base"} missing/invalid. BUY uses Qty as the exact base amount to receive.`);
           fails.push("qty_missing");
         }
-        if (!polkadotEffectiveExactBuyEnabled) {
-          lines.push("Hydration BUY swaps are disabled until UTT_HYDRATION_ENABLE_EXACT_BUY=1. SELL swaps remain available.");
-          fails.push("hydration_buy_swaps_disabled");
-        }
       } else if (qtyNum === null) {
         lines.push("Qty missing/invalid.");
         fails.push("qty_missing");
@@ -3533,14 +3806,30 @@ export default function OrderTicketWidget({
       } else if (!polkadotHydrationStatus) {
         lines.push("Hydration status unavailable.");
         fails.push("hydration_status_missing");
+      } else if (polkadotSyntheticPriceOnly) {
+        lines.push(hideTableData ? "Synthetic Hydration price only; swap route unavailable." : polkadotSyntheticPriceOnlyReason);
+        fails.push("hydration_synthetic_price_only");
       } else if (!polkadotEffectiveQuotesAvailable) {
         lines.push(hideTableData ? "Live Hydration quotes/swaps are disabled." : polkadotEffectiveStatusReason);
         fails.push("hydration_quotes_disabled");
       } else if (!polkadotEffectiveLiveSwapsRecommended) {
         lines.push(hideTableData ? "Live Hydration swaps are disabled." : polkadotEffectiveStatusReason);
         fails.push("hydration_swaps_disabled");
-      } else if (polkadotManualSwapAvailable && !polkadotQuotesAvailable) {
+      } else if (polkadotManualRouterFallbackAvailable && !polkadotQuotesAvailable) {
+        lines.push(`Controlled manual Router fallback available for ${side === "buy" ? "BUY exact-out" : "SELL exact-in"} while generic SDK router quotes remain disabled.`);
+      } else if (polkadotManualRouteAvailable && !polkadotQuotesAvailable) {
         lines.push("Manual XYK/live-pool route available for this pair while generic SDK router quotes remain disabled.");
+      }
+
+      if (
+        side === "buy" &&
+        !polkadotEffectiveExactBuyEnabled &&
+        !polkadotSyntheticPriceOnly &&
+        polkadotEffectiveQuotesAvailable &&
+        polkadotEffectiveLiveSwapsRecommended
+      ) {
+        lines.push("Hydration BUY swaps are disabled until UTT_HYDRATION_ENABLE_EXACT_BUY=1. SELL swaps remain available.");
+        fails.push("hydration_buy_swaps_disabled");
       }
 
       if (polkadotLiquidityWarning) {
@@ -3690,6 +3979,10 @@ export default function OrderTicketWidget({
     polkadotEffectiveLiveSwapsRecommended,
     polkadotEffectiveExactBuyEnabled,
     polkadotManualSwapAvailable,
+    polkadotManualRouteAvailable,
+    polkadotManualRouterFallbackAvailable,
+    polkadotSyntheticPriceOnly,
+    polkadotSyntheticPriceOnlyReason,
     polkadotEffectiveStatusReason,
     polkadotStatusReason,
     polkadotLiquidityWarning,
@@ -4267,6 +4560,26 @@ async function submitPolkadotSwapOrder() {
     return;
   }
 
+  if (polkadotSyntheticPriceOnly) {
+    const reason = polkadotSyntheticPriceOnlyReason || "Synthetic Hydration price only; swap route unavailable.";
+    onToast?.({ kind: "warn", msg: reason });
+    openSubmitResultModal("error", {
+      ok: false,
+      venue: String(effectiveVenue || "polkadot_hydration").toLowerCase().trim(),
+      status_endpoint: "/api/polkadot_dex/hydration/orderbook",
+      next_endpoint: "/api/polkadot_dex/hydration/swap_tx",
+      quoteStatus: polkadotHydrationStatus?.quoteStatus || null,
+      quoteStatusDetail: polkadotStatusDetail,
+      swapTxBuildAvailable: false,
+      manualRouteAvailable: !!polkadotManualSwapAvailable,
+      manualRouterFallbackAvailable: !!polkadotManualRouterFallbackAvailable,
+      syntheticPriceOnly: true,
+      hydrationRouteProbe: polkadotHydrationRouteProbe || null,
+      message: reason,
+    }, "Synthetic Price Only");
+    return;
+  }
+
   if (!polkadotEffectiveQuotesAvailable || !polkadotEffectiveLiveSwapsRecommended) {
     const reason = polkadotEffectiveStatusReason || "Hydration swap transaction building is disabled.";
     onToast?.({ kind: "warn", msg: reason });
@@ -4279,6 +4592,9 @@ async function submitPolkadotSwapOrder() {
       quoteStatusDetail: polkadotStatusDetail,
       swapTxBuildAvailable: !!polkadotEffectiveLiveSwapsRecommended,
       manualRouteAvailable: !!polkadotManualSwapAvailable,
+      manualRouterFallbackAvailable: !!polkadotManualRouterFallbackAvailable,
+      syntheticPriceOnly: !!polkadotSyntheticPriceOnly,
+      hydrationRouteProbe: polkadotHydrationRouteProbe || null,
       message: reason,
     }, "Hydration Swap Submit Disabled");
     return;
@@ -4296,6 +4612,7 @@ async function submitPolkadotSwapOrder() {
       quoteStatusDetail: polkadotStatusDetail,
       swapTxBuildAvailable: !!polkadotEffectiveLiveSwapsRecommended,
       manualRouteAvailable: !!polkadotManualSwapAvailable,
+      manualRouterFallbackAvailable: !!polkadotManualRouterFallbackAvailable,
       exactBuyEnabled: !!polkadotEffectiveExactBuyEnabled,
       side,
       message: reason,
@@ -4341,7 +4658,7 @@ async function submitPolkadotSwapOrder() {
       amount,
       amount_mode: amountMode,
       quote_spend_estimate: Number.isFinite(quoteSpendEstimate) ? quoteSpendEstimate : null,
-      route_mode: normalizeHydrationRouteMode(preferredHydrationRouteMode),
+      route_mode: polkadotManualRouterFallbackAvailable ? "auto" : normalizeHydrationRouteMode(preferredHydrationRouteMode),
       slippage_bps: 100,
       user_pubkey: address,
     };
@@ -4905,6 +5222,8 @@ async function submitLimitOrder() {
 
   const submitEndpointLabel = useMemo(() => {
     if (isPolkadotDexVenue) {
+      if (polkadotManualRouterFallbackAvailable) return `/api/polkadot_dex/hydration/swap_tx (manual Router ${side === "buy" ? "BUY" : "SELL"} fallback) → SubWallet sign/send`;
+      if (polkadotSyntheticPriceOnly) return "/api/polkadot_dex/hydration/orderbook (synthetic price only; no executable route)";
       if (!polkadotEffectiveQuotesAvailable) return "/api/polkadot_dex/hydration/status (quotes disabled)";
       if (!polkadotEffectiveLiveSwapsRecommended) return "/api/polkadot_dex/hydration/swap_tx (build disabled)";
       if (side === "buy" && !polkadotEffectiveExactBuyEnabled) return "/api/polkadot_dex/hydration/swap_tx (BUY disabled; SELL enabled)";
@@ -4918,7 +5237,7 @@ async function submitLimitOrder() {
     if (routerMode === "ultra") return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute";
     if (routerMode === "metis") return "/api/solana_dex/jupiter/swap_tx";
     return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute → fallback /api/solana_dex/jupiter/swap_tx → fallback /api/solana_dex/raydium/swap_tx";
-  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
+  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotManualRouterFallbackAvailable, polkadotSyntheticPriceOnly, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
 
   async function copySubmitResultToClipboard() {
     try {
@@ -4954,7 +5273,7 @@ async function submitLimitOrder() {
       { k: "Symbol", v: hideTableData ? "••••" : sym },
       { k: "Side", v: side.toUpperCase() },
       { k: "Type", v: isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "LIMIT" : "SWAP") : isPolkadotDexVenue ? "SWAP" : "LIMIT" },
-      ...(isPolkadotDexVenue ? [{ k: "Route", v: hydrationRouteModeLabel(preferredHydrationRouteMode) }] : []),
+      ...(isPolkadotDexVenue ? [{ k: "Route", v: polkadotManualRouterFallbackAvailable ? "Manual Router fallback" : hydrationRouteModeLabel(preferredHydrationRouteMode) }] : []),
       { k: "Qty", v: hideTableData ? "••••" : qStr },
       { k: "Limit", v: hideTableData ? "••••" : pxStr },
       { k: `Total (${totalLabel})`, v: hideTableData ? "••••" : totStr },
@@ -5660,7 +5979,7 @@ async function submitLimitOrder() {
                   style={{ ...darkSelectStyle, width: "100%" }}
                   value={preferredHydrationRouteMode}
                   onChange={(e) => setPreferredHydrationRouteModeState(normalizeHydrationRouteMode(e.target.value))}
-                  title="Hydration route source. Auto uses manual XYK for configured custom pairs; generic SDK pairs stay blocked unless the backend explicitly enables router quotes."
+                  title="Hydration route source. Auto uses manual XYK for configured custom pairs and controlled manual Router fallbacks when available; generic SDK pairs stay blocked unless the backend explicitly enables router quotes."
                 >
                   <option value="auto" style={darkOptionStyle}>Auto</option>
                   <option value="sdk" style={darkOptionStyle}>SDK</option>
@@ -5669,7 +5988,7 @@ async function submitLimitOrder() {
                 </select>
               </label>
               <div style={{ ...safeMuted, marginTop: 8, fontSize: 11, lineHeight: 1.25 }}>
-                Current route: <b>{hydrationRouteModeLabel(preferredHydrationRouteMode)}</b>. Auto uses manual XYK for configured custom pairs; generic SDK pairs stay blocked unless the backend explicitly enables router quotes.
+                Current route: <b>{hydrationRouteModeLabel(preferredHydrationRouteMode)}</b>. Auto uses manual XYK for configured custom pairs and controlled manual Router fallbacks when the backend exposes one; generic SDK pairs stay blocked unless router quotes are explicitly enabled.
               </div>
             </div>
           ) : null}

@@ -6,11 +6,12 @@ At a high level, UTT provides one place to:
 
 - connect and manage venue credentials
 - inspect balances and portfolio state
-- view orderbooks and pseudo-orderbooks
-- submit and track orders across venues
-- monitor scanners, discovery tools, wallet activity, market-cap data, and volume data
-- work with local ledger and tax-related state
+- view orderbooks, pseudo-orderbooks, synthetic price-context orderbooks, and manual route orderbooks
+- submit and track CEX orders, Solana swaps / limit-style flows, and confirmed Hydration manual-route swaps
+- monitor scanners, discovery tools, wallet activity, market-cap data, volume data, and self-custody balances
+- work with local ledger, deposits, withdrawals, missing-basis lots, transfer links, FIFO lot-impact previews, and tax-related state
 - plan cross-chain UTTT movements with bridge-transfer records, canonical supply context, and read-only basis previews
+- manage Token Registry rows, Hydration Route Registry rows, wallet addresses, venue API keys, and local operator preferences
 - integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
 
 ---
@@ -37,11 +38,12 @@ UTT includes exchange adapter and routing layers for multiple venues, with a des
 Current functionality in the codebase includes:
 
 - venue registry and adapter routing
-- balances and account views
-- order submission plumbing
-- order status aggregation
-- unified all-orders style data views
-- auth, profile, and API-key management flows
+- balances, available/held amounts, account views, and priced portfolio totals
+- order submission plumbing, cancellation paths, and venue-order refresh
+- order status aggregation and local order reconciliation
+- unified all-orders style data views, including swap-order reflection where supported
+- Robinhood balance hold handling using a fast open-order overlay so balance refresh is not blocked by full order-history scans
+- auth, profile, local session, database backup, 2FA, and API-key management flows
 
 ### Solana DEX workflow
 
@@ -67,15 +69,17 @@ Current architecture in this repository includes support for:
 - Hydration RPC access through profile-managed API keys
 - Token Registry-managed Hydration asset metadata
 - Token Registry-managed external price metadata
-- Hydration Route Registry support for manual/live pool routes
+- Hydration Route Registry support for manual/live pool routes and confirmed manual Router route rows
 - UTTT-HDX manual XYK orderbook generation from live pool reserves
-- Hydration order-ticket execution plumbing for UTTT-HDX
+- DOT-HDX and HDX-DOT confirmed manual Router routes through Aave / aDOT / Omnipool
+- Hydration order-ticket execution plumbing for UTTT-HDX, DOT-HDX, and HDX-DOT
 - Hydration balances in terminal tables and wallet-address views
 - external USD price enrichment for HDX and DOT
 - UTTT/USD derivation from UTTT-HDX live route pricing and HDX/USD
 - Hydration price-cache status reporting with clear fresh, stale, partial, and unavailable classifications
 - persistent Hydration sidecar quote-cache / singleflight / backoff protection for controlled SDK diagnostics
 - Hydration order-ticket execution plumbing for UTTT-HDX manual XYK sell/exact-in and buy/exact-out flows
+- Hydration manual Router sell/exact-in and buy/exact-out flows for confirmed route-registry pairs such as DOT-HDX and HDX-DOT
 - generic Hydration SDK router quote and orderbook paths blocked by default unless explicitly enabled
 - compact Hydration UI price-status indicators in Order Book and Order Ticket using status-only backend polling
 - Hydration swap recording into the unified all-orders flow through `swap_orders`
@@ -302,6 +306,7 @@ Supporting routes and tooling also include:
 - wallet address handling
 - all-orders aggregation
 - scanner and discovery windows
+- donation window and public support-address display/copy helpers
 - airdrop-related routing and tooling
 
 ---
@@ -325,6 +330,361 @@ Supporting routes and tooling also include:
 
 ### Profile / API Keys
 ![Profile API Keys](docs/screenshots/profile-api-keys.png)
+
+
+---
+
+## Feature guide and how to use UTT
+
+This section is a practical operator guide for the main features currently represented in the codebase. Exact UI labels may evolve, but the workflows below describe the intended use model.
+
+### 1) First launch, profile, and API keys
+
+Use the profile controls to create or sign in to the local operator profile, then add venue credentials through the app rather than tracked env files.
+
+Typical flow:
+
+```text
+Profile / account menu
+→ API Keys
+→ choose venue
+→ enter required credential fields
+→ save
+→ use refresh/status buttons to confirm the venue is available
+```
+
+Use this for CEX adapters, Solana-related API helpers where applicable, Hydration / Dwellir keys, Subscan-style history providers, and other venue credentials supported by the local profile store.
+
+Do not put exchange keys, wallet seeds, private keys, or generated key material into tracked repository files.
+
+### 2) Balances and portfolio view
+
+Use the Balances / Tables windows to inspect venue balances, wallet balances, and priced portfolio totals.
+
+Typical flow:
+
+```text
+Open Tables / Balances
+→ select or filter venue
+→ Refresh balances
+→ inspect total, available, hold, USD price, and USD totals
+```
+
+The balance system is designed to distinguish:
+
+```text
+total      = total venue-reported or derived asset quantity
+available  = quantity available for trading / withdrawal where known
+hold       = quantity reserved by open orders or venue restrictions where known
+```
+
+Robinhood balances use a fast open-order hold overlay for balance refresh so the Balances window and Order Ticket do not need to wait for a full paginated order-history refresh. Full order history still remains available through the Orders workflow.
+
+### 3) Orders, All Orders, and order refresh
+
+Use the order tables to inspect venue order state, local order records, and DEX swap records reflected into the unified order view.
+
+Typical flow:
+
+```text
+Open Orders / All Orders
+→ choose venue or source
+→ refresh venue orders
+→ inspect status, side, quantity, price, fees, and net fields
+```
+
+Supported concepts include:
+
+- venue-native order snapshots
+- local order reconciliation
+- status normalization such as open, partial, filled, canceled, rejected, expired, failed
+- swap-order reflection for supported DEX flows
+- net and tax-aware display fields where backend data exists
+
+### 4) Order Book and Order Ticket
+
+The Order Book and Order Ticket are designed to work together but remain venue-aware.
+
+Typical CEX flow:
+
+```text
+select venue
+→ select symbol
+→ review orderbook
+→ enter side, order type, price / quantity
+→ submit order
+→ inspect result and All Orders
+```
+
+Typical DEX flow:
+
+```text
+select DEX venue
+→ connect/select wallet
+→ select symbol
+→ select route mode, usually Auto
+→ review route/status/pre-trade checks
+→ sign or submit only after checks are OK
+```
+
+For Hydration, the safest normal route mode is:
+
+```text
+Auto
+```
+
+Auto lets the backend choose in this order:
+
+```text
+confirmed manual route row
+manual/live XYK route where configured
+synthetic price-only fallback for visual context
+SDK route only when explicitly enabled
+```
+
+### 5) Token Registry
+
+Use the Token Registry to manage local asset metadata that the terminal needs for display, routing, pricing, and diagnostics.
+
+Typical flow:
+
+```text
+Open Token Registry
+→ choose chain / venue
+→ add or edit symbol
+→ set address / mint / contract / asset ID
+→ set decimals
+→ optionally set external price source and external price ID
+→ save
+```
+
+Examples:
+
+```text
+Solana token     → address field stores mint
+EVM token        → address field stores contract address
+Hydration asset  → address field stores asset ID, or native for HDX
+Native asset     → use native when the backend expects the chain-native asset marker
+```
+
+For Hydration route work, intermediate route assets such as `aDOT` can be added with no price source if they are not intended as user-facing priced assets.
+
+### 6) Hydration Route Registry
+
+Use the Hydration Route Registry to control manual routes through the UI instead of hardcoding route assets in backend files.
+
+Manual XYK routes are for pool-reserve-style routes such as UTTT-HDX:
+
+```text
+Route mode: manual_xyk
+Pool type: XYK
+Pool account / route metadata
+Fee bps
+Enabled
+Confirmed after testing
+```
+
+Manual Router routes are for explicit Hydration Router paths such as DOT-HDX and HDX-DOT:
+
+```text
+Route mode: manual_router
+Pool type: Router
+Route JSON
+Enabled
+Confirmed only after successful live testing
+```
+
+Example DOT-HDX route JSON:
+
+```json
+[
+  { "pool": { "type": "Aave" }, "assetIn": 5, "assetOut": 1001 },
+  { "pool": { "type": "Omnipool" }, "assetIn": 1001, "assetOut": 0 }
+]
+```
+
+Example HDX-DOT route JSON:
+
+```json
+[
+  { "pool": { "type": "Omnipool" }, "assetIn": 0, "assetOut": 1001 },
+  { "pool": { "type": "Aave" }, "assetIn": 1001, "assetOut": 5 }
+]
+```
+
+### 7) Hydration swaps
+
+Hydration swaps use wallet signing through the Polkadot / Substrate wallet flow. The backend builds unsigned transaction payloads, the frontend requests signing, and successful swaps are recorded into local swap-order state.
+
+Validated manual route examples:
+
+```text
+UTTT-HDX  manual_xyk     sell/exact-in and buy/exact-out
+DOT-HDX   manual_router  sell/exact-in and buy/exact-out
+HDX-DOT   manual_router  sell/exact-in and buy/exact-out
+```
+
+Recommended test flow:
+
+```text
+Order Ticket
+→ venue: polkadot_hydration
+→ route: Auto
+→ choose pair
+→ use tiny amount
+→ confirm pre-trade checks OK
+→ sign swap
+→ verify signed/submitted/finalized/onChainOk
+→ inspect All Orders / swap_orders reflection
+```
+
+The terminal should never treat a synthetic price-only orderbook as tradable by itself.
+
+### 8) Solana DEX flows
+
+Use Solana DEX flows when a supported wallet is connected and the selected route supports the requested asset pair.
+
+Typical flow:
+
+```text
+select Solana DEX venue
+→ connect/select Solana wallet
+→ choose symbol / token pair
+→ choose swap or limit-style path where available
+→ review route/preflight
+→ sign through wallet
+→ inspect result and order records
+```
+
+Solana support includes Jupiter-related routing paths, Raydium routing, token registry lookup, mint resolution, and wallet-aware Order Ticket behavior.
+
+### 9) Wallet addresses and self-custody visibility
+
+Use wallet-address tooling to register self-custody addresses and include cached wallet balances or history in local views.
+
+Typical flow:
+
+```text
+Open wallet/address tooling
+→ add chain and address
+→ refresh or ingest supported history
+→ inspect cached transactions / balances
+→ materialize deposits or withdrawals only through explicit workflows where supported
+```
+
+Self-custody balances can contribute to AppHeader portfolio totals when cached and available.
+
+### 10) Hydration wallet-history ingestion and ledger materialization
+
+Hydration wallet-history ingestion is a dry-run-first workflow.
+
+Recommended sequence:
+
+```text
+coverage dry run
+→ cache trusted wallet tx rows
+→ preview materialization
+→ apply materialization
+→ rebuild missing-basis lots
+→ preview withdrawal lot impact
+→ apply only clean assets explicitly
+```
+
+This avoids inventing USD basis and avoids treating internal transfers, bridge-like movements, or LP / Omnipool rows as normal taxable disposals by default.
+
+### 11) Deposits, withdrawals, FIFO lots, and basis
+
+The local ledger tooling is designed for conservative local accounting workflows.
+
+Common concepts:
+
+```text
+AssetDeposit       = detected or manual asset inflow
+AssetWithdrawal    = detected or manual asset outflow
+Basis lots         = local inventory / cost-basis tracking rows
+Missing basis      = quantity is known, USD basis is not known yet
+Transfer link      = likely internal movement, not automatically a sale
+FIFO lot impact    = explicit preview/apply workflow for eligible withdrawals
+```
+
+Do not apply broad FIFO rebuilds until preview output looks correct.
+
+### 12) Spread / Bridge dashboard
+
+The Spread / Bridge dashboard is a planning dashboard, not an execution bridge.
+
+Typical safe sequence:
+
+```text
+open Spread / Bridge
+→ choose direction and asset
+→ inspect source/destination price context
+→ inspect Total Canonical Supply and per-chain UTTT supply rows
+→ preview transfer record
+→ create local PLANNED record
+→ link source evidence
+→ link destination evidence
+→ reconcile record
+→ run read-only basis preview
+→ run read-only apply-basis-transfer preview
+```
+
+Actual bridge execution and actual basis mutation remain intentionally disabled until a guarded apply path is explicitly implemented and tested.
+
+### 13) Market Cap and Volume windows
+
+Use the AppHeader Market Cap and Volume tool tabs to inspect normalized backend-cached market metrics.
+
+Typical flow:
+
+```text
+open Market Cap or Volume tool window
+→ select or inspect assets
+→ backend resolves external IDs through Token Registry first
+→ backend falls back to configured/default discovery where available
+→ inspect unavailable or rate-limited rows without frontend directly calling CoinGecko
+```
+
+### 14) Scanner and discovery tooling
+
+Scanner and discovery windows are operator tools for surfacing assets, venue data, or other candidate rows depending on which backend routes are enabled.
+
+General flow:
+
+```text
+open scanner/discovery window
+→ select venue or filter
+→ refresh
+→ inspect discovered rows
+→ use registry or terminal actions to wire supported assets into trading views
+```
+
+### 15) Donate window
+
+The Donate window is an AppHeader utility for public support addresses.
+
+Current behavior:
+
+```text
+addresses hidden by default
+copy buttons can copy even when the address is hidden
+DEX-wallet-aware Send buttons can hand off supported assets toward the wallet/order-ticket layer where wired
+```
+
+Only public donation addresses belong in the UI. Never put private keys or seed phrases into the donation configuration.
+
+### 16) Local backup and session hygiene
+
+Use profile/logout backup behavior and local backup tooling to preserve local DB state before major changes.
+
+Recommended practice:
+
+```text
+backup before large route/ledger changes
+backup before publishing major code changes
+keep backups outside the repo
+verify git status before every commit
+```
 
 ---
 
@@ -627,6 +987,32 @@ UTTT-HDX manual/live route
 → All Orders
 ```
 
+Confirmed non-XYK Hydration routes should also be configured through the Route Registry instead of hardcoded backend route maps. The current manual Router route pattern supports route JSON such as:
+
+```text
+DOT-HDX manual_router / Router / confirmed
+DOT(5) → Aave → aDOT(1001) → Omnipool → HDX(0)
+
+HDX-DOT manual_router / Router / confirmed
+HDX(0) → Omnipool → aDOT(1001) → Aave → DOT(5)
+```
+
+These rows allow the Order Ticket to distinguish between:
+
+```text
+confirmed manual Router routes that may build Router.sell / Router.buy calls
+synthetic price-only orderbooks that must remain non-tradable
+generic SDK router routes that remain disabled unless intentionally enabled
+```
+
+The intermediate `aDOT` route asset should exist in Token Registry for readability and future route tooling:
+
+```text
+aDOT  hydration 1001  decimals 10  price source blank / none
+```
+
+It is not normally a user-facing priced balance asset in UTT; it is an intermediate routing leg.
+
 ### Pricing model
 
 The public-safe Hydration pricing path uses:
@@ -810,6 +1196,43 @@ Check:
 - the correct venue was configured in the profile
 - no real credentials were placed into tracked files
 
+### Robinhood balances show stale available / hold values
+
+If the Balances page or Order Ticket shows a Robinhood USD row where `available` equals `total` but you know funds are reserved by open orders, check whether the balance refresh actually completed.
+
+A response like this means the UI did not receive fresh Robinhood balances:
+
+```text
+Skipping refresh for robinhood: in cooldown after recent failure
+Timeout fetching balances for robinhood after 12s; entering cooldown
+```
+
+The balance refresh path should use a fast open-order hold overlay and should not wait for a full paginated order-history refresh. The Orders page can still run the full venue order refresh separately.
+
+Check:
+
+```text
+POST /api/balances/refresh
+GET  /api/balances/latest?venue=robinhood&with_prices=true
+```
+
+Expected after a real refresh:
+
+```text
+count > 0
+captured_at updates
+USD hold reflects open BUY reserves when available
+available no longer incorrectly equals total when a hold is known
+```
+
+If order refresh is slow, test it separately:
+
+```text
+POST /api/orders/refresh?venue=robinhood&force=true
+```
+
+A slow full order refresh does not necessarily mean the balance refresh should fail.
+
 ### Solana wallet connects but a trade fails
 
 Check:
@@ -869,6 +1292,53 @@ quoteStatus.status = disabled
 ```
 
 Manual/live routes such as `UTTT-HDX` can still build pseudo-orderbooks and unsigned transaction payloads through the manual XYK route. That path supports sell/exact-in and buy/exact-out transaction preparation without reopening generic SDK router quote polling.
+
+Confirmed manual Router routes such as `DOT-HDX` and `HDX-DOT` can build Router.sell exact-in and Router.buy exact-out payloads when their Route Registry rows are enabled and confirmed. If the Order Book shows a synthetic price-only fallback, the Order Ticket should remain blocked until a confirmed route row or a safe SDK route is available.
+
+For Hydration route issues, check:
+
+- Token Registry contains the visible assets and any intermediate route asset such as `aDOT`
+- Route Registry rows use the correct mode: `manual_xyk` for XYK live-pool routes, `manual_router` for Router route JSON
+- `confirmed=true` is set only after a successful live test
+- `route_mode=auto` is selected in Order Ticket so the backend can prefer confirmed manual routes before generic SDK paths
+- SDK router quote toggles remain disabled unless intentionally debugging SDK behavior
+
+### Hydration Route Registry rows do not make the ticket tradable
+
+If a manual Router route row exists but the Order Ticket remains blocked, inspect the route registry and swap-tx preflight.
+
+Check route registry:
+
+```text
+GET /api/polkadot_dex/hydration/route_registry?include_disabled=true
+```
+
+Expected for a confirmed manual Router route:
+
+```text
+routeMode: manual_router
+poolType: Router
+enabled: true
+confirmed: true
+route: non-empty JSON route legs
+```
+
+Then test unsigned swap transaction building:
+
+```text
+POST /api/polkadot_dex/hydration/swap_tx
+```
+
+Expected for a confirmed manual route:
+
+```text
+manualRouterFallback: true
+executionConfirmed: true
+manualCustomSwap.enabled: true
+routeModeEffective: manual_router
+```
+
+If the route returns only synthetic orderbook data, it is price context only and should not enable trading.
 
 ### Hydration wallet-history rows do not appear in deposits or withdrawals
 
@@ -998,6 +1468,7 @@ UTT is an actively evolving trading terminal codebase with ongoing work across:
 - Hydration price-cache status, external USD pricing, and UTTT/USD derivation
 - Hydration sidecar quote-cache / singleflight / backoff safety
 - manual UTTT-HDX orderbook and buy/sell transaction preparation
+- confirmed DOT-HDX and HDX-DOT manual Router buy/sell transaction preparation through route-registry rows
 - compact Hydration UI status indicators for Order Book and Order Ticket
 - Hydration wallet-history ingestion and ledger materialization
 - Spread / Bridge transfer-record planning, canonical supply context, and read-only basis/apply previews

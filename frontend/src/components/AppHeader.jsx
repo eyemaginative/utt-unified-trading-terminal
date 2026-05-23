@@ -57,6 +57,7 @@ const BANNER_EDIT_H = 200; // expanded height when Fit controls are open
 
 // Donate (read-only config; only "hide addresses" is user-local)
 const LS_DONATE_HIDE_ADDRS_KEY = "utt_donate_hide_addrs_v1";
+const LS_DONATE_HIDE_ADDRS_DEFAULTED_KEY = "utt_donate_hide_addrs_defaulted_v2";
 
 // Header media player (user-local)
 const LS_MEDIA_URL_KEY = "utt_header_media_url_v1";
@@ -89,14 +90,34 @@ const DONATE_CONFIG = Object.freeze({
   coins: [
     // TODO: Replace addresses with your real addresses
     { key: "btc", label: "Bitcoin (BTC)", address: "bc1qktcffyxqql280dpxa3mhucfnh6lw7ec66esp9u" },
-    { key: "eth", label: "Ethereum (ETH)", address: "" },
-    { key: "doge", label: "Dogecoin (DOGE)", address: "" },
-    { key: "sol", label: "Solana (SOL)", address: "" },
-    { key: "ltc", label: "Litecoin (LTC)", address: "" },
-    { key: "dot", label: "Polkadot (DOT)", address: "" },
-    { key: "dash", label: "Zcash (ZEC)", address: "" },
+    { key: "eth", label: "Ethereum (ETH)", address: "0xC0e518bE909C8B027F5B87ce705E99CAB828bB7A" },
+    { key: "doge", label: "Dogecoin (DOGE)", address: "DNWwrAxByGtgEDRg44hCvEZhLRAhp6QX2q" },
+    { key: "sol", label: "Solana (SOL)", address: "F1qjFHYPxRHYFQc2ooT11soi9jSo3QzBnSXoV5v8dKAJ" },
+    { key: "ltc", label: "Litecoin (LTC)", address: "ltc1qc026n55xusx2xvugygdm6ugh9rzfnx6umarny2" },
+    { key: "dot", label: "Polkadot (DOT)", address: "13xijG3AEoh1MFAjBndnQE9CDmF8hBkvTqgLbBsxb181ZYa2" },
+    { key: "zec", label: "Zcash (ZEC)", address: "t1MuBhk5wbvMqHWFqgSydjAKpbJigYdoPeg" },
   ],
 });
+
+const DONATE_SEND_ROUTES = Object.freeze({
+  sol: {
+    chain: "solana",
+    venue: "solana_jupiter",
+    asset: "SOL",
+    walletLabel: "Solana wallet",
+  },
+  dot: {
+    chain: "polkadot",
+    venue: "polkadot_hydration",
+    asset: "DOT",
+    walletLabel: "Polkadot/Substrate wallet",
+  },
+});
+
+function donateSendRouteForCoin(coin) {
+  const key = String(coin?.key || "").trim().toLowerCase();
+  return DONATE_SEND_ROUTES[key] || null;
+}
 
 // Copied from TerminalTablesWidget.jsx (palette table + helpers) to guarantee exact match.
 const PALETTES = {
@@ -869,11 +890,22 @@ function readBannerFromStorage() {
 
 function readDonateHideAddrsFromStorage() {
   try {
+    // v2 migration: older builds could persist "0" when the checkbox defaulted
+    // unchecked. Force the new privacy-first default once, then let future
+    // operator toggles persist normally.
+    const defaulted = localStorage.getItem(LS_DONATE_HIDE_ADDRS_DEFAULTED_KEY);
+    if (defaulted !== "1") {
+      localStorage.setItem(LS_DONATE_HIDE_ADDRS_DEFAULTED_KEY, "1");
+      localStorage.setItem(LS_DONATE_HIDE_ADDRS_KEY, "1");
+      return true;
+    }
+
     const raw = localStorage.getItem(LS_DONATE_HIDE_ADDRS_KEY);
-    if (!raw) return false;
-    return String(raw) === "1";
+    // Default to hidden unless the user explicitly turns hiding off after v2.
+    if (raw === null || raw === undefined || raw === "") return true;
+    return String(raw) !== "0";
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -1734,7 +1766,7 @@ addDexAccount,
   const donateCfg = DONATE_CONFIG;
   const [donateOpen, setDonateOpen] = useState(false);
   const [donateHideAddrs, setDonateHideAddrs] = useState(() => {
-    if (typeof window === "undefined") return false;
+    if (typeof window === "undefined") return true;
     return readDonateHideAddrsFromStorage();
   });
   const [donateMsg, setDonateMsg] = useState("");
@@ -3132,7 +3164,7 @@ const buyUtttBtnActiveStyle = {
   // ---------------------------
   const DONATE_MARGIN = 10;
   const DONATE_GAP = 10;
-  const DONATE_MAX_W = 560;
+  const DONATE_MAX_W = 640;
 
   const [donatePos, setDonatePos] = useState(null); // { x, y, w }
   const [profilePos, setProfilePos] = useState(null); // { x, y, w }
@@ -3380,20 +3412,45 @@ const buyUtttBtnActiveStyle = {
 
   const donateRowStyle = {
     display: "grid",
-    gridTemplateColumns: "170px 1fr auto",
-    gap: 10,
+    gridTemplateColumns: "170px minmax(0, 1fr) 54px 54px",
+    columnGap: 8,
+    rowGap: 6,
     alignItems: "center",
   };
 
   const donateInputStyle = {
     width: "100%",
+    maxWidth: "100%",
+    minWidth: 0,
+    boxSizing: "border-box",
+    justifySelf: "stretch",
     background: donateSolidCtlBg,
     border: "1px solid var(--utt-hdr-ctl-border, rgba(255,255,255,0.10))",
     color: "var(--utt-hdr-fg, #e8eef8)",
     borderRadius: 10,
     padding: "8px 10px",
     fontSize: 12,
+    textAlign: "left",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
     outline: "none",
+  };
+
+  const donateActionBtnStyle = {
+    ...donateSmallBtnStyle,
+    width: 54,
+    minWidth: 54,
+    maxWidth: 54,
+    boxSizing: "border-box",
+    justifyContent: "center",
+    padding: "7px 8px",
+  };
+
+  const donateSendBtnPlaceholderStyle = {
+    width: 54,
+    minWidth: 54,
+    maxWidth: 54,
+    height: 1,
   };
 
   const openBannerPicker = () => {
@@ -4590,6 +4647,40 @@ const autoFitBanner = async () => {
     const next = !donateHideAddrs;
     setDonateHideAddrs(next);
     writeDonateHideAddrsToStorage(next);
+  };
+
+  const handleDonateSendRequest = (coin, addr) => {
+    const route = donateSendRouteForCoin(coin);
+    const address = String(addr || "").trim();
+    if (!route || !address) return;
+
+    try {
+      if (typeof setVenue === "function" && route.venue) setVenue(route.venue);
+      if (typeof setVisible === "function") setVisible((v) => ({ ...(v || {}), orderTicket: true }));
+    } catch {
+      // The send handoff should not break the donate window if shell state is unavailable.
+    }
+
+    try {
+      window.dispatchEvent(new CustomEvent("utt:donate-send-request", {
+        detail: {
+          source: "AppHeaderDonate",
+          requestedAt: new Date().toISOString(),
+          coinKey: coin?.key,
+          label: coin?.label,
+          asset: route.asset,
+          chain: route.chain,
+          venue: route.venue,
+          walletLabel: route.walletLabel,
+          destinationAddress: address,
+        },
+      }));
+    } catch {
+      // ignore event dispatch failures
+    }
+
+    setDonateMsg(`${coin?.label || route.asset}: send request prepared for ${route.walletLabel}. Confirm in the wallet/send flow before signing.`);
+    setTimeout(() => setDonateMsg(""), 2800);
   };
 
   // ---------------------------
@@ -6042,11 +6133,12 @@ const autoFitBanner = async () => {
 
             {(donateCfg.coins || []).map((c) => {
               const addr = String(c?.address || "").trim();
+              const sendRoute = donateSendRouteForCoin(c);
               const shown = donateHideAddrs ? (addr ? "••••••••••••••••" : "") : addr;
 
               return (
                 <div key={c.key} style={donateRowStyle}>
-                  <div style={{ fontSize: 12, opacity: 0.9, fontWeight: 800 }}>{c.label}</div>
+                  <div style={{ minWidth: 0, fontSize: 12, opacity: 0.9, fontWeight: 800 }}>{c.label}</div>
                   <input
                     style={donateInputStyle}
                     value={shown}
@@ -6055,17 +6147,30 @@ const autoFitBanner = async () => {
                     onFocus={(e) => e.target.select()}
                     title={addr ? addr : "Not set in this build"}
                   />
+                  {sendRoute ? (
+                    <button
+                      type="button"
+                      style={donateActionBtnStyle}
+                      disabled={!addr}
+                      onClick={() => handleDonateSendRequest(c, addr)}
+                      title={addr ? `Prepare ${sendRoute.walletLabel} send request` : "Configure this donation address before sending"}
+                    >
+                      Send
+                    </button>
+                  ) : (
+                    <span aria-hidden="true" style={donateSendBtnPlaceholderStyle} />
+                  )}
                   <button
                     type="button"
-                    style={donateSmallBtnStyle}
-                    disabled={!addr || donateHideAddrs}
+                    style={donateActionBtnStyle}
+                    disabled={!addr}
                     onClick={async () => {
                       if (!addr) return;
                       const ok = await copyText(addr);
                       setDonateMsg(ok ? `${c.label}: copied.` : `${c.label}: copy failed.`);
                       setTimeout(() => setDonateMsg(""), 1400);
                     }}
-                    title={donateHideAddrs ? "Disable Hide addresses to copy" : addr ? "Copy address" : "Not set in this build"}
+                    title={addr ? "Copy address" : "Not set in this build"}
                   >
                     Copy
                   </button>

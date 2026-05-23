@@ -1388,8 +1388,96 @@ class RobinhoodAdapter(ExchangeAdapter):
     # Balances / Orders / Trading
     # ─────────────────────────────────────────────────────────────
 
+    def _env_float_clamped(self, name: str, default: float, min_value: float, max_value: float) -> float:
+        raw = (os.getenv(name, "") or "").strip()
+        try:
+            val = float(raw) if raw else float(default)
+        except Exception:
+            val = float(default)
+        if val < float(min_value):
+            return float(min_value)
+        if val > float(max_value):
+            return float(max_value)
+        return float(val)
+
+    def _env_int_clamped(self, name: str, default: int, min_value: int, max_value: int) -> int:
+        raw = (os.getenv(name, "") or "").strip()
+        try:
+            val = int(float(raw)) if raw else int(default)
+        except Exception:
+            val = int(default)
+        if val < int(min_value):
+            return int(min_value)
+        if val > int(max_value):
+            return int(max_value)
+        return int(val)
+
+    def _fetch_orders_for_balance_holds(self, dry_run: bool) -> List[VenueOrder]:
+        """
+        Fast, best-effort order scan used only to overlay balance holds.
+
+        Balance refresh runs inside the shared BAL_FETCH_TIMEOUT_SECONDS wrapper
+        (12s by default). Calling the full paginated fetch_orders() path here can
+        exhaust that wrapper before a fresh balance snapshot is written. This
+        helper intentionally scans only the newest few pages and never raises,
+        so holdings/cash balances can still refresh even when the full order
+        history refresh is slow.
+        """
+        max_pages = self._env_int_clamped("ROBINHOOD_BALANCE_HOLDS_MAX_PAGES", 3, 1, 20)
+        budget_s = self._env_float_clamped("ROBINHOOD_BALANCE_HOLDS_TIMEOUT_S", 5.0, 0.5, 20.0)
+        page_timeout_s = self._env_float_clamped("ROBINHOOD_BALANCE_HOLDS_PAGE_TIMEOUT_S", 4.0, 0.5, 10.0)
+
+        out: List[VenueOrder] = []
+        path: Optional[str] = "/api/v1/crypto/trading/orders/"
+        pages = 0
+        started = time.monotonic()
+
+        while path and pages < max_pages:
+            elapsed = time.monotonic() - started
+            remaining_budget = float(budget_s) - float(elapsed)
+            if remaining_budget <= 0:
+                break
+
+            pages += 1
+            try:
+                _, data = self._request(
+                    "GET",
+                    path,
+                    auth=True,
+                    timeout_s=max(0.5, min(float(page_timeout_s), float(remaining_budget))),
+                )
+            except Exception:
+                break
+
+            if not isinstance(data, dict):
+                break
+
+            items = data.get("results") or data.get("data") or data.get("orders") or []
+            if not isinstance(items, list):
+                break
+
+            for o in items:
+                if not isinstance(o, dict):
+                    continue
+                it = self._order_payload_to_item(o)
+                if not it:
+                    continue
+                if str(it.get("status") or "").strip().lower() == "open":
+                    out.append(it)
+
+            nxt = data.get("next") or data.get("next_url") or data.get("nextUrl")
+            path = self._path_from_next(nxt) if nxt else None
+
+        return out
+
     def fetch_balances(self, dry_run: bool) -> List[BalanceItem]:
-        _, data = self._request("GET", "/api/v1/crypto/trading/holdings/", auth=True)
+        holdings_timeout_s = self._env_float_clamped("ROBINHOOD_BALANCE_HOLDINGS_TIMEOUT_S", 8.0, 2.0, 20.0)
+        _, data = self._request(
+            "GET",
+            "/api/v1/crypto/trading/holdings/",
+            auth=True,
+            timeout_s=holdings_timeout_s,
+        )
 
         items = data.get("results") or data.get("data") or data.get("holdings") or []
         out: List[BalanceItem] = []
@@ -1445,7 +1533,13 @@ class RobinhoodAdapter(ExchangeAdapter):
             )
 
         try:
-            _, acct = self._request("GET", "/api/v1/crypto/trading/accounts/", auth=True, timeout_s=15.0)
+            account_timeout_s = self._env_float_clamped("ROBINHOOD_BALANCE_ACCOUNT_TIMEOUT_S", 6.0, 2.0, 20.0)
+            _, acct = self._request(
+                "GET",
+                "/api/v1/crypto/trading/accounts/",
+                auth=True,
+                timeout_s=account_timeout_s,
+            )
 
             rec = None
             if isinstance(acct, dict):
@@ -1473,8 +1567,21 @@ class RobinhoodAdapter(ExchangeAdapter):
                         return x
                 return None
 
+            usd_total = None
             usd_available = None
             if isinstance(rec, dict):
+                usd_total = pick_money(
+                    rec,
+                    [
+                        "cash_balance",
+                        "cash",
+                        "total_cash",
+                        "usd_balance",
+                        "balance",
+                        "cash_value",
+                        "portfolio_cash",
+                    ],
+                )
                 usd_available = pick_money(
                     rec,
                     [
@@ -1483,20 +1590,26 @@ class RobinhoodAdapter(ExchangeAdapter):
                         "available_buying_power",
                         "available_cash",
                         "cash_available",
-                        "cash_balance",
                         "available_to_trade",
                         "available",
+                        "withdrawable_cash",
+                        "withdrawable",
                         "usd_available",
                         "usd_buying_power",
                     ],
                 )
 
-            if usd_available is not None:
+            if usd_total is None and usd_available is not None:
+                usd_total = float(usd_available)
+            if usd_available is None and usd_total is not None:
+                usd_available = float(usd_total)
+
+            if usd_total is not None or usd_available is not None:
                 out.append(
                     {
                         "asset": "USD",
-                        "total": float(usd_available),
-                        "available": float(usd_available),
+                        "total": float(usd_total or 0.0),
+                        "available": float(usd_available or 0.0),
                         "hold": 0.0,
                     }
                 )
@@ -1520,9 +1633,10 @@ class RobinhoodAdapter(ExchangeAdapter):
             d[k] = float(d.get(k, 0.0) + float(amt))
 
         reserved_base: Dict[str, float] = {}
+        reserved_quote: Dict[str, float] = {}
 
         try:
-            orders = self.fetch_orders(dry_run=dry_run)
+            orders = self._fetch_orders_for_balance_holds(dry_run=dry_run)
             for o in orders or []:
                 if not isinstance(o, dict):
                     continue
@@ -1530,9 +1644,6 @@ class RobinhoodAdapter(ExchangeAdapter):
                     continue
 
                 side = str(o.get("side") or "").strip().lower()
-                if side != "sell":
-                    continue
-
                 qty = self._safe_float(o.get("qty")) or 0.0
                 filled = self._safe_float(o.get("filled_qty")) or 0.0
                 remaining = qty - filled
@@ -1540,13 +1651,23 @@ class RobinhoodAdapter(ExchangeAdapter):
                     continue
 
                 sym_any = o.get("symbol_venue") or o.get("symbol_canon")
-                base, _quote = split_base_quote(sym_any)
-                if not base:
+                base, quote = split_base_quote(sym_any)
+
+                if side == "sell":
+                    if base:
+                        add_to(reserved_base, base, remaining)
                     continue
 
-                add_to(reserved_base, base, remaining)
+                if side == "buy":
+                    px = self._safe_float(o.get("limit_price"))
+                    if px is None:
+                        px = self._safe_float(o.get("avg_fill_price"))
+                    if quote and px is not None and px > 0:
+                        add_to(reserved_quote, quote, remaining * float(px))
+                    continue
         except Exception:
             reserved_base = {}
+            reserved_quote = {}
 
         by_asset: Dict[str, BalanceItem] = {}
         for b in out:
@@ -1573,7 +1694,41 @@ class RobinhoodAdapter(ExchangeAdapter):
             computed = float(max(hold_amt, 0.0))
             new_hold = max(hold, computed)
 
+            if total + 1e-12 < new_hold:
+                total = new_hold
             computed_avail = max(total - new_hold, 0.0)
+            b["total"] = total
+            b["hold"] = new_hold
+            b["available"] = min(avail, computed_avail)
+
+        for asset, hold_amt in reserved_quote.items():
+            b = by_asset.get(asset)
+            if b is None:
+                by_asset[asset] = {
+                    "asset": asset,
+                    "total": float(hold_amt),
+                    "available": 0.0,
+                    "hold": float(hold_amt),
+                }
+                continue
+
+            total = float(self._safe_float(b.get("total")) or 0.0)
+            avail = float(self._safe_float(b.get("available")) or total)
+            hold = float(self._safe_float(b.get("hold")) or 0.0)
+
+            computed = float(max(hold_amt, 0.0))
+            new_hold = max(hold, computed)
+
+            # If the account endpoint only gave buying power, total needs to
+            # include the open BUY reserve so the UI can show total / available
+            # / hold consistently.
+            if total <= 0:
+                total = avail + new_hold
+            elif total + 1e-12 < (avail + new_hold):
+                total = avail + new_hold
+
+            computed_avail = max(total - new_hold, 0.0)
+            b["total"] = total
             b["hold"] = new_hold
             b["available"] = min(avail, computed_avail)
 

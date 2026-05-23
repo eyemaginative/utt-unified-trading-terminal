@@ -110,6 +110,72 @@ function buildHydrationLowLiquidityWarning(payload) {
   };
 }
 
+
+function safeJsonPretty(value, fallback = "[]") {
+  try {
+    return JSON.stringify(value ?? [], null, 2);
+  } catch {
+    return fallback;
+  }
+}
+
+function parseRouteJsonText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error("route_json must be a JSON array of route legs.");
+  }
+  return parsed;
+}
+
+function hydrationRouteTemplateForSymbol(symbol) {
+  const s = String(symbol || "").trim().toUpperCase();
+  if (s === "DOT-HDX") {
+    return [
+      { pool: { type: "Aave" }, assetIn: 5, assetOut: 1001 },
+      { pool: { type: "Omnipool" }, assetIn: 1001, assetOut: 0 },
+    ];
+  }
+  if (s === "HDX-DOT") {
+    return [
+      { pool: { type: "Omnipool" }, assetIn: 0, assetOut: 1001 },
+      { pool: { type: "Aave" }, assetIn: 1001, assetOut: 5 },
+    ];
+  }
+  return [
+    { pool: { type: "Omnipool" }, assetIn: 0, assetOut: 0 },
+  ];
+}
+
+function hasKnownHydrationRouteTemplate(symbol) {
+  const s = String(symbol || "").trim().toUpperCase();
+  return s === "DOT-HDX" || s === "HDX-DOT";
+}
+
+function isKnownHydrationRouteTemplateText(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(raw);
+    const json = JSON.stringify(parsed);
+    return (
+      json === JSON.stringify(hydrationRouteTemplateForSymbol("DOT-HDX")) ||
+      json === JSON.stringify(hydrationRouteTemplateForSymbol("HDX-DOT"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function routeModeLabel(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "manual_router") return "Manual Router";
+  if (v === "manual_xyk") return "Manual XYK";
+  return v || "Manual XYK";
+}
+
+
 export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const API_BASE = String(apiBase || "").trim() || "";
 
@@ -146,11 +212,15 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const [routeSaving, setRouteSaving] = useState(false);
   const [routeErr, setRouteErr] = useState(null);
   const [routeSymbol, setRouteSymbol] = useState("UTTT-HDX");
+  const [routeMode, setRouteMode] = useState("manual_xyk");
+  const [routePoolType, setRoutePoolType] = useState("XYK");
   const [routeBaseReserve, setRouteBaseReserve] = useState("");
   const [routeQuoteReserve, setRouteQuoteReserve] = useState("");
   const [routeFeeBps, setRouteFeeBps] = useState("30");
   const [routePoolAccount, setRoutePoolAccount] = useState("");
   const [routeEnabled, setRouteEnabled] = useState(true);
+  const [routeConfirmed, setRouteConfirmed] = useState(false);
+  const [routeJsonText, setRouteJsonText] = useState("");
   const [routeNote, setRouteNote] = useState("");
   const [routeTestResult, setRouteTestResult] = useState(null);
 
@@ -204,11 +274,35 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
   const canUpsertRoute = useMemo(() => {
     const sym = String(routeSymbol || "").trim().toUpperCase();
+    const mode = String(routeMode || "manual_xyk").trim().toLowerCase();
+    const fee = Number(String(routeFeeBps || "").trim());
+    if (!sym || !sym.includes("-") || !Number.isFinite(fee) || fee < 0) return false;
+    if (mode === "manual_router") {
+      try {
+        const route = parseRouteJsonText(routeJsonText);
+        return Array.isArray(route) && route.length > 0;
+      } catch {
+        return false;
+      }
+    }
     const base = Number(String(routeBaseReserve || "").trim());
     const quote = Number(String(routeQuoteReserve || "").trim());
-    const fee = Number(String(routeFeeBps || "").trim());
-    return !!sym && sym.includes("-") && Number.isFinite(base) && base > 0 && Number.isFinite(quote) && quote > 0 && Number.isFinite(fee) && fee >= 0;
-  }, [routeSymbol, routeBaseReserve, routeQuoteReserve, routeFeeBps]);
+    return Number.isFinite(base) && base > 0 && Number.isFinite(quote) && quote > 0;
+  }, [routeSymbol, routeMode, routeBaseReserve, routeQuoteReserve, routeFeeBps, routeJsonText]);
+
+  useEffect(() => {
+    const mode = String(routeMode || "").trim().toLowerCase();
+    const sym = String(routeSymbol || "").trim().toUpperCase();
+    if (mode !== "manual_router" || !hasKnownHydrationRouteTemplate(sym)) return;
+
+    const current = String(routeJsonText || "").trim();
+    if (current && !isKnownHydrationRouteTemplateText(current)) return;
+
+    const next = safeJsonPretty(hydrationRouteTemplateForSymbol(sym));
+    if (current !== next) {
+      setRouteJsonText(next);
+    }
+  }, [routeMode, routeSymbol, routeJsonText]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -469,22 +563,33 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
   const clearRouteForm = useCallback(() => {
     setRouteSymbol("UTTT-HDX");
+    setRouteMode("manual_xyk");
+    setRoutePoolType("XYK");
     setRouteBaseReserve("");
     setRouteQuoteReserve("");
     setRouteFeeBps("30");
     setRoutePoolAccount("");
     setRouteEnabled(true);
+    setRouteConfirmed(false);
+    setRouteJsonText("");
     setRouteNote("");
     setRouteTestResult(null);
   }, []);
 
   const useRoute = useCallback((row) => {
+    const mode = String(row?.routeMode || row?.route_mode || "manual_xyk").trim().toLowerCase() === "manual_router"
+      ? "manual_router"
+      : "manual_xyk";
     setRouteSymbol(String(row?.symbol || ""));
+    setRouteMode(mode);
+    setRoutePoolType(mode === "manual_router" ? "Router" : "XYK");
     setRouteBaseReserve(row?.baseReserve == null ? "" : String(row.baseReserve));
     setRouteQuoteReserve(row?.quoteReserve == null ? "" : String(row.quoteReserve));
     setRouteFeeBps(row?.feeBps == null ? "30" : String(row.feeBps));
     setRoutePoolAccount(String(row?.poolAccount || row?.pool_account || ""));
     setRouteEnabled(row?.enabled !== false);
+    setRouteConfirmed(row?.confirmed === true);
+    setRouteJsonText(Array.isArray(row?.route) ? safeJsonPretty(row.route) : "");
     setRouteNote(String(row?.note || ""));
     setRouteTestResult(null);
   }, []);
@@ -494,14 +599,23 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     setRouteSaving(true);
     setRouteErr(null);
     try {
+      const mode = String(routeMode || "manual_xyk").trim().toLowerCase() === "manual_router" ? "manual_router" : "manual_xyk";
+      const route = parseRouteJsonText(routeJsonText);
       const payload = {
         symbol: String(routeSymbol || "").trim().toUpperCase(),
-        base_reserve: Number(String(routeBaseReserve || "").trim()),
-        quote_reserve: Number(String(routeQuoteReserve || "").trim()),
+        route_mode: mode,
         fee_bps: Number(String(routeFeeBps || "").trim()),
         enabled: !!routeEnabled,
-        pool_type: "XYK",
+        confirmed: !!routeConfirmed,
+        pool_type: mode === "manual_router" ? "Router" : "XYK",
       };
+      if (mode === "manual_xyk") {
+        payload.base_reserve = Number(String(routeBaseReserve || "").trim());
+        payload.quote_reserve = Number(String(routeQuoteReserve || "").trim());
+      }
+      if (route.length) {
+        payload.route_json = route;
+      }
       const pool = String(routePoolAccount || "").trim();
       if (pool) payload.pool_account = pool;
       const n = String(routeNote || "").trim();
@@ -521,7 +635,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     } finally {
       setRouteSaving(false);
     }
-  }, [API_BASE, canUpsertRoute, routeSymbol, routeBaseReserve, routeQuoteReserve, routeFeeBps, routePoolAccount, routeEnabled, routeNote, loadRoutes]);
+  }, [API_BASE, canUpsertRoute, routeSymbol, routeMode, routeBaseReserve, routeQuoteReserve, routeFeeBps, routePoolAccount, routeEnabled, routeConfirmed, routeJsonText, routeNote, loadRoutes]);
 
   const deleteRoute = useCallback(async (row) => {
     const id = row?.id;
@@ -552,7 +666,8 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     setRouteErr(null);
     setRouteTestResult(null);
     try {
-      const r = await fetch(`${API_BASE}/api/polkadot_dex/hydration/orderbook?symbol=${encodeURIComponent(sym)}&depth=5&route_mode=manual_xyk`, {
+      const testMode = String(row?.routeMode || routeMode || "manual_xyk").toLowerCase() === "manual_router" ? "auto" : "manual_xyk";
+      const r = await fetch(`${API_BASE}/api/polkadot_dex/hydration/orderbook?symbol=${encodeURIComponent(sym)}&depth=5&route_mode=${encodeURIComponent(testMode)}`, {
         method: "GET",
         headers: { accept: "application/json" },
       });
@@ -580,7 +695,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       setRouteErr(msg);
       setRouteTestResult({ kind: "orderbook", ok: false, symbol: sym, error: msg });
     }
-  }, [API_BASE, routeSymbol, routePoolAccount]);
+  }, [API_BASE, routeSymbol, routePoolAccount, routeMode]);
 
   const testRouteLiveReserves = useCallback(async (row) => {
     const sym = String(row?.symbol || routeSymbol || "").trim().toUpperCase();
@@ -636,20 +751,20 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   }, []);
 
   return (
-    <div style={{ color: "var(--utt-text, #e9eef7)" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 10 }}>
-        <div style={{ fontWeight: 800, fontSize: 14 }}>Token / Symbol Registry</div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <select value={chain} onChange={(e) => onChainChange(e.target.value)} style={selectStyle}>
+    <div style={{ color: "var(--utt-text, #e9eef7)", minWidth: 0, maxWidth: "100%" }}>
+      <div style={tokenRegistryHeaderStyle}>
+        <div style={{ fontWeight: 800, fontSize: 14, minWidth: 0 }}>Token / Symbol Registry</div>
+        <div style={tokenRegistryHeaderActionsStyle}>
+          <select value={chain} onChange={(e) => onChainChange(e.target.value)} style={headerSelectStyle}>
             {CHAIN_OPTIONS.map((opt) => (
               <option key={opt} value={opt}>{opt}</option>
             ))}
           </select>
-          <button type="button" onClick={load} style={btnStyle} disabled={loading}>
+          <button type="button" onClick={load} style={headerBtnStyle} disabled={loading}>
             {loading ? "Loading…" : "Refresh"}
           </button>
           {onClose && (
-            <button type="button" onClick={onClose} style={btnStyle}>
+            <button type="button" onClick={onClose} style={headerBtnStyle}>
               Close
             </button>
           )}
@@ -698,7 +813,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
       <div style={panelStyle}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>Add token</div>
-        <div style={{ display: "grid", gridTemplateColumns: "140px minmax(220px, 1fr) 90px 150px 135px minmax(160px, 0.8fr) 90px", gap: 8, alignItems: "center" }}>
+        <div style={addTokenGridStyle}>
           <input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="SYMBOL (e.g. UTTT)" style={inputStyle} />
           <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder={GENERIC_ADDRESS_PLACEHOLDER} style={inputStyle} />
           <input value={decimals} onChange={(e) => setDecimals(e.target.value)} placeholder="decimals" style={inputStyle} />
@@ -729,7 +844,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
             <div>
               <div style={{ fontWeight: 700 }}>Hydration Route Registry</div>
               <div style={{ marginTop: 3, fontSize: 12, opacity: 0.72 }}>
-                Manual XYK routes are used by Route = Auto / Manual XYK when the SDK route is unsupported.
+                Manual XYK rows handle reserve-based pools. Manual Router rows handle confirmed multi-leg paths like DOT → aDOT → HDX.
               </div>
             </div>
             <button type="button" onClick={loadRoutes} style={btnStyle} disabled={routeLoading}>
@@ -739,20 +854,85 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
           <div style={routeFormGridStyle}>
             <input value={routeSymbol} onChange={(e) => setRouteSymbol(e.target.value)} placeholder="PAIR (UTTT-HDX)" style={inputStyle} />
-            <input value={routeBaseReserve} onChange={(e) => setRouteBaseReserve(e.target.value)} placeholder="base reserve" style={inputStyle} />
-            <input value={routeQuoteReserve} onChange={(e) => setRouteQuoteReserve(e.target.value)} placeholder="quote reserve" style={inputStyle} />
+            <select
+              value={routeMode}
+              onChange={(e) => {
+                const mode = e.target.value;
+                setRouteMode(mode);
+                setRoutePoolType(mode === "manual_router" ? "Router" : "XYK");
+                if (mode === "manual_router") {
+                  setRouteBaseReserve("");
+                  setRouteQuoteReserve("");
+                  if (hasKnownHydrationRouteTemplate(routeSymbol)) {
+                    setRouteJsonText(safeJsonPretty(hydrationRouteTemplateForSymbol(routeSymbol)));
+                  }
+                }
+              }}
+              style={selectStyle}
+              title="Hydration route mode"
+            >
+              <option value="manual_xyk">Manual XYK</option>
+              <option value="manual_router">Manual Router</option>
+            </select>
+            <select value={routePoolType} onChange={(e) => setRoutePoolType(e.target.value)} style={selectStyle} title="Pool type">
+              <option value={routeMode === "manual_router" ? "Router" : "XYK"}>{routeMode === "manual_router" ? "Router" : "XYK"}</option>
+            </select>
+            <input
+              value={routeBaseReserve}
+              onChange={(e) => setRouteBaseReserve(e.target.value)}
+              placeholder={routeMode === "manual_router" ? "not used: route JSON below" : "base reserve"}
+              title={routeMode === "manual_router" ? "Manual Router rows do not use reserve fields. Use the route JSON box below." : "Base reserve in human units for Manual XYK rows."}
+              style={{ ...inputStyle, opacity: routeMode === "manual_router" ? 0.58 : 1 }}
+              disabled={routeMode === "manual_router"}
+            />
+            <input
+              value={routeQuoteReserve}
+              onChange={(e) => setRouteQuoteReserve(e.target.value)}
+              placeholder={routeMode === "manual_router" ? "not used: route JSON below" : "quote reserve"}
+              title={routeMode === "manual_router" ? "Manual Router rows do not use reserve fields. Use the route JSON box below." : "Quote reserve in human units for Manual XYK rows."}
+              style={{ ...inputStyle, opacity: routeMode === "manual_router" ? 0.58 : 1 }}
+              disabled={routeMode === "manual_router"}
+            />
             <input value={routeFeeBps} onChange={(e) => setRouteFeeBps(e.target.value)} placeholder="fee bps" style={inputStyle} />
             <input value={routePoolAccount} onChange={(e) => setRoutePoolAccount(e.target.value)} placeholder="pool account (optional live reserves)" title={routePoolAccount} style={{ ...inputStyle, fontFamily: codeStyle.fontFamily, fontSize: 11 }} />
             <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, whiteSpace: "nowrap" }}>
               <input type="checkbox" checked={!!routeEnabled} onChange={(e) => setRouteEnabled(e.target.checked)} /> Enabled
             </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, whiteSpace: "nowrap" }} title="Only mark confirmed after a tiny on-chain success for this exact route direction.">
+              <input type="checkbox" checked={!!routeConfirmed} onChange={(e) => setRouteConfirmed(e.target.checked)} /> Confirmed
+            </label>
             <input value={routeNote} onChange={(e) => setRouteNote(e.target.value)} placeholder="note (optional)" style={inputStyle} />
+            <button
+              type="button"
+              onClick={() => {
+                setRouteMode("manual_router");
+                setRoutePoolType("Router");
+                setRouteBaseReserve("");
+                setRouteQuoteReserve("");
+                setRouteJsonText(safeJsonPretty(hydrationRouteTemplateForSymbol(routeSymbol)));
+              }}
+              style={btnStyle}
+              disabled={routeMode !== "manual_router"}
+            >
+              Load route template
+            </button>
             <button type="button" onClick={upsertRoute} style={btnStyle} disabled={!canUpsertRoute || routeSaving}>
               {routeSaving ? "Saving…" : "Save route"}
             </button>
           </div>
+          {routeMode === "manual_router" && (
+            <div style={{ marginTop: 8 }}>
+              <textarea
+                value={routeJsonText}
+                onChange={(e) => setRouteJsonText(e.target.value)}
+                placeholder={'Route JSON, e.g. [{"pool":{"type":"Aave"},"assetIn":5,"assetOut":1001},{"pool":{"type":"Omnipool"},"assetIn":1001,"assetOut":0}]'}
+                style={routeJsonTextAreaStyle}
+                spellCheck={false}
+              />
+            </div>
+          )}
           <div style={{ marginTop: 6, fontSize: 12, opacity: 0.72 }}>
-            Pair reserves are human units. Example: <code style={codeStyle}>UTTT-HDX</code> base reserve <code style={codeStyle}>1000000</code>, quote reserve <code style={codeStyle}>832.45</code>, fee bps <code style={codeStyle}>30</code>. Add a pool account to use live on-chain reserves instead of the static snapshot.
+            Manual XYK reserves are human units. Manual Router rows do not use the reserve fields — they use the route JSON box instead. For DOT-HDX use DOT(5) → Aave → aDOT(1001) → Omnipool → HDX(0); for HDX-DOT use the reverse route. Click “Load route template” after entering the pair, then mark Confirmed only after a tiny live on-chain success.
           </div>
           {routeErr && <div style={{ marginTop: 8, color: "#ffb3b3", fontSize: 12 }}>{routeErr}</div>}
           {routeTestResult && (
@@ -808,19 +988,30 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                   <tr key={row.id} style={{ borderTop: "1px solid rgba(255,255,255,0.08)", opacity: row.enabled === false ? 0.58 : 1 }}>
                     <td style={tdStyle}>
                       <div style={{ fontWeight: 700 }}>{row.symbol}</div>
-                      <div style={{ fontSize: 11, opacity: 0.7 }}>{row.enabled === false ? "disabled" : row.routeMode || "manual_xyk"}</div>
+                      <div style={{ fontSize: 11, opacity: 0.7 }}>
+                          {row.enabled === false ? "disabled" : routeModeLabel(row.routeMode || "manual_xyk")}
+                          {row.confirmed ? " · confirmed" : ""}
+                        </div>
                     </td>
                     <td style={tdStyle}>
                       <code style={codeStyle}>{row.baseAssetId}</code> → <code style={codeStyle}>{row.quoteAssetId}</code>
                     </td>
                     <td style={tdStyle}>
-                      <div>{Number(row.baseReserve || 0).toLocaleString()} {row.baseSymbol}</div>
-                      <div>{Number(row.quoteReserve || 0).toLocaleString()} {row.quoteSymbol}</div>
+                      {String(row.routeMode || "").toLowerCase() === "manual_router" ? (
+                        <div style={{ opacity: 0.75 }}>route JSON</div>
+                      ) : (
+                        <>
+                          <div>{Number(row.baseReserve || 0).toLocaleString()} {row.baseSymbol}</div>
+                          <div>{Number(row.quoteReserve || 0).toLocaleString()} {row.quoteSymbol}</div>
+                        </>
+                      )}
                     </td>
                     <td style={tdStyle}>{row.feeBps ?? "—"} bps</td>
                     <td style={tdStyle}>
                       <div>
-                        <span style={{ opacity: 0.8 }}>{row.poolType || "XYK"}</span>
+                        <span style={{ opacity: 0.8 }}>{row.poolType || (String(row.routeMode || "").toLowerCase() === "manual_router" ? "Router" : "XYK")}</span>
+                        {Array.isArray(row.route) && row.route.length ? <span style={{ opacity: 0.55 }}> · {row.route.length} leg{row.route.length === 1 ? "" : "s"}</span> : null}
+                        {row.confirmed ? <span style={{ opacity: 0.65, color: "#b8f7c7" }}> · confirmed</span> : null}
                         {(row.poolAccount || row.pool_account) ? <span style={{ opacity: 0.55 }}> · live pool account</span> : null}
                       </div>
                       {(row.poolAccount || row.pool_account) ? (
@@ -832,14 +1023,14 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                           <div style={{ marginTop: 4, color: "#ffe2a6", fontSize: 11 }}>⚠ monitor isolated-pool TVL</div>
                         </>
                       ) : (
-                        <span style={{ opacity: 0.55 }}>snapshot only</span>
+                        <span style={{ opacity: 0.55 }}>{String(row.routeMode || "").toLowerCase() === "manual_router" ? "manual Router path" : "snapshot only"}</span>
                       )}
                     </td>
                     <td style={tdStyle}>
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                         <button type="button" style={btnStyle} onClick={() => useRoute(row)}>Use</button>
                         <button type="button" style={btnStyle} onClick={() => testRouteOrderbook(row)}>Test orderbook</button>
-                        <button type="button" style={btnStyle} onClick={() => testRouteLiveReserves(row)}>Live reserves</button>
+                        <button type="button" style={btnStyle} onClick={() => testRouteLiveReserves(row)} disabled={String(row.routeMode || "").toLowerCase() === "manual_router"}>Live reserves</button>
                         <button type="button" style={dangerBtnStyle} onClick={() => deleteRoute(row)} disabled={routeSaving}>Delete</button>
                       </div>
                     </td>
@@ -848,7 +1039,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                 {!routes?.length && (
                   <tr>
                     <td colSpan={6} style={{ ...tdStyle, opacity: 0.7 }}>
-                      No manual Hydration routes yet. SDK-supported pairs do not need rows.
+                      No manual Hydration routes yet. Add manual XYK rows for custom pools or manual Router rows for confirmed multi-leg paths.
                     </td>
                   </tr>
                 )}
@@ -990,15 +1181,41 @@ const panelStyle = {
   background: "rgba(255,255,255,0.04)",
 };
 
-const routeFormGridStyle = {
+const addTokenGridStyle = {
   display: "grid",
-  gridTemplateColumns: "140px 130px 130px 90px minmax(280px, 1.4fr) 90px minmax(180px, 1fr) 115px",
+  gridTemplateColumns: "repeat(auto-fit, minmax(135px, 1fr))",
   gap: 8,
   alignItems: "center",
+  maxWidth: "100%",
+};
+
+const routeFormGridStyle = {
+  display: "grid",
+  gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+  gap: 8,
+  alignItems: "center",
+  maxWidth: "100%",
+};
+
+const routeJsonTextAreaStyle = {
+  width: "100%",
+  minHeight: 92,
+  minWidth: 0,
+  boxSizing: "border-box",
+  padding: "8px 10px",
+  borderRadius: 10,
+  border: "1px solid rgba(255,255,255,0.12)",
+  background: "rgba(0,0,0,0.25)",
+  color: "var(--utt-text, #e9eef7)",
+  outline: "none",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+  fontSize: 11,
+  resize: "vertical",
 };
 
 const inputStyle = {
   width: "100%",
+  minWidth: 0,
   padding: "8px 10px",
   borderRadius: 10,
   border: "1px solid rgba(255,255,255,0.12)",
@@ -1009,6 +1226,9 @@ const inputStyle = {
 };
 
 const selectStyle = {
+  width: "100%",
+  minWidth: 0,
+  boxSizing: "border-box",
   padding: "8px 10px",
   borderRadius: 10,
   border: "1px solid rgba(255,255,255,0.12)",
@@ -1018,6 +1238,7 @@ const selectStyle = {
 };
 
 const btnStyle = {
+  minWidth: 0,
   fontSize: 12,
   padding: "8px 10px",
   borderRadius: 10,
@@ -1025,6 +1246,40 @@ const btnStyle = {
   background: "rgba(255,255,255,0.06)",
   color: "var(--utt-text, #e9eef7)",
   cursor: "pointer",
+};
+
+
+const tokenRegistryHeaderStyle = {
+  display: "flex",
+  justifyContent: "space-between",
+  gap: 10,
+  alignItems: "center",
+  marginBottom: 10,
+  flexWrap: "wrap",
+  minWidth: 0,
+  maxWidth: "100%",
+};
+
+const tokenRegistryHeaderActionsStyle = {
+  display: "flex",
+  gap: 8,
+  alignItems: "center",
+  justifyContent: "flex-end",
+  flexWrap: "wrap",
+  minWidth: 0,
+  maxWidth: "100%",
+};
+
+const headerSelectStyle = {
+  ...selectStyle,
+  width: 132,
+  flex: "0 0 132px",
+};
+
+const headerBtnStyle = {
+  ...btnStyle,
+  flex: "0 0 auto",
+  whiteSpace: "nowrap",
 };
 
 const dangerBtnStyle = {

@@ -49,6 +49,8 @@ def _hydration_route_mode(raw: Optional[str] = None) -> str:
         "helper": "isolated_helper",
         "manual": "manual_xyk",
         "xyk": "manual_xyk",
+        "router": "manual_router",
+        "manual_router_fallback": "manual_router",
     }
     mode = aliases.get(mode, mode)
     if mode not in _HYDRATION_ROUTE_MODES:
@@ -67,6 +69,8 @@ def _hydration_route_mode_label(mode: str, *, manual: bool = False) -> str:
     m = _hydration_route_mode(mode)
     if manual:
         return "manual_xyk_pool_fallback"
+    if m == "manual_router":
+        return "manual_router_route_registry"
     if m == "isolated_helper":
         return "galactic_sdk_next_isolated_helper"
     return "galactic_sdk_next_helper"
@@ -139,7 +143,47 @@ except Exception:
 # request timeout inside the persistent sidecar.  Default orderbook samples to
 # short-lived helper processes so a bad pair cannot poison live SELL/swap routing.
 _HYDRATION_ORDERBOOK_FORCE_ISOLATED_HELPER = _env_bool("UTT_HYDRATION_ORDERBOOK_FORCE_ISOLATED_HELPER", False)
-_HYDRATION_ROUTE_MODES = {"auto", "sdk", "isolated_helper", "manual_xyk"}
+# Visual orderbook fallback for generic Hydration pairs when sdk-next/PAPI
+# getBestSell quote sampling times out or router quotes are intentionally gated.
+# This uses cached/external USD prices only; it does not mark the pair tradable
+# and does not build/sign/submit swaps.
+_HYDRATION_ENABLE_ORDERBOOK_SYNTHETIC_FALLBACK = _env_bool("UTT_HYDRATION_ENABLE_ORDERBOOK_SYNTHETIC_FALLBACK", True)
+_HYDRATION_ORDERBOOK_SYNTHETIC_REFRESH = _env_bool("UTT_HYDRATION_ORDERBOOK_SYNTHETIC_REFRESH", True)
+try:
+    _HYDRATION_ORDERBOOK_SYNTHETIC_SPREAD_BPS = float(os.getenv("UTT_HYDRATION_ORDERBOOK_SYNTHETIC_SPREAD_BPS") or "35")
+except Exception:
+    _HYDRATION_ORDERBOOK_SYNTHETIC_SPREAD_BPS = 35.0
+# Temporary controlled manual-router fallback for known Hydration Omnipool pairs.
+# This does not use sdk-next router quotes. It builds Router.sell call data from
+# a fixed route candidate and a conservative min-out derived from cached/external
+# USD prices. Keep this bounded until route-registry v2 can store confirmed
+# non-XYK routes with a first-class quote source.
+_HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK = _env_bool("UTT_HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK", True)
+_HYDRATION_MANUAL_ROUTER_FALLBACK_PAIRS_CSV = (
+    os.getenv("UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_PAIRS")
+    or ""
+).strip()
+_HYDRATION_MANUAL_ROUTER_FALLBACK_CONFIRMED_PAIRS_CSV = (
+    os.getenv("UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_CONFIRMED_PAIRS")
+    or ""
+).strip()
+_HYDRATION_ALLOW_UNCONFIRMED_MANUAL_ROUTER_FALLBACK = _env_bool(
+    "UTT_HYDRATION_ALLOW_UNCONFIRMED_MANUAL_ROUTER_FALLBACK",
+    False,
+)
+_HYDRATION_MANUAL_ROUTER_FALLBACK_POOL = (
+    os.getenv("UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_POOL")
+    or "Omnipool"
+).strip() or "Omnipool"
+_HYDRATION_MANUAL_ROUTER_FALLBACK_ROUTES_JSON = (
+    os.getenv("UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_ROUTES_JSON")
+    or "{}"
+).strip()
+try:
+    _HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD = float(os.getenv("UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD") or "5")
+except Exception:
+    _HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD = 5.0
+_HYDRATION_ROUTE_MODES = {"auto", "sdk", "isolated_helper", "manual_xyk", "manual_router"}
 _HYDRATION_DEFAULT_ROUTE_MODE = (os.getenv("UTT_HYDRATION_ROUTE_MODE") or "auto").strip().lower()
 if _HYDRATION_DEFAULT_ROUTE_MODE not in _HYDRATION_ROUTE_MODES:
     _HYDRATION_DEFAULT_ROUTE_MODE = "auto"
@@ -2333,6 +2377,9 @@ def _ensure_hydration_route_registry_table(db: Session) -> None:
             quote_reserve REAL,
             fee_bps REAL,
             route_json TEXT,
+            confirmed INTEGER DEFAULT 0,
+            tested_at TEXT,
+            last_test_tx_hash TEXT,
             note TEXT,
             created_at TEXT,
             updated_at TEXT
@@ -2357,6 +2404,9 @@ def _ensure_hydration_route_registry_table(db: Session) -> None:
         "quote_reserve": "REAL",
         "fee_bps": "REAL",
         "route_json": "TEXT",
+        "confirmed": "INTEGER DEFAULT 0",
+        "tested_at": "TEXT",
+        "last_test_tx_hash": "TEXT",
         "note": "TEXT",
         "created_at": "TEXT",
         "updated_at": "TEXT",
@@ -2384,17 +2434,25 @@ def _hydration_route_registry_row_to_cfg(row: Any, *, pair: str, reverse: bool =
     if row is None:
         return None
     r = dict(row) if not isinstance(row, dict) else dict(row)
-    if str(r.get("route_mode") or "manual_xyk").strip().lower() not in {"manual_xyk", "manual", "xyk"}:
-        return None
-    if str(r.get("pool_type") or "XYK").strip().upper() != "XYK":
+
+    route_mode = str(r.get("route_mode") or "manual_xyk").strip().lower()
+    if route_mode in {"manual", "xyk"}:
+        route_mode = "manual_xyk"
+    if route_mode in {"router", "manual_router_fallback"}:
+        route_mode = "manual_router"
+    if route_mode not in {"manual_xyk", "manual_router"}:
         return None
 
-    base_reserve = _float_or_none(r.get("base_reserve"))
-    quote_reserve = _float_or_none(r.get("quote_reserve"))
-    if base_reserve is None or quote_reserve is None:
-        return None
-    if reverse:
-        base_reserve, quote_reserve = quote_reserve, base_reserve
+    pool_type_raw = str(r.get("pool_type") or ("Router" if route_mode == "manual_router" else "XYK")).strip()
+    pool_type_norm = pool_type_raw.lower()
+    is_manual_router = route_mode == "manual_router" or pool_type_norm in {"router", "manual_router", "manual router"}
+    if is_manual_router:
+        route_mode = "manual_router"
+        pool_type = "Router"
+    else:
+        pool_type = "XYK"
+        if pool_type_norm != "xyk":
+            return None
 
     route_json = r.get("route_json")
     route: Optional[List[Dict[str, Any]]] = None
@@ -2408,18 +2466,52 @@ def _hydration_route_registry_row_to_cfg(row: Any, *, pair: str, reverse: bool =
         route = None
 
     source_symbol = str(r.get("symbol") or pair).strip().upper()
+
+    if route_mode == "manual_router":
+        if not isinstance(route, list) or not route:
+            return None
+        confirmed = bool(int(r.get("confirmed") if r.get("confirmed") is not None else 0))
+        return {
+            "pair": pair,
+            "routeMode": "manual_router",
+            "pool": "Router",
+            "poolType": pool_type,
+            "route": route,
+            "poolAccount": str(r.get("pool_account") or "").strip() or None,
+            "source": "db:hydration_route_registry:manual_router" + (":reversed" if reverse else ""),
+            "sourcePair": source_symbol,
+            "routeRegistryId": r.get("id"),
+            "routeRegistrySymbol": source_symbol,
+            "executionConfirmed": confirmed,
+            "confirmed": confirmed,
+            "testedAt": r.get("tested_at"),
+            "lastTestTxHash": r.get("last_test_tx_hash"),
+            "note": r.get("note") or "Manual Hydration Router route registry entry.",
+        }
+
+    base_reserve = _float_or_none(r.get("base_reserve"))
+    quote_reserve = _float_or_none(r.get("quote_reserve"))
+    if base_reserve is None or quote_reserve is None:
+        return None
+    if reverse:
+        base_reserve, quote_reserve = quote_reserve, base_reserve
+
     return {
         "pair": pair,
+        "routeMode": "manual_xyk",
         "baseReserve": float(base_reserve),
         "quoteReserve": float(quote_reserve),
         "feeBps": float(_float_or_none(r.get("fee_bps")) or 30.0),
         "pool": "XYK",
+        "poolType": "XYK",
         "route": route,
         "poolAccount": str(r.get("pool_account") or "").strip() or None,
         "source": "db:hydration_route_registry" + (":reversed" if reverse else ""),
         "sourcePair": source_symbol,
         "routeRegistryId": r.get("id"),
         "routeRegistrySymbol": source_symbol,
+        "executionConfirmed": True,
+        "confirmed": True,
         "note": r.get("note") or "Manual Hydration XYK route registry entry.",
     }
 
@@ -2462,6 +2554,59 @@ def _hydration_route_registry_manual_config(
     return None
 
 
+
+
+def _hydration_route_registry_manual_router_config(
+    *,
+    db: Optional[Session],
+    base: str,
+    quote: str,
+    asset_in_id: int,
+    asset_out_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Return a DB-backed manual Router route oriented to asset_in -> asset_out.
+
+    This is the v2 route-registry path for Hydration multi-leg routes such as
+    DOT -> aDOT -> HDX. It keeps routing assets and confirmation state in the UI
+    instead of hard-coded backend defaults.
+    """
+    if db is None:
+        return None
+    pair = f"{str(base or '').upper()}-{str(quote or '').upper()}"
+    reverse_pair = f"{str(quote or '').upper()}-{str(base or '').upper()}"
+    try:
+        _ensure_hydration_route_registry_table(db)
+        for symbol, reverse in ((pair, False), (reverse_pair, True)):
+            row = db.execute(
+                text("""
+                    SELECT * FROM hydration_route_registry
+                    WHERE UPPER(symbol) = :symbol
+                      AND COALESCE(enabled, 1) = 1
+                    LIMIT 1
+                """),
+                {"symbol": symbol},
+            ).mappings().first()
+            if not row:
+                continue
+            cfg = _hydration_route_registry_row_to_cfg(row, pair=pair, reverse=reverse)
+            if not isinstance(cfg, dict) or str(cfg.get("routeMode") or "").lower() != "manual_router":
+                continue
+            route = _normalize_manual_router_route(
+                cfg.get("route"),
+                asset_in_id=int(asset_in_id),
+                asset_out_id=int(asset_out_id),
+            )
+            if not route:
+                continue
+            out = dict(cfg)
+            out["pair"] = pair
+            out["route"] = route
+            out["assetInId"] = int(asset_in_id)
+            out["assetOutId"] = int(asset_out_id)
+            return out
+    except Exception:
+        return None
+    return None
 
 
 def _hydration_pool_account_from_cfg(cfg: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -2910,6 +3055,697 @@ def _decimal_ui_to_atomic_floor(value: Decimal, decimals: int) -> int:
 
 def _decimal_ui_to_atomic_ceil(value: Decimal, decimals: int) -> int:
     return int((value * (Decimal(10) ** int(decimals))).to_integral_value(rounding=ROUND_CEILING))
+
+
+def _manual_router_fallback_pairs_from_csv(raw_csv: str) -> set[str]:
+    out: set[str] = set()
+    for raw in str(raw_csv or "").split(","):
+        pair = str(raw or "").strip().upper()
+        if not pair or "-" not in pair:
+            continue
+        try:
+            left, right = _parse_symbol(pair)
+            out.add(f"{left}-{right}")
+        except Exception:
+            continue
+    return out
+
+
+def _manual_router_fallback_allowed_pairs() -> set[str]:
+    return _manual_router_fallback_pairs_from_csv(_HYDRATION_MANUAL_ROUTER_FALLBACK_PAIRS_CSV)
+
+
+def _manual_router_fallback_confirmed_pairs() -> set[str]:
+    return _manual_router_fallback_pairs_from_csv(_HYDRATION_MANUAL_ROUTER_FALLBACK_CONFIRMED_PAIRS_CSV)
+
+
+def _manual_router_fallback_pair_allowed(base: str, quote: str) -> bool:
+    pair = f"{str(base or '').upper()}-{str(quote or '').upper()}"
+    return pair in _manual_router_fallback_allowed_pairs()
+
+
+def _manual_router_fallback_pair_confirmed(base: str, quote: str) -> bool:
+    pair = f"{str(base or '').upper()}-{str(quote or '').upper()}"
+    return pair in _manual_router_fallback_confirmed_pairs()
+
+
+def _manual_router_fallback_routes_map() -> Dict[str, List[Dict[str, Any]]]:
+    try:
+        raw = json.loads(_HYDRATION_MANUAL_ROUTER_FALLBACK_ROUTES_JSON or "{}")
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for key, route in raw.items():
+        try:
+            base, quote = _parse_symbol(str(key or ""))
+        except Exception:
+            continue
+        if not isinstance(route, list) or not route:
+            continue
+        clean_route = [dict(leg) for leg in route if isinstance(leg, dict)]
+        if clean_route:
+            out[f"{base}-{quote}"] = clean_route
+    return out
+
+
+def _manual_router_pool_payload(pool: Any) -> Dict[str, str]:
+    if isinstance(pool, dict):
+        pool_type = str(pool.get("type") or pool.get("value") or "").strip()
+    else:
+        pool_type = str(pool or "").strip()
+    if not pool_type:
+        pool_type = str(_HYDRATION_MANUAL_ROUTER_FALLBACK_POOL or "Omnipool")
+    return {"type": pool_type}
+
+
+def _normalize_manual_router_route(
+    route: Any,
+    *,
+    asset_in_id: int,
+    asset_out_id: int,
+) -> Optional[List[Dict[str, Any]]]:
+    if not isinstance(route, list) or not route:
+        return None
+
+    out: List[Dict[str, Any]] = []
+    for leg in route:
+        if not isinstance(leg, dict):
+            return None
+        leg_in = _route_leg_asset_value(leg, "assetIn", "asset_in")
+        leg_out = _route_leg_asset_value(leg, "assetOut", "asset_out")
+        if leg_in is None or leg_out is None:
+            return None
+        out.append({
+            "pool": _manual_router_pool_payload(leg.get("pool")),
+            "assetIn": int(leg_in),
+            "assetOut": int(leg_out),
+        })
+
+    if not out:
+        return None
+    first_in = _route_leg_asset_value(out[0], "assetIn", "asset_in")
+    last_out = _route_leg_asset_value(out[-1], "assetOut", "asset_out")
+    if first_in != int(asset_in_id) or last_out != int(asset_out_id):
+        return None
+
+    # Each route leg must feed into the next one. This catches malformed
+    # DOT-HDX style routes before they can be signed.
+    for idx in range(len(out) - 1):
+        cur_out = _route_leg_asset_value(out[idx], "assetOut", "asset_out")
+        next_in = _route_leg_asset_value(out[idx + 1], "assetIn", "asset_in")
+        if cur_out != next_in:
+            return None
+    return out
+
+
+def _manual_router_fallback_configured_route(
+    *,
+    base: str,
+    quote: str,
+    asset_in_id: int,
+    asset_out_id: int,
+    db: Optional[Session] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    db_cfg = _hydration_route_registry_manual_router_config(
+        db=db,
+        base=base,
+        quote=quote,
+        asset_in_id=int(asset_in_id),
+        asset_out_id=int(asset_out_id),
+    )
+    if isinstance(db_cfg, dict):
+        route = _normalize_manual_router_route(
+            db_cfg.get("route"),
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+        )
+        if route:
+            return route
+
+    pair = f"{str(base or '').upper()}-{str(quote or '').upper()}"
+    routes = _manual_router_fallback_routes_map()
+
+    direct = _normalize_manual_router_route(
+        routes.get(pair),
+        asset_in_id=int(asset_in_id),
+        asset_out_id=int(asset_out_id),
+    )
+    if direct:
+        return direct
+
+    # Env fallback only: if one direction was configured, try a mechanically
+    # reversed version. DB route-registry confirmation still needs each live
+    # direction to be explicitly confirmed before normal signing.
+    reverse_pair = f"{str(quote or '').upper()}-{str(base or '').upper()}"
+    reverse_route = _reverse_hydration_route_legs(routes.get(reverse_pair))
+    return _normalize_manual_router_route(
+        reverse_route,
+        asset_in_id=int(asset_in_id),
+        asset_out_id=int(asset_out_id),
+    )
+
+
+def _manual_router_fallback_route(
+    asset_in_id: int,
+    asset_out_id: int,
+    *,
+    base: Optional[str] = None,
+    quote: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> List[Dict[str, Any]]:
+    if base and quote:
+        configured = _manual_router_fallback_configured_route(
+            base=base,
+            quote=quote,
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+            db=db,
+        )
+        if configured:
+            return configured
+
+    return [{
+        "pool": _manual_router_pool_payload(_HYDRATION_MANUAL_ROUTER_FALLBACK_POOL or "Omnipool"),
+        "assetIn": int(asset_in_id),
+        "assetOut": int(asset_out_id),
+    }]
+
+
+async def _hydration_manual_router_fallback_diagnostics(
+    *,
+    db: Optional[Session],
+    base: str,
+    quote: str,
+    side: str,
+    amount_ui: float,
+    amount_mode: str,
+    slippage_bps: int,
+    base_meta: Dict[str, Any],
+    quote_meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return an explainable preflight report for the manual Router fallback.
+
+    This is intentionally diagnostic-only.  The real swap plan is still built by
+    _hydration_manual_router_fallback_plan so we do not create a second execution
+    path.  The goal is to make /swap_tx failures explain why the fallback did or
+    did not attach before the SDK-router guard.
+    """
+    pair = f"{str(base or '').upper()}-{str(quote or '').upper()}"
+    side_norm = str(side or "").strip().lower()
+    mode = str(amount_mode or "").strip().lower()
+    diag: Dict[str, Any] = {
+        "enabled": bool(_HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK),
+        "pair": pair,
+        "side": side_norm,
+        "amountMode": mode,
+        "amount": float(amount_ui) if _float_or_none(amount_ui) is not None else amount_ui,
+        "slippageBps": int(slippage_bps),
+        "allowedPairs": sorted(_manual_router_fallback_allowed_pairs()),
+        "confirmedPairs": sorted(_manual_router_fallback_confirmed_pairs()),
+        "allowUnconfirmed": bool(_HYDRATION_ALLOW_UNCONFIRMED_MANUAL_ROUTER_FALLBACK),
+        "maxInputUsd": float(_HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD),
+        "eligibleSellExactIn": bool(side_norm == "sell" and mode == "exact_in"),
+        "eligibleBuyExactOut": bool(side_norm == "buy" and mode == "exact_out"),
+        "pairAllowed": bool(_manual_router_fallback_pair_allowed(base, quote)),
+        "pairConfirmed": bool(_manual_router_fallback_pair_confirmed(base, quote)),
+        "attached": False,
+        "ready": False,
+        "reason": None,
+    }
+
+    if not _HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK:
+        diag["reason"] = "manual_router_fallback_disabled"
+        return diag
+    if not ((side_norm == "sell" and mode == "exact_in") or (side_norm == "buy" and mode == "exact_out")):
+        diag["reason"] = "manual_router_fallback_requires_sell_exact_in_or_buy_exact_out"
+        return diag
+
+    try:
+        if side_norm == "buy":
+            asset_in_id = _hydration_sdk_asset_id(quote_meta)
+            asset_out_id = _hydration_sdk_asset_id(base_meta)
+            asset_in_symbol = str((quote_meta or {}).get("symbol") or quote or "").upper()
+            asset_out_symbol = str((base_meta or {}).get("symbol") or base or "").upper()
+            route_base = quote
+            route_quote = base
+        else:
+            asset_in_id = _hydration_sdk_asset_id(base_meta)
+            asset_out_id = _hydration_sdk_asset_id(quote_meta)
+            asset_in_symbol = str((base_meta or {}).get("symbol") or base or "").upper()
+            asset_out_symbol = str((quote_meta or {}).get("symbol") or quote or "").upper()
+            route_base = base
+            route_quote = quote
+
+        diag["routeDirection"] = f"{str(route_base or '').upper()}-{str(route_quote or '').upper()}"
+        diag["pairAllowed"] = bool(_manual_router_fallback_pair_allowed(route_base, route_quote))
+        diag["pairConfirmed"] = bool(_manual_router_fallback_pair_confirmed(route_base, route_quote))
+        if not diag["pairAllowed"]:
+            diag["reason"] = "manual_router_fallback_pair_not_allowlisted"
+            return diag
+        configured_route = _manual_router_fallback_configured_route(
+            base=route_base,
+            quote=route_quote,
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+            db=db,
+        )
+        route = _manual_router_fallback_route(
+            asset_in_id,
+            asset_out_id,
+            base=route_base,
+            quote=route_quote,
+            db=db,
+        )
+        diag.update({
+            "assetInId": int(asset_in_id),
+            "assetOutId": int(asset_out_id),
+            "assetInSymbol": asset_in_symbol,
+            "assetOutSymbol": asset_out_symbol,
+            "configuredRouteAvailable": bool(configured_route),
+            "routeSource": "manual_router_fallback_routes_json" if configured_route else "manual_router_fallback_generated",
+            "route": route,
+        })
+
+        price_payload = await _hydration_refresh_usd_price_cache(
+            db=db,
+            requested=[asset_in_symbol, asset_out_symbol],
+            force_refresh=False,
+            allow_refresh=True,
+        )
+        prices = dict((price_payload or {}).get("prices_usd") or (price_payload or {}).get("usd_prices") or {})
+        sources = dict((price_payload or {}).get("priceSources") or {})
+        in_usd = _float_or_none(prices.get(asset_in_symbol))
+        out_usd = _float_or_none(prices.get(asset_out_symbol))
+        input_usd = float(amount_ui) * float(in_usd) if in_usd is not None else None
+        diag.update({
+            "priceCacheStatus": (price_payload or {}).get("status"),
+            "priceCacheDetail": (price_payload or {}).get("statusDetail"),
+            "usdPrices": {
+                asset_in_symbol: in_usd,
+                asset_out_symbol: out_usd,
+            },
+            "priceSources": {
+                asset_in_symbol: sources.get(asset_in_symbol),
+                asset_out_symbol: sources.get(asset_out_symbol),
+            },
+            "inputUsd": input_usd,
+        })
+
+        if in_usd is None or out_usd is None or out_usd <= 0:
+            diag["reason"] = "manual_router_fallback_price_missing"
+            return diag
+
+        max_input_usd = max(0.0, float(_HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD))
+        if max_input_usd > 0 and input_usd is not None and input_usd > max_input_usd:
+            diag["reason"] = "manual_router_fallback_input_too_large"
+            return diag
+
+        if not diag["pairConfirmed"] and not _HYDRATION_ALLOW_UNCONFIRMED_MANUAL_ROUTER_FALLBACK:
+            diag["reason"] = "manual_router_fallback_pair_unconfirmed"
+            return diag
+
+        diag["ready"] = True
+        diag["reason"] = "manual_router_fallback_ready"
+        return diag
+    except HTTPException as e:
+        diag["reason"] = "manual_router_fallback_http_error"
+        diag["detail"] = e.detail
+        return diag
+    except Exception as e:
+        diag["reason"] = "manual_router_fallback_exception"
+        diag["error"] = type(e).__name__
+        diag["message"] = str(e)
+        return diag
+
+
+def _hydration_mark_manual_router_diag_attached(
+    diag: Optional[Dict[str, Any]],
+    manual_custom_swap: Optional[Dict[str, Any]],
+) -> None:
+    """Normalize diagnostics after a DB/manual Router plan successfully attaches.
+
+    The older diagnostics were originally env allow-list oriented.  Route
+    Registry v2 can attach confirmed DB routes even when the env allow-list is
+    intentionally empty, so the final response should not keep stale
+    pair_not_allowlisted/ready=false wording after a manual Router plan is
+    already attached.
+    """
+    if not isinstance(diag, dict):
+        return
+    if not (isinstance(manual_custom_swap, dict) and manual_custom_swap.get("manualRouterFallback")):
+        return
+
+    execution_confirmed = bool(manual_custom_swap.get("executionConfirmed"))
+    pool_source = str(manual_custom_swap.get("poolSource") or "")
+    db_backed = pool_source.startswith("db:") or bool(manual_custom_swap.get("routeRegistryId"))
+
+    diag.update({
+        "attempted": True,
+        "attached": True,
+        "ready": execution_confirmed,
+        "reason": "manual_router_fallback_ready" if execution_confirmed else "manual_router_fallback_attached_unconfirmed",
+        "planReason": "manual_router_fallback_attached",
+        "configuredRouteAvailable": True,
+        "routeSource": pool_source or diag.get("routeSource"),
+        "route": manual_custom_swap.get("route") or diag.get("route"),
+        "routeDirection": manual_custom_swap.get("routeDirection") or diag.get("routeDirection"),
+        "assetInId": manual_custom_swap.get("assetInId", diag.get("assetInId")),
+        "assetOutId": manual_custom_swap.get("assetOutId", diag.get("assetOutId")),
+        "assetInSymbol": manual_custom_swap.get("assetInSymbol", diag.get("assetInSymbol")),
+        "assetOutSymbol": manual_custom_swap.get("assetOutSymbol", diag.get("assetOutSymbol")),
+        "routeRegistryId": manual_custom_swap.get("routeRegistryId") or diag.get("routeRegistryId"),
+        "routeRegistrySymbol": manual_custom_swap.get("routeRegistrySymbol") or diag.get("routeRegistrySymbol"),
+    })
+
+    if db_backed:
+        diag["pairAllowed"] = True
+        diag["pairConfirmed"] = execution_confirmed
+        diag["allowSource"] = "db:hydration_route_registry:manual_router"
+        diag["confirmedSource"] = "db:hydration_route_registry:manual_router" if execution_confirmed else None
+
+
+def _hydration_quote_status_with_manual_custom_swap(
+    quote_status: Dict[str, Any],
+    *,
+    manual_custom_swap: Optional[Dict[str, Any]],
+    side: str,
+    amount_mode: str,
+) -> Dict[str, Any]:
+    """Return request-local quote/swap status with manual route availability.
+
+    Global SDK flags can correctly remain disabled while a confirmed DB manual
+    Router route is still executable.  Annotate the request payload so UI/debug
+    output does not imply BUY/manual-router swaps are unavailable merely because
+    sdk-next router quote loops are disabled.
+    """
+    out = dict(quote_status or {})
+    if not (isinstance(manual_custom_swap, dict) and manual_custom_swap.get("manualRouterFallback")):
+        return out
+
+    execution_confirmed = bool(manual_custom_swap.get("executionConfirmed"))
+    method = str(manual_custom_swap.get("method") or "").strip().lower()
+    side_norm = str(side or "").strip().lower()
+    mode_norm = str(amount_mode or "").strip().lower()
+    route_exact_buy = bool(side_norm == "buy" and mode_norm == "exact_out" and method == "buy")
+
+    out.update({
+        "manualRouterFallbackAvailable": True,
+        "manualRouterExecutionConfirmed": execution_confirmed,
+        "manualRouterMethod": method or None,
+        "manualRouterRouteDirection": manual_custom_swap.get("routeDirection"),
+        "manualRouterPoolSource": manual_custom_swap.get("poolSource"),
+        "manualRouterRouteRegistryId": manual_custom_swap.get("routeRegistryId"),
+        "manualRouterRouteRegistrySymbol": manual_custom_swap.get("routeRegistrySymbol"),
+        "sdkRouterQuotesEnabled": bool(out.get("enabled")),
+        "sdkExactBuyEnabled": bool(out.get("exactBuyEnabled")),
+    })
+
+    if execution_confirmed:
+        out["status"] = "manual_router_available"
+        out["reason"] = (
+            "Confirmed manual Router route is attached for this request; "
+            "SDK router quotes remain disabled."
+        )
+        out["nextRequired"] = "Front-end SubWallet signing/submission is allowed for this execution-confirmed manual Router route."
+        out["liveSwapsRecommended"] = True
+
+    if route_exact_buy and execution_confirmed:
+        out["exactBuyEnabled"] = True
+        out["exactBuyEnabledForThisRoute"] = True
+        out["exactBuyEnabledSource"] = "db:hydration_route_registry:manual_router"
+        out["liveExactBuyRecommended"] = True
+    elif route_exact_buy:
+        out["exactBuyEnabledForThisRoute"] = False
+
+    return out
+
+
+async def _hydration_manual_router_fallback_plan(
+    *,
+    db: Optional[Session],
+    base: str,
+    quote: str,
+    side: str,
+    amount_ui: float,
+    amount_mode: str,
+    slippage_bps: int,
+    base_meta: Dict[str, Any],
+    quote_meta: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build a DB/UI-controlled manual Router plan for confirmed Hydration routes.
+
+    SELL is exact input BASE -> QUOTE through Router.sell.
+    BUY is exact output BASE paid with QUOTE through Router.buy, so the route
+    direction is QUOTE -> BASE. Both directions are confirmed independently in
+    hydration_route_registry, with env routes left only as emergency fallback.
+    """
+    if not _HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK:
+        return None
+
+    side_norm = str(side or "").strip().lower()
+    mode = str(amount_mode or "").strip().lower()
+    if side_norm == "sell" and mode == "exact_in":
+        method = "sell"
+        asset_in_meta = base_meta
+        asset_out_meta = quote_meta
+        route_base = base
+        route_quote = quote
+    elif side_norm == "buy" and mode == "exact_out":
+        method = "buy"
+        asset_in_meta = quote_meta
+        asset_out_meta = base_meta
+        route_base = quote
+        route_quote = base
+    else:
+        return None
+
+    asset_in_id = _hydration_sdk_asset_id(asset_in_meta)
+    asset_out_id = _hydration_sdk_asset_id(asset_out_meta)
+    asset_in_symbol = str(asset_in_meta.get("symbol") or route_base or "").upper()
+    asset_out_symbol = str(asset_out_meta.get("symbol") or route_quote or "").upper()
+
+    db_cfg = _hydration_route_registry_manual_router_config(
+        db=db,
+        base=route_base,
+        quote=route_quote,
+        asset_in_id=int(asset_in_id),
+        asset_out_id=int(asset_out_id),
+    )
+    route = None
+    execution_confirmed = False
+    pool_source = "manual_router_fallback_generated"
+    route_registry_id = None
+    route_registry_symbol = None
+    note = None
+
+    if isinstance(db_cfg, dict):
+        route = _normalize_manual_router_route(
+            db_cfg.get("route"),
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+        )
+        execution_confirmed = bool(db_cfg.get("executionConfirmed") or db_cfg.get("confirmed"))
+        pool_source = "db:hydration_route_registry:manual_router"
+        route_registry_id = db_cfg.get("routeRegistryId")
+        route_registry_symbol = db_cfg.get("routeRegistrySymbol")
+        note = db_cfg.get("note")
+
+    if not route:
+        if not _manual_router_fallback_pair_allowed(route_base, route_quote):
+            return None
+        route = _manual_router_fallback_configured_route(
+            base=route_base,
+            quote=route_quote,
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+            db=None,
+        )
+        execution_confirmed = _manual_router_fallback_pair_confirmed(route_base, route_quote)
+        pool_source = "env:UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_ROUTES_JSON" if route else "manual_router_fallback_generated"
+        if not route:
+            route = _manual_router_fallback_route(
+                asset_in_id,
+                asset_out_id,
+                base=route_base,
+                quote=route_quote,
+                db=None,
+            )
+
+    if not route:
+        return None
+
+    if not execution_confirmed and not _HYDRATION_ALLOW_UNCONFIRMED_MANUAL_ROUTER_FALLBACK:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "hydration_manual_router_fallback_unconfirmed",
+                "message": "Manual Router route is buildable but not execution-confirmed for this direction. Save/confirm the route in Hydration Route Registry before signing.",
+                "venue": "polkadot_hydration",
+                "resolvedSymbol": f"{base}-{quote}",
+                "routeDirection": f"{route_base}-{route_quote}",
+                "side": side_norm,
+                "amountMode": mode,
+                "enabled": bool(_HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK),
+                "allowUnconfirmed": bool(_HYDRATION_ALLOW_UNCONFIRMED_MANUAL_ROUTER_FALLBACK),
+                "routeRegistryId": route_registry_id,
+                "routeRegistrySymbol": route_registry_symbol,
+                "confirmedPairs": sorted(_manual_router_fallback_confirmed_pairs()),
+                "nextRequired": "Use Token Registry → Hydration Route Registry to mark the exact route direction confirmed only after a tiny live on-chain success.",
+                "unsafeOverride": "Set UTT_HYDRATION_ALLOW_UNCONFIRMED_MANUAL_ROUTER_FALLBACK=1 only for a deliberate fee-risking local test.",
+            },
+        )
+
+    price_payload = await _hydration_refresh_usd_price_cache(
+        db=db,
+        requested=[asset_in_symbol, asset_out_symbol],
+        force_refresh=False,
+        allow_refresh=True,
+    )
+    prices = dict((price_payload or {}).get("prices_usd") or (price_payload or {}).get("usd_prices") or {})
+    sources = dict((price_payload or {}).get("priceSources") or {})
+    in_usd = _float_or_none(prices.get(asset_in_symbol))
+    out_usd = _float_or_none(prices.get(asset_out_symbol))
+    if in_usd is None or out_usd is None or out_usd <= 0:
+        return None
+
+    max_input_usd = max(0.0, float(_HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD))
+    slippage_rate = Decimal(int(slippage_bps)) / Decimal(10_000)
+
+    common: Dict[str, Any] = {
+        "enabled": True,
+        "provider": "manual_papi_router",
+        "reason": note or "Manual Router route registry fallback; min/max guard is derived from cached/external USD prices, not SDK router quotes.",
+        "method": method,
+        "routeModeEffective": "manual_router",
+        "manualRouterFallback": True,
+        "executionConfirmed": bool(execution_confirmed),
+        "assetInId": int(asset_in_id),
+        "assetOutId": int(asset_out_id),
+        "assetInSymbol": asset_in_symbol,
+        "assetOutSymbol": asset_out_symbol,
+        "route": route,
+        "pool": "manual_router_route_registry" if pool_source.startswith("db:") else "manual_router_route_json",
+        "poolSource": pool_source,
+        "routeRegistryId": route_registry_id,
+        "routeRegistrySymbol": route_registry_symbol,
+        "routeDirection": f"{route_base}-{route_quote}",
+        "slippageBps": int(slippage_bps),
+        "maxInputUsd": float(max_input_usd),
+        "priceSources": {
+            asset_in_symbol: sources.get(asset_in_symbol),
+            asset_out_symbol: sources.get(asset_out_symbol),
+        },
+        "usdPrices": {
+            asset_in_symbol: float(in_usd),
+            asset_out_symbol: float(out_usd),
+        },
+        "priceCacheStatus": (price_payload or {}).get("status"),
+        "safetyNote": "Controlled tiny-swap path only until a first-class quote source is added.",
+    }
+
+    if method == "sell":
+        amount_in_atomic = _ui_to_atomic(float(amount_ui), int(asset_in_meta.get("decimals") or 0))
+        amount_in_ui_dec = _atomic_to_decimal_ui(amount_in_atomic, int(asset_in_meta.get("decimals") or 0))
+        input_usd = float(amount_in_ui_dec) * float(in_usd)
+        if max_input_usd > 0 and input_usd > max_input_usd:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "hydration_manual_router_fallback_input_too_large",
+                    "message": "Manual-router fallback is capped for controlled testing. Lower the amount or raise UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD locally after reviewing the route.",
+                    "venue": "polkadot_hydration",
+                    "resolvedSymbol": f"{base}-{quote}",
+                    "routeDirection": f"{route_base}-{route_quote}",
+                    "amount": amount_ui,
+                    "inputUsd": input_usd,
+                    "maxInputUsd": max_input_usd,
+                    "assetIn": asset_in_meta,
+                    "assetOut": asset_out_meta,
+                },
+            )
+        mid_price = Decimal(str(in_usd)) / Decimal(str(out_usd))
+        estimated_out_ui_dec = amount_in_ui_dec * mid_price
+        min_out_ui_dec = estimated_out_ui_dec * (Decimal("1") - slippage_rate)
+        min_out_atomic = _decimal_ui_to_atomic_floor(min_out_ui_dec, int(asset_out_meta.get("decimals") or 0))
+        if min_out_atomic <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "hydration_manual_router_fallback_min_out_too_small",
+                    "message": "Manual-router fallback produced zero min output from external/cached prices. Use a larger controlled test amount.",
+                    "venue": "polkadot_hydration",
+                    "resolvedSymbol": f"{base}-{quote}",
+                    "amount": amount_ui,
+                    "assetIn": asset_in_meta,
+                    "assetOut": asset_out_meta,
+                    "pricePayloadStatus": (price_payload or {}).get("status"),
+                },
+            )
+        common.update({
+            "amountMode": "exact_in",
+            "amountInAtomic": str(amount_in_atomic),
+            "amountInUi": float(amount_in_ui_dec),
+            "estimatedAmountOutAtomic": str(_decimal_ui_to_atomic_floor(estimated_out_ui_dec, int(asset_out_meta.get("decimals") or 0))),
+            "estimatedAmountOutUi": float(estimated_out_ui_dec),
+            "minAmountOutAtomic": str(min_out_atomic),
+            "minAmountOutUi": float(_atomic_to_decimal_ui(min_out_atomic, int(asset_out_meta.get("decimals") or 0))),
+            "midPrice": float(mid_price),
+            "inputUsd": float(input_usd),
+        })
+        return common
+
+    amount_out_atomic = _ui_to_atomic(float(amount_ui), int(asset_out_meta.get("decimals") or 0))
+    amount_out_ui_dec = _atomic_to_decimal_ui(amount_out_atomic, int(asset_out_meta.get("decimals") or 0))
+    mid_price = Decimal(str(out_usd)) / Decimal(str(in_usd))
+    estimated_in_ui_dec = amount_out_ui_dec * mid_price
+    max_in_ui_dec = estimated_in_ui_dec * (Decimal("1") + slippage_rate)
+    max_in_atomic = _decimal_ui_to_atomic_ceil(max_in_ui_dec, int(asset_in_meta.get("decimals") or 0))
+    input_usd = float(estimated_in_ui_dec) * float(in_usd)
+    if max_input_usd > 0 and input_usd > max_input_usd:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "hydration_manual_router_fallback_input_too_large",
+                "message": "Manual-router BUY fallback is capped for controlled testing. Lower the exact output amount or raise UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD locally after reviewing the route.",
+                "venue": "polkadot_hydration",
+                "resolvedSymbol": f"{base}-{quote}",
+                "routeDirection": f"{route_base}-{route_quote}",
+                "amount": amount_ui,
+                "estimatedInputUsd": input_usd,
+                "maxInputUsd": max_input_usd,
+                "assetIn": asset_in_meta,
+                "assetOut": asset_out_meta,
+            },
+        )
+    if max_in_atomic <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "hydration_manual_router_fallback_max_in_too_small",
+                "message": "Manual-router fallback produced zero max input from external/cached prices. Use a larger controlled exact-output amount.",
+                "venue": "polkadot_hydration",
+                "resolvedSymbol": f"{base}-{quote}",
+                "amount": amount_ui,
+                "assetIn": asset_in_meta,
+                "assetOut": asset_out_meta,
+                "pricePayloadStatus": (price_payload or {}).get("status"),
+            },
+        )
+    common.update({
+        "amountMode": "exact_out",
+        "amountOutAtomic": str(amount_out_atomic),
+        "amountOutUi": float(amount_out_ui_dec),
+        "estimatedAmountInAtomic": str(_decimal_ui_to_atomic_ceil(estimated_in_ui_dec, int(asset_in_meta.get("decimals") or 0))),
+        "estimatedAmountInUi": float(estimated_in_ui_dec),
+        "maxAmountInAtomic": str(max_in_atomic),
+        "maxAmountInUi": float(_atomic_to_decimal_ui(max_in_atomic, int(asset_in_meta.get("decimals") or 0))),
+        "midPrice": float(mid_price),
+        "inputUsd": float(input_usd),
+    })
+    return common
 
 
 def _hydration_manual_custom_swap_plan(
@@ -3824,14 +4660,18 @@ def _hydration_swap_record_from_payload(payload: Dict[str, Any], db: Session) ->
 
 
 class HydrationRouteRegistryUpsertRequest(BaseModel):
-    symbol: str = Field(..., description="BASE-QUOTE pair, e.g. UTTT-HDX")
-    base_reserve: float = Field(..., gt=0, description="Manual XYK reserve for BASE, in human units")
-    quote_reserve: float = Field(..., gt=0, description="Manual XYK reserve for QUOTE, in human units")
-    fee_bps: float = Field(30, ge=0, le=2500, description="Pool fee in basis points")
-    enabled: bool = Field(True, description="If false, the route stays saved but Auto/Manual XYK will ignore it")
-    pool_type: str = Field("XYK", description="Currently only XYK is supported by the manual router builder")
+    symbol: str = Field(..., description="BASE-QUOTE pair, e.g. UTTT-HDX or DOT-HDX")
+    route_mode: str = Field("manual_xyk", description="manual_xyk|manual_router")
+    base_reserve: Optional[float] = Field(None, gt=0, description="Manual XYK reserve for BASE, in human units. Required for manual_xyk.")
+    quote_reserve: Optional[float] = Field(None, gt=0, description="Manual XYK reserve for QUOTE, in human units. Required for manual_xyk.")
+    fee_bps: float = Field(30, ge=0, le=2500, description="Pool fee in basis points for manual_xyk routes")
+    enabled: bool = Field(True, description="If false, the route stays saved but Auto/Manual routing will ignore it")
+    confirmed: bool = Field(False, description="Manual-router execution confirmation. Only set true after a tiny on-chain success.")
+    pool_type: str = Field("XYK", description="XYK for reserve-based manual pools, Router for manual Router route_json paths")
     pool_account: Optional[str] = Field(None, description="Optional Hydration XYK pool account SS58 address. When set, UTT reads live pool reserves from this account instead of the saved snapshot.")
-    route_json: Optional[List[Dict[str, Any]]] = Field(None, description="Optional Hydration Router route legs. Defaults to one XYK leg BASE -> QUOTE.")
+    route_json: Optional[List[Dict[str, Any]]] = Field(None, description="Optional Hydration Router route legs. Required for manual_router; defaults to one XYK leg for manual_xyk.")
+    tested_at: Optional[str] = Field(None, description="Optional ISO timestamp for the last route test.")
+    last_test_tx_hash: Optional[str] = Field(None, description="Optional tx hash from the confirming route test.")
     note: Optional[str] = Field(None, description="Optional operator note shown in diagnostics")
 
 
@@ -3841,9 +4681,22 @@ class HydrationSwapTxRequest(BaseModel):
     amount: float = Field(..., gt=0, description="Human amount. For exact_in this is input; for exact_out this is requested output.")
     amount_mode: str = Field("exact_in", description="exact_in|exact_out. exact_out BUY/getBestBuy is disabled by default behind UTT_HYDRATION_ENABLE_EXACT_BUY after controlled testing caused sidecar timeouts.")
     quote_spend_estimate: Optional[float] = Field(None, description="Optional UI quote-spend estimate for BUY display/debug only.")
-    route_mode: Optional[str] = Field(None, description="Hydration route source: auto|sdk|isolated_helper|manual_xyk. auto uses manual XYK only for configured custom pairs and managed sdk-next/sidecar for normal pairs.")
+    route_mode: Optional[str] = Field(None, description="Hydration route source: auto|sdk|isolated_helper|manual_xyk|manual_router. auto uses confirmed manual routes when available and managed sdk-next/sidecar for normal pairs.")
     slippage_bps: int = Field(100, ge=1, le=5000)
     user_pubkey: str = Field(..., description="Substrate/SS58 account address from SubWallet")
+
+
+class HydrationManualRouteProbeRequest(BaseModel):
+    symbol: str = Field(..., description="BASE-QUOTE pair to probe, e.g. DOT-HDX or HDX-DOT")
+    side: str = Field("sell", description="Currently only sell/exact_in is supported for non-mutating manual route probes")
+    amount: float = Field(..., gt=0, description="Human input amount for sell/exact_in probe")
+    amount_mode: str = Field("exact_in", description="Currently only exact_in is supported for manual route probes")
+    slippage_bps: int = Field(100, ge=1, le=5000)
+    user_pubkey: str = Field(..., description="Substrate/SS58 account address used as beneficiary in the unsigned call builder")
+    min_amount_out_atomic: Optional[str] = Field(None, description="Optional raw minimum output amount. If omitted, probe uses 1 atomic unit so it only tests call-data encoding, not execution economics.")
+    min_amount_out_ui: Optional[float] = Field(None, gt=0, description="Optional minimum output in human units. Ignored when min_amount_out_atomic is provided.")
+    route_candidates: Optional[List[List[Dict[str, Any]]]] = Field(None, description="Optional candidate Hydration Router route legs. If omitted, Omnipool and XYK single-leg candidates are tried.")
+    pool_candidates: Optional[List[str]] = Field(None, description="Optional pool names for generated single-leg candidates, e.g. Omnipool, XYK")
 
 
 def _hydration_debug_rpc_url() -> str:
@@ -3877,6 +4730,18 @@ async def polkadot_dex_debug() -> Dict[str, Any]:
         "orderbook_step_timeout_s": _HYDRATION_ORDERBOOK_STEP_TIMEOUT_S,
         "orderbook_max_consecutive_errors": _HYDRATION_ORDERBOOK_MAX_CONSECUTIVE_ERRORS,
         "orderbook_force_isolated_helper": _HYDRATION_ORDERBOOK_FORCE_ISOLATED_HELPER,
+        "orderbook_synthetic_fallback_enabled": bool(_HYDRATION_ENABLE_ORDERBOOK_SYNTHETIC_FALLBACK),
+        "orderbook_synthetic_refresh_enabled": bool(_HYDRATION_ORDERBOOK_SYNTHETIC_REFRESH),
+        "orderbook_synthetic_spread_bps": _HYDRATION_ORDERBOOK_SYNTHETIC_SPREAD_BPS,
+        "manual_router_fallback_enabled": bool(_HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK),
+        "manual_router_fallback_pairs": _HYDRATION_MANUAL_ROUTER_FALLBACK_PAIRS_CSV,
+        "manual_router_fallback_confirmed_pairs": _HYDRATION_MANUAL_ROUTER_FALLBACK_CONFIRMED_PAIRS_CSV,
+        "manual_router_fallback_allow_unconfirmed": bool(_HYDRATION_ALLOW_UNCONFIRMED_MANUAL_ROUTER_FALLBACK),
+        "manual_router_fallback_pool": _HYDRATION_MANUAL_ROUTER_FALLBACK_POOL,
+        "manual_router_fallback_route_pairs": sorted(_manual_router_fallback_routes_map().keys()),
+        "manual_router_fallback_routes_configured": bool(_manual_router_fallback_routes_map()),
+        "manual_router_fallback_max_input_usd": _HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD,
+        "manual_router_fallback_note": "manual_route_probe only proves call-data encoding. UI signing is blocked unless a DB route-registry manual_router row is confirmed, the pair is listed in UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_CONFIRMED_PAIRS, or the unsafe local override is enabled.",
         "default_route_mode": _HYDRATION_DEFAULT_ROUTE_MODE,
         "route_modes": sorted(_HYDRATION_ROUTE_MODES),
         "route_mode_note": "Auto returns manual XYK for configured custom pairs. Generic sdk/isolated_helper quote modes are explicit opt-in and are blocked while UTT_HYDRATION_ENABLE_ROUTER_QUOTES=0 to protect RPC quota.",
@@ -4003,6 +4868,9 @@ def _hydration_route_registry_payload(row: Any) -> Dict[str, Any]:
         "quoteReserve": r.get("quote_reserve"),
         "feeBps": r.get("fee_bps"),
         "route": route_json,
+        "confirmed": bool(int(r.get("confirmed") if r.get("confirmed") is not None else 0)),
+        "testedAt": r.get("tested_at"),
+        "lastTestTxHash": r.get("last_test_tx_hash"),
         "note": r.get("note"),
         "createdAt": r.get("created_at"),
         "updatedAt": r.get("updated_at"),
@@ -4024,7 +4892,7 @@ async def hydration_route_registry_list(
         "venue": "polkadot_hydration",
         "items": [_hydration_route_registry_payload(r) for r in rows],
         "count": len(rows),
-        "note": "Manual XYK route rows are used only by route_mode=auto/manual_xyk. SDK-supported pairs do not need rows.",
+        "note": "manual_xyk rows provide reserve-based routes; manual_router rows provide confirmed multi-leg Router paths used by route_mode=auto/manual_router. SDK-supported pairs do not need rows.",
     }
 
 
@@ -4035,19 +4903,74 @@ async def hydration_route_registry_upsert(
 ) -> Dict[str, Any]:
     _ensure_hydration_route_registry_table(db)
     base, quote = _parse_symbol(req.symbol)
-    pool_type = str(req.pool_type or "XYK").strip().upper()
-    if pool_type != "XYK":
-        raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_manual_pool_type", "poolType": req.pool_type, "supported": ["XYK"]})
+    route_mode = str(req.route_mode or "manual_xyk").strip().lower()
+    aliases = {
+        "manual": "manual_xyk",
+        "xyk": "manual_xyk",
+        "router": "manual_router",
+        "manual router": "manual_router",
+        "manual_router_fallback": "manual_router",
+    }
+    route_mode = aliases.get(route_mode, route_mode)
+    if route_mode not in {"manual_xyk", "manual_router"}:
+        raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_route_mode", "routeMode": req.route_mode, "supported": ["manual_xyk", "manual_router"]})
+
+    pool_type_raw = str(req.pool_type or ("Router" if route_mode == "manual_router" else "XYK")).strip()
+    pool_type_norm = pool_type_raw.lower()
+    if route_mode == "manual_router":
+        if pool_type_norm not in {"router", "manual_router", "manual router"}:
+            raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_manual_router_pool_type", "poolType": req.pool_type, "supported": ["Router"]})
+        pool_type = "Router"
+    else:
+        if pool_type_norm != "xyk":
+            raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_manual_pool_type", "poolType": req.pool_type, "supported": ["XYK", "Router"]})
+        pool_type = "XYK"
 
     base_meta = _resolve_asset(base, db=db)
     quote_meta = _resolve_asset(quote, db=db)
     route = req.route_json
-    if not isinstance(route, list) or not route:
-        route = [{
-            "pool": "XYK",
-            "assetIn": _hydration_sdk_asset_id(base_meta),
-            "assetOut": _hydration_sdk_asset_id(quote_meta),
-        }]
+
+    if route_mode == "manual_router":
+        asset_in_id = _hydration_sdk_asset_id(base_meta)
+        asset_out_id = _hydration_sdk_asset_id(quote_meta)
+        route = _normalize_manual_router_route(
+            route,
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+        )
+        if not route:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_hydration_manual_router_route_json",
+                    "message": "manual_router routes require route_json legs that start with BASE asset ID, end with QUOTE asset ID, and connect each leg assetOut -> next assetIn.",
+                    "symbol": f"{base}-{quote}",
+                    "expectedAssetInId": int(asset_in_id),
+                    "expectedAssetOutId": int(asset_out_id),
+                    "route_json": req.route_json,
+                },
+            )
+        base_reserve = _float_or_none(req.base_reserve)
+        quote_reserve = _float_or_none(req.quote_reserve)
+    else:
+        base_reserve = _float_or_none(req.base_reserve)
+        quote_reserve = _float_or_none(req.quote_reserve)
+        if base_reserve is None or quote_reserve is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "manual_xyk_reserves_required",
+                    "message": "manual_xyk routes require positive base_reserve and quote_reserve.",
+                    "symbol": f"{base}-{quote}",
+                },
+            )
+        if not isinstance(route, list) or not route:
+            route = [{
+                "pool": "XYK",
+                "assetIn": _hydration_sdk_asset_id(base_meta),
+                "assetOut": _hydration_sdk_asset_id(quote_meta),
+            }]
+
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     existing = db.execute(
         text("SELECT id, created_at FROM hydration_route_registry WHERE UPPER(symbol) = :symbol LIMIT 1"),
@@ -4060,11 +4983,13 @@ async def hydration_route_registry_upsert(
             INSERT OR REPLACE INTO hydration_route_registry (
                 id, symbol, base_symbol, quote_symbol, base_asset_id, quote_asset_id,
                 base_decimals, quote_decimals, route_mode, pool_type, pool_account, enabled,
-                base_reserve, quote_reserve, fee_bps, route_json, note, created_at, updated_at
+                base_reserve, quote_reserve, fee_bps, route_json, confirmed, tested_at,
+                last_test_tx_hash, note, created_at, updated_at
             ) VALUES (
                 :id, :symbol, :base_symbol, :quote_symbol, :base_asset_id, :quote_asset_id,
                 :base_decimals, :quote_decimals, :route_mode, :pool_type, :pool_account, :enabled,
-                :base_reserve, :quote_reserve, :fee_bps, :route_json, :note, :created_at, :updated_at
+                :base_reserve, :quote_reserve, :fee_bps, :route_json, :confirmed, :tested_at,
+                :last_test_tx_hash, :note, :created_at, :updated_at
             )
         """),
         {
@@ -4076,15 +5001,18 @@ async def hydration_route_registry_upsert(
             "quote_asset_id": str(quote_meta.get("assetId") or ""),
             "base_decimals": int(base_meta.get("decimals") or 0),
             "quote_decimals": int(quote_meta.get("decimals") or 0),
-            "route_mode": "manual_xyk",
-            "pool_type": "XYK",
+            "route_mode": route_mode,
+            "pool_type": pool_type,
             "pool_account": str(req.pool_account or "").strip() or None,
             "enabled": 1 if req.enabled else 0,
-            "base_reserve": float(req.base_reserve),
-            "quote_reserve": float(req.quote_reserve),
+            "base_reserve": float(base_reserve) if base_reserve is not None else None,
+            "quote_reserve": float(quote_reserve) if quote_reserve is not None else None,
             "fee_bps": float(req.fee_bps),
             "route_json": json.dumps(route, separators=(",", ":"), default=str),
-            "note": req.note or "Manual Hydration XYK route registry entry.",
+            "confirmed": 1 if req.confirmed else 0,
+            "tested_at": str(req.tested_at or "").strip() or None,
+            "last_test_tx_hash": str(req.last_test_tx_hash or "").strip() or None,
+            "note": req.note or ("Manual Hydration Router route registry entry." if route_mode == "manual_router" else "Manual Hydration XYK route registry entry."),
             "created_at": created_at,
             "updated_at": now,
         },
@@ -4096,7 +5024,8 @@ async def hydration_route_registry_upsert(
         "venue": "polkadot_hydration",
         "item": _hydration_route_registry_payload(row),
         "next": {
-            "orderbook": f"/api/polkadot_dex/hydration/orderbook?symbol={base}-{quote}&route_mode=manual_xyk",
+            "orderbook": f"/api/polkadot_dex/hydration/orderbook?symbol={base}-{quote}&route_mode=manual_xyk" if route_mode == "manual_xyk" else None,
+            "swapTx": f"/api/polkadot_dex/hydration/swap_tx",
             "autoOrderbook": f"/api/polkadot_dex/hydration/orderbook?symbol={base}-{quote}&route_mode=auto",
         },
     }
@@ -4807,6 +5736,196 @@ async def hydration_getbestbuy_probe(
     }
 
 
+def _hydration_orderbook_common_config(
+    *,
+    orderbook_step_timeout_s: float,
+    max_consecutive_errors: int,
+    force_isolated_orderbook: bool,
+    route_mode_norm: str,
+    requested_depth: int,
+    sample_depth: int,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {
+        "stepTimeoutS": float(orderbook_step_timeout_s),
+        "maxConsecutiveErrors": int(max_consecutive_errors),
+        "forceIsolatedHelper": bool(force_isolated_orderbook),
+        "legacyForceIsolatedHelperEnv": bool(_HYDRATION_ORDERBOOK_FORCE_ISOLATED_HELPER),
+        "routeMode": route_mode_norm,
+        "routeModeEffective": "isolated_helper" if force_isolated_orderbook else "sdk",
+        "requestedDepth": int(requested_depth),
+        "sampleDepth": int(sample_depth),
+    }
+    if isinstance(extra, dict):
+        cfg.update(extra)
+    return cfg
+
+
+def _hydration_synthetic_spot_levels(
+    *,
+    base: str,
+    base_meta: Dict[str, Any],
+    quote_meta: Dict[str, Any],
+    mid_price: float,
+    depth: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    n = max(1, min(int(depth), 10))
+    spread_rate = max(0.0001, min(float(_HYDRATION_ORDERBOOK_SYNTHETIC_SPREAD_BPS) / 10000.0, 0.05))
+    bids: List[Dict[str, Any]] = []
+    asks: List[Dict[str, Any]] = []
+    sizes = _hydration_sample_sizes(base, int((base_meta or {}).get("decimals") or 0), side="synthetic", depth=n)
+    for idx, raw_size in enumerate(sizes):
+        try:
+            size = float(raw_size)
+        except Exception:
+            continue
+        if size <= 0:
+            continue
+        # Widen each synthetic level slightly away from the derived mid.
+        step = spread_rate * float(idx + 1)
+        bid_px = max(float(mid_price) * (1.0 - step), 0.0)
+        ask_px = float(mid_price) * (1.0 + step)
+        if bid_px > 0:
+            bids.append({
+                "price": bid_px,
+                "size": size,
+                "outputSize": size * bid_px,
+                "synthetic": True,
+            })
+        if ask_px > 0:
+            asks.append({
+                "price": ask_px,
+                "size": size,
+                "inputSize": size * ask_px,
+                "synthetic": True,
+            })
+    return bids, asks
+
+
+async def _hydration_synthetic_spot_orderbook_response(
+    *,
+    symbol: str,
+    base: str,
+    quote: str,
+    base_meta: Dict[str, Any],
+    quote_meta: Dict[str, Any],
+    depth: int,
+    db: Optional[Session],
+    route_mode_norm: str,
+    orderbook_config: Dict[str, Any],
+    sample_errors: Optional[List[Dict[str, Any]]] = None,
+    fallback_reason: str = "sdk_quote_sampling_failed",
+) -> Optional[Dict[str, Any]]:
+    if not _HYDRATION_ENABLE_ORDERBOOK_SYNTHETIC_FALLBACK:
+        return None
+
+    requested = [str(base or "").upper(), str(quote or "").upper()]
+    try:
+        price_payload = await _hydration_refresh_usd_price_cache(
+            db=db,
+            requested=requested,
+            force_refresh=False,
+            allow_refresh=bool(_HYDRATION_ORDERBOOK_SYNTHETIC_REFRESH),
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "hydration_synthetic_orderbook_price_source_failed",
+            "message": str(e),
+            "exc": type(e).__name__,
+        }
+
+    prices = dict((price_payload or {}).get("prices_usd") or (price_payload or {}).get("usd_prices") or {})
+    sources = dict((price_payload or {}).get("priceSources") or {})
+    base_usd = _float_or_none(prices.get(str(base).upper()))
+    quote_usd = _float_or_none(prices.get(str(quote).upper()))
+    if base_usd is None or quote_usd is None or quote_usd <= 0:
+        return {
+            "ok": False,
+            "error": "hydration_synthetic_orderbook_prices_missing",
+            "message": "Synthetic Hydration orderbook fallback needs USD prices for both BASE and QUOTE.",
+            "requested": requested,
+            "prices_usd": prices,
+            "missing": [s for s in requested if _float_or_none(prices.get(s)) is None],
+            "pricePayloadStatus": (price_payload or {}).get("status"),
+            "pricePayloadErrors": (price_payload or {}).get("errors"),
+        }
+
+    mid_price = float(base_usd) / float(quote_usd)
+    bids, asks = _hydration_synthetic_spot_levels(
+        base=base,
+        base_meta=base_meta,
+        quote_meta=quote_meta,
+        mid_price=mid_price,
+        depth=depth,
+    )
+    if not bids and not asks:
+        return {
+            "ok": False,
+            "error": "hydration_synthetic_orderbook_empty",
+            "message": "Synthetic Hydration orderbook fallback could not build any levels.",
+        }
+
+    asks.sort(key=lambda x: float(x.get("price") or 0.0))
+    bids.sort(key=lambda x: -float(x.get("price") or 0.0))
+    price_decimals = _suggest_price_decimals(asks + bids, int((quote_meta or {}).get("decimals") or 0))
+    size_decimals = min(int((base_meta or {}).get("decimals") or 0), 8)
+    cfg = dict(orderbook_config or {})
+    cfg.update({
+        "routeModeEffective": "synthetic_spot_fallback",
+        "source": "synthetic_spot_fallback",
+        "fallbackReason": fallback_reason,
+        "syntheticFallbackEnabled": True,
+        "syntheticFallbackRefreshEnabled": bool(_HYDRATION_ORDERBOOK_SYNTHETIC_REFRESH),
+        "syntheticSpreadBps": float(_HYDRATION_ORDERBOOK_SYNTHETIC_SPREAD_BPS),
+        "tradable": False,
+        "tradeRequiresRealRouterQuote": True,
+    })
+
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "router": "synthetic_spot_fallback",
+        "syntheticFallback": True,
+        "tradable": False,
+        "tradeRequiresRealRouterQuote": True,
+        "syntheticFallbackReason": (
+            "SDK getBestSell quote sampling failed or was gated, so this visual orderbook was derived from cached/external USD prices. "
+            "Do not use this response alone to mark swaps executable."
+        ),
+        "rawSymbol": symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+        "base": base,
+        "quote": quote,
+        "baseAssetId": (base_meta or {}).get("assetId"),
+        "quoteAssetId": (quote_meta or {}).get("assetId"),
+        "baseDecimals": int((base_meta or {}).get("decimals") or 0),
+        "quoteDecimals": int((quote_meta or {}).get("decimals") or 0),
+        "baseMeta": base_meta,
+        "quoteMeta": quote_meta,
+        "priceDecimals": price_decimals,
+        "displayPriceDecimals": max(1, min(price_decimals, 8)),
+        "sizeDecimals": size_decimals,
+        "midPrice": float(mid_price),
+        "priceSources": {
+            base: sources.get(base) or sources.get(str(base).upper()),
+            quote: sources.get(quote) or sources.get(str(quote).upper()),
+        },
+        "usdPrices": {
+            base: float(base_usd),
+            quote: float(quote_usd),
+        },
+        "priceCacheStatus": (price_payload or {}).get("status"),
+        "priceCache": (price_payload or {}).get("cache"),
+        "routeMode": route_mode_norm,
+        "routeModeEffective": "synthetic_spot_fallback",
+        "orderbookConfig": cfg,
+        "bids": bids,
+        "asks": asks,
+        "sampleErrors": sample_errors or [],
+    }
+
+
 @router.get("/hydration/orderbook")
 async def hydration_pseudo_orderbook(
     symbol: str = Query(..., description="Symbol pair, e.g. UTTT-DOT (BASE-QUOTE)"),
@@ -4853,21 +5972,45 @@ async def hydration_pseudo_orderbook(
         return resp
 
     if not _HYDRATION_ENABLE_ROUTER_QUOTES:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "hydration_router_quotes_disabled",
-                "message": "Hydration router quote/orderbook calls are intentionally disabled.",
-                "venue": "polkadot_hydration",
-                "rawSymbol": symbol,
-                "resolvedSymbol": f"{base}-{quote}",
-                "base": base_meta,
-                "quote": quote_meta,
-                "enableRouterQuotes": _HYDRATION_ENABLE_ROUTER_QUOTES,
-                "quoteStatus": _hydration_router_quote_status(symbol=f"{base}-{quote}", base_meta=base_meta, quote_meta=quote_meta),
-                "routeMode": route_mode_norm,
-            },
-        )
+        disabled_detail = {
+            "error": "hydration_router_quotes_disabled",
+            "message": "Hydration router quote/orderbook calls are intentionally disabled.",
+            "venue": "polkadot_hydration",
+            "rawSymbol": symbol,
+            "resolvedSymbol": f"{base}-{quote}",
+            "base": base_meta,
+            "quote": quote_meta,
+            "enableRouterQuotes": _HYDRATION_ENABLE_ROUTER_QUOTES,
+            "quoteStatus": _hydration_router_quote_status(symbol=f"{base}-{quote}", base_meta=base_meta, quote_meta=quote_meta),
+            "routeMode": route_mode_norm,
+        }
+        if route_mode_norm == "auto":
+            n0 = max(1, min(int(depth), 10))
+            fallback = await _hydration_synthetic_spot_orderbook_response(
+                symbol=symbol,
+                base=base,
+                quote=quote,
+                base_meta=base_meta,
+                quote_meta=quote_meta,
+                depth=depth,
+                db=db,
+                route_mode_norm=route_mode_norm,
+                orderbook_config=_hydration_orderbook_common_config(
+                    orderbook_step_timeout_s=max(1.0, float(_HYDRATION_ORDERBOOK_STEP_TIMEOUT_S)),
+                    max_consecutive_errors=max(1, int(_HYDRATION_ORDERBOOK_MAX_CONSECUTIVE_ERRORS)),
+                    force_isolated_orderbook=bool(_HYDRATION_ORDERBOOK_FORCE_ISOLATED_HELPER),
+                    route_mode_norm=route_mode_norm,
+                    requested_depth=int(depth),
+                    sample_depth=n0,
+                    extra={"routerQuotesDisabled": True},
+                ),
+                sample_errors=[{"side": "both", "detail": disabled_detail}],
+                fallback_reason="router_quotes_disabled",
+            )
+            if isinstance(fallback, dict) and fallback.get("ok"):
+                return fallback
+            disabled_detail["syntheticFallback"] = fallback
+        raise HTTPException(status_code=503, detail=disabled_detail)
 
     n = max(1, min(int(depth), 10))
     bids: List[Dict[str, Any]] = []
@@ -4875,7 +6018,7 @@ async def hydration_pseudo_orderbook(
     sample_errors: List[Dict[str, Any]] = []
     orderbook_step_timeout_s = max(1.0, float(_HYDRATION_ORDERBOOK_STEP_TIMEOUT_S))
     max_consecutive_errors = max(1, int(_HYDRATION_ORDERBOOK_MAX_CONSECUTIVE_ERRORS))
-    force_isolated_orderbook = bool(route_mode_norm == "isolated_helper")
+    force_isolated_orderbook = bool(route_mode_norm == "isolated_helper" or _HYDRATION_ORDERBOOK_FORCE_ISOLATED_HELPER)
 
     # Asks: buying BASE by selling QUOTE into Hydration. Price = QUOTE / BASE.
     ask_consecutive_errors = 0
@@ -4956,6 +6099,29 @@ async def hydration_pseudo_orderbook(
                 break
 
     if not bids and not asks:
+        orderbook_config = _hydration_orderbook_common_config(
+            orderbook_step_timeout_s=orderbook_step_timeout_s,
+            max_consecutive_errors=max_consecutive_errors,
+            force_isolated_orderbook=force_isolated_orderbook,
+            route_mode_norm=route_mode_norm,
+            requested_depth=int(depth),
+            sample_depth=n,
+        )
+        fallback = await _hydration_synthetic_spot_orderbook_response(
+            symbol=symbol,
+            base=base,
+            quote=quote,
+            base_meta=base_meta,
+            quote_meta=quote_meta,
+            depth=depth,
+            db=db,
+            route_mode_norm=route_mode_norm,
+            orderbook_config=orderbook_config,
+            sample_errors=sample_errors,
+            fallback_reason="sdk_quote_sampling_failed",
+        )
+        if isinstance(fallback, dict) and fallback.get("ok"):
+            return fallback
         raise HTTPException(
             status_code=502,
             detail={
@@ -4967,17 +6133,9 @@ async def hydration_pseudo_orderbook(
                 "base": base_meta,
                 "quote": quote_meta,
                 "helperPath": str(_hydration_helper_path()),
-                "orderbookConfig": {
-                    "stepTimeoutS": orderbook_step_timeout_s,
-                    "maxConsecutiveErrors": max_consecutive_errors,
-                    "forceIsolatedHelper": force_isolated_orderbook,
-                    "legacyForceIsolatedHelperEnv": bool(_HYDRATION_ORDERBOOK_FORCE_ISOLATED_HELPER),
-                    "routeMode": route_mode_norm,
-                    "routeModeEffective": "isolated_helper" if force_isolated_orderbook else "sdk",
-                    "requestedDepth": int(depth),
-                    "sampleDepth": n,
-                },
+                "orderbookConfig": orderbook_config,
                 "sampleErrors": sample_errors,
+                "syntheticFallback": fallback,
             },
         )
 
@@ -5021,6 +6179,228 @@ async def hydration_pseudo_orderbook(
     }
 
 
+def _manual_route_probe_pool_candidates(raw: Optional[List[str]]) -> List[str]:
+    vals: List[str] = []
+    for item in (raw or ["Omnipool", "XYK"]):
+        s = str(item or "").strip()
+        if s and s not in vals:
+            vals.append(s)
+    return vals or ["Omnipool", "XYK"]
+
+
+def _manual_route_probe_candidates(
+    *,
+    asset_in_id: int,
+    asset_out_id: int,
+    req: HydrationManualRouteProbeRequest,
+    base: Optional[str] = None,
+    quote: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(req.route_candidates, list) and req.route_candidates:
+        for idx, route in enumerate(req.route_candidates):
+            if not isinstance(route, list) or not route:
+                continue
+            clean_route = _normalize_manual_router_route(
+                route,
+                asset_in_id=int(asset_in_id),
+                asset_out_id=int(asset_out_id),
+            )
+            if clean_route:
+                candidates.append({"name": f"request_candidate_{idx + 1}", "source": "request", "route": clean_route})
+
+    if not candidates and base and quote:
+        configured = _manual_router_fallback_configured_route(
+            base=base,
+            quote=quote,
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+            db=db,
+        )
+        if configured:
+            candidates.append({
+                "name": "configured_route_json",
+                "source": "db_or_env_manual_router_route",
+                "route": configured,
+            })
+
+    if not candidates:
+        for pool in _manual_route_probe_pool_candidates(req.pool_candidates):
+            candidates.append({
+                "name": f"single_leg_{str(pool).strip().lower()}",
+                "source": "generated",
+                "route": [{"pool": _manual_router_pool_payload(pool), "assetIn": int(asset_in_id), "assetOut": int(asset_out_id)}],
+            })
+    return candidates
+
+
+def _manual_route_probe_min_out_atomic(
+    *,
+    req: HydrationManualRouteProbeRequest,
+    asset_out: Dict[str, Any],
+) -> str:
+    raw = str(req.min_amount_out_atomic or "").replace(",", "").strip()
+    if raw:
+        if not raw.isdigit() or int(raw) <= 0:
+            raise HTTPException(status_code=422, detail={"error": "invalid_min_amount_out_atomic", "value": req.min_amount_out_atomic})
+        return raw
+    if req.min_amount_out_ui is not None:
+        return str(_ui_to_atomic(float(req.min_amount_out_ui), int(asset_out.get("decimals") or 0)))
+    # Probe default: 1 atomic output unit.  This proves PAPI call-data encoding
+    # only.  It is intentionally not an execution-safe slippage minimum.
+    return "1"
+
+
+@router.post("/hydration/manual_route_probe")
+async def hydration_manual_route_probe(
+    req: HydrationManualRouteProbeRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Try manual Hydration Router call-data candidates without mutation.
+
+    This endpoint is intentionally diagnostic-only.  It does not write route
+    registry rows, sign, submit, or validate economic execution.  It only checks
+    whether the existing manual PAPI Router call builder can encode unsigned
+    Router.sell call data for candidate route legs such as DOT->HDX Omnipool.
+    """
+    base, quote = _parse_symbol(req.symbol)
+    side = str(req.side or "sell").strip().lower()
+    amount_mode = str(req.amount_mode or "exact_in").strip().lower()
+    if side != "sell" or amount_mode != "exact_in":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "hydration_manual_route_probe_sell_exact_in_only",
+                "message": "Manual route probing currently supports only side=sell and amount_mode=exact_in. BUY/exact_out remains gated separately.",
+                "side": side,
+                "amountMode": amount_mode,
+            },
+        )
+
+    base_meta = _resolve_asset(base, db=db)
+    quote_meta = _resolve_asset(quote, db=db)
+    asset_in = base_meta
+    asset_out = quote_meta
+    asset_in_id = _hydration_sdk_asset_id(asset_in)
+    asset_out_id = _hydration_sdk_asset_id(asset_out)
+    amount_in_atomic = _ui_to_atomic(float(req.amount), int(asset_in.get("decimals") or 0))
+    min_amount_out_atomic = _manual_route_probe_min_out_atomic(req=req, asset_out=asset_out)
+    candidates = _manual_route_probe_candidates(
+        asset_in_id=asset_in_id,
+        asset_out_id=asset_out_id,
+        req=req,
+        base=base,
+        quote=quote,
+        db=db,
+    )
+
+    results: List[Dict[str, Any]] = []
+    first_success: Optional[Dict[str, Any]] = None
+    for candidate in candidates:
+        route = candidate.get("route") or []
+        manual_custom_swap = {
+            "enabled": True,
+            "method": "sell",
+            "reason": "manual route probe only - unsigned call-data encoding test; route execution is not confirmed",
+            "amountMode": "exact_in",
+            "assetInId": int(asset_in_id),
+            "assetOutId": int(asset_out_id),
+            "amountInAtomic": str(amount_in_atomic),
+            "minAmountOutAtomic": str(min_amount_out_atomic),
+            "estimatedAmountOutAtomic": None,
+            "estimatedAmountOutUi": None,
+            "route": route,
+            "slippageBps": int(req.slippage_bps),
+            "probeOnly": True,
+        }
+        try:
+            built = await _hydration_swap_tx_build(
+                raw_symbol=req.symbol,
+                base=base,
+                quote=quote,
+                side="sell",
+                asset_in=asset_in,
+                asset_out=asset_out,
+                amount_ui=float(req.amount),
+                amount_mode="exact_in",
+                slippage_bps=int(req.slippage_bps),
+                user_pubkey=req.user_pubkey,
+                manual_custom_swap=manual_custom_swap,
+                route_mode="manual_xyk",
+            )
+            item = {
+                "ok": True,
+                "name": candidate.get("name"),
+                "source": candidate.get("source"),
+                "route": route,
+                "provider": built.get("provider") if isinstance(built, dict) else None,
+                "builderVariant": built.get("builderVariant") if isinstance(built, dict) else None,
+                "encodedCallData": built.get("encodedCallData") if isinstance(built, dict) else None,
+                "transactionData": built.get("transactionData") if isinstance(built, dict) else None,
+                "tx": built,
+                "executionConfirmed": False,
+                "signed": False,
+                "submitted": False,
+            }
+            results.append(item)
+            if first_success is None:
+                first_success = item
+        except HTTPException as e:
+            results.append({
+                "ok": False,
+                "name": candidate.get("name"),
+                "source": candidate.get("source"),
+                "route": route,
+                "status": e.status_code,
+                "detail": e.detail,
+            })
+        except Exception as e:
+            results.append({
+                "ok": False,
+                "name": candidate.get("name"),
+                "source": candidate.get("source"),
+                "route": route,
+                "error": type(e).__name__,
+                "message": str(e),
+            })
+
+    successes = [r for r in results if r.get("ok")]
+    return {
+        "ok": True,
+        "mode": "manual_route_probe",
+        "willMutate": False,
+        "mutationScope": "none_read_only",
+        "venue": "polkadot_hydration",
+        "rawSymbol": req.symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+        "side": side,
+        "amount": float(req.amount),
+        "amountMode": amount_mode,
+        "assetIn": asset_in,
+        "assetOut": asset_out,
+        "assetInId": int(asset_in_id),
+        "assetOutId": int(asset_out_id),
+        "amountInAtomic": str(amount_in_atomic),
+        "minAmountOutAtomic": str(min_amount_out_atomic),
+        "candidateCount": len(results),
+        "successfulCandidateCount": len(successes),
+        "routeBuildAvailable": bool(successes),
+        "firstSuccess": first_success,
+        "candidates": results,
+        "warnings": [
+            "This endpoint only tests unsigned manual Router call-data encoding; it does not prove the route will execute on-chain.",
+            "Default minAmountOutAtomic=1 is unsafe for real trading. Use this result only to identify buildable route shapes before adding a confirmed route/quote path.",
+            "No route registry row is created and no bridge/swap/ledger state is mutated.",
+        ],
+        "nextRequired": (
+            "If a candidate builds encoded call data, test a tiny controlled swap only after adding a real quote/min-output source or explicit manual route confirmation."
+            if successes
+            else "No manual route candidate encoded. Inspect candidate errors/router attempts and adjust route pool/type shape."
+        ),
+    }
+
+
 @router.post("/hydration/swap_tx")
 async def hydration_swap_tx(req: HydrationSwapTxRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
     base, quote = _parse_symbol(req.symbol)
@@ -5054,27 +6434,9 @@ async def hydration_swap_tx(req: HydrationSwapTxRequest, db: Session = Depends(g
             },
         )
 
-    # Keep exact-out BUY gated.  Isolated getBestBuy diagnostics now prove the
-    # quote can succeed, but live BUY signing/submission remains opt-in behind
-    # UTT_HYDRATION_ENABLE_EXACT_BUY=1 so the stable SELL path stays protected.
-    if side == "buy" and not _HYDRATION_ENABLE_EXACT_BUY:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "hydration_buy_swap_disabled",
-                "message": "Hydration BUY swaps are temporarily disabled while exact-buy/getBestBuy routing is isolated. SELL swaps remain available for controlled testing.",
-                "venue": "polkadot_hydration",
-                "rawSymbol": req.symbol,
-                "resolvedSymbol": f"{base}-{quote}",
-                "side": side,
-                "amount": req.amount,
-                "quoteSpendEstimate": req.quote_spend_estimate,
-                "base": base_meta,
-                "quote": quote_meta,
-                "quoteStatus": quote_status,
-                "routeMode": route_mode_norm,
-            },
-        )
+    # BUY is no longer blocked here unconditionally.  Exact-out SDK BUY remains
+    # gated below, but DB-confirmed manual_router routes can build Router.buy
+    # without enabling the broad sdk-next getBestBuy/router quote path.
 
     amount_mode = str(req.amount_mode or ("exact_out" if side == "buy" else "exact_in")).strip().lower()
     if amount_mode not in {"exact_in", "exact_out"}:
@@ -5184,6 +6546,99 @@ async def hydration_swap_tx(req: HydrationSwapTxRequest, db: Session = Depends(g
             "note": "UTT BUY is built as Hydration router.sell exact-in quote spend for this custom XYK pair to avoid exact-output max_amount_in failures from stale manual reserves.",
         })
 
+    manual_router_fallback_diag: Optional[Dict[str, Any]] = None
+    if route_mode_norm in {"auto", "manual_router"}:
+        manual_router_fallback_diag = await _hydration_manual_router_fallback_diagnostics(
+            db=db,
+            base=base,
+            quote=quote,
+            side=manual_plan_side,
+            amount_ui=build_amount_ui,
+            amount_mode=build_amount_mode,
+            slippage_bps=int(req.slippage_bps),
+            base_meta=base_meta,
+            quote_meta=quote_meta,
+        )
+
+    if not manual_custom_swap and route_mode_norm in {"auto", "manual_router"}:
+        try:
+            manual_custom_swap = await _hydration_manual_router_fallback_plan(
+                db=db,
+                base=base,
+                quote=quote,
+                side=manual_plan_side,
+                amount_ui=build_amount_ui,
+                amount_mode=build_amount_mode,
+                slippage_bps=int(req.slippage_bps),
+                base_meta=base_meta,
+                quote_meta=quote_meta,
+            )
+            if isinstance(manual_router_fallback_diag, dict):
+                manual_router_fallback_diag["attempted"] = True
+                manual_router_fallback_diag["attached"] = bool(isinstance(manual_custom_swap, dict) and manual_custom_swap.get("enabled"))
+                manual_router_fallback_diag["planReason"] = (
+                    "manual_router_fallback_attached"
+                    if manual_router_fallback_diag.get("attached")
+                    else "manual_router_fallback_plan_returned_none"
+                )
+        except HTTPException as e:
+            if isinstance(manual_router_fallback_diag, dict):
+                manual_router_fallback_diag["attempted"] = True
+                manual_router_fallback_diag["attached"] = False
+                manual_router_fallback_diag["planError"] = e.detail
+            # Preserve precise safety errors instead of falling through to the
+            # generic SDK-router-quotes-disabled error.
+            detail_error = None
+            try:
+                detail_error = (e.detail or {}).get("error") if isinstance(e.detail, dict) else None
+            except Exception:
+                detail_error = None
+            if detail_error in {
+                "hydration_manual_router_fallback_unconfirmed",
+                "hydration_manual_router_fallback_input_too_large",
+                "hydration_manual_router_fallback_min_out_too_small",
+                "hydration_manual_router_fallback_max_in_too_small",
+            }:
+                raise
+        except Exception as e:
+            if isinstance(manual_router_fallback_diag, dict):
+                manual_router_fallback_diag["attempted"] = True
+                manual_router_fallback_diag["attached"] = False
+                manual_router_fallback_diag["planError"] = {
+                    "error": type(e).__name__,
+                    "message": str(e),
+                }
+
+    _hydration_mark_manual_router_diag_attached(manual_router_fallback_diag, manual_custom_swap)
+    quote_status = _hydration_quote_status_with_manual_custom_swap(
+        quote_status,
+        manual_custom_swap=manual_custom_swap,
+        side=side,
+        amount_mode=amount_mode,
+    )
+
+    if side == "buy" and not _HYDRATION_ENABLE_EXACT_BUY and not manual_custom_swap:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "hydration_buy_swap_disabled",
+                "message": "Hydration BUY swaps are disabled for SDK/router-quote paths, but confirmed manual_router BUY routes may still build without enabling SDK quotes. No confirmed manual_router BUY route attached for this request.",
+                "venue": "polkadot_hydration",
+                "rawSymbol": req.symbol,
+                "resolvedSymbol": f"{base}-{quote}",
+                "side": side,
+                "amount": req.amount,
+                "amountMode": amount_mode,
+                "quoteSpendEstimate": req.quote_spend_estimate,
+                "base": base_meta,
+                "quote": quote_meta,
+                "quoteStatus": quote_status,
+                "routeMode": route_mode_norm,
+                "manualRouterFallback": manual_router_fallback_diag,
+                "nextRequired": "Save/confirm the reverse spend route in Hydration Route Registry, or set UTT_HYDRATION_ENABLE_EXACT_BUY=1 only for controlled SDK exact-buy diagnostics.",
+            },
+        )
+
     if not manual_custom_swap and not _HYDRATION_ENABLE_ROUTER_QUOTES:
         raise HTTPException(
             status_code=503,
@@ -5199,6 +6654,7 @@ async def hydration_swap_tx(req: HydrationSwapTxRequest, db: Session = Depends(g
                 "quote": quote_meta,
                 "quoteStatus": quote_status,
                 "routeMode": route_mode_norm,
+                "manualRouterFallback": manual_router_fallback_diag,
             },
         )
 
@@ -5233,7 +6689,20 @@ async def hydration_swap_tx(req: HydrationSwapTxRequest, db: Session = Depends(g
         "slippageBps": int(req.slippage_bps),
         "effectiveSlippageBps": int(manual_plan_slippage_bps if manual_quote_spend_buy else req.slippage_bps),
         "routeMode": route_mode_norm,
-        "routeModeEffective": "manual_xyk" if manual_custom_swap else ("isolated_helper" if route_mode_norm == "isolated_helper" else "sdk"),
+        "routeModeEffective": (
+            "manual_router"
+            if isinstance(manual_custom_swap, dict) and manual_custom_swap.get("manualRouterFallback")
+            else ("manual_xyk" if manual_custom_swap else ("isolated_helper" if route_mode_norm == "isolated_helper" else "sdk"))
+        ),
+        "manualRouterFallback": bool(isinstance(manual_custom_swap, dict) and manual_custom_swap.get("manualRouterFallback")),
+        "executionConfirmed": bool(
+            isinstance(manual_custom_swap, dict)
+            and (
+                bool(manual_custom_swap.get("executionConfirmed"))
+                or not manual_custom_swap.get("manualRouterFallback")
+            )
+        ),
+        "manualRouterFallbackDiagnostics": manual_router_fallback_diag,
         "user_pubkey": req.user_pubkey,
         "base": base_meta,
         "quote": quote_meta,
@@ -5245,7 +6714,11 @@ async def hydration_swap_tx(req: HydrationSwapTxRequest, db: Session = Depends(g
             "enabled": True,
             "signed": False,
             "submitted": False,
-            "nextRequired": "Front-end SubWallet signing/submission is the next step. This endpoint returns unsigned encoded call data from the SDK path or manual custom-asset Router fallback.",
+            "nextRequired": (
+                "Front-end SubWallet signing/submission is the next step for execution-confirmed routes."
+                if not (isinstance(manual_custom_swap, dict) and manual_custom_swap.get("manualRouterFallback") and not manual_custom_swap.get("executionConfirmed"))
+                else "Manual Router fallback is buildable but not execution-confirmed. Do not sign/submit until the route is confirmed."
+            ),
         },
         "tx": built,
     }

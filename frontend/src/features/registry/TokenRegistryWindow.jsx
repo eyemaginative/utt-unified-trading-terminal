@@ -210,6 +210,8 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const [routes, setRoutes] = useState([]);
   const [routeLoading, setRouteLoading] = useState(false);
   const [routeSaving, setRouteSaving] = useState(false);
+  const [routeValidating, setRouteValidating] = useState(false);
+  const [routeReversing, setRouteReversing] = useState(false);
   const [routeErr, setRouteErr] = useState(null);
   const [routeSymbol, setRouteSymbol] = useState("UTTT-HDX");
   const [routeMode, setRouteMode] = useState("manual_xyk");
@@ -594,32 +596,127 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     setRouteTestResult(null);
   }, []);
 
+  const buildRouteRegistryPayload = useCallback(() => {
+    const mode = String(routeMode || "manual_xyk").trim().toLowerCase() === "manual_router" ? "manual_router" : "manual_xyk";
+    const route = parseRouteJsonText(routeJsonText);
+    const payload = {
+      symbol: String(routeSymbol || "").trim().toUpperCase(),
+      route_mode: mode,
+      fee_bps: Number(String(routeFeeBps || "").trim()),
+      enabled: !!routeEnabled,
+      confirmed: !!routeConfirmed,
+      pool_type: mode === "manual_router" ? "Router" : "XYK",
+    };
+    if (mode === "manual_xyk") {
+      payload.base_reserve = Number(String(routeBaseReserve || "").trim());
+      payload.quote_reserve = Number(String(routeQuoteReserve || "").trim());
+    }
+    if (route.length) {
+      payload.route_json = route;
+    }
+    const pool = String(routePoolAccount || "").trim();
+    if (pool) payload.pool_account = pool;
+    const n = String(routeNote || "").trim();
+    if (n) payload.note = n;
+    return payload;
+  }, [routeSymbol, routeMode, routeBaseReserve, routeQuoteReserve, routeFeeBps, routePoolAccount, routeEnabled, routeConfirmed, routeJsonText, routeNote]);
+
+  const validateRoute = useCallback(async () => {
+    if (!canUpsertRoute) return;
+    setRouteValidating(true);
+    setRouteErr(null);
+    setRouteTestResult(null);
+    try {
+      const payload = buildRouteRegistryPayload();
+      const r = await fetch(`${API_BASE}/api/polkadot_dex/hydration/route_registry/validate`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
+      const validation = j?.routeValidation || {};
+      setRouteTestResult({
+        kind: "validation",
+        ok: !!(j?.ok && validation?.ok),
+        symbol: j?.symbol || payload.symbol,
+        routeMode: j?.routeMode || payload.route_mode,
+        direction: j?.direction || null,
+        validation,
+        normalizedRoute: validation?.route || [],
+        errors: Array.isArray(validation?.errors) ? validation.errors : [],
+        warnings: Array.isArray(validation?.warnings) ? validation.warnings : [],
+      });
+    } catch (e) {
+      const msg = String(e?.message || e);
+      setRouteErr(msg);
+      setRouteTestResult({ kind: "validation", ok: false, symbol: String(routeSymbol || "").trim().toUpperCase(), error: msg });
+    } finally {
+      setRouteValidating(false);
+    }
+  }, [API_BASE, canUpsertRoute, routeSymbol, buildRouteRegistryPayload]);
+
+  const reverseRoute = useCallback(async () => {
+    if (!canUpsertRoute) return;
+    setRouteReversing(true);
+    setRouteErr(null);
+    setRouteTestResult(null);
+    try {
+      const payload = buildRouteRegistryPayload();
+      const r = await fetch(`${API_BASE}/api/polkadot_dex/hydration/route_registry/reverse_preview`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
+
+      const reversedPayload = j?.reversedPayload || {};
+      const validation = j?.routeValidation || {};
+      const reversedRoute = Array.isArray(reversedPayload?.route_json)
+        ? reversedPayload.route_json
+        : (Array.isArray(validation?.route) ? validation.route : []);
+
+      setRouteSymbol(String(reversedPayload?.symbol || j?.symbol || "").trim().toUpperCase());
+      setRouteMode(String(reversedPayload?.route_mode || j?.routeMode || routeMode || "manual_xyk").trim().toLowerCase() === "manual_router" ? "manual_router" : "manual_xyk");
+      setRoutePoolType(String(reversedPayload?.route_mode || j?.routeMode || routeMode || "").trim().toLowerCase() === "manual_router" ? "Router" : "XYK");
+      setRouteBaseReserve(reversedPayload?.base_reserve == null ? "" : String(reversedPayload.base_reserve));
+      setRouteQuoteReserve(reversedPayload?.quote_reserve == null ? "" : String(reversedPayload.quote_reserve));
+      setRouteFeeBps(reversedPayload?.fee_bps == null ? String(routeFeeBps || "30") : String(reversedPayload.fee_bps));
+      setRoutePoolAccount(String(reversedPayload?.pool_account || ""));
+      setRouteEnabled(reversedPayload?.enabled !== false);
+      setRouteConfirmed(false);
+      setRouteJsonText(reversedRoute.length ? safeJsonPretty(reversedRoute) : "");
+      setRouteNote(String(reversedPayload?.note || routeNote || ""));
+
+      setRouteTestResult({
+        kind: "reverse_preview",
+        ok: !!(j?.ok && validation?.ok),
+        symbol: j?.symbol || reversedPayload?.symbol || payload.symbol,
+        routeMode: j?.routeMode || reversedPayload?.route_mode || payload.route_mode,
+        direction: j?.direction || null,
+        validation,
+        normalizedRoute: reversedRoute,
+        errors: Array.isArray(validation?.errors) ? validation.errors : [],
+        warnings: Array.isArray(validation?.warnings) ? validation.warnings : [],
+        original: j?.original || null,
+      });
+    } catch (e) {
+      const msg = String(e?.message || e);
+      setRouteErr(msg);
+      setRouteTestResult({ kind: "reverse_preview", ok: false, symbol: String(routeSymbol || "").trim().toUpperCase(), error: msg });
+    } finally {
+      setRouteReversing(false);
+    }
+  }, [API_BASE, canUpsertRoute, routeMode, routeFeeBps, routeNote, routeSymbol, buildRouteRegistryPayload]);
+
+
   const upsertRoute = useCallback(async () => {
     if (!canUpsertRoute) return;
     setRouteSaving(true);
     setRouteErr(null);
     try {
-      const mode = String(routeMode || "manual_xyk").trim().toLowerCase() === "manual_router" ? "manual_router" : "manual_xyk";
-      const route = parseRouteJsonText(routeJsonText);
-      const payload = {
-        symbol: String(routeSymbol || "").trim().toUpperCase(),
-        route_mode: mode,
-        fee_bps: Number(String(routeFeeBps || "").trim()),
-        enabled: !!routeEnabled,
-        confirmed: !!routeConfirmed,
-        pool_type: mode === "manual_router" ? "Router" : "XYK",
-      };
-      if (mode === "manual_xyk") {
-        payload.base_reserve = Number(String(routeBaseReserve || "").trim());
-        payload.quote_reserve = Number(String(routeQuoteReserve || "").trim());
-      }
-      if (route.length) {
-        payload.route_json = route;
-      }
-      const pool = String(routePoolAccount || "").trim();
-      if (pool) payload.pool_account = pool;
-      const n = String(routeNote || "").trim();
-      if (n) payload.note = n;
+      const payload = buildRouteRegistryPayload();
 
       const r = await fetch(`${API_BASE}/api/polkadot_dex/hydration/route_registry/upsert`, {
         method: "POST",
@@ -635,7 +732,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     } finally {
       setRouteSaving(false);
     }
-  }, [API_BASE, canUpsertRoute, routeSymbol, routeMode, routeBaseReserve, routeQuoteReserve, routeFeeBps, routePoolAccount, routeEnabled, routeConfirmed, routeJsonText, routeNote, loadRoutes]);
+  }, [API_BASE, canUpsertRoute, buildRouteRegistryPayload, loadRoutes]);
 
   const deleteRoute = useCallback(async (row) => {
     const id = row?.id;
@@ -916,7 +1013,13 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
             >
               Load route template
             </button>
-            <button type="button" onClick={upsertRoute} style={btnStyle} disabled={!canUpsertRoute || routeSaving}>
+            <button type="button" onClick={validateRoute} style={btnStyle} disabled={!canUpsertRoute || routeSaving || routeValidating || routeReversing}>
+              {routeValidating ? "Validating…" : "Validate route"}
+            </button>
+            <button type="button" onClick={reverseRoute} style={btnStyle} disabled={!canUpsertRoute || routeSaving || routeValidating || routeReversing}>
+              {routeReversing ? "Reversing…" : "Reverse route"}
+            </button>
+            <button type="button" onClick={upsertRoute} style={btnStyle} disabled={!canUpsertRoute || routeSaving || routeValidating || routeReversing}>
               {routeSaving ? "Saving…" : "Save route"}
             </button>
           </div>
@@ -938,10 +1041,36 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
           {routeTestResult && (
             <div style={{ marginTop: 8, padding: 8, borderRadius: 10, border: "1px solid rgba(255,255,255,0.10)", background: routeTestResult.ok ? "rgba(20,80,45,0.25)" : "rgba(120,30,30,0.25)", fontSize: 12 }}>
               <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                {routeTestResult.kind === "live_reserves" ? "Live reserve test" : "Manual route orderbook test"}: {routeTestResult.symbol || "—"}
+                {routeTestResult.kind === "validation" ? "Route validation" : (routeTestResult.kind === "reverse_preview" ? "Route reverse preview" : (routeTestResult.kind === "live_reserves" ? "Live reserve test" : "Manual route orderbook test"))}: {routeTestResult.symbol || "—"}
               </div>
               {routeTestResult.error ? (
                 <div style={{ color: "#ffb3b3" }}>{routeTestResult.error}</div>
+              ) : (routeTestResult.kind === "validation" || routeTestResult.kind === "reverse_preview") ? (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 6 }}>
+                  <div>Validation: <code style={codeStyle}>{routeTestResult.ok ? "OK" : "Failed"}</code></div>
+                  <div>Mode: <code style={codeStyle}>{routeTestResult.routeMode || "—"}</code></div>
+                  <div>Legs: <code style={codeStyle}>{routeTestResult.validation?.legCount ?? "—"}</code></div>
+                  <div style={{ gridColumn: "1 / -1" }}>Direction: <code style={codeStyle}>{routeTestResult.direction?.label || "—"}</code></div>
+                  {routeTestResult.kind === "reverse_preview" && routeTestResult.original?.direction?.label ? (
+                    <div style={{ gridColumn: "1 / -1" }}>Original: <code style={codeStyle}>{routeTestResult.original.direction.label}</code></div>
+                  ) : null}
+                  {routeTestResult.warnings?.length ? (
+                    <div style={{ gridColumn: "1 / -1", padding: 6, borderRadius: 8, border: "1px solid rgba(245,158,11,0.45)", background: "rgba(120,72,16,0.18)", color: "#ffe2a6" }}>
+                      <b>Warnings</b>
+                      <pre style={routeValidationPreStyle}>{safeJsonPretty(routeTestResult.warnings)}</pre>
+                    </div>
+                  ) : null}
+                  {routeTestResult.errors?.length ? (
+                    <div style={{ gridColumn: "1 / -1", padding: 6, borderRadius: 8, border: "1px solid rgba(248,113,113,0.45)", background: "rgba(120,30,30,0.18)", color: "#ffdddd" }}>
+                      <b>Errors</b>
+                      <pre style={routeValidationPreStyle}>{safeJsonPretty(routeTestResult.errors)}</pre>
+                    </div>
+                  ) : null}
+                  <div style={{ gridColumn: "1 / -1" }}>
+                    <b>Normalized route</b>
+                    <pre style={routeValidationPreStyle}>{safeJsonPretty(routeTestResult.normalizedRoute)}</pre>
+                  </div>
+                </div>
               ) : (
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 6 }}>
                   {routeTestResult.router ? <div>Router: <code style={codeStyle}>{routeTestResult.router}</code></div> : null}
@@ -1212,6 +1341,20 @@ const routeJsonTextAreaStyle = {
   fontSize: 11,
   resize: "vertical",
 };
+
+const routeValidationPreStyle = {
+  margin: "6px 0 0",
+  padding: 8,
+  borderRadius: 8,
+  background: "rgba(0,0,0,0.22)",
+  color: "inherit",
+  fontSize: 11,
+  lineHeight: 1.35,
+  overflowX: "auto",
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+};
+
 
 const inputStyle = {
   width: "100%",

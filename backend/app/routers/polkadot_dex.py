@@ -4046,6 +4046,379 @@ def _normalize_manual_router_route(
     return clean if isinstance(clean, list) and clean else None
 
 
+
+
+def _hydration_route_asset_label(
+    asset_id: Any,
+    *,
+    db: Optional[Session],
+    base: str,
+    quote: str,
+    base_meta: Dict[str, Any],
+    quote_meta: Dict[str, Any],
+) -> str:
+    asset_norm = _asset_id_norm_for_compare(asset_id)
+    if asset_norm == _asset_id_norm_for_compare((base_meta or {}).get("assetId")):
+        return str(base or (base_meta or {}).get("symbol") or asset_norm).upper()
+    if asset_norm == _asset_id_norm_for_compare((quote_meta or {}).get("assetId")):
+        return str(quote or (quote_meta or {}).get("symbol") or asset_norm).upper()
+    if asset_norm == _asset_id_norm_for_compare(_HYDRATION_NATIVE_ASSET_ID):
+        return _HYDRATION_NATIVE_SYMBOL or "HDX"
+
+    known_intermediates = {
+        "1001": "aDOT",
+    }
+    if asset_norm in known_intermediates:
+        return known_intermediates[asset_norm]
+
+    if db is not None and asset_norm:
+        try:
+            cols = {
+                str(r.get("name") or "")
+                for r in db.execute(text("PRAGMA table_info(token_registry)")).mappings().all()
+            }
+            lookup_cols = [c for c in ("address", "asset_id", "contract_address", "mint", "mint_address") if c in cols]
+            if "symbol" in cols and lookup_cols:
+                where_sql = " OR ".join([f"CAST({c} AS TEXT) = :asset_id" for c in lookup_cols])
+                row = db.execute(
+                    text(f"SELECT symbol FROM token_registry WHERE {where_sql} LIMIT 1"),
+                    {"asset_id": str(asset_norm)},
+                ).mappings().first()
+                if row and row.get("symbol"):
+                    return str(row.get("symbol")).upper()
+        except Exception:
+            pass
+
+    return f"asset:{asset_norm}" if asset_norm else "asset:?"
+
+
+def _hydration_route_asset_sequence(
+    route: Any,
+    *,
+    fallback_asset_in_id: int,
+    fallback_asset_out_id: int,
+) -> List[int]:
+    if not isinstance(route, list) or not route:
+        return [int(fallback_asset_in_id), int(fallback_asset_out_id)]
+
+    out: List[int] = []
+    first_in = _route_leg_asset_value(route[0], "assetIn", "asset_in")
+    if first_in is not None:
+        out.append(int(first_in))
+    for leg in route:
+        if not isinstance(leg, dict):
+            continue
+        leg_out = _route_leg_asset_value(leg, "assetOut", "asset_out")
+        if leg_out is not None:
+            out.append(int(leg_out))
+
+    if len(out) >= 2:
+        return out
+    return [int(fallback_asset_in_id), int(fallback_asset_out_id)]
+
+
+def _hydration_route_direction_summary(
+    route: Any,
+    *,
+    db: Optional[Session],
+    base: str,
+    quote: str,
+    base_meta: Dict[str, Any],
+    quote_meta: Dict[str, Any],
+    fallback_asset_in_id: int,
+    fallback_asset_out_id: int,
+) -> Dict[str, Any]:
+    asset_ids = _hydration_route_asset_sequence(
+        route,
+        fallback_asset_in_id=int(fallback_asset_in_id),
+        fallback_asset_out_id=int(fallback_asset_out_id),
+    )
+    labels = [
+        _hydration_route_asset_label(
+            asset_id,
+            db=db,
+            base=base,
+            quote=quote,
+            base_meta=base_meta,
+            quote_meta=quote_meta,
+        )
+        for asset_id in asset_ids
+    ]
+    hops: List[Dict[str, Any]] = []
+    for idx in range(max(0, len(asset_ids) - 1)):
+        hops.append({
+            "fromAssetId": int(asset_ids[idx]),
+            "toAssetId": int(asset_ids[idx + 1]),
+            "from": labels[idx],
+            "to": labels[idx + 1],
+        })
+    return {
+        "label": " → ".join(labels),
+        "assetIds": asset_ids,
+        "labels": labels,
+        "hops": hops,
+    }
+
+
+def _hydration_route_registry_validation_payload(
+    req: HydrationRouteRegistryUpsertRequest,
+    *,
+    db: Optional[Session],
+) -> Dict[str, Any]:
+    try:
+        base, quote = _parse_symbol(req.symbol)
+    except HTTPException as e:
+        return {
+            "ok": False,
+            "venue": "polkadot_hydration",
+            "symbol": str(req.symbol or "").strip().upper(),
+            "routeValidation": {
+                "ok": False,
+                "errors": [{"error": "invalid_symbol", "detail": e.detail}],
+                "warnings": [],
+                "legCount": 0,
+                "route": None,
+                "shapeHints": _manual_router_route_shape_hints(),
+            },
+            "writesDb": False,
+        }
+
+    route_mode = str(req.route_mode or "manual_xyk").strip().lower()
+    aliases = {
+        "manual": "manual_xyk",
+        "xyk": "manual_xyk",
+        "router": "manual_router",
+        "manual router": "manual_router",
+        "manual_router_fallback": "manual_router",
+    }
+    route_mode = aliases.get(route_mode, route_mode)
+
+    errors: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    if route_mode not in {"manual_xyk", "manual_router"}:
+        errors.append({
+            "error": "unsupported_hydration_route_mode",
+            "routeMode": req.route_mode,
+            "supported": ["manual_xyk", "manual_router"],
+        })
+
+    try:
+        base_meta = _resolve_asset(base, db=db)
+        quote_meta = _resolve_asset(quote, db=db)
+    except HTTPException as e:
+        return {
+            "ok": False,
+            "venue": "polkadot_hydration",
+            "symbol": f"{base}-{quote}",
+            "routeMode": route_mode,
+            "base": base,
+            "quote": quote,
+            "routeValidation": {
+                "ok": False,
+                "errors": errors + [{"error": "asset_resolution_failed", "detail": e.detail}],
+                "warnings": warnings,
+                "legCount": 0,
+                "route": None,
+                "shapeHints": _manual_router_route_shape_hints(),
+            },
+            "writesDb": False,
+        }
+
+    asset_in_id = _hydration_sdk_asset_id(base_meta)
+    asset_out_id = _hydration_sdk_asset_id(quote_meta)
+    pool_type = "Router" if route_mode == "manual_router" else "XYK"
+
+    if route_mode == "manual_router":
+        pool_type_raw = str(req.pool_type or "Router").strip()
+        if pool_type_raw.lower() not in {"router", "manual_router", "manual router"}:
+            errors.append({
+                "error": "unsupported_hydration_manual_router_pool_type",
+                "poolType": req.pool_type,
+                "supported": ["Router"],
+            })
+
+        route_validation = _validate_manual_router_route(
+            req.route_json,
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+        )
+        if errors:
+            route_validation = {
+                **route_validation,
+                "ok": False,
+                "errors": errors + list(route_validation.get("errors") or []),
+            }
+    else:
+        pool_type_raw = str(req.pool_type or "XYK").strip()
+        if pool_type_raw.lower() != "xyk":
+            errors.append({
+                "error": "unsupported_hydration_manual_pool_type",
+                "poolType": req.pool_type,
+                "supported": ["XYK", "Router"],
+            })
+
+        base_reserve = _float_or_none(req.base_reserve)
+        quote_reserve = _float_or_none(req.quote_reserve)
+        if base_reserve is None or quote_reserve is None:
+            errors.append({
+                "error": "manual_xyk_reserves_required",
+                "message": "manual_xyk routes require positive base_reserve and quote_reserve.",
+            })
+
+        route = req.route_json
+        if not isinstance(route, list) or not route:
+            route = [{
+                "pool": {"type": "XYK"},
+                "assetIn": int(asset_in_id),
+                "assetOut": int(asset_out_id),
+            }]
+        route_validation = {
+            "ok": not errors,
+            "route": route if not errors else None,
+            "errors": errors,
+            "warnings": warnings,
+            "legCount": len(route) if isinstance(route, list) else 0,
+            "shapeHints": {
+                "manualXyk": {
+                    "baseReserve": "required positive human-unit reserve for BASE",
+                    "quoteReserve": "required positive human-unit reserve for QUOTE",
+                    "feeBps": "pool fee in basis points",
+                },
+                **_manual_router_route_shape_hints(),
+            },
+        }
+
+    clean_route = route_validation.get("route") if route_validation.get("ok") else (req.route_json or [])
+    direction = _hydration_route_direction_summary(
+        clean_route,
+        db=db,
+        base=base,
+        quote=quote,
+        base_meta=base_meta,
+        quote_meta=quote_meta,
+        fallback_asset_in_id=int(asset_in_id),
+        fallback_asset_out_id=int(asset_out_id),
+    )
+
+    return {
+        "ok": bool(route_validation.get("ok")),
+        "venue": "polkadot_hydration",
+        "symbol": f"{base}-{quote}",
+        "routeMode": route_mode,
+        "poolType": pool_type,
+        "base": base,
+        "quote": quote,
+        "baseAssetId": int(asset_in_id),
+        "quoteAssetId": int(asset_out_id),
+        "baseMeta": base_meta,
+        "quoteMeta": quote_meta,
+        "enabled": bool(req.enabled),
+        "confirmed": bool(req.confirmed),
+        "routeValidation": route_validation,
+        "direction": direction,
+        "writesDb": False,
+        "note": "Validate-only endpoint; no route registry row was inserted or updated.",
+    }
+
+
+
+def _hydration_route_registry_reverse_preview_payload(
+    req: HydrationRouteRegistryUpsertRequest,
+    *,
+    db: Optional[Session],
+) -> Dict[str, Any]:
+    # Reverse-preview path for Route Registry UI. This intentionally does not
+    # insert, update, delete, sign, build swaps, or submit transactions.
+    try:
+        base, quote = _parse_symbol(req.symbol)
+    except HTTPException as e:
+        return {
+            "ok": False,
+            "venue": "polkadot_hydration",
+            "symbol": str(req.symbol or "").strip().upper(),
+            "error": "invalid_symbol",
+            "detail": e.detail,
+            "writesDb": False,
+        }
+
+    mode_raw = str(req.route_mode or "manual_xyk").strip().lower()
+    aliases = {
+        "manual": "manual_xyk",
+        "xyk": "manual_xyk",
+        "router": "manual_router",
+        "manual router": "manual_router",
+        "manual_router_fallback": "manual_router",
+    }
+    route_mode = aliases.get(mode_raw, mode_raw)
+    reversed_symbol = f"{quote}-{base}"
+
+    original_validation = _hydration_route_registry_validation_payload(req, db=db)
+
+    reversed_route = req.route_json
+    if route_mode == "manual_router":
+        reversed_route = _reverse_hydration_route_legs(req.route_json or [])
+    elif route_mode == "manual_xyk":
+        # XYK rows are reserve-oriented, so the reserves are swapped below.  The
+        # route JSON is kept empty/default unless the operator supplied one.
+        reversed_route = req.route_json
+
+    reversed_req = HydrationRouteRegistryUpsertRequest(
+        symbol=reversed_symbol,
+        route_mode=route_mode,
+        base_reserve=req.quote_reserve,
+        quote_reserve=req.base_reserve,
+        fee_bps=req.fee_bps,
+        enabled=req.enabled,
+        # Do not auto-confirm a mechanically reversed route.  Confirmation stays
+        # an explicit operator action after a tiny live on-chain success.
+        confirmed=False,
+        pool_type=req.pool_type,
+        pool_account=req.pool_account,
+        route_json=reversed_route if isinstance(reversed_route, list) and reversed_route else None,
+        tested_at=None,
+        last_test_tx_hash=None,
+        note=req.note,
+    )
+    reversed_validation = _hydration_route_registry_validation_payload(reversed_req, db=db)
+
+    return {
+        "ok": bool(reversed_validation.get("ok")),
+        "venue": "polkadot_hydration",
+        "symbol": reversed_symbol,
+        "routeMode": reversed_validation.get("routeMode") or route_mode,
+        "poolType": reversed_validation.get("poolType"),
+        "base": reversed_validation.get("base"),
+        "quote": reversed_validation.get("quote"),
+        "baseAssetId": reversed_validation.get("baseAssetId"),
+        "quoteAssetId": reversed_validation.get("quoteAssetId"),
+        "enabled": bool(req.enabled),
+        "confirmed": False,
+        "routeValidation": reversed_validation.get("routeValidation") or {},
+        "direction": reversed_validation.get("direction"),
+        "reversedPayload": {
+            "symbol": reversed_symbol,
+            "route_mode": route_mode,
+            "base_reserve": req.quote_reserve,
+            "quote_reserve": req.base_reserve,
+            "fee_bps": req.fee_bps,
+            "enabled": bool(req.enabled),
+            "confirmed": False,
+            "pool_type": reversed_validation.get("poolType") or req.pool_type,
+            "pool_account": req.pool_account,
+            "route_json": (reversed_validation.get("routeValidation") or {}).get("route") or reversed_route or [],
+            "note": req.note,
+        },
+        "original": {
+            "symbol": f"{base}-{quote}",
+            "routeValidation": original_validation.get("routeValidation") or {},
+            "direction": original_validation.get("direction"),
+            "ok": bool(original_validation.get("ok")),
+        },
+        "writesDb": False,
+        "note": "Reverse-preview endpoint; no route registry row was inserted or updated.",
+    }
+
+
 def _manual_router_fallback_configured_route(
     *,
     base: str,
@@ -5638,6 +6011,8 @@ async def polkadot_dex_debug() -> Dict[str, Any]:
             "table": "hydration_route_registry",
             "endpoints": [
                 "/api/polkadot_dex/hydration/route_registry",
+                "/api/polkadot_dex/hydration/route_registry/validate",
+                "/api/polkadot_dex/hydration/route_registry/reverse_preview",
                 "/api/polkadot_dex/hydration/route_registry/upsert",
                 "/api/polkadot_dex/hydration/route_registry/{symbol}",
             ],
@@ -5791,6 +6166,26 @@ async def hydration_route_registry_list(
     }
 
 
+@router.post("/hydration/route_registry/validate")
+async def hydration_route_registry_validate(
+    req: HydrationRouteRegistryUpsertRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    # Validate-only path for Route Registry UI. This intentionally does not
+    # insert, update, delete, sign, build swaps, or submit transactions.
+    return _hydration_route_registry_validation_payload(req, db=db)
+
+
+@router.post("/hydration/route_registry/reverse_preview")
+async def hydration_route_registry_reverse_preview(
+    req: HydrationRouteRegistryUpsertRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    # Reverse-preview path for Route Registry UI. This intentionally does not
+    # insert, update, delete, sign, build swaps, or submit transactions.
+    return _hydration_route_registry_reverse_preview_payload(req, db=db)
+
+
 @router.post("/hydration/route_registry/upsert")
 async def hydration_route_registry_upsert(
     req: HydrationRouteRegistryUpsertRequest,
@@ -5812,7 +6207,20 @@ async def hydration_route_registry_upsert(
 
     pool_type_raw = str(req.pool_type or ("Router" if route_mode == "manual_router" else "XYK")).strip()
     pool_type_norm = pool_type_raw.lower()
+    if route_mode == "manual_router":
+        if pool_type_norm not in {"router", "manual_router", "manual router"}:
+            raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_manual_router_pool_type", "poolType": req.pool_type, "supported": ["Router"]})
+        pool_type = "Router"
+    else:
+        if pool_type_norm != "xyk":
+            raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_manual_pool_type", "poolType": req.pool_type, "supported": ["XYK", "Router"]})
+        pool_type = "XYK"
+
+    base_meta = _resolve_asset(base, db=db)
+    quote_meta = _resolve_asset(quote, db=db)
+    route = req.route_json
     route_validation: Optional[Dict[str, Any]] = None
+
     if route_mode == "manual_router":
         asset_in_id = _hydration_sdk_asset_id(base_meta)
         asset_out_id = _hydration_sdk_asset_id(quote_meta)
@@ -5833,37 +6241,6 @@ async def hydration_route_registry_upsert(
                     "expectedAssetOutId": int(asset_out_id),
                     "route_json": req.route_json,
                     "routeValidation": route_validation,
-                },
-            )
-        base_reserve = _float_or_none(req.base_reserve)
-        quote_reserve = _float_or_none(req.quote_reserve)
-    else:
-        if pool_type_norm != "xyk":
-            raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_manual_pool_type", "poolType": req.pool_type, "supported": ["XYK", "Router"]})
-        pool_type = "XYK"
-
-    base_meta = _resolve_asset(base, db=db)
-    quote_meta = _resolve_asset(quote, db=db)
-    route = req.route_json
-
-    if route_mode == "manual_router":
-        asset_in_id = _hydration_sdk_asset_id(base_meta)
-        asset_out_id = _hydration_sdk_asset_id(quote_meta)
-        route = _normalize_manual_router_route(
-            route,
-            asset_in_id=int(asset_in_id),
-            asset_out_id=int(asset_out_id),
-        )
-        if not route:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "invalid_hydration_manual_router_route_json",
-                    "message": "manual_router routes require route_json legs that start with BASE asset ID, end with QUOTE asset ID, and connect each leg assetOut -> next assetIn.",
-                    "symbol": f"{base}-{quote}",
-                    "expectedAssetInId": int(asset_in_id),
-                    "expectedAssetOutId": int(asset_out_id),
-                    "route_json": req.route_json,
                 },
             )
         base_reserve = _float_or_none(req.base_reserve)
@@ -5946,7 +6323,6 @@ async def hydration_route_registry_upsert(
             "autoOrderbook": f"/api/polkadot_dex/hydration/orderbook?symbol={base}-{quote}&route_mode=auto",
         },
     }
-
 
 @router.delete("/hydration/route_registry/{symbol}")
 async def hydration_route_registry_delete(

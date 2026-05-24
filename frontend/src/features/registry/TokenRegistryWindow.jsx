@@ -129,20 +129,115 @@ function parseRouteJsonText(text) {
   return parsed;
 }
 
-function hydrationRouteTemplateForSymbol(symbol) {
-  const s = String(symbol || "").trim().toUpperCase();
-  if (s === "DOT-HDX") {
-    return [
+const HYDRATION_BUILTIN_ROUTE_TEMPLATES = [
+  {
+    id: "builtin:DOT-HDX:manual_router",
+    source: "builtin",
+    label: "DOT-HDX manual Router · DOT → aDOT → HDX",
+    symbol: "DOT-HDX",
+    routeMode: "manual_router",
+    poolType: "Router",
+    baseReserve: "",
+    quoteReserve: "",
+    feeBps: 30,
+    poolAccount: "",
+    routeJson: [
       { pool: { type: "Aave" }, assetIn: 5, assetOut: 1001 },
       { pool: { type: "Omnipool" }, assetIn: 1001, assetOut: 0 },
-    ];
-  }
-  if (s === "HDX-DOT") {
-    return [
+    ],
+    direction: { label: "DOT → aDOT → HDX" },
+    note: "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+  },
+  {
+    id: "builtin:HDX-DOT:manual_router",
+    source: "builtin",
+    label: "HDX-DOT manual Router · HDX → aDOT → DOT",
+    symbol: "HDX-DOT",
+    routeMode: "manual_router",
+    poolType: "Router",
+    baseReserve: "",
+    quoteReserve: "",
+    feeBps: 30,
+    poolAccount: "",
+    routeJson: [
       { pool: { type: "Omnipool" }, assetIn: 0, assetOut: 1001 },
       { pool: { type: "Aave" }, assetIn: 1001, assetOut: 5 },
-    ];
-  }
+    ],
+    direction: { label: "HDX → aDOT → DOT" },
+    note: "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+  },
+  {
+    id: "builtin:UTTT-HDX:manual_xyk",
+    source: "builtin",
+    label: "UTTT-HDX manual XYK · UTTT → HDX snapshot",
+    symbol: "UTTT-HDX",
+    routeMode: "manual_xyk",
+    poolType: "XYK",
+    baseReserve: 1000000,
+    quoteReserve: 832.45,
+    feeBps: 30,
+    poolAccount: "",
+    routeJson: [
+      { pool: { type: "XYK" }, assetIn: 1001331, assetOut: 0 },
+    ],
+    direction: { label: "UTTT → HDX" },
+    note: "Built-in manual XYK snapshot template. Add or verify pool account before relying on live reserves; confirm only after a tiny live on-chain success.",
+  },
+  {
+    id: "builtin:HDX-UTTT:manual_xyk",
+    source: "builtin",
+    label: "HDX-UTTT manual XYK · HDX → UTTT snapshot",
+    symbol: "HDX-UTTT",
+    routeMode: "manual_xyk",
+    poolType: "XYK",
+    baseReserve: 832.45,
+    quoteReserve: 1000000,
+    feeBps: 30,
+    poolAccount: "",
+    routeJson: [
+      { pool: { type: "XYK" }, assetIn: 0, assetOut: 1001331 },
+    ],
+    direction: { label: "HDX → UTTT" },
+    note: "Built-in reverse manual XYK snapshot template. Add or verify pool account before relying on live reserves; confirm only after a tiny live on-chain success.",
+  },
+];
+
+function normalizeHydrationRouteTemplate(raw, index = 0) {
+  const t = raw && typeof raw === "object" ? raw : {};
+  const symbol = String(t.symbol || "").trim().toUpperCase();
+  const routeMode = String(t.routeMode || t.route_mode || "manual_xyk").trim().toLowerCase() === "manual_router"
+    ? "manual_router"
+    : "manual_xyk";
+  const routeJson = Array.isArray(t.routeJson)
+    ? t.routeJson
+    : (Array.isArray(t.route_json) ? t.route_json : (Array.isArray(t.route) ? t.route : []));
+  const source = String(t.source || "template").trim() || "template";
+  const id = String(t.id || `${source}:${symbol || "route"}:${routeMode}:${index}`).trim();
+  const label = String(t.label || [symbol, routeMode === "manual_router" ? "manual Router" : "manual XYK", t.routeDirection || t.direction?.label].filter(Boolean).join(" · ")).trim();
+  return {
+    id,
+    source,
+    label,
+    symbol,
+    routeMode,
+    poolType: String(t.poolType || t.pool_type || (routeMode === "manual_router" ? "Router" : "XYK")).trim(),
+    baseReserve: t.baseReserve ?? t.base_reserve ?? "",
+    quoteReserve: t.quoteReserve ?? t.quote_reserve ?? "",
+    feeBps: t.feeBps ?? t.fee_bps ?? 30,
+    poolAccount: t.poolAccount ?? t.pool_account ?? "",
+    routeJson,
+    direction: t.direction || (t.routeDirection ? { label: t.routeDirection } : null),
+    routeDirection: t.routeDirection || t.direction?.label || "",
+    note: t.note || "",
+    sourceConfirmed: !!t.sourceConfirmed,
+    requiresConfirmation: t.requiresConfirmation !== false,
+  };
+}
+
+function hydrationRouteTemplateForSymbol(symbol) {
+  const s = String(symbol || "").trim().toUpperCase();
+  const found = HYDRATION_BUILTIN_ROUTE_TEMPLATES.find((tpl) => String(tpl.symbol || "").toUpperCase() === s);
+  if (found && Array.isArray(found.routeJson)) return found.routeJson;
   return [
     { pool: { type: "Omnipool" }, assetIn: 0, assetOut: 0 },
   ];
@@ -150,7 +245,7 @@ function hydrationRouteTemplateForSymbol(symbol) {
 
 function hasKnownHydrationRouteTemplate(symbol) {
   const s = String(symbol || "").trim().toUpperCase();
-  return s === "DOT-HDX" || s === "HDX-DOT";
+  return HYDRATION_BUILTIN_ROUTE_TEMPLATES.some((tpl) => String(tpl.symbol || "").toUpperCase() === s);
 }
 
 function isKnownHydrationRouteTemplateText(value) {
@@ -159,10 +254,7 @@ function isKnownHydrationRouteTemplateText(value) {
   try {
     const parsed = JSON.parse(raw);
     const json = JSON.stringify(parsed);
-    return (
-      json === JSON.stringify(hydrationRouteTemplateForSymbol("DOT-HDX")) ||
-      json === JSON.stringify(hydrationRouteTemplateForSymbol("HDX-DOT"))
-    );
+    return HYDRATION_BUILTIN_ROUTE_TEMPLATES.some((tpl) => json === JSON.stringify(tpl.routeJson || []));
   } catch {
     return false;
   }
@@ -329,12 +421,33 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const [routeJsonText, setRouteJsonText] = useState("");
   const [routeNote, setRouteNote] = useState("");
   const [routeTestResult, setRouteTestResult] = useState(null);
+  const [routeTemplates, setRouteTemplates] = useState([]);
+  const [routeTemplateLoading, setRouteTemplateLoading] = useState(false);
+  const [selectedRouteTemplateId, setSelectedRouteTemplateId] = useState("builtin:DOT-HDX:manual_router");
 
   const activeVenueFilter = useMemo(() => defaultVenueForChain(chain), [chain]);
   const showHydrationRoutes = useMemo(() => {
     const c = String(chain || "").trim().toLowerCase();
     return c === "hydration" || c === "polkadot";
   }, [chain]);
+
+  const routeTemplateOptions = useMemo(() => {
+    const out = [];
+    const seen = new Set();
+    for (const raw of [...HYDRATION_BUILTIN_ROUTE_TEMPLATES, ...(routeTemplates || [])]) {
+      const tpl = normalizeHydrationRouteTemplate(raw, out.length);
+      const key = tpl.id || `${tpl.source}:${tpl.symbol}:${tpl.routeMode}:${out.length}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(tpl);
+    }
+    return out;
+  }, [routeTemplates]);
+
+  const selectedRouteTemplate = useMemo(
+    () => routeTemplateOptions.find((tpl) => tpl.id === selectedRouteTemplateId) || null,
+    [routeTemplateOptions, selectedRouteTemplateId]
+  );
 
   const loadSuggestions = useCallback(() => {
     try {
@@ -453,6 +566,30 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     }
   }, [API_BASE, showHydrationRoutes]);
 
+  const loadRouteTemplates = useCallback(async () => {
+    if (!showHydrationRoutes) {
+      setRouteTemplates([]);
+      return;
+    }
+    setRouteTemplateLoading(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/polkadot_dex/hydration/route_registry/templates?include_builtin=1&include_saved=1`, {
+        method: "GET",
+        headers: { accept: "application/json" },
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
+      const items = Array.isArray(j?.templates) ? j.templates : (Array.isArray(j?.items) ? j.items : []);
+      setRouteTemplates(items.map((item, idx) => normalizeHydrationRouteTemplate(item, idx)));
+    } catch {
+      // Keep built-in templates available even if the optional backend template
+      // endpoint is temporarily unavailable during a rolling local restart.
+      setRouteTemplates([]);
+    } finally {
+      setRouteTemplateLoading(false);
+    }
+  }, [API_BASE, showHydrationRoutes]);
+
   useEffect(() => {
     load();
     loadSuggestions();
@@ -460,7 +597,8 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
   useEffect(() => {
     loadRoutes();
-  }, [loadRoutes]);
+    loadRouteTemplates();
+  }, [loadRoutes, loadRouteTemplates]);
 
   useEffect(() => {
     const onFocus = () => loadSuggestions();
@@ -700,6 +838,38 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     setRouteTestResult(null);
   }, []);
 
+  const applyRouteTemplate = useCallback((rawTemplate) => {
+    const tpl = normalizeHydrationRouteTemplate(rawTemplate || selectedRouteTemplate || {}, 0);
+    if (!tpl.symbol) {
+      setRouteErr("No route template selected.");
+      return;
+    }
+    setRouteSymbol(tpl.symbol);
+    setRouteMode(tpl.routeMode);
+    setRoutePoolType(tpl.routeMode === "manual_router" ? "Router" : "XYK");
+    setRouteBaseReserve(tpl.routeMode === "manual_router" ? "" : (tpl.baseReserve == null ? "" : String(tpl.baseReserve)));
+    setRouteQuoteReserve(tpl.routeMode === "manual_router" ? "" : (tpl.quoteReserve == null ? "" : String(tpl.quoteReserve)));
+    setRouteFeeBps(tpl.feeBps == null ? "30" : String(tpl.feeBps));
+    setRoutePoolAccount(String(tpl.poolAccount || ""));
+    setRouteEnabled(true);
+    // Templates are operator aids. Keep confirmation explicit even when the
+    // source template came from an already-confirmed saved row.
+    setRouteConfirmed(false);
+    setRouteJsonText(Array.isArray(tpl.routeJson) && tpl.routeJson.length ? safeJsonPretty(tpl.routeJson) : "");
+    setRouteNote(String(tpl.note || ""));
+    setRouteErr(null);
+    setRouteTestResult({
+      kind: "template",
+      ok: true,
+      symbol: tpl.symbol,
+      routeMode: tpl.routeMode,
+      direction: tpl.direction || (tpl.routeDirection ? { label: tpl.routeDirection } : null),
+      normalizedRoute: Array.isArray(tpl.routeJson) ? tpl.routeJson : [],
+      template: tpl,
+      message: "Template loaded. Validate before saving; Confirmed stays unchecked until explicitly restored after a live test.",
+    });
+  }, [selectedRouteTemplate]);
+
   const buildRouteRegistryPayload = useCallback(() => {
     const mode = String(routeMode || "manual_xyk").trim().toLowerCase() === "manual_router" ? "manual_router" : "manual_xyk";
     const route = parseRouteJsonText(routeJsonText);
@@ -831,12 +1001,13 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
       setRouteTestResult(null);
       await loadRoutes();
+      await loadRouteTemplates();
     } catch (e) {
       setRouteErr(String(e?.message || e));
     } finally {
       setRouteSaving(false);
     }
-  }, [API_BASE, canUpsertRoute, buildRouteRegistryPayload, loadRoutes]);
+  }, [API_BASE, canUpsertRoute, buildRouteRegistryPayload, loadRoutes, loadRouteTemplates]);
 
   const deleteRoute = useCallback(async (row) => {
     const id = row?.id;
@@ -854,12 +1025,13 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
       setRouteTestResult(null);
       await loadRoutes();
+      await loadRouteTemplates();
     } catch (e) {
       setRouteErr(String(e?.message || e));
     } finally {
       setRouteSaving(false);
     }
-  }, [API_BASE, loadRoutes]);
+  }, [API_BASE, loadRoutes, loadRouteTemplates]);
 
   const testRouteOrderbook = useCallback(async (row) => {
     const sym = String(row?.symbol || routeSymbol || "").trim().toUpperCase();
@@ -958,7 +1130,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         <div style={tokenRegistryHeaderActionsStyle}>
           <select value={chain} onChange={(e) => onChainChange(e.target.value)} style={headerSelectStyle}>
             {CHAIN_OPTIONS.map((opt) => (
-              <option key={opt} value={opt}>{opt}</option>
+              <option key={opt} value={opt} style={selectOptionStyle}>{opt}</option>
             ))}
           </select>
           <button type="button" onClick={load} style={headerBtnStyle} disabled={loading}>
@@ -1021,7 +1193,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
           <input value={venue} onChange={(e) => setVenue(e.target.value)} placeholder="venue override" style={inputStyle} />
           <select value={externalPriceSource} onChange={(e) => setExternalPriceSource(e.target.value)} style={selectStyle} title="External price source">
             {EXTERNAL_PRICE_SOURCE_OPTIONS.map((opt) => (
-              <option key={opt || "blank"} value={opt}>{opt ? externalPriceSourceLabel(opt) : "Price source"}</option>
+              <option key={opt || "blank"} value={opt} style={selectOptionStyle}>{opt ? externalPriceSourceLabel(opt) : "Price source"}</option>
             ))}
           </select>
           <input value={externalPriceId} onChange={(e) => setExternalPriceId(e.target.value)} placeholder="price ID (hydradx)" style={inputStyle} />
@@ -1048,8 +1220,8 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                 Manual XYK rows handle reserve-based pools. Manual Router rows handle confirmed multi-leg paths like DOT → aDOT → HDX.
               </div>
             </div>
-            <button type="button" onClick={loadRoutes} style={btnStyle} disabled={routeLoading}>
-              {routeLoading ? "Loading…" : "Refresh routes"}
+            <button type="button" onClick={() => { loadRoutes(); loadRouteTemplates(); }} style={btnStyle} disabled={routeLoading || routeTemplateLoading}>
+              {routeLoading || routeTemplateLoading ? "Loading…" : "Refresh routes"}
             </button>
           </div>
 
@@ -1072,11 +1244,11 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
               style={selectStyle}
               title="Hydration route mode"
             >
-              <option value="manual_xyk">Manual XYK</option>
-              <option value="manual_router">Manual Router</option>
+              <option value="manual_xyk" style={selectOptionStyle}>Manual XYK</option>
+              <option value="manual_router" style={selectOptionStyle}>Manual Router</option>
             </select>
             <select value={routePoolType} onChange={(e) => setRoutePoolType(e.target.value)} style={selectStyle} title="Pool type">
-              <option value={routeMode === "manual_router" ? "Router" : "XYK"}>{routeMode === "manual_router" ? "Router" : "XYK"}</option>
+              <option value={routeMode === "manual_router" ? "Router" : "XYK"} style={selectOptionStyle}>{routeMode === "manual_router" ? "Router" : "XYK"}</option>
             </select>
             <input
               value={routeBaseReserve}
@@ -1103,19 +1275,49 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
               <input type="checkbox" checked={!!routeConfirmed} onChange={(e) => setRouteConfirmed(e.target.checked)} /> Confirmed
             </label>
             <input value={routeNote} onChange={(e) => setRouteNote(e.target.value)} placeholder="note (optional)" style={inputStyle} />
+            <select
+              value={selectedRouteTemplateId}
+              onChange={(e) => setSelectedRouteTemplateId(e.target.value)}
+              style={selectStyle}
+              title="Built-in and saved Hydration route templates"
+            >
+              <option value="" style={selectOptionStyle}>Template for current pair / blank</option>
+              {routeTemplateOptions.map((tpl) => (
+                <option key={tpl.id} value={tpl.id} style={selectOptionStyle}>
+                  {tpl.source === "saved_route_registry" ? "Saved · " : "Built-in · "}{tpl.label}
+                </option>
+              ))}
+            </select>
             <button
               type="button"
               onClick={() => {
-                setRouteMode("manual_router");
-                setRoutePoolType("Router");
-                setRouteBaseReserve("");
-                setRouteQuoteReserve("");
-                setRouteJsonText(safeJsonPretty(hydrationRouteTemplateForSymbol(routeSymbol)));
+                if (selectedRouteTemplate) {
+                  applyRouteTemplate(selectedRouteTemplate);
+                  return;
+                }
+                const sym = String(routeSymbol || "").trim().toUpperCase();
+                const matchingTemplate = routeTemplateOptions.find((tpl) => String(tpl.symbol || "").toUpperCase() === sym);
+                if (matchingTemplate) {
+                  applyRouteTemplate(matchingTemplate);
+                  return;
+                }
+                const routeJson = hydrationRouteTemplateForSymbol(sym);
+                const fallback = normalizeHydrationRouteTemplate({
+                  id: `fallback:${sym || "route"}`,
+                  source: "fallback",
+                  label: sym ? `${sym} fallback template` : "Fallback route template",
+                  symbol: sym,
+                  routeMode: "manual_router",
+                  poolType: "Router",
+                  routeJson,
+                  note: "Fallback template loaded from current pair. Validate before saving.",
+                });
+                applyRouteTemplate(fallback);
               }}
               style={btnStyle}
-              disabled={routeMode !== "manual_router"}
+              disabled={routeSaving || routeValidating || routeReversing || routeTemplateLoading}
             >
-              Load route template
+              {routeTemplateLoading ? "Loading templates…" : "Load selected template"}
             </button>
             <button type="button" onClick={validateRoute} style={btnStyle} disabled={!canUpsertRoute || routeSaving || routeValidating || routeReversing}>
               {routeValidating ? "Validating…" : "Validate route"}
@@ -1145,16 +1347,22 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
           {routeTestResult && (
             <div style={{ marginTop: 8, padding: 8, borderRadius: 10, border: "1px solid rgba(255,255,255,0.10)", background: routeTestResult.ok ? "rgba(20,80,45,0.25)" : "rgba(120,30,30,0.25)", fontSize: 12 }}>
               <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                {routeTestResult.kind === "validation" ? "Route validation" : (routeTestResult.kind === "reverse_preview" ? "Route reverse preview" : (routeTestResult.kind === "live_reserves" ? "Live reserve test" : "Manual route orderbook test"))}: {routeTestResult.symbol || "—"}
+                {routeTestResult.kind === "validation" ? "Route validation" : (routeTestResult.kind === "reverse_preview" ? "Route reverse preview" : (routeTestResult.kind === "template" ? "Route template loaded" : (routeTestResult.kind === "live_reserves" ? "Live reserve test" : "Manual route orderbook test")))}: {routeTestResult.symbol || "—"}
               </div>
               {routeTestResult.error ? (
                 <div style={{ color: "#ffb3b3" }}>{routeTestResult.error}</div>
-              ) : (routeTestResult.kind === "validation" || routeTestResult.kind === "reverse_preview") ? (
+              ) : (routeTestResult.kind === "validation" || routeTestResult.kind === "reverse_preview" || routeTestResult.kind === "template") ? (
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 6 }}>
                   <div>Validation: <code style={codeStyle}>{routeTestResult.ok ? "OK" : "Failed"}</code></div>
                   <div>Mode: <code style={codeStyle}>{routeTestResult.routeMode || "—"}</code></div>
                   <div>Legs: <code style={codeStyle}>{routeTestResult.validation?.legCount ?? "—"}</code></div>
                   <div style={{ gridColumn: "1 / -1" }}>Direction: <code style={codeStyle}>{routeTestResult.direction?.label || "—"}</code></div>
+                  {routeTestResult.template?.source ? (
+                    <div>Template source: <code style={codeStyle}>{routeTestResult.template.source}</code></div>
+                  ) : null}
+                  {routeTestResult.message ? (
+                    <div style={{ gridColumn: "1 / -1", color: "#c7d2fe" }}>{routeTestResult.message}</div>
+                  ) : null}
                   {routeTestResult.kind === "reverse_preview" && routeTestResult.original?.direction?.label ? (
                     <div style={{ gridColumn: "1 / -1" }}>Original: <code style={codeStyle}>{routeTestResult.original.direction.label}</code></div>
                   ) : null}
@@ -1362,7 +1570,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                       {isEdit ? (
                         <select value={editRow.external_price_source || ""} onChange={(e) => setEditRow((p) => ({ ...p, external_price_source: e.target.value }))} style={selectStyle}>
                           {EXTERNAL_PRICE_SOURCE_OPTIONS.map((opt) => (
-                            <option key={opt || "blank"} value={opt}>{opt ? externalPriceSourceLabel(opt) : "—"}</option>
+                            <option key={opt || "blank"} value={opt} style={selectOptionStyle}>{opt ? externalPriceSourceLabel(opt) : "—"}</option>
                           ))}
                         </select>
                       ) : (
@@ -1496,8 +1704,15 @@ const selectStyle = {
   borderRadius: 10,
   border: "1px solid rgba(255,255,255,0.12)",
   background: "rgba(0,0,0,0.25)",
+  backgroundColor: "#111821",
   color: "var(--utt-text, #e9eef7)",
+  colorScheme: "dark",
   outline: "none",
+};
+
+const selectOptionStyle = {
+  backgroundColor: "#111821",
+  color: "var(--utt-text, #e9eef7)",
 };
 
 const btnStyle = {

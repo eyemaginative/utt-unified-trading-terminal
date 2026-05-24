@@ -6258,6 +6258,191 @@ def _hydration_route_registry_payload(row: Any, *, db: Optional[Session] = None)
     }
 
 
+
+
+def _hydration_builtin_route_templates() -> List[Dict[str, Any]]:
+    """Built-in Hydration route templates surfaced to the Route Registry UI.
+
+    These are operator aids only. Loading a template should not mark a row
+    confirmed; confirmation remains an explicit action after a tiny live test.
+    """
+    return [
+        {
+            "id": "builtin:DOT-HDX:manual_router",
+            "source": "builtin",
+            "label": "DOT-HDX manual Router · DOT → aDOT → HDX",
+            "symbol": "DOT-HDX",
+            "routeMode": "manual_router",
+            "route_mode": "manual_router",
+            "poolType": "Router",
+            "pool_type": "Router",
+            "baseReserve": None,
+            "quoteReserve": None,
+            "base_reserve": None,
+            "quote_reserve": None,
+            "feeBps": 30,
+            "fee_bps": 30,
+            "poolAccount": None,
+            "pool_account": None,
+            "routeJson": [
+                {"pool": {"type": "Aave"}, "assetIn": 5, "assetOut": 1001},
+                {"pool": {"type": "Omnipool"}, "assetIn": 1001, "assetOut": 0},
+            ],
+            "route_json": [
+                {"pool": {"type": "Aave"}, "assetIn": 5, "assetOut": 1001},
+                {"pool": {"type": "Omnipool"}, "assetIn": 1001, "assetOut": 0},
+            ],
+            "direction": {"label": "DOT → aDOT → HDX", "assetIds": [5, 1001, 0], "labels": ["DOT", "aDOT", "HDX"]},
+            "routeDirection": "DOT → aDOT → HDX",
+            "enabled": True,
+            "confirmed": False,
+            "templateConfirmedDefault": False,
+            "requiresConfirmation": True,
+            "note": "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+        },
+        {
+            "id": "builtin:HDX-DOT:manual_router",
+            "source": "builtin",
+            "label": "HDX-DOT manual Router · HDX → aDOT → DOT",
+            "symbol": "HDX-DOT",
+            "routeMode": "manual_router",
+            "route_mode": "manual_router",
+            "poolType": "Router",
+            "pool_type": "Router",
+            "baseReserve": None,
+            "quoteReserve": None,
+            "base_reserve": None,
+            "quote_reserve": None,
+            "feeBps": 30,
+            "fee_bps": 30,
+            "poolAccount": None,
+            "pool_account": None,
+            "routeJson": [
+                {"pool": {"type": "Omnipool"}, "assetIn": 0, "assetOut": 1001},
+                {"pool": {"type": "Aave"}, "assetIn": 1001, "assetOut": 5},
+            ],
+            "route_json": [
+                {"pool": {"type": "Omnipool"}, "assetIn": 0, "assetOut": 1001},
+                {"pool": {"type": "Aave"}, "assetIn": 1001, "assetOut": 5},
+            ],
+            "direction": {"label": "HDX → aDOT → DOT", "assetIds": [0, 1001, 5], "labels": ["HDX", "aDOT", "DOT"]},
+            "routeDirection": "HDX → aDOT → DOT",
+            "enabled": True,
+            "confirmed": False,
+            "templateConfirmedDefault": False,
+            "requiresConfirmation": True,
+            "note": "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+        },
+        {
+            "id": "builtin:UTTT-HDX:manual_xyk",
+            "source": "builtin",
+            "label": "UTTT-HDX manual XYK · UTTT → HDX snapshot",
+            "symbol": "UTTT-HDX",
+            "routeMode": "manual_xyk",
+            "route_mode": "manual_xyk",
+            "poolType": "XYK",
+            "pool_type": "XYK",
+            "baseReserve": 1000000.0,
+            "quoteReserve": 832.45,
+            "base_reserve": 1000000.0,
+            "quote_reserve": 832.45,
+            "feeBps": 30,
+            "fee_bps": 30,
+            "poolAccount": None,
+            "pool_account": None,
+            "routeJson": [
+                {"pool": {"type": "XYK"}, "assetIn": 1001331, "assetOut": 0},
+            ],
+            "route_json": [
+                {"pool": {"type": "XYK"}, "assetIn": 1001331, "assetOut": 0},
+            ],
+            "direction": {"label": "UTTT → HDX", "assetIds": [1001331, 0], "labels": ["UTTT", "HDX"]},
+            "routeDirection": "UTTT → HDX",
+            "enabled": True,
+            "confirmed": False,
+            "templateConfirmedDefault": False,
+            "requiresConfirmation": True,
+            "note": "Built-in manual XYK snapshot template. Add or verify pool account before relying on live reserves; confirm only after a tiny live on-chain success.",
+        },
+        {
+            "id": "builtin:HDX-UTTT:manual_xyk",
+            "source": "builtin",
+            "label": "HDX-UTTT manual XYK · HDX → UTTT snapshot",
+            "symbol": "HDX-UTTT",
+            "routeMode": "manual_xyk",
+            "route_mode": "manual_xyk",
+            "poolType": "XYK",
+            "pool_type": "XYK",
+            "baseReserve": 832.45,
+            "quoteReserve": 1000000.0,
+            "base_reserve": 832.45,
+            "quote_reserve": 1000000.0,
+            "feeBps": 30,
+            "fee_bps": 30,
+            "poolAccount": None,
+            "pool_account": None,
+            "routeJson": [
+                {"pool": {"type": "XYK"}, "assetIn": 0, "assetOut": 1001331},
+            ],
+            "route_json": [
+                {"pool": {"type": "XYK"}, "assetIn": 0, "assetOut": 1001331},
+            ],
+            "direction": {"label": "HDX → UTTT", "assetIds": [0, 1001331], "labels": ["HDX", "UTTT"]},
+            "routeDirection": "HDX → UTTT",
+            "enabled": True,
+            "confirmed": False,
+            "templateConfirmedDefault": False,
+            "requiresConfirmation": True,
+            "note": "Built-in reverse manual XYK snapshot template. Add or verify pool account before relying on live reserves; confirm only after a tiny live on-chain success.",
+        },
+    ]
+
+
+def _hydration_route_registry_saved_template_payload(row: Any, *, db: Optional[Session] = None) -> Dict[str, Any]:
+    payload = _hydration_route_registry_payload(row, db=db)
+    route_mode = str(payload.get("routeMode") or "manual_xyk").strip().lower()
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    confirmed = bool(payload.get("confirmed"))
+    direction_label = str(payload.get("routeDirection") or ((payload.get("direction") or {}).get("label") if isinstance(payload.get("direction"), dict) else "") or "").strip()
+    mode_label = "manual Router" if route_mode == "manual_router" else "manual XYK"
+    label_parts = [symbol, f"saved {mode_label}"]
+    if direction_label:
+        label_parts.append(direction_label)
+    if confirmed:
+        label_parts.append("confirmed source")
+
+    return {
+        "id": f"saved:{payload.get('id') or symbol}",
+        "source": "saved_route_registry",
+        "label": " · ".join([p for p in label_parts if p]),
+        "symbol": symbol,
+        "routeMode": route_mode,
+        "route_mode": route_mode,
+        "poolType": payload.get("poolType") or ("Router" if route_mode == "manual_router" else "XYK"),
+        "pool_type": payload.get("poolType") or ("Router" if route_mode == "manual_router" else "XYK"),
+        "baseReserve": payload.get("baseReserve"),
+        "quoteReserve": payload.get("quoteReserve"),
+        "base_reserve": payload.get("baseReserve"),
+        "quote_reserve": payload.get("quoteReserve"),
+        "feeBps": payload.get("feeBps") if payload.get("feeBps") is not None else 30,
+        "fee_bps": payload.get("feeBps") if payload.get("feeBps") is not None else 30,
+        "poolAccount": payload.get("poolAccount"),
+        "pool_account": payload.get("poolAccount"),
+        "routeJson": payload.get("route") if isinstance(payload.get("route"), list) else [],
+        "route_json": payload.get("route") if isinstance(payload.get("route"), list) else [],
+        "direction": payload.get("direction"),
+        "routeDirection": payload.get("routeDirection"),
+        "enabled": payload.get("enabled") is not False,
+        "confirmed": False,
+        "templateConfirmedDefault": False,
+        "sourceConfirmed": confirmed,
+        "requiresConfirmation": True,
+        "routeRegistryId": payload.get("id"),
+        "routeRegistrySymbol": symbol,
+        "note": payload.get("note") or "Template loaded from a saved Hydration Route Registry row. Confirm remains unchecked until explicitly set.",
+    }
+
+
 @router.get("/hydration/route_registry")
 async def hydration_route_registry_list(
     include_disabled: bool = Query(True, description="If false, only enabled manual routes are returned."),
@@ -6274,6 +6459,52 @@ async def hydration_route_registry_list(
         "items": [_hydration_route_registry_payload(r, db=db) for r in rows],
         "count": len(rows),
         "note": "manual_xyk rows provide reserve-based routes; manual_router rows provide confirmed multi-leg Router paths used by route_mode=auto/manual_router. SDK-supported pairs do not need rows.",
+    }
+
+
+
+
+@router.get("/hydration/route_registry/templates")
+async def hydration_route_registry_templates(
+    include_builtin: bool = Query(True, description="Include built-in Hydration route templates."),
+    include_saved: bool = Query(True, description="Include saved route registry rows as reusable templates."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    # Read-only template helper for the Route Registry UI. This does not insert,
+    # update, delete, sign, build swaps, or submit transactions.
+    _ensure_hydration_route_registry_table(db)
+    templates: List[Dict[str, Any]] = []
+    if include_builtin:
+        templates.extend(_hydration_builtin_route_templates())
+
+    if include_saved:
+        rows = db.execute(text("SELECT * FROM hydration_route_registry ORDER BY symbol ASC")).mappings().all()
+        for row in rows:
+            try:
+                templates.append(_hydration_route_registry_saved_template_payload(row, db=db))
+            except Exception:
+                continue
+
+    seen: set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for item in templates:
+        key = str(item.get("id") or "").strip()
+        if not key:
+            key = f"{item.get('source') or 'template'}:{item.get('symbol') or ''}:{item.get('routeMode') or item.get('route_mode') or ''}:{len(deduped)}"
+            item["id"] = key
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "templates": deduped,
+        "items": deduped,
+        "count": len(deduped),
+        "writesDb": False,
+        "note": "Route templates are operator aids only. Loading a template does not confirm a route or submit any transaction.",
     }
 
 

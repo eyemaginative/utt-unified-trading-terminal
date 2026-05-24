@@ -6115,12 +6115,119 @@ async def hydration_resolve_asset(
 
 
 
-def _hydration_route_registry_payload(row: Any) -> Dict[str, Any]:
+def _hydration_route_registry_asset_id_int(value: Any) -> int:
+    norm = _asset_id_norm_for_compare(value)
+    try:
+        return int(norm)
+    except Exception:
+        return int(_HYDRATION_NATIVE_ASSET_ID)
+
+
+def _hydration_route_registry_direction_for_row(
+    row: Any,
+    *,
+    route_json: Optional[List[Dict[str, Any]]] = None,
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
+    r = dict(row) if not isinstance(row, dict) else dict(row)
+    base = str(r.get("base_symbol") or "").strip().upper()
+    quote = str(r.get("quote_symbol") or "").strip().upper()
+    base_asset_id = r.get("base_asset_id")
+    quote_asset_id = r.get("quote_asset_id")
+    base_id = _hydration_route_registry_asset_id_int(base_asset_id)
+    quote_id = _hydration_route_registry_asset_id_int(quote_asset_id)
+    base_meta = {
+        "symbol": base,
+        "assetId": base_asset_id,
+        "decimals": r.get("base_decimals"),
+        "native": _asset_id_norm_for_compare(base_asset_id) == _asset_id_norm_for_compare(_HYDRATION_NATIVE_ASSET_ID),
+    }
+    quote_meta = {
+        "symbol": quote,
+        "assetId": quote_asset_id,
+        "decimals": r.get("quote_decimals"),
+        "native": _asset_id_norm_for_compare(quote_asset_id) == _asset_id_norm_for_compare(_HYDRATION_NATIVE_ASSET_ID),
+    }
+    try:
+        return _hydration_route_direction_summary(
+            route_json or [],
+            db=db,
+            base=base,
+            quote=quote,
+            base_meta=base_meta,
+            quote_meta=quote_meta,
+            fallback_asset_in_id=int(base_id),
+            fallback_asset_out_id=int(quote_id),
+        )
+    except Exception:
+        return {
+            "label": f"{base or base_id} → {quote or quote_id}",
+            "assetIds": [int(base_id), int(quote_id)],
+            "labels": [base or f"asset:{base_id}", quote or f"asset:{quote_id}"],
+            "hops": [],
+        }
+
+
+def _hydration_route_registry_execution_status(
+    row: Any,
+    *,
+    route_mode: str,
+    confirmed: bool,
+    enabled: bool,
+) -> Dict[str, Any]:
+    mode = str(route_mode or "").strip().lower()
+    if not enabled:
+        return {
+            "status": "disabled",
+            "label": "Disabled",
+            "executable": False,
+            "severity": "muted",
+        }
+    if mode == "manual_router":
+        if confirmed:
+            return {
+                "status": "confirmed_executable",
+                "label": "Confirmed executable",
+                "executable": True,
+                "severity": "ok",
+            }
+        return {
+            "status": "unconfirmed_blocked",
+            "label": "Needs confirmation",
+            "executable": False,
+            "severity": "warn",
+        }
+    if mode == "manual_xyk":
+        return {
+            "status": "manual_pool_available",
+            "label": "Manual pool route",
+            "executable": True,
+            "severity": "ok" if confirmed else "info",
+        }
+    return {
+        "status": "unknown",
+        "label": "Unknown",
+        "executable": False,
+        "severity": "warn",
+    }
+
+
+def _hydration_route_registry_payload(row: Any, *, db: Optional[Session] = None) -> Dict[str, Any]:
     r = dict(row) if not isinstance(row, dict) else dict(row)
     try:
         route_json = json.loads(r.get("route_json") or "[]")
     except Exception:
         route_json = []
+    route_mode = str(r.get("route_mode") or "manual_xyk").strip().lower()
+    confirmed = bool(int(r.get("confirmed") if r.get("confirmed") is not None else 0))
+    enabled = bool(int(r.get("enabled") if r.get("enabled") is not None else 1))
+    direction = _hydration_route_registry_direction_for_row(r, route_json=route_json, db=db)
+    execution_status = _hydration_route_registry_execution_status(
+        r,
+        route_mode=route_mode,
+        confirmed=confirmed,
+        enabled=enabled,
+    )
     return {
         "id": r.get("id"),
         "symbol": r.get("symbol"),
@@ -6133,12 +6240,16 @@ def _hydration_route_registry_payload(row: Any) -> Dict[str, Any]:
         "routeMode": r.get("route_mode") or "manual_xyk",
         "poolType": r.get("pool_type") or "XYK",
         "poolAccount": r.get("pool_account"),
-        "enabled": bool(int(r.get("enabled") if r.get("enabled") is not None else 1)),
+        "enabled": enabled,
         "baseReserve": r.get("base_reserve"),
         "quoteReserve": r.get("quote_reserve"),
         "feeBps": r.get("fee_bps"),
         "route": route_json,
-        "confirmed": bool(int(r.get("confirmed") if r.get("confirmed") is not None else 0)),
+        "confirmed": confirmed,
+        "direction": direction,
+        "routeDirection": (direction or {}).get("label"),
+        "executionStatus": execution_status,
+        "executable": bool((execution_status or {}).get("executable")),
         "testedAt": r.get("tested_at"),
         "lastTestTxHash": r.get("last_test_tx_hash"),
         "note": r.get("note"),
@@ -6160,7 +6271,7 @@ async def hydration_route_registry_list(
     return {
         "ok": True,
         "venue": "polkadot_hydration",
-        "items": [_hydration_route_registry_payload(r) for r in rows],
+        "items": [_hydration_route_registry_payload(r, db=db) for r in rows],
         "count": len(rows),
         "note": "manual_xyk rows provide reserve-based routes; manual_router rows provide confirmed multi-leg Router paths used by route_mode=auto/manual_router. SDK-supported pairs do not need rows.",
     }

@@ -175,6 +175,110 @@ function routeModeLabel(value) {
   return v || "Manual XYK";
 }
 
+function assetIdForCompare(value) {
+  const s = String(value ?? "").trim().toLowerCase();
+  if (!s) return "";
+  if (s === "native") return "0";
+  return s;
+}
+
+function routeAssetLabel(assetId, row) {
+  const id = assetIdForCompare(assetId);
+  if (!id) return "asset:?";
+  if (id === assetIdForCompare(row?.baseAssetId)) return String(row?.baseSymbol || row?.base || id).toUpperCase();
+  if (id === assetIdForCompare(row?.quoteAssetId)) return String(row?.quoteSymbol || row?.quote || id).toUpperCase();
+  if (id === "0") return "HDX";
+  if (id === "1001") return "aDOT";
+  if (id === "1001331") return "UTTT";
+  return `asset:${id}`;
+}
+
+function routeLegAssetValue(leg, ...keys) {
+  if (!leg || typeof leg !== "object") return null;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(leg, key)) {
+      const n = Number(String(leg[key]).trim());
+      if (Number.isFinite(n)) return n;
+      return null;
+    }
+  }
+  return null;
+}
+
+function routeDirectionLabel(row) {
+  const supplied = String(row?.routeDirection || row?.direction?.label || "").trim();
+  if (supplied) return supplied;
+
+  const route = Array.isArray(row?.route) ? row.route : [];
+  const ids = [];
+  if (route.length) {
+    const firstIn = routeLegAssetValue(route[0], "assetIn", "asset_in");
+    if (firstIn !== null) ids.push(firstIn);
+    for (const leg of route) {
+      const out = routeLegAssetValue(leg, "assetOut", "asset_out");
+      if (out !== null) ids.push(out);
+    }
+  }
+  if (ids.length < 2) {
+    ids.push(assetIdForCompare(row?.baseAssetId) || row?.baseSymbol || "?");
+    ids.push(assetIdForCompare(row?.quoteAssetId) || row?.quoteSymbol || "?");
+  }
+  return ids.map((id) => routeAssetLabel(id, row)).join(" → ");
+}
+
+function routeExecutionStatus(row) {
+  const fromBackend = row?.executionStatus;
+  if (fromBackend && typeof fromBackend === "object") {
+    return {
+      status: String(fromBackend.status || "").trim() || "unknown",
+      label: String(fromBackend.label || "").trim() || "Unknown",
+      severity: String(fromBackend.severity || "").trim() || "info",
+      executable: !!fromBackend.executable,
+    };
+  }
+
+  if (row?.enabled === false) {
+    return { status: "disabled", label: "Disabled", severity: "muted", executable: false };
+  }
+  if (String(row?.routeMode || "").toLowerCase() === "manual_router") {
+    return row?.confirmed
+      ? { status: "confirmed_executable", label: "Confirmed executable", severity: "ok", executable: true }
+      : { status: "unconfirmed_blocked", label: "Needs confirmation", severity: "warn", executable: false };
+  }
+  return { status: "manual_pool_available", label: "Manual pool route", severity: row?.confirmed ? "ok" : "info", executable: true };
+}
+
+function routeBadgeStyle(severity = "info") {
+  const s = String(severity || "info").toLowerCase();
+  if (s === "ok") {
+    return {
+      border: "1px solid rgba(74,222,128,0.35)",
+      background: "rgba(22,101,52,0.18)",
+      color: "#b8f7c7",
+    };
+  }
+  if (s === "warn") {
+    return {
+      border: "1px solid rgba(245,158,11,0.40)",
+      background: "rgba(120,72,16,0.18)",
+      color: "#ffe2a6",
+    };
+  }
+  if (s === "muted") {
+    return {
+      border: "1px solid rgba(148,163,184,0.22)",
+      background: "rgba(148,163,184,0.08)",
+      color: "rgba(226,232,240,0.70)",
+    };
+  }
+  return {
+    border: "1px solid rgba(96,165,250,0.30)",
+    background: "rgba(30,64,175,0.16)",
+    color: "#cfe4ff",
+  };
+}
+
+
 
 export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const API_BASE = String(apiBase || "").trim() || "";
@@ -1121,6 +1225,14 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                           {row.enabled === false ? "disabled" : routeModeLabel(row.routeMode || "manual_xyk")}
                           {row.confirmed ? " · confirmed" : ""}
                         </div>
+                      <div style={{ marginTop: 4, fontSize: 11, color: "#d6f5ff", opacity: 0.9 }} title="Saved route direction">
+                        {routeDirectionLabel(row)}
+                      </div>
+                      <div style={{ marginTop: 5 }}>
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 6px", borderRadius: 999, fontSize: 10, lineHeight: 1.3, ...routeBadgeStyle(routeExecutionStatus(row).severity) }}>
+                          {routeExecutionStatus(row).label}
+                        </span>
+                      </div>
                     </td>
                     <td style={tdStyle}>
                       <code style={codeStyle}>{row.baseAssetId}</code> → <code style={codeStyle}>{row.quoteAssetId}</code>
@@ -1142,6 +1254,14 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                         {Array.isArray(row.route) && row.route.length ? <span style={{ opacity: 0.55 }}> · {row.route.length} leg{row.route.length === 1 ? "" : "s"}</span> : null}
                         {row.confirmed ? <span style={{ opacity: 0.65, color: "#b8f7c7" }}> · confirmed</span> : null}
                         {(row.poolAccount || row.pool_account) ? <span style={{ opacity: 0.55 }}> · live pool account</span> : null}
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 5 }}>
+                        <span style={{ display: "inline-flex", alignItems: "center", padding: "2px 6px", borderRadius: 999, fontSize: 10, lineHeight: 1.3, ...routeBadgeStyle(routeExecutionStatus(row).severity) }}>
+                          {routeExecutionStatus(row).label}
+                        </span>
+                        <span style={{ display: "inline-flex", alignItems: "center", padding: "2px 6px", borderRadius: 999, fontSize: 10, lineHeight: 1.3, ...routeBadgeStyle("info") }} title="Route direction">
+                          {routeDirectionLabel(row)}
+                        </span>
                       </div>
                       {(row.poolAccount || row.pool_account) ? (
                         <>

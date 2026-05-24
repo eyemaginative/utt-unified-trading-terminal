@@ -45,6 +45,10 @@ def _hydration_route_mode(raw: Optional[str] = None) -> str:
         "managed_sdk": "sdk",
         "sidecar": "sdk",
         "sdk_router": "sdk",
+        "spot": "sdk_spot",
+        "spot_price": "sdk_spot",
+        "sdkspot": "sdk_spot",
+        "sdk_spot_price": "sdk_spot",
         "isolated": "isolated_helper",
         "helper": "isolated_helper",
         "manual": "manual_xyk",
@@ -71,6 +75,8 @@ def _hydration_route_mode_label(mode: str, *, manual: bool = False) -> str:
         return "manual_xyk_pool_fallback"
     if m == "manual_router":
         return "manual_router_route_registry"
+    if m == "sdk_spot":
+        return "galactic_sdk_next_spot_price"
     if m == "isolated_helper":
         return "galactic_sdk_next_isolated_helper"
     return "galactic_sdk_next_helper"
@@ -183,7 +189,7 @@ try:
     _HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD = float(os.getenv("UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD") or "5")
 except Exception:
     _HYDRATION_MANUAL_ROUTER_FALLBACK_MAX_INPUT_USD = 5.0
-_HYDRATION_ROUTE_MODES = {"auto", "sdk", "isolated_helper", "manual_xyk", "manual_router"}
+_HYDRATION_ROUTE_MODES = {"auto", "sdk", "sdk_spot", "isolated_helper", "manual_xyk", "manual_router"}
 _HYDRATION_DEFAULT_ROUTE_MODE = (os.getenv("UTT_HYDRATION_ROUTE_MODE") or "auto").strip().lower()
 if _HYDRATION_DEFAULT_ROUTE_MODE not in _HYDRATION_ROUTE_MODES:
     _HYDRATION_DEFAULT_ROUTE_MODE = "auto"
@@ -194,6 +200,31 @@ except Exception:
 
 _HYDRATION_ENABLE_HEAVY_INSPECT = _env_bool("UTT_HYDRATION_ENABLE_HEAVY_INSPECT", False)
 _HYDRATION_ENABLE_ROUTER_QUOTES = _env_bool("UTT_HYDRATION_ENABLE_ROUTER_QUOTES", False)
+_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES = _env_bool("UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES", False)
+# H-SDK.1 diagnostic/visual path: use sdk-next getSpotPrice for visible-pair
+# pseudo-orderbooks without reopening getBestSell ladder sampling.  This is
+# intentionally separate from UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES because
+# getBestSell is the path currently timing out.
+_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK = _env_bool("UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK", False)
+_HYDRATION_SDK_SPOT_ORDERBOOK_FORCE_ISOLATED_HELPER = _env_bool("UTT_HYDRATION_SDK_SPOT_ORDERBOOK_FORCE_ISOLATED_HELPER", True)
+_HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE = _env_bool("UTT_HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE", False)
+_HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION = (
+    os.getenv("UTT_HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION")
+    or "direct"
+).strip().lower()
+if _HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION not in {"direct", "context"}:
+    _HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION = "direct"
+try:
+    _HYDRATION_SDK_SPOT_ORDERBOOK_MIN_DAILY_VOLUME_USD = float(os.getenv("UTT_HYDRATION_SDK_SPOT_ORDERBOOK_MIN_DAILY_VOLUME_USD") or "0")
+except Exception:
+    _HYDRATION_SDK_SPOT_ORDERBOOK_MIN_DAILY_VOLUME_USD = 0.0
+_HYDRATION_SDK_SPOT_ORDERBOOK_POOL_TYPES_CSV = (
+    os.getenv("UTT_HYDRATION_SDK_SPOT_ORDERBOOK_POOL_TYPES")
+    or "Omnipool,XYK,StableSwap"
+).strip()
+_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES = _env_bool("UTT_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES", False)
+_HYDRATION_ENABLE_SDK_SWAP_TX = _env_bool("UTT_HYDRATION_ENABLE_SDK_SWAP_TX", False)
+_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES = _env_bool("UTT_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES", False)
 _HYDRATION_ENABLE_STATE_CALL_QUOTES = _env_bool("UTT_HYDRATION_ENABLE_STATE_CALL_QUOTES", False)
 _HYDRATION_ENABLE_SWAP_TX = _env_bool("UTT_HYDRATION_ENABLE_SWAP_TX", False)
 _HYDRATION_ENABLE_EXACT_BUY = _env_bool("UTT_HYDRATION_ENABLE_EXACT_BUY", False)
@@ -746,6 +777,371 @@ async def _state_call_probe_method(method: str, data: str = "0x") -> Dict[str, A
     }
 
 
+
+# H-SDK.1 metadata diagnostics: lightweight Metadata v15 scanner.
+#
+# This intentionally does not attempt a full SCALE metadata decode.  The goal is
+# to keep a safe, read-only diagnostic endpoint that can confirm useful runtime
+# names and nearby call strings after Metadata_metadata_at_version succeeds.
+# The raw metadata blob can be large, so responses return bounded ASCII windows.
+def _metadata_v15_probe_payload() -> str:
+    # SCALE u32 15 little-endian for Metadata_metadata_at_version(version: u32).
+    return "0x0f000000"
+
+
+def _metadata_result_hex_from_probe(probe: Dict[str, Any]) -> Optional[str]:
+    try:
+        result = ((probe or {}).get("rpc") or {}).get("result")
+        if isinstance(result, str) and result.startswith("0x"):
+            return result
+    except Exception:
+        pass
+    return None
+
+
+def _bytes_from_hex_result(hex_value: str) -> bytes:
+    h = str(hex_value or "").strip()
+    if h.startswith("0x"):
+        h = h[2:]
+    if not h:
+        return b""
+    try:
+        return bytes.fromhex(h)
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "hydration_metadata_hex_decode_failed",
+                "message": "Metadata_metadata_at_version returned non-decodable hex.",
+                "rawPrefix": str(hex_value or "")[:120],
+            },
+        )
+
+
+def _ascii_preview(data: bytes) -> str:
+    chars: List[str] = []
+    last_space = False
+    for b in data or b"":
+        if 32 <= int(b) <= 126:
+            chars.append(chr(int(b)))
+            last_space = False
+        else:
+            if not last_space:
+                chars.append(" ")
+                last_space = True
+    return " ".join("".join(chars).split())
+
+
+def _metadata_ascii_strings(data: bytes, *, min_len: int = 3, max_strings: int = 500) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    start: Optional[int] = None
+    buf: List[str] = []
+
+    def _flush(end_offset: int) -> None:
+        nonlocal start, buf
+        if start is not None and len(buf) >= int(min_len):
+            text = "".join(buf)
+            out.append({
+                "offset": int(start),
+                "endOffset": int(end_offset),
+                "text": text,
+            })
+        start = None
+        buf = []
+
+    for idx, b in enumerate(data or b""):
+        bi = int(b)
+        if 32 <= bi <= 126:
+            if start is None:
+                start = idx
+            buf.append(chr(bi))
+        else:
+            _flush(idx)
+            if len(out) >= int(max_strings):
+                break
+    if len(out) < int(max_strings):
+        _flush(len(data or b""))
+
+    return out[: max(0, int(max_strings))]
+
+
+def _metadata_strings_in_window(
+    strings: List[Dict[str, Any]],
+    *,
+    start: int,
+    end: int,
+    max_items: int = 30,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in strings or []:
+        try:
+            off = int(item.get("offset") or 0)
+            end_off = int(item.get("endOffset") or off)
+        except Exception:
+            continue
+        if end_off < int(start) or off > int(end):
+            continue
+        out.append(item)
+        if len(out) >= int(max_items):
+            break
+    return out
+
+
+def _metadata_is_snakeish_name(value: Any) -> bool:
+    s = str(value or "").strip()
+    if not s or len(s) > 80:
+        return False
+    if " " in s or "\t" in s or "\n" in s:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789_")
+    lowered = s.lower()
+    return bool(any(c.isalpha() for c in lowered) and all(c in allowed for c in lowered))
+
+
+def _metadata_target_windows(
+    data: bytes,
+    *,
+    targets: List[str],
+    context_bytes: int = 220,
+    max_windows_per_target: int = 8,
+    strings: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    blob = bytes(data or b"")
+    lower_blob = blob.lower()
+    strings = strings or []
+    out: Dict[str, Any] = {}
+
+    for raw_target in targets or []:
+        target = str(raw_target or "").strip()
+        if not target:
+            continue
+        needle = target.encode("utf-8", errors="ignore").lower()
+        if not needle:
+            continue
+
+        offsets: List[int] = []
+        search_from = 0
+        while True:
+            idx = lower_blob.find(needle, search_from)
+            if idx < 0:
+                break
+            offsets.append(int(idx))
+            search_from = idx + max(1, len(needle))
+            if len(offsets) >= int(max_windows_per_target):
+                break
+
+        windows: List[Dict[str, Any]] = []
+        candidate_names: List[str] = []
+        for idx in offsets:
+            start = max(0, idx - int(context_bytes))
+            end = min(len(blob), idx + len(needle) + int(context_bytes))
+            nearby = _metadata_strings_in_window(strings, start=start, end=end, max_items=35)
+            for item in nearby:
+                name = str(item.get("text") or "").strip()
+                if _metadata_is_snakeish_name(name) and name not in candidate_names:
+                    candidate_names.append(name)
+            windows.append({
+                "offset": int(idx),
+                "start": int(start),
+                "end": int(end),
+                "preview": _ascii_preview(blob[start:end]),
+                "nearbyStrings": nearby,
+            })
+
+        out[target] = {
+            "hitCountReturned": len(offsets),
+            "windows": windows,
+            "snakeishNearbyNames": candidate_names[:40],
+        }
+
+    return out
+
+
+def _metadata_scan_summary(
+    metadata_hex: str,
+    *,
+    targets: List[str],
+    context_bytes: int,
+    max_windows_per_target: int,
+    max_ascii_strings: int,
+) -> Dict[str, Any]:
+    data = _bytes_from_hex_result(metadata_hex)
+    strings = _metadata_ascii_strings(data, min_len=3, max_strings=max_ascii_strings)
+    target_windows = _metadata_target_windows(
+        data,
+        targets=targets,
+        context_bytes=context_bytes,
+        max_windows_per_target=max_windows_per_target,
+        strings=strings,
+    )
+
+    target_strings: Dict[str, List[Dict[str, Any]]] = {}
+    all_call_candidates: List[str] = []
+    for target in targets or []:
+        t = str(target or "").strip()
+        if not t:
+            continue
+        tl = t.lower()
+        matches: List[Dict[str, Any]] = []
+        for item in strings:
+            s = str(item.get("text") or "")
+            if tl in s.lower():
+                matches.append(item)
+                if len(matches) >= 40:
+                    break
+        target_strings[t] = matches
+
+        for name in ((target_windows.get(t) or {}).get("snakeishNearbyNames") or []):
+            if name not in all_call_candidates:
+                all_call_candidates.append(name)
+
+    return {
+        "byteLen": len(data),
+        "hexLen": len(str(metadata_hex or "")),
+        "rawPrefix": str(metadata_hex or "")[:96],
+        "rawSuffix": str(metadata_hex or "")[-96:],
+        "asciiStringCountReturned": len(strings),
+        "asciiStringsSample": strings[:80],
+        "targetStrings": target_strings,
+        "targetWindows": target_windows,
+        "nearbyCallNameCandidates": all_call_candidates[:120],
+        "scannerLimitations": [
+            "This is a bounded ASCII/SCALE metadata scanner, not a full Metadata v15 decoder.",
+            "Use target windows to confirm pallet/call names before adding manual builders.",
+            "No signing, swap building, or state mutation is performed by this scanner.",
+        ],
+    }
+
+
+
+def _metadata_focused_default_terms() -> List[str]:
+    # These are deliberately human-readable byte/ASCII targets, not decoded SCALE
+    # paths.  They focus the already-safe Metadata v15 scanner on Hydration DEX
+    # call/storage areas relevant to manual route hardening.
+    return [
+        "pallet_route_executor",
+        "pallet_omnipool",
+        "pallet_xyk",
+        "pallet_stableswap",
+        "hydradx_traits",
+        "router Trade",
+        "PoolType",
+        "AssetPair",
+        "RouteExecuted",
+        "Route execution",
+        "Routes | Storing routes",
+        "add_token",
+        "add_liquidity",
+        "remove_liquidity",
+        "sell",
+        "buy",
+    ]
+
+
+def _metadata_focus_terms(raw_csv: Optional[str]) -> List[str]:
+    raw = str(raw_csv or "").strip()
+    if not raw:
+        return _metadata_focused_default_terms()
+
+    out: List[str] = []
+    for part in raw.split(","):
+        term = str(part or "").strip()
+        if term and term not in out:
+            out.append(term)
+    return out or _metadata_focused_default_terms()
+
+
+def _metadata_find_term_offsets(
+    data: bytes,
+    *,
+    term: str,
+    max_hits: int,
+) -> List[int]:
+    blob = bytes(data or b"").lower()
+    needle = str(term or "").encode("utf-8", errors="ignore").lower()
+    if not needle:
+        return []
+
+    hits: List[int] = []
+    start = 0
+    while True:
+        idx = blob.find(needle, start)
+        if idx < 0:
+            break
+        hits.append(int(idx))
+        start = idx + max(1, len(needle))
+        if len(hits) >= int(max_hits):
+            break
+    return hits
+
+
+def _metadata_focused_windows(
+    metadata_hex: str,
+    *,
+    terms: List[str],
+    context_bytes: int,
+    max_hits_per_term: int,
+    max_ascii_strings: int,
+) -> Dict[str, Any]:
+    data = _bytes_from_hex_result(metadata_hex)
+    strings = _metadata_ascii_strings(data, min_len=3, max_strings=max_ascii_strings)
+    focused: Dict[str, Any] = {}
+
+    for term in terms or []:
+        clean_term = str(term or "").strip()
+        if not clean_term:
+            continue
+
+        hits = _metadata_find_term_offsets(
+            data,
+            term=clean_term,
+            max_hits=max_hits_per_term,
+        )
+        windows: List[Dict[str, Any]] = []
+        for idx in hits:
+            start = max(0, int(idx) - int(context_bytes))
+            end = min(len(data), int(idx) + len(clean_term.encode("utf-8", errors="ignore")) + int(context_bytes))
+            preview = _ascii_preview(data[start:end])
+            nearby = _metadata_strings_in_window(strings, start=start, end=end, max_items=60)
+            windows.append({
+                "offset": int(idx),
+                "start": int(start),
+                "end": int(end),
+                "preview": preview,
+                "nearbyStrings": nearby,
+            })
+
+        focused[clean_term] = {
+            "hitCountReturned": len(hits),
+            "windows": windows,
+        }
+
+    return {
+        "byteLen": len(data),
+        "hexLen": len(str(metadata_hex or "")),
+        "rawPrefix": str(metadata_hex or "")[:96],
+        "rawSuffix": str(metadata_hex or "")[-96:],
+        "terms": terms,
+        "focusedWindows": focused,
+        "manualRouteShapeHints": {
+            "routeLeg": {
+                "pool": "hydradx_traits::router::PoolType<AssetId>",
+                "assetIn": "AssetId",
+                "assetOut": "AssetId",
+            },
+            "observedPoolTypeNames": ["XYK", "LBP", "Stableswap", "Omnipool", "Aave", "HSM"],
+            "observedStorageHint": "Router Routes | Storing routes for asset pairs",
+            "note": "These hints are extracted from ASCII metadata windows and should guide manual-route validation only; they are not a full SCALE Metadata v15 decode.",
+        },
+        "scannerLimitations": [
+            "This endpoint is read-only and diagnostic-only.",
+            "It searches bounded ASCII windows inside Metadata v15; it does not decode full SCALE type IDs.",
+            "Do not use this output alone to enable new signing paths without a tiny live confirmation transaction.",
+        ],
+    }
+
+
+
 def _sidecar_url_host_port() -> Tuple[str, int]:
     parsed = urlparse(_HYDRATION_SIDECAR_URL or "http://127.0.0.1:8787")
     host = parsed.hostname or "127.0.0.1"
@@ -781,11 +1177,15 @@ def _stop_hydration_sidecar_process() -> None:
 atexit.register(_stop_hydration_sidecar_process)
 
 
-async def _ensure_hydration_sidecar_running(*, price_cache: bool = False) -> Dict[str, Any]:
+async def _ensure_hydration_sidecar_running(
+    *,
+    price_cache: bool = False,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     if not _HYDRATION_USE_SIDECAR or not _HYDRATION_SIDECAR_URL:
         return {"enabled": bool(_HYDRATION_USE_SIDECAR), "ok": False, "skipped": True}
 
-    effective_autostart = _hydration_effective_autostart_sidecar(price_cache=price_cache)
+    effective_autostart = _hydration_effective_autostart_sidecar(price_cache=price_cache, payload=payload)
     current = await _sidecar_health()
     if current.get("ok"):
         return {
@@ -798,7 +1198,7 @@ async def _ensure_hydration_sidecar_running(*, price_cache: bool = False) -> Dic
         }
 
     if not effective_autostart:
-        reason = "price_cache_autostart_disabled" if price_cache else ("router_quotes_disabled" if not _HYDRATION_ENABLE_ROUTER_QUOTES else "autostart_disabled")
+        reason = "price_cache_autostart_disabled" if price_cache else ("router_quotes_disabled_for_sdk_scope" if not _hydration_router_quotes_enabled_for_payload(payload or {}) else "autostart_disabled")
         return {
             **current,
             "autostart": False,
@@ -904,43 +1304,89 @@ def _hydration_router_quote_status(
     symbol: Optional[str] = None,
     base_meta: Optional[Dict[str, Any]] = None,
     quote_meta: Optional[Dict[str, Any]] = None,
+    use_case: Optional[str] = None,
 ) -> Dict[str, Any]:
-    quotes_enabled = bool(_HYDRATION_ENABLE_ROUTER_QUOTES)
-    quotes_available = bool(quotes_enabled and _HYDRATION_USE_SIDECAR and (_hydration_ws_url() or "").strip())
-    reason = (
-        "Hydration router quotes are enabled for controlled testing through the local sidecar. "
-        "Keep live swap submission disabled until quote shape, slippage handling, and SubWallet transaction building are verified."
-        if quotes_available
-        else _HYDRATION_ROUTER_QUOTES_UNAVAILABLE_REASON
-    )
+    sdk_use_case = _normalize_hydration_sdk_use_case(use_case)
+    if sdk_use_case:
+        probe_payload = {
+            "mode": "swap_tx" if sdk_use_case == "order_ticket" else "quote_sell",
+            "sdkUseCase": sdk_use_case,
+            "routeMode": "auto",
+        }
+        use_case_enabled = bool(_hydration_router_quotes_enabled_for_payload(probe_payload))
+    else:
+        use_case_enabled = bool(_HYDRATION_ENABLE_ROUTER_QUOTES)
+
+    global_enabled = bool(_HYDRATION_ENABLE_ROUTER_QUOTES)
+    ws_configured = bool((_hydration_ws_url() or "").strip())
+    use_case_available = bool(use_case_enabled and _HYDRATION_USE_SIDECAR and ws_configured)
+    quotes_available = use_case_available if sdk_use_case else bool(global_enabled and _HYDRATION_USE_SIDECAR and ws_configured)
+
+    if quotes_available:
+        reason = (
+            f"Hydration SDK router quotes are enabled for {sdk_use_case or 'global'} controlled testing through the local sidecar. "
+            "Watch RPC quota and disable immediately if chainHead calls spike."
+        )
+    elif sdk_use_case == "orderbook" and not use_case_enabled:
+        reason = (
+            "Hydration SDK OrderBook quotes are disabled. Manual routes and synthetic price-only fallback remain safe; "
+            "set UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES=1 only for visible-pair SDK orderbook testing."
+        )
+    elif sdk_use_case == "order_ticket" and not use_case_enabled:
+        reason = (
+            "Hydration SDK OrderTicket quote/swap building is disabled. Confirmed manual routes may still build; "
+            "set UTT_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES=1 and UTT_HYDRATION_ENABLE_SDK_SWAP_TX=1 only for controlled ticket testing."
+        )
+    else:
+        reason = _HYDRATION_ROUTER_QUOTES_UNAVAILABLE_REASON
+
     return {
-        "enabled": quotes_enabled,
+        "enabled": use_case_enabled if sdk_use_case else global_enabled,
         "available": quotes_available,
-        "status": "available_experimental" if quotes_available else ("enabled_but_unavailable" if quotes_enabled else "disabled"),
+        "status": "available_experimental" if quotes_available else ("enabled_but_unavailable" if use_case_enabled else "disabled"),
         "reason": reason,
         "symbol": symbol,
         "base": base_meta,
         "quote": quote_meta,
+        "sdkUseCase": sdk_use_case,
+        "globalRouterQuotesEnabled": global_enabled,
+        "sdkOrderbookQuotesEnabled": bool(_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES),
+        "sdkSpotOrderbookEnabled": bool(_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK),
+        "sdkSpotOrderbookImplementation": _HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION,
+        "sdkSpotOrderbookForceIsolatedHelper": bool(_HYDRATION_SDK_SPOT_ORDERBOOK_FORCE_ISOLATED_HELPER),
+        "sdkSpotOrderbookTradable": bool(_HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE),
+        "sdkSpotOrderbookMinDailyVolumeUsd": float(_HYDRATION_SDK_SPOT_ORDERBOOK_MIN_DAILY_VOLUME_USD),
+        "sdkOrderTicketQuotesEnabled": bool(_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES),
+        "sdkSwapTxEnabled": bool(_HYDRATION_ENABLE_SDK_SWAP_TX),
+        "backgroundSdkPricesEnabled": bool(_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES),
+        "useCaseEnabled": use_case_enabled,
+        "useCaseAvailable": use_case_available,
+        "wsConfigured": ws_configured,
+        "sidecarEnabled": bool(_HYDRATION_USE_SIDECAR),
         "safeEndpoints": [
             "/api/polkadot_dex/_debug",
             "/api/polkadot_dex/resolve",
             "/api/polkadot_dex/balances",
             "/api/polkadot_dex/hydration/status",
             "/api/polkadot_dex/hydration/inspect with inspect_mode=light",
-            "/api/polkadot_dex/hydration/orderbook for configured manual XYK routes",
-            "/api/polkadot_dex/hydration/orderbook for SDK pairs only when UTT_HYDRATION_ENABLE_ROUTER_QUOTES=1",
+            "/api/polkadot_dex/hydration/orderbook for configured manual routes",
+            "/api/polkadot_dex/hydration/orderbook SDK getBestSell sampling only when UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES=1 or global override is enabled",
+            "/api/polkadot_dex/hydration/orderbook route_mode=sdk_spot only when UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK=1",
+            "/api/polkadot_dex/hydration/sdk_path_diagnostics for explicit spot/sell/swap path separation",
+            "/api/polkadot_dex/hydration/swap_tx SDK build only when UTT_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES=1 plus UTT_HYDRATION_ENABLE_SDK_SWAP_TX=1 or global override is enabled",
         ],
         "blockedMethods": [] if quotes_available else [
             "sdk.api.router.getSpotPrice",
             "sdk.api.router.getBestSell",
+            "sdk.api.router.getBestBuy",
             "sdk.api.router.getRoutes",
             "sdk.api.router.getPools",
             "sdk.api.router.getTradeableAssets",
         ],
         "nextRequired": (
-            "SDK router quotes are enabled for controlled testing. Watch Dwellir quota and disable immediately if chainHead calls spike."
+            "SDK router quotes are enabled for this scoped use-case. Watch Dwellir quota and disable immediately if chainHead calls spike."
             if quotes_available
-            else "Keep router quotes disabled until a lighter quote source, cached price layer, or safe SDK reset strategy is implemented."
+            else "Keep SDK router quote scopes disabled except for deliberate visible OrderBook or user-action OrderTicket testing."
         ),
         "quotesExperimental": quotes_available,
         "liveSwapsRecommended": bool(quotes_available and _HYDRATION_ENABLE_SWAP_TX),
@@ -950,6 +1396,31 @@ def _hydration_router_quote_status(
         "liveExactBuyRecommended": bool(quotes_available and _HYDRATION_ENABLE_SWAP_TX and _HYDRATION_ENABLE_EXACT_BUY),
     }
 
+
+
+def _normalize_hydration_sdk_use_case(raw: Optional[str]) -> Optional[str]:
+    s = str(raw or "").strip().lower().replace("-", "_")
+    if not s:
+        return None
+    aliases = {
+        "order_book": "orderbook",
+        "orderbook": "orderbook",
+        "book": "orderbook",
+        "order_ticket": "order_ticket",
+        "orderticket": "order_ticket",
+        "ticket": "order_ticket",
+        "swap": "order_ticket",
+        "swap_tx": "order_ticket",
+        "trade": "order_ticket",
+        "price_cache": "price_cache",
+        "prices": "price_cache",
+        "background": "background",
+        "portfolio": "background",
+        "balances": "background",
+        "spread_bridge": "background",
+        "bridge": "background",
+    }
+    return aliases.get(s, s)
 
 
 def _hydration_payload_manual_custom_swap_enabled(payload: Dict[str, Any]) -> bool:
@@ -967,13 +1438,92 @@ def _hydration_payload_price_cache_enabled(payload: Dict[str, Any]) -> bool:
         return False
 
 
-def _hydration_effective_autostart_sidecar(*, price_cache: bool = False) -> bool:
+def _hydration_payload_sdk_use_case(payload: Dict[str, Any]) -> Optional[str]:
+    try:
+        raw = (
+            (payload or {}).get("sdkUseCase")
+            or (payload or {}).get("sdk_use_case")
+            or (payload or {}).get("useCase")
+            or (payload or {}).get("use_case")
+        )
+        return _normalize_hydration_sdk_use_case(raw)
+    except Exception:
+        return None
+
+
+def _hydration_router_quotes_enabled_for_payload(payload: Dict[str, Any]) -> bool:
+    """Return whether SDK router quote methods may run for this request.
+
+    Manual custom swap builders do not require sdk-next router quotes.  The broad
+    UTT_HYDRATION_ENABLE_ROUTER_QUOTES flag remains a global emergency override,
+    while H-SDK.1 adds narrow OrderBook and OrderTicket scopes so background
+    pricing/balance/spread paths stay quiet by default.
+    """
+    payload = payload or {}
+    if _hydration_payload_manual_custom_swap_enabled(payload):
+        return True
+    if bool(_HYDRATION_ENABLE_ROUTER_QUOTES):
+        return True
+
+    route_mode = _hydration_route_mode(payload.get("routeMode") or payload.get("route_mode") or "auto")
+    if route_mode in {"manual_xyk", "manual_router"}:
+        return False
+
+    use_case = _hydration_payload_sdk_use_case(payload)
+    mode = str(payload.get("mode") or "").strip().lower()
+
+    if use_case == "orderbook":
+        if mode in {"price_spot", "price_spot_direct"}:
+            return bool(_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK)
+        if route_mode == "sdk_spot":
+            return False
+        return bool(_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES)
+
+    if use_case == "order_ticket":
+        if mode == "swap_tx":
+            return bool(_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES and _HYDRATION_ENABLE_SDK_SWAP_TX)
+        return bool(_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES)
+
+    if use_case == "price_cache":
+        return bool(_HYDRATION_ENABLE_SDK_PRICE_CACHE and _HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK)
+
+    if use_case == "background":
+        return bool(_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES)
+
+    return False
+
+
+def _hydration_router_quote_scope_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    use_case = _hydration_payload_sdk_use_case(payload or {})
+    mode = str((payload or {}).get("mode") or "").strip().lower()
+    route_mode_raw = (payload or {}).get("routeMode") or (payload or {}).get("route_mode") or "auto"
+    route_mode = _hydration_route_mode(route_mode_raw)
+    enabled_for_payload = bool(_hydration_router_quotes_enabled_for_payload(payload or {}))
+    return {
+        "sdkUseCase": use_case,
+        "mode": mode,
+        "routeMode": route_mode,
+        "enabledForPayload": enabled_for_payload,
+        "globalRouterQuotesEnabled": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+        "sdkOrderbookQuotesEnabled": bool(_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES),
+        "sdkSpotOrderbookEnabled": bool(_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK),
+        "sdkSpotOrderbookImplementation": _HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION,
+        "sdkOrderTicketQuotesEnabled": bool(_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES),
+        "sdkSwapTxEnabled": bool(_HYDRATION_ENABLE_SDK_SWAP_TX),
+        "backgroundSdkPricesEnabled": bool(_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES),
+    }
+
+
+def _hydration_effective_autostart_sidecar(
+    *,
+    price_cache: bool = False,
+    payload: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Return whether the managed JS sidecar may be auto-started.
 
-    Normal SDK orderbook/router quote autostart remains gated by
-    UTT_HYDRATION_ENABLE_ROUTER_QUOTES.  The controlled USD price cache has its
-    own opt-in autostart flag so we can test SDK pricing without reopening the
-    broad frontend orderbook quote path.
+    Price-cache autostart remains separate.  Normal SDK router autostart is now
+    permitted only for the request's scoped use-case: OrderBook, OrderTicket, or
+    the legacy global emergency override.
     """
     if price_cache:
         return bool(
@@ -981,7 +1531,13 @@ def _hydration_effective_autostart_sidecar(*, price_cache: bool = False) -> bool
             and _HYDRATION_PRICE_CACHE_USE_SIDECAR
             and _HYDRATION_PRICE_CACHE_AUTOSTART_SIDECAR
         )
-    return bool(_HYDRATION_AUTOSTART_SIDECAR and _HYDRATION_ENABLE_ROUTER_QUOTES)
+    if not _HYDRATION_AUTOSTART_SIDECAR:
+        return False
+    if bool(_HYDRATION_ENABLE_ROUTER_QUOTES):
+        return True
+    if payload:
+        return bool(_hydration_router_quotes_enabled_for_payload(payload))
+    return False
 
 
 def _hydration_router_quotes_disabled_detail(
@@ -990,18 +1546,30 @@ def _hydration_router_quotes_disabled_detail(
     payload: Optional[Dict[str, Any]] = None,
     symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
+    payload = payload or {}
+    scope = _hydration_router_quote_scope_config(payload)
+    use_case = scope.get("sdkUseCase")
+    status = _hydration_router_quote_status(
+        symbol=symbol or payload.get("resolvedSymbol") or payload.get("rawSymbol"),
+        use_case=use_case,
+    )
     return {
         "error": "hydration_router_quotes_disabled",
-        "message": "Hydration SDK router quote calls are disabled to protect RPC quota. Manual XYK/live-reserve routes remain available for configured pairs such as UTTT-HDX.",
+        "message": (
+            "Hydration SDK router quote calls are disabled for this scoped use-case. "
+            "Manual XYK/manual Router routes remain available for configured pairs."
+        ),
         "venue": "polkadot_hydration",
         "mode": mode,
-        "symbol": symbol or (payload or {}).get("resolvedSymbol") or (payload or {}).get("rawSymbol"),
+        "symbol": symbol or payload.get("resolvedSymbol") or payload.get("rawSymbol"),
         "enableRouterQuotes": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
-        "manualCustomSwap": _hydration_payload_manual_custom_swap_enabled(payload or {}),
-        "quoteStatus": _hydration_router_quote_status(symbol=symbol or (payload or {}).get("resolvedSymbol")),
+        "manualCustomSwap": _hydration_payload_manual_custom_swap_enabled(payload),
+        "sdkQuoteScope": scope,
+        "quoteStatus": status,
         "safePaths": [
-            "route_mode=manual_xyk for configured manual routes",
-            "route_mode=auto only when a manual route registry row exists",
+            "route_mode=manual_xyk for configured manual XYK routes",
+            "route_mode=manual_router for confirmed DB manual Router routes",
+            "route_mode=auto only uses SDK when the matching scoped SDK env flag is enabled",
             "/api/polkadot_dex/balances",
             "/api/polkadot_dex/hydration/route_registry",
         ],
@@ -1013,7 +1581,11 @@ def _hydration_router_quotes_disabled_detail(
             "sdk.api.router.getPools",
             "sdk.api.router.getTradeableAssets",
         ],
-        "nextRequired": "Leave UTT_HYDRATION_ENABLE_ROUTER_QUOTES=0 until a lighter quote source, cached price layer, or safe SDK reset strategy is implemented.",
+        "nextRequired": (
+            "For visible OrderBook getBestSell testing, set UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES=1. For visible OrderBook getSpotPrice testing, set UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK=1 and use route_mode=sdk_spot. "
+            "For user-action OrderTicket SDK builds, set UTT_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES=1 and UTT_HYDRATION_ENABLE_SDK_SWAP_TX=1. "
+            "Leave UTT_HYDRATION_ENABLE_ROUTER_QUOTES=0 unless deliberately using the global emergency override."
+        ),
     }
 
 
@@ -1113,15 +1685,17 @@ async def _run_hydration_sidecar(payload: Dict[str, Any]) -> Dict[str, Any]:
     mode = str((payload or {}).get("mode") or "").strip()
     if mode not in {"inspect", "quote_sell", "price_spot", "price_spot_direct", "swap_tx"}:
         raise HTTPException(status_code=422, detail={"error": "hydration_sidecar_unsupported_mode", "mode": mode})
-    if _hydration_requires_router_quotes(payload) and not _HYDRATION_ENABLE_ROUTER_QUOTES:
-        raise HTTPException(
-            status_code=503,
-            detail=_hydration_router_quotes_disabled_detail(mode=mode, payload=payload),
-        )
+    if _hydration_requires_router_quotes(payload):
+        payload["enableRouterQuotes"] = bool(_hydration_router_quotes_enabled_for_payload(payload))
+        if not payload["enableRouterQuotes"]:
+            raise HTTPException(
+                status_code=503,
+                detail=_hydration_router_quotes_disabled_detail(mode=mode, payload=payload),
+            )
     if not _HYDRATION_SIDECAR_URL:
         raise HTTPException(status_code=503, detail={"error": "hydration_sidecar_url_not_configured"})
     price_cache = _hydration_payload_price_cache_enabled(payload or {})
-    sidecar_state = await _ensure_hydration_sidecar_running(price_cache=price_cache)
+    sidecar_state = await _ensure_hydration_sidecar_running(price_cache=price_cache, payload=payload)
     if not sidecar_state.get("ok"):
         raise HTTPException(
             status_code=503,
@@ -1174,14 +1748,16 @@ async def _run_hydration_helper(payload: Dict[str, Any], *, force_isolated: bool
             },
         )
 
-    if _hydration_requires_router_quotes(payload) and not _HYDRATION_ENABLE_ROUTER_QUOTES:
-        raise HTTPException(
-            status_code=503,
-            detail=_hydration_router_quotes_disabled_detail(
-                mode=str(payload.get("mode") or ""),
-                payload=payload,
-            ),
-        )
+    if _hydration_requires_router_quotes(payload):
+        payload["enableRouterQuotes"] = bool(_hydration_router_quotes_enabled_for_payload(payload))
+        if not payload["enableRouterQuotes"]:
+            raise HTTPException(
+                status_code=503,
+                detail=_hydration_router_quotes_disabled_detail(
+                    mode=str(payload.get("mode") or ""),
+                    payload=payload,
+                ),
+            )
 
     price_cache = _hydration_payload_price_cache_enabled(payload)
     use_sidecar_for_request = bool(_HYDRATION_USE_SIDECAR and not force_isolated)
@@ -1278,6 +1854,8 @@ async def _hydration_quote_sell(
     amount_in_ui: float,
     step_timeout_s: Optional[float] = None,
     force_isolated: bool = False,
+    sdk_use_case: str = "orderbook",
+    route_mode: str = "auto",
 ) -> Dict[str, Any]:
     amount_in_atomic = _ui_to_atomic(float(amount_in_ui), int(asset_in.get("decimals") or 0))
     return await _run_hydration_helper(
@@ -1293,7 +1871,13 @@ async def _hydration_quote_sell(
             "amountInAtomic": str(amount_in_atomic),
             "amountInUi": float(amount_in_ui),
             "stepTimeoutS": float(step_timeout_s if step_timeout_s is not None else _HYDRATION_HELPER_STEP_TIMEOUT_S),
-            "enableRouterQuotes": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+            "sdkUseCase": sdk_use_case,
+            "routeMode": _hydration_route_mode(route_mode),
+            "enableRouterQuotes": bool(_hydration_router_quotes_enabled_for_payload({
+                "mode": "quote_sell",
+                "sdkUseCase": sdk_use_case,
+                "routeMode": _hydration_route_mode(route_mode),
+            })),
             "forceIsolatedHelper": bool(force_isolated),
         },
         force_isolated=bool(force_isolated),
@@ -1489,6 +2073,156 @@ def _hydration_price_cache_force_isolated() -> bool:
         _HYDRATION_PRICE_CACHE_FORCE_ISOLATED_HELPER
         or not _HYDRATION_PRICE_CACHE_USE_SIDECAR
     )
+
+
+def _hydration_sdk_spot_orderbook_force_isolated(route_mode: str) -> bool:
+    return bool(
+        _hydration_route_mode(route_mode) == "isolated_helper"
+        or _HYDRATION_SDK_SPOT_ORDERBOOK_FORCE_ISOLATED_HELPER
+    )
+
+
+async def _hydration_sdk_spot_for_orderbook(
+    *,
+    raw_symbol: str,
+    base: str,
+    quote: str,
+    asset_in: Dict[str, Any],
+    asset_out: Dict[str, Any],
+    step_timeout_s: Optional[float] = None,
+    route_mode: str = "sdk_spot",
+    implementation: Optional[str] = None,
+) -> Dict[str, Any]:
+    impl = str(implementation or _HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION or "direct").strip().lower()
+    if impl not in {"direct", "context"}:
+        impl = "direct"
+    mode = "price_spot_direct" if impl == "direct" else "price_spot"
+    force_isolated = _hydration_sdk_spot_orderbook_force_isolated(route_mode)
+    payload = {
+        "mode": mode,
+        "venue": "polkadot_hydration",
+        "rawSymbol": raw_symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+        "base": base,
+        "quote": quote,
+        "assetIn": _helper_asset_payload(asset_in),
+        "assetOut": _helper_asset_payload(asset_out),
+        "stepTimeoutS": float(step_timeout_s if step_timeout_s is not None else _HYDRATION_ORDERBOOK_STEP_TIMEOUT_S),
+        "sdkUseCase": "orderbook",
+        "routeMode": _hydration_route_mode(route_mode),
+        "enableRouterQuotes": bool(_hydration_router_quotes_enabled_for_payload({
+            "mode": mode,
+            "sdkUseCase": "orderbook",
+            "routeMode": _hydration_route_mode(route_mode),
+        })),
+        "forceIsolatedHelper": bool(force_isolated),
+        "sdkSpotOrderbook": True,
+        "sdkSpotOrderbookImplementation": impl,
+        "sdkSpotOrderbookMinDailyVolumeUsd": float(_HYDRATION_SDK_SPOT_ORDERBOOK_MIN_DAILY_VOLUME_USD),
+        "sdkSpotOrderbookPoolTypes": _HYDRATION_SDK_SPOT_ORDERBOOK_POOL_TYPES_CSV,
+    }
+    return await _run_hydration_helper(payload, force_isolated=bool(force_isolated))
+
+
+async def _hydration_sdk_spot_orderbook_response(
+    *,
+    symbol: str,
+    base: str,
+    quote: str,
+    base_meta: Dict[str, Any],
+    quote_meta: Dict[str, Any],
+    depth: int,
+    route_mode_norm: str,
+    orderbook_config: Dict[str, Any],
+    sample_errors: Optional[List[Dict[str, Any]]] = None,
+    fallback_reason: str = "sdk_spot_orderbook",
+) -> Optional[Dict[str, Any]]:
+    if not _HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK:
+        return None
+
+    spot_result = await _hydration_sdk_spot_for_orderbook(
+        raw_symbol=symbol,
+        base=base,
+        quote=quote,
+        asset_in=base_meta,
+        asset_out=quote_meta,
+        step_timeout_s=float((orderbook_config or {}).get("stepTimeoutS") or _HYDRATION_ORDERBOOK_STEP_TIMEOUT_S),
+        route_mode=route_mode_norm,
+    )
+    mid_price = _hydration_price_from_spot(spot_result)
+    if mid_price is None or mid_price <= 0:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "hydration_sdk_spot_price_empty",
+                "message": "SDK getSpotPrice returned no usable positive price for this pair.",
+                "venue": "polkadot_hydration",
+                "rawSymbol": symbol,
+                "resolvedSymbol": f"{base}-{quote}",
+                "base": base_meta,
+                "quote": quote_meta,
+                "spotResult": spot_result,
+            },
+        )
+
+    bids, asks = _hydration_synthetic_spot_levels(
+        base=base,
+        base_meta=base_meta,
+        quote_meta=quote_meta,
+        mid_price=float(mid_price),
+        depth=depth,
+    )
+    asks.sort(key=lambda x: float(x.get("price") or 0.0))
+    bids.sort(key=lambda x: -float(x.get("price") or 0.0))
+    price_decimals = _suggest_price_decimals(asks + bids, int((quote_meta or {}).get("decimals") or 0))
+    size_decimals = min(int((base_meta or {}).get("decimals") or 0), 8)
+    cfg = dict(orderbook_config or {})
+    cfg.update({
+        "routeModeEffective": "sdk_spot",
+        "source": "sdk_spot_orderbook",
+        "fallbackReason": fallback_reason,
+        "sdkSpotOrderbook": True,
+        "sdkSpotOrderbookImplementation": _HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION,
+        "sdkSpotOrderbookForceIsolatedHelper": _hydration_sdk_spot_orderbook_force_isolated(route_mode_norm),
+        "sdkSpotOrderbookMinDailyVolumeUsd": float(_HYDRATION_SDK_SPOT_ORDERBOOK_MIN_DAILY_VOLUME_USD),
+        "sdkSpotOrderbookPoolTypes": _HYDRATION_SDK_SPOT_ORDERBOOK_POOL_TYPES_CSV,
+        "spotPrice": float(mid_price),
+        "tradable": bool(_HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE),
+        "tradeRequiresSwapPreflight": True,
+        "tradeRequiresRealRouterQuote": not bool(_HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE),
+    })
+
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "router": "galactic_sdk_next_spot_price",
+        "routeMode": route_mode_norm,
+        "routeModeEffective": "sdk_spot",
+        "sdkSpotOrderbook": True,
+        "spotPriceOnly": True,
+        "tradable": bool(_HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE),
+        "tradeRequiresSwapPreflight": True,
+        "tradeRequiresRealRouterQuote": not bool(_HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE),
+        "rawSymbol": symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+        "base": base,
+        "quote": quote,
+        "baseAssetId": (base_meta or {}).get("assetId"),
+        "quoteAssetId": (quote_meta or {}).get("assetId"),
+        "baseDecimals": int((base_meta or {}).get("decimals") or 0),
+        "quoteDecimals": int((quote_meta or {}).get("decimals") or 0),
+        "baseMeta": base_meta,
+        "quoteMeta": quote_meta,
+        "priceDecimals": price_decimals,
+        "displayPriceDecimals": max(1, min(price_decimals, 8)),
+        "sizeDecimals": size_decimals,
+        "midPrice": float(mid_price),
+        "spotResult": spot_result,
+        "orderbookConfig": cfg,
+        "bids": bids,
+        "asks": asks,
+        "sampleErrors": sample_errors or [],
+    }
 
 
 async def _hydration_price_cache_quote_sell(
@@ -2139,7 +2873,8 @@ async def _hydration_swap_tx_build(
         "userPubkey": str(user_pubkey or "").strip(),
         "beneficiary": str(user_pubkey or "").strip(),
         "stepTimeoutS": float(_HYDRATION_HELPER_STEP_TIMEOUT_S),
-        "enableRouterQuotes": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+        "sdkUseCase": "order_ticket",
+        "enableRouterQuotes": False,
         "enableSwapTx": bool(_HYDRATION_ENABLE_SWAP_TX),
         "enableExactBuy": bool(_HYDRATION_ENABLE_EXACT_BUY),
         "forceIsolatedHelper": bool(force_isolated_helper),
@@ -2151,7 +2886,10 @@ async def _hydration_swap_tx_build(
         # safe to use the isolated helper for both exact-in and exact-out calls.
         force_isolated_helper = True
         payload["forceIsolatedHelper"] = True
-        payload["enableRouterQuotes"] = bool(_HYDRATION_ENABLE_ROUTER_QUOTES)
+        payload["enableRouterQuotes"] = bool(_hydration_router_quotes_enabled_for_payload(payload))
+
+    if not (isinstance(manual_custom_swap, dict) and manual_custom_swap.get("enabled")):
+        payload["enableRouterQuotes"] = bool(_hydration_router_quotes_enabled_for_payload(payload))
 
     result = await _run_hydration_helper(
         payload,
@@ -3111,14 +3849,186 @@ def _manual_router_fallback_routes_map() -> Dict[str, List[Dict[str, Any]]]:
     return out
 
 
-def _manual_router_pool_payload(pool: Any) -> Dict[str, str]:
+_HYDRATION_MANUAL_ROUTER_POOL_TYPES = {"XYK", "LBP", "Stableswap", "Omnipool", "Aave", "HSM"}
+_HYDRATION_MANUAL_ROUTER_POOL_ALIASES = {
+    "xyk": "XYK",
+    "lbp": "LBP",
+    "stableswap": "Stableswap",
+    "stable_swap": "Stableswap",
+    "stable swap": "Stableswap",
+    "stable": "Stableswap",
+    "omnipool": "Omnipool",
+    "omni": "Omnipool",
+    "aave": "Aave",
+    "hsm": "HSM",
+}
+
+
+def _manual_router_pool_type_raw(pool: Any) -> str:
     if isinstance(pool, dict):
-        pool_type = str(pool.get("type") or pool.get("value") or "").strip()
-    else:
-        pool_type = str(pool or "").strip()
+        return str(
+            pool.get("type")
+            or pool.get("value")
+            or pool.get("name")
+            or pool.get("poolType")
+            or pool.get("pool_type")
+            or ""
+        ).strip()
+    return str(pool or "").strip()
+
+
+def _manual_router_pool_type_canonical(pool: Any) -> str:
+    raw = _manual_router_pool_type_raw(pool)
+    if not raw:
+        raw = str(_HYDRATION_MANUAL_ROUTER_FALLBACK_POOL or "Omnipool").strip()
+    return _HYDRATION_MANUAL_ROUTER_POOL_ALIASES.get(raw.lower(), raw)
+
+
+def _manual_router_pool_payload(pool: Any) -> Dict[str, str]:
+    pool_type = _manual_router_pool_type_canonical(pool)
     if not pool_type:
-        pool_type = str(_HYDRATION_MANUAL_ROUTER_FALLBACK_POOL or "Omnipool")
+        pool_type = "Omnipool"
     return {"type": pool_type}
+
+
+def _manual_router_route_shape_hints() -> Dict[str, Any]:
+    return {
+        "source": "Metadata v15 focused scan",
+        "routeLeg": {
+            "pool": "hydradx_traits::router::PoolType<AssetId>",
+            "assetIn": "AssetId",
+            "assetOut": "AssetId",
+        },
+        "routerSell": {
+            "asset_in": "AssetId",
+            "asset_out": "AssetId",
+            "amount_in": "Balance",
+            "min_amount_out": "Balance",
+            "route": "Route<AssetId>",
+        },
+        "routerBuy": {
+            "asset_in": "AssetId",
+            "asset_out": "AssetId",
+            "amount_out": "Balance",
+            "max_amount_in": "Balance",
+            "route": "Route<AssetId>",
+        },
+        "observedPoolTypeNames": sorted(_HYDRATION_MANUAL_ROUTER_POOL_TYPES),
+        "stableswapNote": "Metadata shows Stableswap carries an AssetId payload. Keep Stableswap route rows diagnostic-only until the JS manual route builder preserves that payload shape.",
+    }
+
+
+def _validate_manual_router_route(
+    route: Any,
+    *,
+    asset_in_id: int,
+    asset_out_id: int,
+) -> Dict[str, Any]:
+    errors: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
+
+    if not isinstance(route, list) or not route:
+        return {
+            "ok": False,
+            "route": None,
+            "errors": [{"error": "manual_router_route_required", "message": "manual_router route_json must be a non-empty list of route legs."}],
+            "warnings": warnings,
+            "shapeHints": _manual_router_route_shape_hints(),
+        }
+
+    for idx, leg in enumerate(route):
+        if not isinstance(leg, dict):
+            errors.append({"error": "manual_router_route_leg_not_object", "index": idx, "leg": leg})
+            continue
+
+        leg_in = _route_leg_asset_value(leg, "assetIn", "asset_in")
+        leg_out = _route_leg_asset_value(leg, "assetOut", "asset_out")
+        if leg_in is None:
+            errors.append({"error": "manual_router_route_leg_missing_asset_in", "index": idx, "leg": leg})
+        if leg_out is None:
+            errors.append({"error": "manual_router_route_leg_missing_asset_out", "index": idx, "leg": leg})
+        if leg_in is None or leg_out is None:
+            continue
+        if int(leg_in) == int(leg_out):
+            errors.append({"error": "manual_router_route_leg_same_asset", "index": idx, "assetId": int(leg_in), "leg": leg})
+
+        pool_raw = _manual_router_pool_type_raw(leg.get("pool"))
+        pool_payload = _manual_router_pool_payload(leg.get("pool"))
+        pool_type = str(pool_payload.get("type") or "").strip()
+        if pool_type not in _HYDRATION_MANUAL_ROUTER_POOL_TYPES:
+            errors.append({
+                "error": "manual_router_route_pool_type_unsupported",
+                "index": idx,
+                "poolType": pool_raw or pool_type,
+                "canonicalPoolType": pool_type,
+                "supportedPoolTypes": sorted(_HYDRATION_MANUAL_ROUTER_POOL_TYPES),
+                "leg": leg,
+            })
+
+        if pool_type == "Stableswap":
+            warnings.append({
+                "warning": "manual_router_stableswap_payload_not_execution_hardened",
+                "index": idx,
+                "message": "Metadata shows PoolType::Stableswap carries an AssetId. The current JS manual route builder normalizes pools to type-only variants, so Stableswap rows should remain diagnostic-only until builder support is added.",
+                "leg": leg,
+            })
+
+        out.append({
+            "pool": pool_payload,
+            "assetIn": int(leg_in),
+            "assetOut": int(leg_out),
+        })
+
+    if not out:
+        errors.append({"error": "manual_router_route_no_valid_legs"})
+
+    if out:
+        first_in = _route_leg_asset_value(out[0], "assetIn", "asset_in")
+        last_out = _route_leg_asset_value(out[-1], "assetOut", "asset_out")
+        if first_in != int(asset_in_id):
+            errors.append({
+                "error": "manual_router_route_wrong_start_asset",
+                "expectedAssetInId": int(asset_in_id),
+                "actualAssetInId": first_in,
+                "firstLeg": out[0],
+            })
+        if last_out != int(asset_out_id):
+            errors.append({
+                "error": "manual_router_route_wrong_end_asset",
+                "expectedAssetOutId": int(asset_out_id),
+                "actualAssetOutId": last_out,
+                "lastLeg": out[-1],
+            })
+
+    for idx in range(max(0, len(out) - 1)):
+        cur_out = _route_leg_asset_value(out[idx], "assetOut", "asset_out")
+        next_in = _route_leg_asset_value(out[idx + 1], "assetIn", "asset_in")
+        if cur_out != next_in:
+            errors.append({
+                "error": "manual_router_route_disconnected_legs",
+                "index": idx,
+                "currentAssetOut": cur_out,
+                "nextAssetIn": next_in,
+                "currentLeg": out[idx],
+                "nextLeg": out[idx + 1],
+            })
+
+    if len(out) > 8:
+        warnings.append({
+            "warning": "manual_router_route_many_legs",
+            "legCount": len(out),
+            "message": "Metadata exposes Router.MaxTradesExceeded; keep route rows short unless a tiny live confirmation has proven this path.",
+        })
+
+    return {
+        "ok": not errors,
+        "route": out if not errors else None,
+        "errors": errors,
+        "warnings": warnings,
+        "legCount": len(out),
+        "shapeHints": _manual_router_route_shape_hints(),
+    }
 
 
 def _normalize_manual_router_route(
@@ -3127,38 +4037,13 @@ def _normalize_manual_router_route(
     asset_in_id: int,
     asset_out_id: int,
 ) -> Optional[List[Dict[str, Any]]]:
-    if not isinstance(route, list) or not route:
-        return None
-
-    out: List[Dict[str, Any]] = []
-    for leg in route:
-        if not isinstance(leg, dict):
-            return None
-        leg_in = _route_leg_asset_value(leg, "assetIn", "asset_in")
-        leg_out = _route_leg_asset_value(leg, "assetOut", "asset_out")
-        if leg_in is None or leg_out is None:
-            return None
-        out.append({
-            "pool": _manual_router_pool_payload(leg.get("pool")),
-            "assetIn": int(leg_in),
-            "assetOut": int(leg_out),
-        })
-
-    if not out:
-        return None
-    first_in = _route_leg_asset_value(out[0], "assetIn", "asset_in")
-    last_out = _route_leg_asset_value(out[-1], "assetOut", "asset_out")
-    if first_in != int(asset_in_id) or last_out != int(asset_out_id):
-        return None
-
-    # Each route leg must feed into the next one. This catches malformed
-    # DOT-HDX style routes before they can be signed.
-    for idx in range(len(out) - 1):
-        cur_out = _route_leg_asset_value(out[idx], "assetOut", "asset_out")
-        next_in = _route_leg_asset_value(out[idx + 1], "assetIn", "asset_in")
-        if cur_out != next_in:
-            return None
-    return out
+    checked = _validate_manual_router_route(
+        route,
+        asset_in_id=int(asset_in_id),
+        asset_out_id=int(asset_out_id),
+    )
+    clean = checked.get("route") if checked.get("ok") else None
+    return clean if isinstance(clean, list) and clean else None
 
 
 def _manual_router_fallback_configured_route(
@@ -4744,7 +5629,7 @@ async def polkadot_dex_debug() -> Dict[str, Any]:
         "manual_router_fallback_note": "manual_route_probe only proves call-data encoding. UI signing is blocked unless a DB route-registry manual_router row is confirmed, the pair is listed in UTT_HYDRATION_MANUAL_ROUTER_FALLBACK_CONFIRMED_PAIRS, or the unsafe local override is enabled.",
         "default_route_mode": _HYDRATION_DEFAULT_ROUTE_MODE,
         "route_modes": sorted(_HYDRATION_ROUTE_MODES),
-        "route_mode_note": "Auto returns manual XYK for configured custom pairs. Generic sdk/isolated_helper quote modes are explicit opt-in and are blocked while UTT_HYDRATION_ENABLE_ROUTER_QUOTES=0 to protect RPC quota.",
+        "route_mode_note": "Auto returns confirmed manual routes first. SDK quote modes are scoped: OrderBook getBestSell uses UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES, OrderBook getSpotPrice uses UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK, OrderTicket uses UTT_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES plus UTT_HYDRATION_ENABLE_SDK_SWAP_TX, and the legacy UTT_HYDRATION_ENABLE_ROUTER_QUOTES flag remains a global emergency override.",
         "manual_pool_fallback_enabled": _HYDRATION_ENABLE_MANUAL_POOL_FALLBACK,
         "manual_pool_live_reserves_enabled": _HYDRATION_MANUAL_POOL_LIVE_RESERVES,
         "manual_pool_prices_configured": bool(str(_HYDRATION_MANUAL_POOL_PRICES_JSON or "{}").strip() not in {"", "{}"}),
@@ -4760,6 +5645,16 @@ async def polkadot_dex_debug() -> Dict[str, Any]:
         "native_sdk_asset_id_fallback": _HYDRATION_NATIVE_ASSET_ID,
         "enable_heavy_inspect": _HYDRATION_ENABLE_HEAVY_INSPECT,
         "enable_router_quotes": _HYDRATION_ENABLE_ROUTER_QUOTES,
+        "enable_sdk_orderbook_quotes": _HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES,
+        "enable_sdk_spot_orderbook": _HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK,
+        "sdk_spot_orderbook_force_isolated_helper": _HYDRATION_SDK_SPOT_ORDERBOOK_FORCE_ISOLATED_HELPER,
+        "sdk_spot_orderbook_tradable": _HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE,
+        "sdk_spot_orderbook_implementation": _HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION,
+        "sdk_spot_orderbook_min_daily_volume_usd": _HYDRATION_SDK_SPOT_ORDERBOOK_MIN_DAILY_VOLUME_USD,
+        "sdk_spot_orderbook_pool_types": _HYDRATION_SDK_SPOT_ORDERBOOK_POOL_TYPES_CSV,
+        "enable_sdk_order_ticket_quotes": _HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES,
+        "enable_sdk_swap_tx": _HYDRATION_ENABLE_SDK_SWAP_TX,
+        "enable_background_sdk_prices": _HYDRATION_ENABLE_BACKGROUND_SDK_PRICES,
         "enable_state_call_quotes": _HYDRATION_ENABLE_STATE_CALL_QUOTES,
         "enable_swap_tx": _HYDRATION_ENABLE_SWAP_TX,
         "enable_exact_buy": _HYDRATION_ENABLE_EXACT_BUY,
@@ -4917,10 +5812,31 @@ async def hydration_route_registry_upsert(
 
     pool_type_raw = str(req.pool_type or ("Router" if route_mode == "manual_router" else "XYK")).strip()
     pool_type_norm = pool_type_raw.lower()
+    route_validation: Optional[Dict[str, Any]] = None
     if route_mode == "manual_router":
-        if pool_type_norm not in {"router", "manual_router", "manual router"}:
-            raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_manual_router_pool_type", "poolType": req.pool_type, "supported": ["Router"]})
-        pool_type = "Router"
+        asset_in_id = _hydration_sdk_asset_id(base_meta)
+        asset_out_id = _hydration_sdk_asset_id(quote_meta)
+        route_validation = _validate_manual_router_route(
+            route,
+            asset_in_id=int(asset_in_id),
+            asset_out_id=int(asset_out_id),
+        )
+        route = route_validation.get("route") if route_validation.get("ok") else None
+        if not route:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_hydration_manual_router_route_json",
+                    "message": "manual_router routes require route_json legs that start with BASE asset ID, end with QUOTE asset ID, connect each leg assetOut -> next assetIn, and use metadata-supported pool types.",
+                    "symbol": f"{base}-{quote}",
+                    "expectedAssetInId": int(asset_in_id),
+                    "expectedAssetOutId": int(asset_out_id),
+                    "route_json": req.route_json,
+                    "routeValidation": route_validation,
+                },
+            )
+        base_reserve = _float_or_none(req.base_reserve)
+        quote_reserve = _float_or_none(req.quote_reserve)
     else:
         if pool_type_norm != "xyk":
             raise HTTPException(status_code=422, detail={"error": "unsupported_hydration_manual_pool_type", "poolType": req.pool_type, "supported": ["XYK", "Router"]})
@@ -5023,6 +5939,7 @@ async def hydration_route_registry_upsert(
         "ok": True,
         "venue": "polkadot_hydration",
         "item": _hydration_route_registry_payload(row),
+        "routeValidation": route_validation if route_mode == "manual_router" else None,
         "next": {
             "orderbook": f"/api/polkadot_dex/hydration/orderbook?symbol={base}-{quote}&route_mode=manual_xyk" if route_mode == "manual_xyk" else None,
             "swapTx": f"/api/polkadot_dex/hydration/swap_tx",
@@ -5132,6 +6049,8 @@ async def hydration_status(
     base_meta = _resolve_asset(base, db=db)
     quote_meta = _resolve_asset(quote, db=db)
     status = _hydration_router_quote_status(symbol=f"{base}-{quote}", base_meta=base_meta, quote_meta=quote_meta)
+    orderbook_status = _hydration_router_quote_status(symbol=f"{base}-{quote}", base_meta=base_meta, quote_meta=quote_meta, use_case="orderbook")
+    order_ticket_status = _hydration_router_quote_status(symbol=f"{base}-{quote}", base_meta=base_meta, quote_meta=quote_meta, use_case="order_ticket")
     sidecar = await _sidecar_health() if include_sidecar_health else {"skipped": True}
     return {
         "ok": True,
@@ -5143,8 +6062,14 @@ async def hydration_status(
         "quote": quote_meta,
         "sidecar": sidecar,
         "quoteStatus": status,
+        "orderbookQuoteStatus": orderbook_status,
+        "orderTicketQuoteStatus": order_ticket_status,
         "liveQuotesEnabled": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
         "liveQuotesAvailable": bool(status.get("available")),
+        "liveOrderbookQuotesEnabled": bool(orderbook_status.get("enabled")),
+        "liveOrderbookQuotesAvailable": bool(orderbook_status.get("available")),
+        "liveOrderTicketQuotesEnabled": bool(order_ticket_status.get("enabled")),
+        "liveOrderTicketQuotesAvailable": bool(order_ticket_status.get("available")),
         # This means unsigned swap transaction building is enabled/available.
         # Final wallet signing/submission is still handled by the frontend.
         "liveSwapsRecommended": bool(status.get("liveSwapsRecommended")),
@@ -5429,6 +6354,8 @@ async def hydration_usd_prices_status(
             "url_redacted": _redact_url(_HYDRATION_SIDECAR_URL),
             "managed_process_running": _sidecar_process_running(),
             "autostart_for_router_quotes": bool(_hydration_effective_autostart_sidecar(price_cache=False)),
+            "autostart_for_orderbook_sdk": bool(_hydration_effective_autostart_sidecar(price_cache=False, payload={"mode": "quote_sell", "sdkUseCase": "orderbook", "routeMode": "auto"})),
+            "autostart_for_order_ticket_sdk": bool(_hydration_effective_autostart_sidecar(price_cache=False, payload={"mode": "swap_tx", "sdkUseCase": "order_ticket", "routeMode": "auto"})),
             "autostart_for_price_cache": bool(_hydration_effective_autostart_sidecar(price_cache=True)),
             "health": sidecar_health,
         },
@@ -5437,6 +6364,10 @@ async def hydration_usd_prices_status(
             "status_endpoint_autostarts_sidecar": False,
             "include_sidecar_health_is_local_only": bool(include_sidecar_health),
             "router_quotes_enabled": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+            "sdk_orderbook_quotes_enabled": bool(_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES),
+            "sdk_order_ticket_quotes_enabled": bool(_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES),
+            "sdk_swap_tx_enabled": bool(_HYDRATION_ENABLE_SDK_SWAP_TX),
+            "background_sdk_prices_enabled": bool(_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES),
             "sdk_price_cache_enabled": bool(_HYDRATION_ENABLE_SDK_PRICE_CACHE),
             "sdk_price_cache_fallback_enabled": bool(_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK),
             "external_usd_prices_enabled": bool(_HYDRATION_ENABLE_EXTERNAL_USD_PRICES),
@@ -5543,6 +6474,156 @@ async def hydration_runtime_api_inventory(
             "not_found": "Runtime did not export this method name.",
         },
     }
+
+
+
+@router.get("/hydration/metadata_v15_scan")
+async def hydration_metadata_v15_scan(
+    targets_csv: Optional[str] = Query(
+        "Router,Omnipool,XYK,Stableswap,AssetRegistry,Tokens,Currencies",
+        description="Comma-separated ASCII targets to scan for in Metadata v15.",
+    ),
+    context_bytes: int = Query(220, ge=40, le=1200, description="Number of bytes before/after each target hit to include."),
+    max_windows_per_target: int = Query(8, ge=1, le=25),
+    max_ascii_strings: int = Query(500, ge=50, le=3000),
+    include_raw_metadata: bool = Query(False, description="If true, includes the full raw metadata hex. Usually leave false."),
+) -> Dict[str, Any]:
+    """Fetch and scan Hydration Metadata v15 for pallet/call discovery.
+
+    Diagnostic-only. This uses state_call Metadata_metadata_at_version with the
+    correct SCALE u32 v15 probe data (0x0f000000), then returns bounded ASCII
+    windows around Router/Omnipool/XYK/Stableswap-related names. It deliberately
+    avoids signing, quote execution, swap building, or storage mutation.
+    """
+    targets = [t.strip() for t in str(targets_csv or "").split(",") if t.strip()]
+    if not targets:
+        targets = ["Router", "Omnipool", "XYK", "Stableswap"]
+
+    metadata_probe = await _state_call_probe_method("Metadata_metadata_at_version", _metadata_v15_probe_payload())
+    metadata_hex = _metadata_result_hex_from_probe(metadata_probe)
+    if not metadata_hex or metadata_probe.get("classification") != "accepted":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "hydration_metadata_v15_fetch_failed",
+                "message": "Metadata_metadata_at_version did not return an accepted Metadata v15 blob.",
+                "probe": metadata_probe,
+                "probeData": _metadata_v15_probe_payload(),
+            },
+        )
+
+    scan = _metadata_scan_summary(
+        metadata_hex,
+        targets=targets,
+        context_bytes=int(context_bytes),
+        max_windows_per_target=int(max_windows_per_target),
+        max_ascii_strings=int(max_ascii_strings),
+    )
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "network": "hydration",
+        "rpc_url": _redact_url(_hydration_rpc_url()),
+        "method": "Metadata_metadata_at_version",
+        "probeData": _metadata_v15_probe_payload(),
+        "classification": metadata_probe.get("classification"),
+        "metadataRpc": {
+            "ok": ((metadata_probe.get("rpc") or {}).get("ok") if isinstance(metadata_probe.get("rpc"), dict) else None),
+            "httpStatus": ((metadata_probe.get("rpc") or {}).get("httpStatus") if isinstance(metadata_probe.get("rpc"), dict) else None),
+        },
+        "scanConfig": {
+            "targets": targets,
+            "contextBytes": int(context_bytes),
+            "maxWindowsPerTarget": int(max_windows_per_target),
+            "maxAsciiStrings": int(max_ascii_strings),
+            "includeRawMetadata": bool(include_raw_metadata),
+        },
+        "scan": scan,
+        "interpretation": {
+            "purpose": "Discover Hydration pallet/call names from Metadata v15 before hardening manual Router/Omnipool/XYK/Stableswap builders.",
+            "safe": True,
+            "mutation": False,
+            "nextStep": "Review targetWindows.Router, targetWindows.Omnipool, targetWindows.XYK, and nearbyCallNameCandidates for exact call names and argument labels.",
+        },
+    }
+    if include_raw_metadata:
+        out["rawMetadataHex"] = metadata_hex
+    return out
+
+
+
+@router.get("/hydration/metadata_v15_focused_scan")
+async def hydration_metadata_v15_focused_scan(
+    terms_csv: Optional[str] = Query(
+        None,
+        description="Optional comma-separated focused byte/ASCII terms. Defaults to Hydration DEX call/storage terms.",
+    ),
+    context_bytes: int = Query(900, ge=120, le=4000, description="Number of bytes before/after each focused term hit to include."),
+    max_hits_per_term: int = Query(8, ge=1, le=30),
+    max_ascii_strings: int = Query(1800, ge=100, le=5000),
+    include_raw_metadata: bool = Query(False, description="If true, includes the full raw metadata hex. Usually leave false."),
+) -> Dict[str, Any]:
+    """Focused Hydration Metadata v15 scan for route-builder hardening.
+
+    This is narrower than /metadata_v15_scan.  It targets the byte/ASCII regions
+    around pallet_route_executor, pallet_omnipool, pallet_xyk, pallet_stableswap,
+    hydradx_traits::router types, RouteExecuted, and Router storage hints.
+    Diagnostic-only: no signing, swap building, state mutation, or SDK router
+    quote execution is performed.
+    """
+    terms = _metadata_focus_terms(terms_csv)
+    metadata_probe = await _state_call_probe_method("Metadata_metadata_at_version", _metadata_v15_probe_payload())
+    metadata_hex = _metadata_result_hex_from_probe(metadata_probe)
+    if not metadata_hex or metadata_probe.get("classification") != "accepted":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "hydration_metadata_v15_fetch_failed",
+                "message": "Metadata_metadata_at_version did not return an accepted Metadata v15 blob.",
+                "probe": metadata_probe,
+                "probeData": _metadata_v15_probe_payload(),
+            },
+        )
+
+    focused = _metadata_focused_windows(
+        metadata_hex,
+        terms=terms,
+        context_bytes=int(context_bytes),
+        max_hits_per_term=int(max_hits_per_term),
+        max_ascii_strings=int(max_ascii_strings),
+    )
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "network": "hydration",
+        "rpc_url": _redact_url(_hydration_rpc_url()),
+        "method": "Metadata_metadata_at_version",
+        "probeData": _metadata_v15_probe_payload(),
+        "classification": metadata_probe.get("classification"),
+        "metadataRpc": {
+            "ok": ((metadata_probe.get("rpc") or {}).get("ok") if isinstance(metadata_probe.get("rpc"), dict) else None),
+            "httpStatus": ((metadata_probe.get("rpc") or {}).get("httpStatus") if isinstance(metadata_probe.get("rpc"), dict) else None),
+        },
+        "scanConfig": {
+            "terms": terms,
+            "contextBytes": int(context_bytes),
+            "maxHitsPerTerm": int(max_hits_per_term),
+            "maxAsciiStrings": int(max_ascii_strings),
+            "includeRawMetadata": bool(include_raw_metadata),
+        },
+        "scan": focused,
+        "interpretation": {
+            "purpose": "Focus Hydration Metadata v15 around Router/Omnipool/XYK/Stableswap call and storage regions for manual route hardening.",
+            "safe": True,
+            "mutation": False,
+            "nextStep": "Review scan.focusedWindows['pallet_route_executor'], scan.focusedWindows['hydradx_traits'], and scan.manualRouteShapeHints before changing manual route builders.",
+        },
+    }
+    if include_raw_metadata:
+        out["rawMetadataHex"] = metadata_hex
+    return out
 
 
 @router.get("/hydration/state_call_quote_probe")
@@ -5926,11 +7007,216 @@ async def _hydration_synthetic_spot_orderbook_response(
     }
 
 
+@router.get("/hydration/sdk_path_diagnostics")
+async def hydration_sdk_path_diagnostics(
+    symbol: str = Query("DOT-HDX", description="Symbol pair to diagnose, e.g. DOT-HDX"),
+    amount_ui: float = Query(1.0, gt=0),
+    step_timeout_s: Optional[float] = Query(None, gt=0),
+    route_mode: Optional[str] = Query("sdk_spot", description="auto|sdk|sdk_spot|isolated_helper"),
+    force_isolated: Optional[bool] = Query(None, description="Override helper isolation for this diagnostic request."),
+    include_spot_direct: bool = Query(True),
+    include_spot_context: bool = Query(True),
+    include_quote_sell: bool = Query(True),
+    include_swap_tx: bool = Query(False),
+    user_pubkey: Optional[str] = Query(None, description="Required only when include_swap_tx=true."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Run scoped Hydration SDK diagnostics without reopening background pricing.
+
+    This endpoint intentionally separates getSpotPrice from getBestSell and
+    swap_tx so we can identify which sdk-next path is actually healthy.
+    """
+    base, quote = _parse_symbol(symbol)
+    base_meta = _resolve_asset(base, db=db)
+    quote_meta = _resolve_asset(quote, db=db)
+    route_mode_norm = _hydration_route_mode(route_mode)
+    timeout_s = float(step_timeout_s if step_timeout_s is not None else _HYDRATION_ORDERBOOK_STEP_TIMEOUT_S)
+    if force_isolated is None:
+        force_isolated_effective = bool(route_mode_norm == "isolated_helper" or _HYDRATION_SDK_SPOT_ORDERBOOK_FORCE_ISOLATED_HELPER)
+    else:
+        force_isolated_effective = bool(force_isolated)
+
+    async def _attempt(name: str, fn) -> Dict[str, Any]:
+        t0 = time.monotonic()
+        try:
+            result = await fn()
+            return {
+                "ok": True,
+                "name": name,
+                "elapsed_s": round(time.monotonic() - t0, 4),
+                "result": result,
+            }
+        except HTTPException as e:
+            return {
+                "ok": False,
+                "name": name,
+                "elapsed_s": round(time.monotonic() - t0, 4),
+                "status_code": e.status_code,
+                "detail": e.detail,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "name": name,
+                "elapsed_s": round(time.monotonic() - t0, 4),
+                "error": type(e).__name__,
+                "message": str(e),
+            }
+
+    paths: Dict[str, Any] = {}
+
+    if include_spot_direct:
+        paths["spot_direct_forward"] = await _attempt(
+            "spot_direct_forward",
+            lambda: _hydration_sdk_spot_for_orderbook(
+                raw_symbol=symbol,
+                base=base,
+                quote=quote,
+                asset_in=base_meta,
+                asset_out=quote_meta,
+                step_timeout_s=timeout_s,
+                route_mode="sdk_spot",
+                implementation="direct",
+            ),
+        )
+        paths["spot_direct_reverse"] = await _attempt(
+            "spot_direct_reverse",
+            lambda: _hydration_sdk_spot_for_orderbook(
+                raw_symbol=f"{quote}-{base}",
+                base=quote,
+                quote=base,
+                asset_in=quote_meta,
+                asset_out=base_meta,
+                step_timeout_s=timeout_s,
+                route_mode="sdk_spot",
+                implementation="direct",
+            ),
+        )
+
+    if include_spot_context:
+        paths["spot_context_forward"] = await _attempt(
+            "spot_context_forward",
+            lambda: _hydration_sdk_spot_for_orderbook(
+                raw_symbol=symbol,
+                base=base,
+                quote=quote,
+                asset_in=base_meta,
+                asset_out=quote_meta,
+                step_timeout_s=timeout_s,
+                route_mode="sdk_spot",
+                implementation="context",
+            ),
+        )
+        paths["spot_context_reverse"] = await _attempt(
+            "spot_context_reverse",
+            lambda: _hydration_sdk_spot_for_orderbook(
+                raw_symbol=f"{quote}-{base}",
+                base=quote,
+                quote=base,
+                asset_in=quote_meta,
+                asset_out=base_meta,
+                step_timeout_s=timeout_s,
+                route_mode="sdk_spot",
+                implementation="context",
+            ),
+        )
+
+    if include_quote_sell:
+        paths["quote_sell_forward"] = await _attempt(
+            "quote_sell_forward",
+            lambda: _hydration_quote_sell(
+                raw_symbol=symbol,
+                base=base,
+                quote=quote,
+                asset_in=base_meta,
+                asset_out=quote_meta,
+                amount_in_ui=float(amount_ui),
+                step_timeout_s=timeout_s,
+                force_isolated=force_isolated_effective,
+                sdk_use_case="orderbook",
+                route_mode="sdk",
+            ),
+        )
+        paths["quote_sell_reverse"] = await _attempt(
+            "quote_sell_reverse",
+            lambda: _hydration_quote_sell(
+                raw_symbol=f"{quote}-{base}",
+                base=quote,
+                quote=base,
+                asset_in=quote_meta,
+                asset_out=base_meta,
+                amount_in_ui=float(amount_ui),
+                step_timeout_s=timeout_s,
+                force_isolated=force_isolated_effective,
+                sdk_use_case="orderbook",
+                route_mode="sdk",
+            ),
+        )
+
+    if include_swap_tx:
+        if not str(user_pubkey or "").strip():
+            paths["swap_tx"] = {
+                "ok": False,
+                "skipped": True,
+                "reason": "user_pubkey_required",
+                "message": "Pass user_pubkey only for deliberate OrderTicket SDK swap build diagnostics.",
+            }
+        else:
+            paths["swap_tx_exact_in_sell"] = await _attempt(
+                "swap_tx_exact_in_sell",
+                lambda: _hydration_swap_tx_build(
+                    raw_symbol=symbol,
+                    base=base,
+                    quote=quote,
+                    side="sell",
+                    asset_in=base_meta,
+                    asset_out=quote_meta,
+                    amount_ui=float(amount_ui),
+                    amount_mode="exact_in",
+                    slippage_bps=50,
+                    user_pubkey=str(user_pubkey or "").strip(),
+                    manual_custom_swap=None,
+                    route_mode="sdk",
+                ),
+            )
+
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "network": "hydration",
+        "rawSymbol": symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+        "base": base_meta,
+        "quote": quote_meta,
+        "amountUi": float(amount_ui),
+        "stepTimeoutS": timeout_s,
+        "routeMode": route_mode_norm,
+        "forceIsolated": force_isolated_effective,
+        "sdkScopes": {
+            "globalRouterQuotesEnabled": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+            "sdkOrderbookQuotesEnabled": bool(_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES),
+            "sdkSpotOrderbookEnabled": bool(_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK),
+            "sdkOrderTicketQuotesEnabled": bool(_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES),
+            "sdkSwapTxEnabled": bool(_HYDRATION_ENABLE_SDK_SWAP_TX),
+            "backgroundSdkPricesEnabled": bool(_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES),
+        },
+        "spotOrderbookPolicy": {
+            "implementation": _HYDRATION_SDK_SPOT_ORDERBOOK_IMPLEMENTATION,
+            "forceIsolatedHelper": bool(_HYDRATION_SDK_SPOT_ORDERBOOK_FORCE_ISOLATED_HELPER),
+            "tradable": bool(_HYDRATION_SDK_SPOT_ORDERBOOK_TRADABLE),
+            "minDailyVolumeUsd": float(_HYDRATION_SDK_SPOT_ORDERBOOK_MIN_DAILY_VOLUME_USD),
+            "poolTypes": _HYDRATION_SDK_SPOT_ORDERBOOK_POOL_TYPES_CSV,
+            "note": "Daily-volume gating is surfaced here but not enforced until a trusted Hydration pool volume source is wired.",
+        },
+        "paths": paths,
+    }
+
+
 @router.get("/hydration/orderbook")
 async def hydration_pseudo_orderbook(
     symbol: str = Query(..., description="Symbol pair, e.g. UTTT-DOT (BASE-QUOTE)"),
     depth: int = Query(10, ge=1, le=50),
-    route_mode: Optional[str] = Query(None, description="Hydration quote source: auto|sdk|isolated_helper|manual_xyk. auto uses manual XYK only for configured custom pairs and managed sdk-next/sidecar for normal pairs."),
+    route_mode: Optional[str] = Query(None, description="Hydration quote source: auto|sdk|sdk_spot|isolated_helper|manual_xyk|manual_router. sdk_spot uses getSpotPrice for visible-pair pseudo-orderbook diagnostics."),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     base, quote = _parse_symbol(symbol)
@@ -5971,21 +7257,143 @@ async def hydration_pseudo_orderbook(
         resp.setdefault("orderbookConfig", {})["legacyForceIsolatedHelperEnv"] = bool(_HYDRATION_ORDERBOOK_FORCE_ISOLATED_HELPER)
         return resp
 
-    if not _HYDRATION_ENABLE_ROUTER_QUOTES:
-        disabled_detail = {
-            "error": "hydration_router_quotes_disabled",
-            "message": "Hydration router quote/orderbook calls are intentionally disabled.",
-            "venue": "polkadot_hydration",
+    if route_mode_norm == "sdk_spot":
+        orderbook_step_timeout_s = max(1.0, float(_HYDRATION_ORDERBOOK_STEP_TIMEOUT_S))
+        n0 = max(1, min(int(depth), 10))
+        orderbook_config = _hydration_orderbook_common_config(
+            orderbook_step_timeout_s=orderbook_step_timeout_s,
+            max_consecutive_errors=max(1, int(_HYDRATION_ORDERBOOK_MAX_CONSECUTIVE_ERRORS)),
+            force_isolated_orderbook=_hydration_sdk_spot_orderbook_force_isolated(route_mode_norm),
+            route_mode_norm=route_mode_norm,
+            requested_depth=int(depth),
+            sample_depth=n0,
+            extra={"sdkSpotOrderbookRequested": True},
+        )
+        sample_errors: List[Dict[str, Any]] = []
+        spot_resp: Optional[Dict[str, Any]] = None
+        try:
+            spot_resp = await _hydration_sdk_spot_orderbook_response(
+                symbol=symbol,
+                base=base,
+                quote=quote,
+                base_meta=base_meta,
+                quote_meta=quote_meta,
+                depth=depth,
+                route_mode_norm=route_mode_norm,
+                orderbook_config=orderbook_config,
+                sample_errors=[],
+                fallback_reason="explicit_sdk_spot_route_mode",
+            )
+            if isinstance(spot_resp, dict) and spot_resp.get("ok"):
+                return spot_resp
+            sample_errors.append({
+                "side": "both",
+                "stage": "sdk_spot_orderbook",
+                "detail": {
+                    "error": "hydration_sdk_spot_orderbook_empty",
+                    "message": "route_mode=sdk_spot returned no usable spot orderbook response.",
+                    "spotOrderbook": spot_resp,
+                },
+            })
+        except HTTPException as e:
+            sample_errors.append({"side": "both", "stage": "sdk_spot_orderbook", "detail": e.detail})
+        except Exception as e:
+            sample_errors.append({
+                "side": "both",
+                "stage": "sdk_spot_orderbook",
+                "error": type(e).__name__,
+                "message": str(e),
+            })
+
+        fallback = await _hydration_synthetic_spot_orderbook_response(
+            symbol=symbol,
+            base=base,
+            quote=quote,
+            base_meta=base_meta,
+            quote_meta=quote_meta,
+            depth=depth,
+            db=db,
+            route_mode_norm=route_mode_norm,
+            orderbook_config={
+                **orderbook_config,
+                "sdkSpotOrderbookFailed": True,
+                "sdkSpotOrderbookFallback": "synthetic_spot_fallback",
+            },
+            sample_errors=sample_errors,
+            fallback_reason="explicit_sdk_spot_failed_synthetic_fallback",
+        )
+        if isinstance(fallback, dict) and fallback.get("ok"):
+            fallback["routeMode"] = route_mode_norm
+            fallback.setdefault("orderbookConfig", {})["requestedRouteMode"] = route_mode_norm
+            fallback.setdefault("orderbookConfig", {})["sdkSpotOrderbookFailed"] = True
+            fallback.setdefault("orderbookConfig", {})["sdkSpotOrderbookFallback"] = "synthetic_spot_fallback"
+            return fallback
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "hydration_sdk_spot_orderbook_unavailable",
+                "message": "route_mode=sdk_spot was requested, but SDK getSpotPrice failed and no synthetic fallback could be built.",
+                "venue": "polkadot_hydration",
+                "rawSymbol": symbol,
+                "resolvedSymbol": f"{base}-{quote}",
+                "base": base_meta,
+                "quote": quote_meta,
+                "routeMode": route_mode_norm,
+                "spotOrderbook": spot_resp,
+                "sampleErrors": sample_errors,
+                "syntheticFallback": fallback,
+            },
+        )
+
+    orderbook_sdk_payload = {
+        "mode": "quote_sell",
+        "sdkUseCase": "orderbook",
+        "routeMode": route_mode_norm,
+        "rawSymbol": symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+    }
+    if not _hydration_router_quotes_enabled_for_payload(orderbook_sdk_payload):
+        disabled_detail = _hydration_router_quotes_disabled_detail(
+            mode="quote_sell",
+            payload=orderbook_sdk_payload,
+            symbol=f"{base}-{quote}",
+        )
+        disabled_detail.update({
+            "message": "Hydration SDK OrderBook quote sampling is disabled for this route scope.",
             "rawSymbol": symbol,
             "resolvedSymbol": f"{base}-{quote}",
             "base": base_meta,
             "quote": quote_meta,
-            "enableRouterQuotes": _HYDRATION_ENABLE_ROUTER_QUOTES,
-            "quoteStatus": _hydration_router_quote_status(symbol=f"{base}-{quote}", base_meta=base_meta, quote_meta=quote_meta),
             "routeMode": route_mode_norm,
-        }
+        })
         if route_mode_norm == "auto":
             n0 = max(1, min(int(depth), 10))
+            if _HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK:
+                spot_fallback = await _hydration_sdk_spot_orderbook_response(
+                    symbol=symbol,
+                    base=base,
+                    quote=quote,
+                    base_meta=base_meta,
+                    quote_meta=quote_meta,
+                    depth=depth,
+                    route_mode_norm="sdk_spot",
+                    orderbook_config=_hydration_orderbook_common_config(
+                        orderbook_step_timeout_s=max(1.0, float(_HYDRATION_ORDERBOOK_STEP_TIMEOUT_S)),
+                        max_consecutive_errors=max(1, int(_HYDRATION_ORDERBOOK_MAX_CONSECUTIVE_ERRORS)),
+                        force_isolated_orderbook=_hydration_sdk_spot_orderbook_force_isolated("sdk_spot"),
+                        route_mode_norm="sdk_spot",
+                        requested_depth=int(depth),
+                        sample_depth=n0,
+                        extra={"sdkOrderbookQuotesDisabled": True, "sdkSpotFallbackFromAuto": True},
+                    ),
+                    sample_errors=[{"side": "both", "detail": disabled_detail}],
+                    fallback_reason="sdk_orderbook_quotes_disabled_spot_fallback",
+                )
+                if isinstance(spot_fallback, dict) and spot_fallback.get("ok"):
+                    spot_fallback["routeMode"] = route_mode_norm
+                    spot_fallback.setdefault("orderbookConfig", {})["requestedRouteMode"] = route_mode_norm
+                    return spot_fallback
             fallback = await _hydration_synthetic_spot_orderbook_response(
                 symbol=symbol,
                 base=base,
@@ -6002,10 +7410,10 @@ async def hydration_pseudo_orderbook(
                     route_mode_norm=route_mode_norm,
                     requested_depth=int(depth),
                     sample_depth=n0,
-                    extra={"routerQuotesDisabled": True},
+                    extra={"sdkOrderbookQuotesDisabled": True},
                 ),
                 sample_errors=[{"side": "both", "detail": disabled_detail}],
-                fallback_reason="router_quotes_disabled",
+                fallback_reason="sdk_orderbook_quotes_disabled",
             )
             if isinstance(fallback, dict) and fallback.get("ok"):
                 return fallback
@@ -6033,6 +7441,8 @@ async def hydration_pseudo_orderbook(
                 amount_in_ui=float(qsz),
                 step_timeout_s=orderbook_step_timeout_s,
                 force_isolated=force_isolated_orderbook,
+                sdk_use_case="orderbook",
+                route_mode=route_mode_norm,
             )
             out_atomic = qt.get("amountOutAtomic")
             out_ui = qt.get("amountOutUi")
@@ -6072,6 +7482,8 @@ async def hydration_pseudo_orderbook(
                 amount_in_ui=float(bsz),
                 step_timeout_s=orderbook_step_timeout_s,
                 force_isolated=force_isolated_orderbook,
+                sdk_use_case="orderbook",
+                route_mode=route_mode_norm,
             )
             out_atomic = qt.get("amountOutAtomic")
             out_ui = qt.get("amountOutUi")
@@ -6107,6 +7519,35 @@ async def hydration_pseudo_orderbook(
             requested_depth=int(depth),
             sample_depth=n,
         )
+        if _HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK:
+            try:
+                spot_fallback = await _hydration_sdk_spot_orderbook_response(
+                    symbol=symbol,
+                    base=base,
+                    quote=quote,
+                    base_meta=base_meta,
+                    quote_meta=quote_meta,
+                    depth=depth,
+                    route_mode_norm="sdk_spot",
+                    orderbook_config={
+                        **orderbook_config,
+                        "requestedRouteMode": route_mode_norm,
+                        "sdkSpotFallbackFromQuoteSamplingFailure": True,
+                    },
+                    sample_errors=sample_errors,
+                    fallback_reason="sdk_quote_sampling_failed_spot_fallback",
+                )
+                if isinstance(spot_fallback, dict) and spot_fallback.get("ok"):
+                    spot_fallback["routeMode"] = route_mode_norm
+                    spot_fallback.setdefault("orderbookConfig", {})["requestedRouteMode"] = route_mode_norm
+                    return spot_fallback
+            except HTTPException as e:
+                if len(sample_errors) < 12:
+                    sample_errors.append({"side": "both", "stage": "sdk_spot_fallback", "detail": e.detail})
+            except Exception as e:
+                if len(sample_errors) < 12:
+                    sample_errors.append({"side": "both", "stage": "sdk_spot_fallback", "error": type(e).__name__, "message": str(e)})
+
         fallback = await _hydration_synthetic_spot_orderbook_response(
             symbol=symbol,
             base=base,
@@ -6410,7 +7851,7 @@ async def hydration_swap_tx(req: HydrationSwapTxRequest, db: Session = Depends(g
 
     base_meta = _resolve_asset(base, db=db)
     quote_meta = _resolve_asset(quote, db=db)
-    quote_status = _hydration_router_quote_status(symbol=f"{base}-{quote}", base_meta=base_meta, quote_meta=quote_meta)
+    quote_status = _hydration_router_quote_status(symbol=f"{base}-{quote}", base_meta=base_meta, quote_meta=quote_meta, use_case="order_ticket")
     route_mode_norm = _hydration_route_mode(req.route_mode)
 
     if not _HYDRATION_ENABLE_SWAP_TX:
@@ -6639,24 +8080,34 @@ async def hydration_swap_tx(req: HydrationSwapTxRequest, db: Session = Depends(g
             },
         )
 
-    if not manual_custom_swap and not _HYDRATION_ENABLE_ROUTER_QUOTES:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "hydration_swap_tx_requires_router_quotes",
-                "message": "Hydration swap transaction building requires UTT_HYDRATION_ENABLE_ROUTER_QUOTES=1 unless a manual custom-asset fallback is available for this pair.",
-                "venue": "polkadot_hydration",
-                "rawSymbol": req.symbol,
-                "resolvedSymbol": f"{base}-{quote}",
-                "side": side,
-                "amount": req.amount,
-                "base": base_meta,
-                "quote": quote_meta,
-                "quoteStatus": quote_status,
-                "routeMode": route_mode_norm,
-                "manualRouterFallback": manual_router_fallback_diag,
-            },
+    ticket_sdk_payload = {
+        "mode": "swap_tx",
+        "sdkUseCase": "order_ticket",
+        "routeMode": route_mode_norm,
+        "rawSymbol": req.symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+    }
+    if not manual_custom_swap and not _hydration_router_quotes_enabled_for_payload(ticket_sdk_payload):
+        detail = _hydration_router_quotes_disabled_detail(
+            mode="swap_tx",
+            payload=ticket_sdk_payload,
+            symbol=f"{base}-{quote}",
         )
+        detail.update({
+            "error": "hydration_swap_tx_requires_scoped_sdk_quotes",
+            "message": "Hydration SDK swap transaction building is disabled for the OrderTicket scope unless a manual custom-asset fallback is available for this pair.",
+            "venue": "polkadot_hydration",
+            "rawSymbol": req.symbol,
+            "resolvedSymbol": f"{base}-{quote}",
+            "side": side,
+            "amount": req.amount,
+            "base": base_meta,
+            "quote": quote_meta,
+            "quoteStatus": quote_status,
+            "routeMode": route_mode_norm,
+            "manualRouterFallback": manual_router_fallback_diag,
+        })
+        raise HTTPException(status_code=503, detail=detail)
 
     built = await _hydration_swap_tx_build(
         raw_symbol=req.symbol,

@@ -202,6 +202,24 @@ const HYDRATION_BUILTIN_ROUTE_TEMPLATES = [
   },
 ];
 
+function routeTemplateSourceLabel(sourceType) {
+  const s = String(sourceType || "").trim().toLowerCase();
+  if (s === "built_in" || s === "builtin") return "Built-in template";
+  if (s === "saved_registry" || s === "saved_route_registry") return "Saved Route Registry row";
+  if (s === "reverse_preview") return "Reverse preview";
+  if (s === "active_registry_row") return "Active Route Registry row";
+  if (s === "fallback") return "Local fallback template";
+  return "Route template";
+}
+
+function routeTemplateSourceBadgeSeverity(tpl) {
+  const s = String(tpl?.warningLevel || "").trim().toLowerCase();
+  if (s === "info" || s === "ok") return "info";
+  if (s === "danger" || s === "error") return "warn";
+  if (tpl?.sourceExecutable) return "ok";
+  return "warn";
+}
+
 function normalizeHydrationRouteTemplate(raw, index = 0) {
   const t = raw && typeof raw === "object" ? raw : {};
   const symbol = String(t.symbol || "").trim().toUpperCase();
@@ -212,14 +230,21 @@ function normalizeHydrationRouteTemplate(raw, index = 0) {
     ? t.routeJson
     : (Array.isArray(t.route_json) ? t.route_json : (Array.isArray(t.route) ? t.route : []));
   const source = String(t.source || "template").trim() || "template";
+  const sourceTypeRaw = String(t.sourceType || t.source_type || source || "template").trim().toLowerCase();
+  const sourceType = sourceTypeRaw === "builtin" || sourceTypeRaw === "built-in" ? "built_in" : sourceTypeRaw;
   const id = String(t.id || `${source}:${symbol || "route"}:${routeMode}:${index}`).trim();
   const label = String(t.label || [symbol, routeMode === "manual_router" ? "manual Router" : "manual XYK", t.routeDirection || t.direction?.label].filter(Boolean).join(" · ")).trim();
+  const warnings = Array.isArray(t.warnings) ? t.warnings.filter(Boolean).map((x) => String(x)) : [];
   return {
     id,
     source,
+    sourceType,
+    sourceLabel: String(t.sourceLabel || t.source_label || routeTemplateSourceLabel(sourceType)).trim(),
     label,
     symbol,
     routeMode,
+    sourceRouteMode: String(t.sourceRouteMode || t.source_route_mode || routeMode).trim().toLowerCase(),
+    sourceSymbol: String(t.sourceSymbol || t.source_symbol || t.routeRegistrySymbol || symbol || "").trim().toUpperCase(),
     poolType: String(t.poolType || t.pool_type || (routeMode === "manual_router" ? "Router" : "XYK")).trim(),
     baseReserve: t.baseReserve ?? t.base_reserve ?? "",
     quoteReserve: t.quoteReserve ?? t.quote_reserve ?? "",
@@ -229,7 +254,17 @@ function normalizeHydrationRouteTemplate(raw, index = 0) {
     direction: t.direction || (t.routeDirection ? { label: t.routeDirection } : null),
     routeDirection: t.routeDirection || t.direction?.label || "",
     note: t.note || "",
-    sourceConfirmed: !!t.sourceConfirmed,
+    sourceConfirmed: !!(t.sourceConfirmed || t.source_confirmed),
+    sourceExecutable: !!(t.sourceExecutable || t.source_executable),
+    warningLevel: String(t.warningLevel || t.warning_level || (sourceType === "saved_registry" && (t.sourceConfirmed || t.source_confirmed) ? "info" : "warn")).trim().toLowerCase(),
+    warnings,
+    recommendedNextAction: String(t.recommendedNextAction || t.recommended_next_action || "Validate before saving. Keep Confirmed unchecked until this exact direction is live-tested.").trim(),
+    loadSafety: t.loadSafety || t.load_safety || {
+      clearsConfirmed: true,
+      writesDb: false,
+      requiresValidateBeforeSave: true,
+      requiresLiveTestBeforeConfirmed: true,
+    },
     requiresConfirmation: t.requiresConfirmation !== false,
   };
 }
@@ -833,12 +868,34 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     setRoutePoolAccount(String(row?.poolAccount || row?.pool_account || ""));
     setRouteEnabled(row?.enabled !== false);
     setRouteConfirmed(row?.confirmed === true);
-    setRouteJsonText(Array.isArray(row?.route) ? safeJsonPretty(row.route) : "");
+    const normalizedRoute = Array.isArray(row?.route) ? row.route : [];
+    setRouteJsonText(normalizedRoute.length ? safeJsonPretty(normalizedRoute) : "");
     setRouteNote(String(row?.note || ""));
-    setRouteTestResult(null);
+    const status = routeExecutionStatus(row);
+    setRouteTestResult({
+      kind: "template",
+      templateAction: "active_row",
+      ok: true,
+      symbol: String(row?.symbol || ""),
+      routeMode: mode,
+      direction: row?.direction || (row?.routeDirection ? { label: row.routeDirection } : null),
+      normalizedRoute,
+      validation: { legCount: normalizedRoute.length },
+      template: {
+        source: "active_registry_row",
+        sourceType: "active_registry_row",
+        sourceLabel: "Active Route Registry row",
+        sourceConfirmed: row?.confirmed === true,
+        sourceExecutable: !!status.executable,
+        recommendedNextAction: row?.confirmed
+          ? "Active confirmed row loaded. Edit carefully; saving will update this route row."
+          : "Active unconfirmed row loaded. Validate and live-test before checking Confirmed.",
+      },
+      message: "Active Route Registry row loaded into the form. Saving will update this pair.",
+    });
   }, []);
 
-  const applyRouteTemplate = useCallback((rawTemplate) => {
+  const applyRouteTemplate = useCallback((rawTemplate, action = "load") => {
     const tpl = normalizeHydrationRouteTemplate(rawTemplate || selectedRouteTemplate || {}, 0);
     if (!tpl.symbol) {
       setRouteErr("No route template selected.");
@@ -860,13 +917,17 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     setRouteErr(null);
     setRouteTestResult({
       kind: "template",
+      templateAction: action === "clone" ? "clone" : "load",
       ok: true,
       symbol: tpl.symbol,
       routeMode: tpl.routeMode,
       direction: tpl.direction || (tpl.routeDirection ? { label: tpl.routeDirection } : null),
       normalizedRoute: Array.isArray(tpl.routeJson) ? tpl.routeJson : [],
       template: tpl,
-      message: "Template loaded. Validate before saving; Confirmed stays unchecked until explicitly restored after a live test.",
+      warnings: Array.isArray(tpl.warnings) ? tpl.warnings.map((message) => ({ warning: "template_source_warning", message })) : [],
+      message: action === "clone"
+        ? "Template cloned into the form. No DB write happened. Validate before saving; Confirmed stays unchecked until explicitly restored after a live test."
+        : "Template loaded. Validate before saving; Confirmed stays unchecked until explicitly restored after a live test.",
     });
   }, [selectedRouteTemplate]);
 
@@ -974,6 +1035,18 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         errors: Array.isArray(validation?.errors) ? validation.errors : [],
         warnings: Array.isArray(validation?.warnings) ? validation.warnings : [],
         original: j?.original || null,
+        template: {
+          source: "reverse_preview",
+          sourceType: "reverse_preview",
+          sourceLabel: j?.sourceLabel || "Reverse preview",
+          warningLevel: j?.warningLevel || "warn",
+          warnings: Array.isArray(j?.warnings) ? j.warnings : [],
+          recommendedNextAction: j?.recommendedNextAction || "Validate before saving. Keep Confirmed unchecked until this exact direction is live-tested.",
+        },
+        warnings: [
+          ...(Array.isArray(j?.warnings) ? j.warnings.map((message) => ({ warning: "reverse_preview_warning", message })) : []),
+          ...(Array.isArray(validation?.warnings) ? validation.warnings : []),
+        ],
       });
     } catch (e) {
       const msg = String(e?.message || e);
@@ -1284,7 +1357,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
               <option value="" style={selectOptionStyle}>Template for current pair / blank</option>
               {routeTemplateOptions.map((tpl) => (
                 <option key={tpl.id} value={tpl.id} style={selectOptionStyle}>
-                  {tpl.source === "saved_route_registry" ? "Saved · " : "Built-in · "}{tpl.label}
+                  {tpl.sourceType === "saved_registry" || tpl.source === "saved_route_registry" ? "Saved · " : (tpl.sourceType === "fallback" ? "Fallback · " : "Built-in · ")}{tpl.label}
                 </option>
               ))}
             </select>
@@ -1292,19 +1365,20 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
               type="button"
               onClick={() => {
                 if (selectedRouteTemplate) {
-                  applyRouteTemplate(selectedRouteTemplate);
+                  applyRouteTemplate(selectedRouteTemplate, "load");
                   return;
                 }
                 const sym = String(routeSymbol || "").trim().toUpperCase();
                 const matchingTemplate = routeTemplateOptions.find((tpl) => String(tpl.symbol || "").toUpperCase() === sym);
                 if (matchingTemplate) {
-                  applyRouteTemplate(matchingTemplate);
+                  applyRouteTemplate(matchingTemplate, "load");
                   return;
                 }
                 const routeJson = hydrationRouteTemplateForSymbol(sym);
                 const fallback = normalizeHydrationRouteTemplate({
                   id: `fallback:${sym || "route"}`,
                   source: "fallback",
+                  sourceType: "fallback",
                   label: sym ? `${sym} fallback template` : "Fallback route template",
                   symbol: sym,
                   routeMode: "manual_router",
@@ -1312,12 +1386,25 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                   routeJson,
                   note: "Fallback template loaded from current pair. Validate before saving.",
                 });
-                applyRouteTemplate(fallback);
+                applyRouteTemplate(fallback, "load");
               }}
               style={btnStyle}
               disabled={routeSaving || routeValidating || routeReversing || routeTemplateLoading}
             >
               {routeTemplateLoading ? "Loading templates…" : "Load selected template"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (selectedRouteTemplate) {
+                  applyRouteTemplate(selectedRouteTemplate, "clone");
+                }
+              }}
+              style={btnStyle}
+              disabled={!selectedRouteTemplate || routeSaving || routeValidating || routeReversing || routeTemplateLoading}
+              title="Clone the selected template into the form without saving. Confirmed remains unchecked."
+            >
+              Clone selected
             </button>
             <button type="button" onClick={validateRoute} style={btnStyle} disabled={!canUpsertRoute || routeSaving || routeValidating || routeReversing}>
               {routeValidating ? "Validating…" : "Validate route"}
@@ -1329,6 +1416,21 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
               {routeSaving ? "Saving…" : "Save route"}
             </button>
           </div>
+          {selectedRouteTemplate ? (
+            <div style={{ marginTop: 8, padding: 8, borderRadius: 10, border: "1px solid rgba(96,165,250,0.22)", background: "rgba(15,23,42,0.55)", fontSize: 12 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                <span style={{ display: "inline-flex", alignItems: "center", padding: "2px 6px", borderRadius: 999, fontSize: 10, lineHeight: 1.3, ...routeBadgeStyle(routeTemplateSourceBadgeSeverity(selectedRouteTemplate)) }}>
+                  {selectedRouteTemplate.sourceLabel || routeTemplateSourceLabel(selectedRouteTemplate.sourceType)}
+                </span>
+                <b>{selectedRouteTemplate.symbol || "—"}</b>
+                {selectedRouteTemplate.routeDirection ? <span style={{ opacity: 0.8 }}>{selectedRouteTemplate.routeDirection}</span> : null}
+                {selectedRouteTemplate.sourceConfirmed ? <span style={{ color: "#b8f7c7" }}>source confirmed</span> : <span style={{ color: "#ffe2a6" }}>source not confirmed</span>}
+              </div>
+              <div style={{ marginTop: 5, color: "#c7d2fe" }}>
+                {selectedRouteTemplate.recommendedNextAction || "Load/clone, validate, then confirm only after a tiny live test."}
+              </div>
+            </div>
+          ) : null}
           {routeMode === "manual_router" && (
             <div style={{ marginTop: 8 }}>
               <textarea
@@ -1347,7 +1449,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
           {routeTestResult && (
             <div style={{ marginTop: 8, padding: 8, borderRadius: 10, border: "1px solid rgba(255,255,255,0.10)", background: routeTestResult.ok ? "rgba(20,80,45,0.25)" : "rgba(120,30,30,0.25)", fontSize: 12 }}>
               <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                {routeTestResult.kind === "validation" ? "Route validation" : (routeTestResult.kind === "reverse_preview" ? "Route reverse preview" : (routeTestResult.kind === "template" ? "Route template loaded" : (routeTestResult.kind === "live_reserves" ? "Live reserve test" : "Manual route orderbook test")))}: {routeTestResult.symbol || "—"}
+                {routeTestResult.kind === "validation" ? "Route validation" : (routeTestResult.kind === "reverse_preview" ? "Route reverse preview" : (routeTestResult.kind === "template" ? (routeTestResult.templateAction === "clone" ? "Route template cloned" : "Route template loaded") : (routeTestResult.kind === "live_reserves" ? "Live reserve test" : "Manual route orderbook test")))}: {routeTestResult.symbol || "—"}
               </div>
               {routeTestResult.error ? (
                 <div style={{ color: "#ffb3b3" }}>{routeTestResult.error}</div>
@@ -1357,8 +1459,17 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                   <div>Mode: <code style={codeStyle}>{routeTestResult.routeMode || "—"}</code></div>
                   <div>Legs: <code style={codeStyle}>{routeTestResult.validation?.legCount ?? "—"}</code></div>
                   <div style={{ gridColumn: "1 / -1" }}>Direction: <code style={codeStyle}>{routeTestResult.direction?.label || "—"}</code></div>
-                  {routeTestResult.template?.source ? (
-                    <div>Template source: <code style={codeStyle}>{routeTestResult.template.source}</code></div>
+                  {routeTestResult.template?.sourceLabel || routeTestResult.template?.source ? (
+                    <>
+                      <div>Template source: <code style={codeStyle}>{routeTestResult.template.sourceLabel || routeTestResult.template.source}</code></div>
+                      <div>Source confirmed: <code style={codeStyle}>{routeTestResult.template.sourceConfirmed ? "yes" : "no"}</code></div>
+                      {routeTestResult.template.sourceExecutable != null ? (
+                        <div>Source executable: <code style={codeStyle}>{routeTestResult.template.sourceExecutable ? "yes" : "no"}</code></div>
+                      ) : null}
+                      {routeTestResult.template.recommendedNextAction ? (
+                        <div style={{ gridColumn: "1 / -1", color: "#c7d2fe" }}>Next: {routeTestResult.template.recommendedNextAction}</div>
+                      ) : null}
+                    </>
                   ) : null}
                   {routeTestResult.message ? (
                     <div style={{ gridColumn: "1 / -1", color: "#c7d2fe" }}>{routeTestResult.message}</div>

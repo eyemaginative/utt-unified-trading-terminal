@@ -4414,6 +4414,19 @@ def _hydration_route_registry_reverse_preview_payload(
             "direction": original_validation.get("direction"),
             "ok": bool(original_validation.get("ok")),
         },
+        "sourceType": "reverse_preview",
+        "sourceLabel": "Reverse preview",
+        "warningLevel": "warn",
+        "warnings": [
+            "Reverse preview clears Confirmed intentionally. Validate and live-test this exact direction before marking it confirmed."
+        ],
+        "recommendedNextAction": "Validate the reversed route, then save with Confirmed unchecked unless this direction was already live-tested.",
+        "loadSafety": {
+            "clearsConfirmed": True,
+            "writesDb": False,
+            "requiresValidateBeforeSave": True,
+            "requiresLiveTestBeforeConfirmed": True,
+        },
         "writesDb": False,
         "note": "Reverse-preview endpoint; no route registry row was inserted or updated.",
     }
@@ -6443,6 +6456,99 @@ def _hydration_route_registry_saved_template_payload(row: Any, *, db: Optional[S
     }
 
 
+def _hydration_route_template_source_type(item: Dict[str, Any]) -> str:
+    source = str((item or {}).get("source") or "").strip().lower()
+    if source in {"builtin", "built_in", "built-in"}:
+        return "built_in"
+    if source in {"saved_route_registry", "saved_registry", "saved"} or source.startswith("saved"):
+        return "saved_registry"
+    if source in {"reverse_preview", "reversed_preview"}:
+        return "reverse_preview"
+    if source in {"fallback", "local_fallback"}:
+        return "fallback"
+    return source or "template"
+
+
+def _hydration_route_template_source_label(source_type: str) -> str:
+    s = str(source_type or "").strip().lower()
+    if s == "built_in":
+        return "Built-in template"
+    if s == "saved_registry":
+        return "Saved Route Registry row"
+    if s == "reverse_preview":
+        return "Reverse preview"
+    if s == "fallback":
+        return "Local fallback template"
+    return "Route template"
+
+
+def _hydration_route_template_enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Add source/safety metadata used by the Route Registry UI.
+
+    The template endpoint remains read-only.  This metadata is only display and
+    operator guidance: loading a template must still clear confirmation in the UI.
+    """
+    out = dict(item or {})
+    source_type = _hydration_route_template_source_type(out)
+    route_mode = str(out.get("routeMode") or out.get("route_mode") or "manual_xyk").strip().lower()
+    confirmed = bool(out.get("sourceConfirmed") or out.get("source_confirmed") or out.get("confirmed"))
+    enabled = out.get("enabled") is not False
+    executable = bool(source_type == "saved_registry" and confirmed and enabled)
+
+    warnings: List[str] = []
+    if isinstance(out.get("warnings"), list):
+        warnings.extend([str(w) for w in out.get("warnings") if str(w).strip()])
+    if source_type == "built_in":
+        warnings.append("Built-in templates are starters only; validate before saving and confirm only after a tiny live on-chain success.")
+    elif source_type == "saved_registry" and confirmed:
+        warnings.append("Source row is confirmed, but loading this template still clears Confirmed so cloned routes cannot become signable accidentally.")
+    elif source_type == "saved_registry":
+        warnings.append("Source row is not confirmed; validate and live-test before marking any clone confirmed.")
+    elif source_type == "fallback":
+        warnings.append("Fallback templates are local UI helpers; validate carefully before saving.")
+    if route_mode == "manual_router":
+        warnings.append("Manual Router rows use route JSON only; reserve and pool-account fields are not execution inputs.")
+    elif route_mode == "manual_xyk":
+        warnings.append("Manual XYK rows depend on reserve/pool-account data; verify live reserves before relying on pricing.")
+
+    if source_type == "saved_registry" and executable:
+        warning_level = "info"
+        next_action = "Clone/load, validate, then re-check Confirmed only if this exact direction remains intentionally executable."
+    elif source_type == "built_in":
+        warning_level = "warn"
+        next_action = "Load template, validate route, run a tiny live confirmation before checking Confirmed."
+    else:
+        warning_level = "warn"
+        next_action = "Validate before saving. Keep Confirmed unchecked until route direction has been tested live."
+
+    out.update({
+        "sourceType": source_type,
+        "source_type": source_type,
+        "sourceLabel": _hydration_route_template_source_label(source_type),
+        "source_label": _hydration_route_template_source_label(source_type),
+        "sourceSymbol": out.get("routeRegistrySymbol") or out.get("symbol"),
+        "source_symbol": out.get("routeRegistrySymbol") or out.get("symbol"),
+        "sourceRouteMode": route_mode,
+        "source_route_mode": route_mode,
+        "sourceConfirmed": confirmed,
+        "source_confirmed": confirmed,
+        "sourceExecutable": executable,
+        "source_executable": executable,
+        "warningLevel": warning_level,
+        "warning_level": warning_level,
+        "warnings": warnings,
+        "recommendedNextAction": next_action,
+        "recommended_next_action": next_action,
+        "loadSafety": {
+            "clearsConfirmed": True,
+            "writesDb": False,
+            "requiresValidateBeforeSave": True,
+            "requiresLiveTestBeforeConfirmed": True,
+        },
+    })
+    return out
+
+
 @router.get("/hydration/route_registry")
 async def hydration_route_registry_list(
     include_disabled: bool = Query(True, description="If false, only enabled manual routes are returned."),
@@ -6487,7 +6593,8 @@ async def hydration_route_registry_templates(
 
     seen: set[str] = set()
     deduped: List[Dict[str, Any]] = []
-    for item in templates:
+    for raw_item in templates:
+        item = _hydration_route_template_enrich(raw_item)
         key = str(item.get("id") or "").strip()
         if not key:
             key = f"{item.get('source') or 'template'}:{item.get('symbol') or ''}:{item.get('routeMode') or item.get('route_mode') or ''}:{len(deduped)}"
@@ -6504,6 +6611,16 @@ async def hydration_route_registry_templates(
         "items": deduped,
         "count": len(deduped),
         "writesDb": False,
+        "templateSourceTypes": {
+            "built_in": "Bundled operator starter templates.",
+            "saved_registry": "Existing Route Registry rows reused as clone templates.",
+        },
+        "templateSafety": {
+            "loadingClearsConfirmed": True,
+            "validateBeforeSave": True,
+            "confirmOnlyAfterLiveTest": True,
+            "writesDb": False,
+        },
         "note": "Route templates are operator aids only. Loading a template does not confirm a route or submit any transaction.",
     }
 

@@ -7,6 +7,7 @@ import React, { useEffect, useMemo, useState } from "react";
  * Backend endpoints (current):
  *  - GET    /api/wallet_addresses?asset=&network=&limit=
  *  - POST   /api/wallet_addresses
+ *  - PATCH  /api/wallet_addresses/{address_id}
  *  - DELETE /api/wallet_addresses/{address_id}
  *  - GET    /api/wallet_addresses/balances/latest?limit=
  *  - POST   /api/wallet_addresses/balances/refresh
@@ -890,6 +891,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               </button>
               <div style={{ flexBasis: "100%", opacity: 0.75 }}>
                 Use one account-level Hydration row: <b>Asset</b> <code>ALL</code>, <b>Venue</b> <code>polkadot_hydration</code>, and <b>Network</b> <code>hydration</code>. The same SubWallet/Substrate address can be scanned for all supported Hydration assets; no per-asset address rows are needed.
+                For Solana bridge reserve / treasury rows, <b>Asset</b> <code>ALL</code> is metadata-only for address selection until Solana SPL-token balance refresh is wired.
               </div>
             </div>
 

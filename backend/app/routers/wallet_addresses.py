@@ -590,6 +590,20 @@ def list_wallet_addresses(
     ]
 
 
+
+def _wallet_address_out(row: WalletAddress) -> WalletAddressOut:
+    return WalletAddressOut(
+        id=row.id,
+        asset=row.asset,
+        network=row.network,
+        address=row.address,
+        label=row.label,
+        wallet_id=row.wallet_id,
+        owner_scope=row.owner_scope,
+        created_at=row.created_at,
+    )
+
+
 @router.post("", response_model=WalletAddressOut)
 def create_wallet_address(payload: WalletAddressCreate, db: Session = Depends(get_db)):
     asset = _norm_asset(payload.asset)
@@ -626,6 +640,46 @@ def create_wallet_address(payload: WalletAddressCreate, db: Session = Depends(ge
         owner_scope=row.owner_scope,
         created_at=row.created_at,
     )
+
+
+
+@router.patch("/{address_id}", response_model=WalletAddressOut)
+@router.put("/{address_id}", response_model=WalletAddressOut)
+def update_wallet_address(address_id: str, payload: WalletAddressCreate, db: Session = Depends(get_db)):
+    row = db.get(WalletAddress, address_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="wallet address not found")
+
+    asset = _norm_asset(payload.asset)
+    network = _norm_network(payload.network, asset)
+    address = str(payload.address or "").strip()
+    if not address:
+        raise HTTPException(status_code=400, detail="address is required")
+
+    wallet_id = None
+    if payload.wallet_id is not None:
+        s = str(payload.wallet_id).strip()
+        wallet_id = s if s else None
+
+    row.wallet_id = wallet_id
+    row.asset = asset
+    row.network = network
+    row.address = address
+    row.label = str(payload.label or "").strip() or None
+    row.owner_scope = str(payload.owner_scope or "user").strip().lower()
+
+    db.add(row)
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="wallet address update conflicts with an existing wallet address row",
+        ) from e
+
+    db.refresh(row)
+    return _wallet_address_out(row)
 
 
 @router.delete("/{address_id}")
@@ -732,6 +786,34 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
     errors: List[Dict] = []
 
     for a in addrs:
+        asset_norm = _norm_asset(a.asset)
+        if asset_norm in ("ALL", "*"):
+            # Metadata-only rows are useful for bridge/treasury address selection.
+            # They do not represent one specific on-chain asset, so create a zero
+            # metadata snapshot instead of calling chain explorers and surfacing an error.
+            try:
+                snap = WalletAddressSnapshot(
+                    wallet_address_id=a.id,
+                    asset=asset_norm,
+                    network=a.network,
+                    address=a.address,
+                    balance_qty=0.0,
+                    balance_raw={
+                        "metadata_only": True,
+                        "reason": "asset_all_or_wildcard",
+                        "message": "Address row is metadata-only; use asset-specific rows for on-chain balance snapshots.",
+                    },
+                    source="metadata_only",
+                    fetched_at=datetime.utcnow(),
+                )
+                db.add(snap)
+                db.commit()
+                refreshed += 1
+            except Exception as e:
+                db.rollback()
+                errors.append({"id": a.id, "asset": a.asset, "address": a.address, "error": str(e)})
+            continue
+
         try:
             atomic, decimals, raw, source = await _get_balance_atomic(a.asset, a.network, a.address)
             units = atomic / (10 ** decimals)
@@ -1012,6 +1094,7 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
 
     cached = 0
     ledger_written = 0
+    metadata_only_skipped = 0
 
     def _wa_tx_skip_reason(raw) -> Optional[str]:
         try:
@@ -1053,6 +1136,13 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
 
     for a in addrs:
         asset = _norm_asset(a.asset)
+
+        if asset in ("ALL", "*"):
+            # Metadata-only address rows are for address selection/bridge context.
+            # They are intentionally skipped by transaction ingest because they do
+            # not identify a single asset-specific explorer/parser path.
+            metadata_only_skipped += 1
+            continue
 
         # enforce skip policy early
         wa_wallet_id = (a.wallet_id or "").strip().lower() or None
@@ -1592,6 +1682,9 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
     except Exception:
         # Counters are best-effort; never fail the ingest response.
         pass
+
+    if metadata_only_skipped:
+        skipped_by_reason["metadata_only_asset"] = skipped_by_reason.get("metadata_only_asset", 0) + metadata_only_skipped
 
     skipped_total = sum(skipped_by_reason.values())
 

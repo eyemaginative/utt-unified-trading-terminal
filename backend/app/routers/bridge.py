@@ -113,6 +113,8 @@ _BRIDGE_TRANSFER_MECHANISMS = {
     "treasury_mediated",
     "burn_mint",
     "lock_release",
+    "lock_mint",
+    "vault_deposit_mint_xcm",
     "xcm_transfer",
     "external_bridge",
 }
@@ -127,7 +129,16 @@ class BridgeTransferPreviewRequest(BaseModel):
     destination_address: Optional[str] = Field(None, description="Destination wallet/address, if known.")
     source_wallet_id: Optional[str] = Field(None, description="Optional local wallet/account grouping.")
     destination_wallet_id: Optional[str] = Field(None, description="Optional local wallet/account grouping.")
-    bridge_mechanism: str = Field("manual", description="manual|treasury_mediated|burn_mint|lock_release|xcm_transfer|external_bridge")
+    bridge_mechanism: str = Field("manual", description="manual|treasury_mediated|burn_mint|lock_release|lock_mint|vault_deposit_mint_xcm|xcm_transfer|external_bridge")
+    gross_amount: Optional[float] = Field(None, description="Optional gross amount before destination fees/dust, in human units.")
+    destination_received_amount: Optional[float] = Field(None, description="Optional destination received amount, in human units.")
+    xcm_delta_amount: Optional[float] = Field(None, description="Optional gross-minus-received delta, in human units.")
+    source_vault_address: Optional[str] = Field(None, description="Optional source bridge reserve/vault address.")
+    asset_hub_mint_txid: Optional[str] = Field(None, description="Optional Asset Hub mint extrinsic/hash.")
+    asset_hub_xcm_txid: Optional[str] = Field(None, description="Optional Asset Hub XCM/send extrinsic/hash.")
+    hydration_receive_txid: Optional[str] = Field(None, description="Optional Hydration receive/XCM message/extrinsic/hash.")
+    source_proof_url: Optional[str] = Field(None, description="Optional source proof/explorer URL.")
+    destination_proof_url: Optional[str] = Field(None, description="Optional destination proof/explorer URL.")
     note: Optional[str] = Field(None, description="Optional planning note. Preview does not persist this.")
 
 
@@ -141,17 +152,55 @@ class BridgeTransferCreateRequest(BridgeTransferPreviewRequest):
 class BridgeTransferLinkSourceRequest(BaseModel):
     source_withdrawal_id: Optional[str] = Field(None, description="Existing AssetWithdrawal id to link as the source-side outflow.")
     source_txid: Optional[str] = Field(None, description="Optional source-chain transaction id/signature/hash.")
+    source_evidence_type: Optional[str] = Field(None, description="Optional source evidence type, e.g. solana_vault_deposit.")
+    source_vault_address: Optional[str] = Field(None, description="Optional source bridge reserve/vault address.")
+    source_amount: Optional[float] = Field(None, description="Optional source-side amount in human units.")
+    source_proof_url: Optional[str] = Field(None, description="Optional source proof/explorer URL.")
     note: Optional[str] = Field(None, description="Optional linkage note. Appended to the transfer record raw audit trail.")
 
 
 class BridgeTransferLinkDestinationRequest(BaseModel):
     destination_deposit_id: Optional[str] = Field(None, description="Existing AssetDeposit id to link as the destination-side inflow.")
     destination_txid: Optional[str] = Field(None, description="Optional destination-chain transaction id/signature/hash.")
+    destination_evidence_type: Optional[str] = Field(None, description="Optional destination evidence type, e.g. asset_hub_mint_xcm_receive.")
+    asset_hub_mint_txid: Optional[str] = Field(None, description="Optional Asset Hub mint extrinsic/hash.")
+    asset_hub_mint_amount: Optional[float] = Field(None, description="Optional Asset Hub minted amount in human units.")
+    asset_hub_xcm_txid: Optional[str] = Field(None, description="Optional Asset Hub XCM/send extrinsic/hash.")
+    hydration_receive_txid: Optional[str] = Field(None, description="Optional Hydration receive/XCM message/extrinsic/hash.")
+    hydration_received_amount: Optional[float] = Field(None, description="Optional Hydration received amount in human units.")
+    xcm_delta_amount: Optional[float] = Field(None, description="Optional gross-minus-received delta in human units.")
+    destination_proof_url: Optional[str] = Field(None, description="Optional destination proof/explorer URL.")
     note: Optional[str] = Field(None, description="Optional linkage note. Appended to the transfer record raw audit trail.")
+
+
+class BridgeTransferAmendEvidenceRequest(BaseModel):
+    source_txid: Optional[str] = Field(None, description="Optional corrected source-chain transaction id/signature/hash.")
+    source_evidence_type: Optional[str] = Field(None, description="Optional corrected source evidence type.")
+    source_vault_address: Optional[str] = Field(None, description="Optional corrected source bridge reserve/vault address.")
+    source_amount: Optional[float] = Field(None, description="Optional corrected source-side amount in human units.")
+    source_proof_url: Optional[str] = Field(None, description="Optional corrected source proof/explorer URL.")
+    destination_txid: Optional[str] = Field(None, description="Optional corrected destination-chain transaction id/signature/hash.")
+    destination_evidence_type: Optional[str] = Field(None, description="Optional corrected destination evidence type.")
+    asset_hub_mint_txid: Optional[str] = Field(None, description="Optional corrected Asset Hub mint extrinsic/hash.")
+    asset_hub_mint_amount: Optional[float] = Field(None, description="Optional corrected Asset Hub minted amount in human units.")
+    asset_hub_xcm_txid: Optional[str] = Field(None, description="Optional corrected Asset Hub XCM/send extrinsic/hash.")
+    hydration_receive_txid: Optional[str] = Field(None, description="Optional corrected Hydration receive/XCM message/extrinsic/hash.")
+    hydration_received_amount: Optional[float] = Field(None, description="Optional corrected Hydration received amount in human units.")
+    xcm_delta_amount: Optional[float] = Field(None, description="Optional corrected gross-minus-received delta in human units.")
+    destination_proof_url: Optional[str] = Field(None, description="Optional corrected destination proof/explorer URL.")
+    note: Optional[str] = Field(None, description="Optional amendment note. Appended to raw audit trail without changing reconciliation status.")
 
 
 class BridgeTransferReconcileRequest(BaseModel):
     note: Optional[str] = Field(None, description="Optional reconciliation note. This does not mutate ledger/FIFO state.")
+
+
+class BridgeTransferCancelRequest(BaseModel):
+    note: Optional[str] = Field(None, description="Optional cancellation note. This does not mutate ledger/FIFO state.")
+    allow_reconciled_manual_cancel: bool = Field(
+        False,
+        description="Safety flag for cancelling old reconciled manual/evidence-only records that were local test artifacts.",
+    )
 
 
 class BridgeTransferApplyBasisPreviewRequest(BaseModel):
@@ -307,6 +356,7 @@ def _bridge_transfer_record_payload(row: BridgeTransferRecord) -> Dict[str, Any]
         "destination_deposit_id": row.destination_deposit_id,
         "note": row.note,
         "raw": row.raw,
+        "evidenceSummary": (row.raw or {}).get("bridgeEvidence") if isinstance(row.raw, dict) else None,
         "created_at": row.created_at.isoformat() if isinstance(row.created_at, datetime) else row.created_at,
         "updated_at": row.updated_at.isoformat() if isinstance(row.updated_at, datetime) else row.updated_at,
     }
@@ -334,6 +384,42 @@ def _bridge_raw_with_event(row: BridgeTransferRecord, event: Dict[str, Any]) -> 
     return {
         **raw,
         "events": [*events, event_payload],
+    }
+
+
+def _bridge_clean_str(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _bridge_clean_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def _bridge_raw_merge_evidence(row: BridgeTransferRecord, *, section: str, evidence: Dict[str, Any]) -> Dict[str, Any]:
+    raw = row.raw if isinstance(row.raw, dict) else {}
+    bridge_evidence = raw.get("bridgeEvidence")
+    if not isinstance(bridge_evidence, dict):
+        bridge_evidence = {}
+    current = bridge_evidence.get(section)
+    if not isinstance(current, dict):
+        current = {}
+    cleaned = {k: v for k, v in (evidence or {}).items() if v is not None and v != ""}
+    return {
+        **raw,
+        "bridgeEvidence": {
+            **bridge_evidence,
+            section: {
+                **current,
+                **cleaned,
+                "updatedAtUtc": datetime.utcnow().isoformat(),
+            },
+        },
     }
 
 
@@ -731,6 +817,113 @@ def _bridge_basis_journal_preview(
     ]
 
 
+def _bridge_transfer_record_min_payload(row: BridgeTransferRecord) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "asset": row.asset,
+        "amount": row.amount,
+        "source_chain": row.source_chain,
+        "destination_chain": row.destination_chain,
+        "source_txid": row.source_txid,
+        "destination_txid": row.destination_txid,
+        "status": row.status,
+        "bridge_mechanism": row.bridge_mechanism,
+        "source_withdrawal_id": row.source_withdrawal_id,
+        "destination_deposit_id": row.destination_deposit_id,
+        "note": row.note,
+        "created_at": row.created_at.isoformat() if isinstance(row.created_at, datetime) else row.created_at,
+        "updated_at": row.updated_at.isoformat() if isinstance(row.updated_at, datetime) else row.updated_at,
+    }
+
+
+def _bridge_transfer_record_supply_summary(db: Session, *, asset: str, limit: int = 100) -> Dict[str, Any]:
+    asset_u = _bridge_norm_asset(asset)
+    try:
+        rows = (
+            db.query(BridgeTransferRecord)
+            .filter(BridgeTransferRecord.asset == asset_u)
+            .order_by(BridgeTransferRecord.created_at.desc())
+            .limit(int(limit))
+            .all()
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "bridge_transfer_record_supply_summary_failed",
+            "exc": type(e).__name__,
+            "message": str(e),
+            "items": [],
+        }
+
+    summary: Dict[str, Any] = {
+        "ok": True,
+        "asset": asset_u,
+        "count": len(rows),
+        "pendingAmount": 0.0,
+        "linkedAmount": 0.0,
+        "reconciledAmount": 0.0,
+        "solanaToHydrationPendingAmount": 0.0,
+        "solanaToHydrationLinkedAmount": 0.0,
+        "solanaToHydrationReconciledAmount": 0.0,
+        "vaultMintXcmReconciledGrossAmount": 0.0,
+        "vaultMintXcmReconciledHydrationReceivedAmount": 0.0,
+        "vaultMintXcmReconciledXcmDeltaAmount": 0.0,
+        "solanaToHydrationVaultMintXcmReconciledGrossAmount": 0.0,
+        "solanaToHydrationVaultMintXcmReconciledHydrationReceivedAmount": 0.0,
+        "solanaToHydrationVaultMintXcmReconciledXcmDeltaAmount": 0.0,
+        "items": [],
+    }
+
+    for row in rows:
+        status = str(row.status or "").strip().upper()
+        mechanism = str(row.bridge_mechanism or "").strip().lower()
+        amount = float(row.amount or 0.0)
+        source_chain = _bridge_norm_chain(row.source_chain)
+        destination_chain = _bridge_norm_chain(row.destination_chain)
+        is_sol_to_hyd = source_chain == "solana" and destination_chain == "hydration"
+        item = _bridge_transfer_record_min_payload(row)
+        item["sourceLabel"] = _bridge_chain_label(source_chain)
+        item["destinationLabel"] = _bridge_chain_label(destination_chain)
+        item["isSolanaToHydration"] = bool(is_sol_to_hyd)
+        bridge_evidence = (row.raw or {}).get("bridgeEvidence") if isinstance(row.raw, dict) else None
+        destination_evidence = bridge_evidence.get("destination") if isinstance(bridge_evidence, dict) and isinstance(bridge_evidence.get("destination"), dict) else {}
+        hydration_received_amount = _bridge_clean_float(destination_evidence.get("hydrationReceivedAmount"))
+        xcm_delta_amount = _bridge_clean_float(destination_evidence.get("xcmDeltaAmount"))
+        item["evidence"] = {
+            "sourceLinked": bool(row.source_withdrawal_id or row.source_txid),
+            "destinationLinked": bool(row.destination_deposit_id or row.destination_txid),
+            "lockMintWorkflow": mechanism == "lock_mint",
+            "vaultMintXcmWorkflow": mechanism == "vault_deposit_mint_xcm",
+            "bridgeEvidence": bridge_evidence,
+            "hydrationReceivedAmount": hydration_received_amount,
+            "xcmDeltaAmount": xcm_delta_amount,
+        }
+        summary["items"].append(item)
+
+        if status == "RECONCILED":
+            summary["reconciledAmount"] += amount
+            if mechanism == "vault_deposit_mint_xcm":
+                summary["vaultMintXcmReconciledGrossAmount"] += amount
+                summary["vaultMintXcmReconciledHydrationReceivedAmount"] += hydration_received_amount if hydration_received_amount is not None else amount
+                summary["vaultMintXcmReconciledXcmDeltaAmount"] += xcm_delta_amount if xcm_delta_amount is not None else 0.0
+            if is_sol_to_hyd:
+                summary["solanaToHydrationReconciledAmount"] += amount
+                if mechanism == "vault_deposit_mint_xcm":
+                    summary["solanaToHydrationVaultMintXcmReconciledGrossAmount"] += amount
+                    summary["solanaToHydrationVaultMintXcmReconciledHydrationReceivedAmount"] += hydration_received_amount if hydration_received_amount is not None else amount
+                    summary["solanaToHydrationVaultMintXcmReconciledXcmDeltaAmount"] += xcm_delta_amount if xcm_delta_amount is not None else 0.0
+        elif status == "LINKED":
+            summary["linkedAmount"] += amount
+            if is_sol_to_hyd:
+                summary["solanaToHydrationLinkedAmount"] += amount
+        elif status not in {"CANCELLED"}:
+            summary["pendingAmount"] += amount
+            if is_sol_to_hyd:
+                summary["solanaToHydrationPendingAmount"] += amount
+
+    return summary
+
+
 @router.get("/transfer_records/status")
 def bridge_transfer_records_status() -> Dict[str, Any]:
     return {
@@ -749,13 +942,37 @@ def bridge_transfer_records_status() -> Dict[str, Any]:
             "create": "POST /api/bridge/transfer_records",
             "link_source": "POST /api/bridge/transfer_records/{id}/link_source",
             "link_destination": "POST /api/bridge/transfer_records/{id}/link_destination",
+            "amend_evidence": "POST /api/bridge/transfer_records/{id}/amend_evidence",
             "reconcile": "POST /api/bridge/transfer_records/{id}/reconcile",
+            "cancel": "POST /api/bridge/transfer_records/{id}/cancel",
             "basis_preview": "GET /api/bridge/transfer_records/{id}/basis_preview",
             "apply_basis_transfer_preview": "POST /api/bridge/transfer_records/{id}/apply_basis_transfer_preview",
         },
         "allowedStatuses": sorted(_BRIDGE_TRANSFER_STATUSES),
         "allowedMechanisms": sorted(_BRIDGE_TRANSFER_MECHANISMS),
-        "nextRequired": "Apply-basis-transfer preview is wired read-only. The actual apply endpoint remains intentionally disabled until a real bridge transfer is ready for testing.",
+        "workflows": {
+            "utttSolanaToHydration10mVaultMintXcm": {
+                "asset": "UTTT",
+                "amount": 10_000_000.0,
+                "source_chain": "solana",
+                "destination_chain": "hydration",
+                "bridge_mechanism": "vault_deposit_mint_xcm",
+                "executionEnabled": False,
+                "evidencePlan": [
+                    "Create a local PLANNED transfer record.",
+                    "Link the Solana bridge-reserve deposit transaction as source evidence.",
+                    "Link the Asset Hub mint and Asset Hub → Hydration receive/XCM evidence as destination evidence.",
+                    "Reconcile after both sides are linked.",
+                ],
+            },
+            "initial30mDeferred": {
+                "asset": "UTTT",
+                "amount": 30_000_000.0,
+                "status": "deferred_until_solana_side_reserve_or_equivalent_evidence_exists",
+                "message": "Do not record the initial 30M as reconciled until Solana-side reserve/lock/burn/equivalent evidence is available.",
+            },
+        },
+        "nextRequired": "Use vault_deposit_mint_xcm for the 10M Solana-to-Hydration UTTT record. Apply-basis-transfer preview remains read-only and the actual apply endpoint remains disabled until a real bridge transfer is ready for testing.",
     }
 
 
@@ -830,6 +1047,21 @@ def bridge_transfer_record_create(
         raw={
             "createdFrom": "bridge_transfer_record_preview",
             "preview": preview,
+            "bridgeEvidence": {
+                "planned": {
+                    "workflow": planned.get("workflow"),
+                    "evidencePlan": planned.get("evidence_plan"),
+                    "sourceVaultAddress": planned.get("source_vault_address"),
+                    "assetHubMintTxid": planned.get("asset_hub_mint_txid"),
+                    "assetHubXcmTxid": planned.get("asset_hub_xcm_txid"),
+                    "hydrationReceiveTxid": planned.get("hydration_receive_txid"),
+                    "grossAmount": planned.get("gross_amount"),
+                    "destinationReceivedAmount": planned.get("destination_received_amount"),
+                    "xcmDeltaAmount": planned.get("xcm_delta_amount"),
+                    "sourceProofUrl": planned.get("source_proof_url"),
+                    "destinationProofUrl": planned.get("destination_proof_url"),
+                },
+            },
             "safety": {
                 "bridgeExecutionEnabled": False,
                 "ledgerFifoMutation": False,
@@ -906,10 +1138,20 @@ def bridge_transfer_record_link_source(
         row.source_txid = source_txid
     row.status = _bridge_status_after_link(row)
     row.updated_at = now
+    source_evidence = {
+        "evidenceType": _bridge_clean_str(req.source_evidence_type) or ("solana_vault_deposit" if _bridge_norm_chain(row.source_chain) == "solana" else "source_outflow"),
+        "sourceTxid": row.source_txid,
+        "sourceWithdrawalId": row.source_withdrawal_id,
+        "sourceVaultAddress": _bridge_clean_str(req.source_vault_address),
+        "sourceAmount": _bridge_clean_float(req.source_amount),
+        "sourceProofUrl": _bridge_clean_str(req.source_proof_url),
+    }
+    row.raw = _bridge_raw_merge_evidence(row, section="source", evidence=source_evidence)
     row.raw = _bridge_raw_with_event(row, {
         "type": "link_source",
         "source_withdrawal_id": row.source_withdrawal_id,
         "source_txid": row.source_txid,
+        "sourceEvidence": source_evidence,
         "status": row.status,
         "note": req.note,
         "mutationScope": "bridge_transfer_records_only",
@@ -964,7 +1206,12 @@ def bridge_transfer_record_link_destination(
         destination_deposit_id=req.destination_deposit_id,
     )
 
-    destination_txid = str(req.destination_txid or "").strip() or None
+    destination_txid = (
+        _bridge_clean_str(req.destination_txid)
+        or _bridge_clean_str(req.hydration_receive_txid)
+        or _bridge_clean_str(req.asset_hub_xcm_txid)
+        or _bridge_clean_str(req.asset_hub_mint_txid)
+    )
     if deposit is not None and not destination_txid:
         destination_txid = str(deposit.txid or "").strip() or None
 
@@ -973,7 +1220,7 @@ def bridge_transfer_record_link_destination(
             status_code=422,
             detail={
                 "error": "destination_link_required",
-                "message": "Provide destination_deposit_id and/or destination_txid.",
+                "message": "Provide destination_deposit_id, destination_txid, Asset Hub XCM txid, Hydration receive txid, or Asset Hub mint txid.",
             },
         )
 
@@ -984,10 +1231,24 @@ def bridge_transfer_record_link_destination(
         row.destination_txid = destination_txid
     row.status = _bridge_status_after_link(row)
     row.updated_at = now
+    destination_evidence = {
+        "evidenceType": _bridge_clean_str(req.destination_evidence_type) or ("asset_hub_mint_xcm_receive" if str(row.bridge_mechanism or "").strip().lower() == "vault_deposit_mint_xcm" else "destination_inflow"),
+        "destinationTxid": row.destination_txid,
+        "destinationDepositId": row.destination_deposit_id,
+        "assetHubMintTxid": _bridge_clean_str(req.asset_hub_mint_txid),
+        "assetHubMintAmount": _bridge_clean_float(req.asset_hub_mint_amount),
+        "assetHubXcmTxid": _bridge_clean_str(req.asset_hub_xcm_txid),
+        "hydrationReceiveTxid": _bridge_clean_str(req.hydration_receive_txid),
+        "hydrationReceivedAmount": _bridge_clean_float(req.hydration_received_amount),
+        "xcmDeltaAmount": _bridge_clean_float(req.xcm_delta_amount),
+        "destinationProofUrl": _bridge_clean_str(req.destination_proof_url),
+    }
+    row.raw = _bridge_raw_merge_evidence(row, section="destination", evidence=destination_evidence)
     row.raw = _bridge_raw_with_event(row, {
         "type": "link_destination",
         "destination_deposit_id": row.destination_deposit_id,
         "destination_txid": row.destination_txid,
+        "destinationEvidence": destination_evidence,
         "status": row.status,
         "note": req.note,
         "mutationScope": "bridge_transfer_records_only",
@@ -1021,6 +1282,112 @@ def bridge_transfer_record_link_destination(
             "message": "Linked destination-side evidence to the local transfer record only. Ledger/FIFO state was not mutated.",
         },
         "nextRequired": "Reconcile the transfer record after both sides are linked.",
+    }
+
+
+@router.post("/transfer_records/{record_id}/amend_evidence")
+def bridge_transfer_record_amend_evidence(
+    record_id: str,
+    req: BridgeTransferAmendEvidenceRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Amend source/destination evidence on a local bridge transfer record.
+
+    This is an audit correction endpoint. It updates only bridgeEvidence/raw
+    fields and optional top-level txid mirrors. It intentionally preserves the
+    existing transfer-record status, including RECONCILED, and does not mutate
+    ledger, FIFO, deposit, withdrawal, or bridge execution state.
+    """
+    row = _bridge_get_transfer_record(db, record_id)
+    status = str(row.status or "").strip().upper()
+    if status == "CANCELLED":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "bridge_transfer_record_cancelled_amend_blocked",
+                "message": "Cancelled bridge records cannot be amended. Create a new correcting record instead.",
+                "item": _bridge_transfer_record_payload(row),
+            },
+        )
+
+    source_evidence = {
+        "evidenceType": _bridge_clean_str(req.source_evidence_type),
+        "sourceTxid": _bridge_clean_str(req.source_txid),
+        "sourceVaultAddress": _bridge_clean_str(req.source_vault_address),
+        "sourceAmount": _bridge_clean_float(req.source_amount),
+        "sourceProofUrl": _bridge_clean_str(req.source_proof_url),
+    }
+    destination_evidence = {
+        "evidenceType": _bridge_clean_str(req.destination_evidence_type),
+        "destinationTxid": _bridge_clean_str(req.destination_txid),
+        "assetHubMintTxid": _bridge_clean_str(req.asset_hub_mint_txid),
+        "assetHubMintAmount": _bridge_clean_float(req.asset_hub_mint_amount),
+        "assetHubXcmTxid": _bridge_clean_str(req.asset_hub_xcm_txid),
+        "hydrationReceiveTxid": _bridge_clean_str(req.hydration_receive_txid),
+        "hydrationReceivedAmount": _bridge_clean_float(req.hydration_received_amount),
+        "xcmDeltaAmount": _bridge_clean_float(req.xcm_delta_amount),
+        "destinationProofUrl": _bridge_clean_str(req.destination_proof_url),
+    }
+
+    source_clean = {k: v for k, v in source_evidence.items() if v is not None and v != ""}
+    destination_clean = {k: v for k, v in destination_evidence.items() if v is not None and v != ""}
+    if not source_clean and not destination_clean:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "bridge_transfer_amendment_empty",
+                "message": "Provide at least one source or destination evidence field to amend.",
+            },
+        )
+
+    original_status = row.status
+    now = datetime.utcnow()
+    if source_clean:
+        row.raw = _bridge_raw_merge_evidence(row, section="source", evidence=source_clean)
+        if source_clean.get("sourceTxid"):
+            row.source_txid = source_clean.get("sourceTxid")
+    if destination_clean:
+        row.raw = _bridge_raw_merge_evidence(row, section="destination", evidence=destination_clean)
+        if destination_clean.get("destinationTxid"):
+            row.destination_txid = destination_clean.get("destinationTxid")
+    row.status = original_status
+    row.updated_at = now
+    row.raw = _bridge_raw_with_event(row, {
+        "type": "amend_evidence",
+        "status": row.status,
+        "sourceEvidenceAmended": source_clean or None,
+        "destinationEvidenceAmended": destination_clean or None,
+        "note": req.note,
+        "mutationScope": "bridge_transfer_records_only",
+        "ledgerFifoMutation": False,
+    })
+
+    db.add(row)
+    try:
+        db.commit()
+        db.refresh(row)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "bridge_transfer_record_amend_evidence_failed", "exc": type(e).__name__, "message": str(e)},
+        )
+
+    return {
+        "ok": True,
+        "mode": "amend_evidence",
+        "amended": True,
+        "willMutate": True,
+        "mutationScope": "bridge_transfer_records_only",
+        "item": _bridge_transfer_record_payload(row),
+        "amendedSections": {
+            "source": bool(source_clean),
+            "destination": bool(destination_clean),
+        },
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "message": "Amended local bridge evidence only. Transfer-record status was preserved and ledger/FIFO state was not mutated.",
+        },
     }
 
 
@@ -1090,6 +1457,85 @@ def bridge_transfer_record_reconcile(
             "message": "Marked the local transfer record RECONCILED only. Ledger/FIFO basis preservation is still intentionally deferred.",
         },
         "nextRequired": "Connect reconciled transfer records to non-taxable transfer handling and FIFO basis preservation.",
+    }
+
+
+@router.post("/transfer_records/{record_id}/cancel")
+def bridge_transfer_record_cancel(
+    record_id: str,
+    req: BridgeTransferCancelRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Cancel a local bridge transfer record without deleting it.
+
+    This updates only the bridge_transfer_records row. It does not mutate ledger,
+    FIFO, deposit, withdrawal, or bridge execution state. Reconciled records remain
+    protected except for explicitly confirmed manual/evidence-only records, which is
+    intended for stale local test artifacts.
+    """
+    row = _bridge_get_transfer_record(db, record_id)
+    status = str(row.status or "").strip().upper()
+    mechanism = str(row.bridge_mechanism or "").strip().lower()
+    if status == "RECONCILED":
+        can_cancel_reconciled_manual = bool(req.allow_reconciled_manual_cancel) and mechanism == "manual" and not row.source_withdrawal_id and not row.destination_deposit_id
+        if not can_cancel_reconciled_manual:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "bridge_transfer_record_reconciled_cancel_blocked",
+                    "message": "Reconciled bridge records cannot be cancelled unless this is an explicitly confirmed manual/evidence-only local test artifact. Create an explicit correcting record instead.",
+                    "item": _bridge_transfer_record_payload(row),
+                },
+            )
+    if status == "CANCELLED":
+        return {
+            "ok": True,
+            "mode": "cancel",
+            "cancelled": True,
+            "willMutate": False,
+            "mutationScope": "none_already_cancelled",
+            "item": _bridge_transfer_record_payload(row),
+            "execution": {
+                "bridgeExecutionEnabled": False,
+                "message": "Transfer record was already CANCELLED. No ledger/FIFO state was mutated.",
+            },
+        }
+
+    now = datetime.utcnow()
+    row.status = "CANCELLED"
+    row.updated_at = now
+    row.raw = _bridge_raw_with_event(row, {
+        "type": "cancel_reconciled_manual_record" if status == "RECONCILED" else "cancel",
+        "previousStatus": status,
+        "status": row.status,
+        "allowReconciledManualCancel": bool(req.allow_reconciled_manual_cancel),
+        "note": req.note,
+        "mutationScope": "bridge_transfer_records_only",
+        "ledgerFifoMutation": False,
+    })
+
+    db.add(row)
+    try:
+        db.commit()
+        db.refresh(row)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "bridge_transfer_record_cancel_failed", "exc": type(e).__name__, "message": str(e)},
+        )
+
+    return {
+        "ok": True,
+        "mode": "cancel",
+        "cancelled": True,
+        "willMutate": True,
+        "mutationScope": "bridge_transfer_records_only",
+        "item": _bridge_transfer_record_payload(row),
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "message": "Marked the local transfer record CANCELLED only. Ledger/FIFO, deposit, withdrawal, and bridge execution state were not mutated.",
+        },
     }
 
 
@@ -1451,6 +1897,44 @@ def bridge_transfer_record_preview(
         },
     ]
 
+    if mechanism in {"lock_mint", "vault_deposit_mint_xcm"}:
+        if mechanism == "vault_deposit_mint_xcm":
+            readiness.extend([
+                {
+                    "key": "source_vault_deposit_evidence",
+                    "label": "Source vault deposit evidence",
+                    "status": "planned",
+                    "message": "Link the Solana bridge-reserve deposit transaction as source evidence.",
+                },
+                {
+                    "key": "asset_hub_mint_evidence",
+                    "label": "Asset Hub mint evidence",
+                    "status": "planned",
+                    "message": "Record the Asset Hub mint extrinsic/hash and minted amount.",
+                },
+                {
+                    "key": "hydration_receive_evidence",
+                    "label": "Hydration receive/XCM evidence",
+                    "status": "planned",
+                    "message": "Record the Asset Hub → Hydration XCM evidence and exact Hydration received amount.",
+                },
+            ])
+        else:
+            readiness.extend([
+                {
+                    "key": "source_lock_evidence",
+                    "label": "Source lock evidence",
+                    "status": "planned",
+                    "message": "After the Solana-side lock transaction exists, link its signature as source evidence.",
+                },
+                {
+                    "key": "destination_mint_evidence",
+                    "label": "Destination mint evidence",
+                    "status": "planned",
+                    "message": "After the Hydration-side mint/receive transaction exists, link its hash as destination evidence.",
+                },
+            ])
+
     warnings: List[str] = []
     if source_wallet is None:
         warnings.append("Source wallet is not registered locally yet.")
@@ -1460,6 +1944,10 @@ def bridge_transfer_record_preview(
         warnings.append("No matching source withdrawal/outflow candidates are currently cached.")
     if destination_candidates.get("count") == 0:
         warnings.append("No matching destination deposit/inflow candidates are currently cached.")
+    if mechanism == "lock_mint":
+        warnings.append("Lock/mint workflow is record-only: link Solana lock evidence and Hydration mint evidence before reconciliation. Bridge execution remains disabled.")
+    if mechanism == "vault_deposit_mint_xcm":
+        warnings.append("Vault/mint/XCM workflow is record-only: link Solana vault deposit, Asset Hub mint, and Hydration receive evidence before reconciliation. Bridge execution remains disabled.")
 
     return {
         "ok": True,
@@ -1483,6 +1971,38 @@ def bridge_transfer_record_preview(
             "destination_address": destination_address,
             "status": "PLANNED",
             "bridge_mechanism": mechanism,
+            "workflow": (
+                "solana_to_hydration_vault_deposit_mint_xcm"
+                if mechanism == "vault_deposit_mint_xcm" and source_chain == "solana" and destination_chain == "hydration"
+                else ("solana_to_hydration_lock_mint" if mechanism == "lock_mint" and source_chain == "solana" and destination_chain == "hydration" else mechanism)
+            ),
+            "evidence_plan": (
+                {
+                    "source": "solana_vault_deposit_txid",
+                    "asset_hub_mint": "asset_hub_mint_txid",
+                    "asset_hub_xcm": "asset_hub_xcm_txid",
+                    "destination": "hydration_receive_txid",
+                    "amounts": {
+                        "gross_amount": req.gross_amount or amount,
+                        "destination_received_amount": req.destination_received_amount,
+                        "xcm_delta_amount": req.xcm_delta_amount,
+                    },
+                }
+                if mechanism == "vault_deposit_mint_xcm"
+                else {
+                    "source": "solana_lock_txid" if mechanism == "lock_mint" else "source_outflow",
+                    "destination": "hydration_mint_txid" if mechanism == "lock_mint" else "destination_inflow",
+                }
+            ),
+            "source_vault_address": _bridge_clean_str(req.source_vault_address),
+            "asset_hub_mint_txid": _bridge_clean_str(req.asset_hub_mint_txid),
+            "asset_hub_xcm_txid": _bridge_clean_str(req.asset_hub_xcm_txid),
+            "hydration_receive_txid": _bridge_clean_str(req.hydration_receive_txid),
+            "gross_amount": _bridge_clean_float(req.gross_amount) or amount,
+            "destination_received_amount": _bridge_clean_float(req.destination_received_amount),
+            "xcm_delta_amount": _bridge_clean_float(req.xcm_delta_amount),
+            "source_proof_url": _bridge_clean_str(req.source_proof_url),
+            "destination_proof_url": _bridge_clean_str(req.destination_proof_url),
             "note": req.note,
         },
         "wallets": {
@@ -1536,9 +2056,33 @@ def bridge_uttt_supply(
         venue_aliases=["polkadot_hydration", "hydration"],
     )
 
+    transfer_record_summary = _bridge_transfer_record_supply_summary(db, asset=sym)
+    bridge_backed_gross_amount = float(
+        (transfer_record_summary or {}).get("solanaToHydrationVaultMintXcmReconciledGrossAmount")
+        or (transfer_record_summary or {}).get("vaultMintXcmReconciledGrossAmount")
+        or 0.0
+    )
+    bridge_backed_received_amount = float(
+        (transfer_record_summary or {}).get("solanaToHydrationVaultMintXcmReconciledHydrationReceivedAmount")
+        or (transfer_record_summary or {}).get("vaultMintXcmReconciledHydrationReceivedAmount")
+        or 0.0
+    )
+    bridge_backed_delta_amount = float(
+        (transfer_record_summary or {}).get("solanaToHydrationVaultMintXcmReconciledXcmDeltaAmount")
+        or (transfer_record_summary or {}).get("vaultMintXcmReconciledXcmDeltaAmount")
+        or 0.0
+    )
+
     default_asset_hub_supply = _env_float("UTT_UTTT_POLKADOT_ASSET_HUB_SUPPLY", None)
+    asset_hub_supply_source = "env:UTT_UTTT_POLKADOT_ASSET_HUB_SUPPLY" if os.getenv("UTT_UTTT_POLKADOT_ASSET_HUB_SUPPLY") else None
     if default_asset_hub_supply is None:
-        default_asset_hub_supply = _env_float("UTT_UTTT_ASSET_HUB_SUPPLY", 30_000_000.0)
+        default_asset_hub_supply = _env_float("UTT_UTTT_ASSET_HUB_SUPPLY", None)
+        asset_hub_supply_source = "env:UTT_UTTT_ASSET_HUB_SUPPLY" if os.getenv("UTT_UTTT_ASSET_HUB_SUPPLY") else None
+    if default_asset_hub_supply is None:
+        initial_asset_hub_supply = _env_float("UTT_UTTT_INITIAL_POLKADOT_ALLOCATION_SUPPLY", 30_000_000.0)
+        include_bridge_records = _env_bool("UTT_UTTT_INCLUDE_RECONCILED_BRIDGE_IN_ASSET_HUB_SUPPLY", True)
+        default_asset_hub_supply = float(initial_asset_hub_supply or 0.0) + (bridge_backed_gross_amount if include_bridge_records else 0.0)
+        asset_hub_supply_source = "derived:initial_allocation_plus_reconciled_bridge_records" if include_bridge_records else "derived:initial_allocation_only"
 
     target_supply = _env_float("UTT_UTTT_CANONICAL_TOTAL_SUPPLY", None)
     if target_supply is None:
@@ -1570,7 +2114,7 @@ def bridge_uttt_supply(
             "assetId": _display_asset_id(asset_hub_row, "50000456"),
             "supply": default_asset_hub_supply,
             "counted": True,
-            "source": "env:UTT_UTTT_POLKADOT_ASSET_HUB_SUPPLY" if os.getenv("UTT_UTTT_POLKADOT_ASSET_HUB_SUPPLY") else "default:known_asset_hub_mint",
+            "source": asset_hub_supply_source or ("env:UTT_UTTT_POLKADOT_ASSET_HUB_SUPPLY" if os.getenv("UTT_UTTT_POLKADOT_ASSET_HUB_SUPPLY") else "default:known_asset_hub_mint"),
             "status": "configured" if default_asset_hub_supply is not None else "missing_supply",
             "registry": _registry_row_payload(asset_hub_row),
             "decimals": int(getattr(asset_hub_row, "decimals", 6) or 6),
@@ -1607,6 +2151,19 @@ def bridge_uttt_supply(
     if hyd_row is not None and not hydration_counted:
         warnings.append("Hydration UTTT metadata is shown but not double-counted against Asset Hub-side canonical supply.")
 
+    bridge_treasury = {
+        "ok": True,
+        "asset": sym,
+        "model": "record_derived_until_live_treasury_balance_sync",
+        "sourceReserveAmount": bridge_backed_gross_amount,
+        "destinationTreasuryAmount": bridge_backed_received_amount,
+        "xcmDeltaAmount": bridge_backed_delta_amount,
+        "sourceReserveLabel": "Solana Bridge Reserve",
+        "destinationTreasuryLabel": "Hydration Bridge Treasury",
+        "source": "bridge_transfer_records:vault_deposit_mint_xcm:reconciled",
+        "note": "These amounts are derived from reconciled vault/mint/XCM bridge records. Live treasury balance sync is a later bridge registry task.",
+    }
+
     return {
         "ok": True,
         "asset": sym,
@@ -1617,6 +2174,12 @@ def bridge_uttt_supply(
         "totalConicalSupply": counted_supply,
         "targetSupply": target_supply,
         "chains": chains,
+        "transferRecords": transfer_record_summary,
+        "bridgeTreasury": bridge_treasury,
+        "pendingBridgeAmount": transfer_record_summary.get("pendingAmount") if isinstance(transfer_record_summary, dict) else None,
+        "reconciledBridgeAmount": transfer_record_summary.get("reconciledAmount") if isinstance(transfer_record_summary, dict) else None,
+        "solanaToHydrationPendingAmount": transfer_record_summary.get("solanaToHydrationPendingAmount") if isinstance(transfer_record_summary, dict) else None,
+        "solanaToHydrationReconciledAmount": transfer_record_summary.get("solanaToHydrationReconciledAmount") if isinstance(transfer_record_summary, dict) else None,
         "warnings": warnings,
         "execution": {
             "bridgeExecutionEnabled": False,

@@ -7,6 +7,27 @@ const POP_MARGIN = 8;
 const SPREAD_CACHE_KEY = "utt_cross_chain_spread_uttt_v1";
 const BRIDGE_DASH_CACHE_KEY = "utt_bridge_transfer_dashboard_v1";
 const BRIDGE_DASH_POS_KEY = "utt_bridge_transfer_dashboard_pos_v1";
+const BRIDGE_VIEWED_CANCELLED_KEY = "utt_bridge_viewed_cancelled_records_v1";
+
+const BRIDGE_10M_PRESET = {
+  direction: "sol_to_hyd",
+  asset: "UTTT",
+  amount: "10000000",
+  bridgeMechanism: "vault_deposit_mint_xcm",
+  hydrationReceivedAmount: "9999999.999999",
+  xcmDeltaAmount: "0.000001",
+};
+
+const BRIDGE_MECHANISM_OPTIONS = [
+  { value: "vault_deposit_mint_xcm", label: "Solana vault → Asset Hub mint → Hydration receive" },
+  { value: "lock_mint", label: "Lock on Solana → mint on Hydration" },
+  { value: "manual", label: "Manual record / evidence only" },
+  { value: "burn_mint", label: "Burn → mint" },
+  { value: "lock_release", label: "Lock → release" },
+  { value: "treasury_mediated", label: "Treasury mediated" },
+  { value: "xcm_transfer", label: "XCM transfer" },
+  { value: "external_bridge", label: "External bridge" },
+];
 
 const smallBtnStyle = {
   display: "inline-flex",
@@ -127,6 +148,25 @@ function spreadReadCache() {
 function spreadWriteCache(v) {
   try {
     localStorage.setItem(SPREAD_CACHE_KEY, JSON.stringify(v || {}));
+  } catch {
+    // ignore
+  }
+}
+
+function bridgeReadViewedCancelledIds() {
+  try {
+    const raw = localStorage.getItem(BRIDGE_VIEWED_CANCELLED_KEY);
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed) ? parsed.map((v) => String(v || "").trim()).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function bridgeWriteViewedCancelledIds(ids) {
+  try {
+    const clean = Array.from(new Set((ids || []).map((v) => String(v || "").trim()).filter(Boolean)));
+    localStorage.setItem(BRIDGE_VIEWED_CANCELLED_KEY, JSON.stringify(clean));
   } catch {
     // ignore
   }
@@ -545,6 +585,64 @@ async function bridgePostTransferRecordLink(base, recordId, kind, payload, signa
   return data;
 }
 
+async function bridgePostTransferRecordCancel(base, recordId, payload, signal) {
+  const root = spreadTrimApiBase(base);
+  const rid = String(recordId || "").trim();
+  if (!root) throw new Error("API base is not configured.");
+  if (!rid) throw new Error("Create or load a transfer record before cancelling.");
+  const res = await fetch(`${root}/api/bridge/transfer_records/${encodeURIComponent(rid)}/cancel`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(payload || {}),
+    signal,
+  });
+
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+
+  if (!res.ok) {
+    throw new Error(bridgeApiErrorMessage(data, `Transfer-record cancel failed (${res.status})`));
+  }
+  if (!data || typeof data !== "object") {
+    throw new Error("Transfer-record cancel returned an unexpected response.");
+  }
+  return data;
+}
+
+
+async function bridgePostTransferRecordAmendEvidence(base, recordId, payload, signal) {
+  const root = spreadTrimApiBase(base);
+  const rid = String(recordId || "").trim();
+  if (!root) throw new Error("API base is not configured.");
+  if (!rid) throw new Error("Create or load a transfer record before amending evidence.");
+  const res = await fetch(`${root}/api/bridge/transfer_records/${encodeURIComponent(rid)}/amend_evidence`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(payload || {}),
+    signal,
+  });
+
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+
+  if (!res.ok) {
+    throw new Error(bridgeApiErrorMessage(data, `Transfer-record evidence amendment failed (${res.status})`));
+  }
+  if (!data || typeof data !== "object") {
+    throw new Error("Transfer-record evidence amendment returned an unexpected response.");
+  }
+  return data;
+}
+
+
 async function bridgeGetTransferRecordBasisPreview(base, recordId, signal) {
   const root = spreadTrimApiBase(base);
   const rid = String(recordId || "").trim();
@@ -658,16 +756,55 @@ function bridgeIsSolanaAddressRow(row) {
   return venue.startsWith("solana") || network === "solana";
 }
 
-function bridgePickAddress(rows, kind) {
+function bridgeAddressRoleScore(row, kind, preferredAsset = "UTTT") {
+  const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+  const preferred = String(preferredAsset || "UTTT").trim().toUpperCase() || "UTTT";
+  const haystack = [
+    row?.label,
+    row?.name,
+    row?.wallet_id,
+    row?.walletId,
+    row?.role,
+    row?.source,
+    row?.notes,
+    row?.note,
+  ].map((x) => String(x || "").toLowerCase()).join(" ");
+
+  let score = 100;
+  if (asset === preferred) score -= 45;
+  else if (asset === "ALL" || asset === "*" || !asset) score -= 8;
+
+  // Prefer dedicated bridge/reserve/vault rows over generic treasury rows.
+  // Initial-allocation treasuries are valid records, but they should not win
+  // the default live bridge context while the selected workflow is bridge-backed.
+  if (/(bridge|reserve|vault)/.test(haystack)) score -= 70;
+  if (/treasury/.test(haystack)) score -= 25;
+  if (/(initial[- ]?allocation|pending[- ]?evidence|deferred)/.test(haystack)) score += 35;
+
+  if (kind === "hydration" && /(hydration|hydradx|polkadot_hydration)/.test(haystack)) score -= 8;
+  if (kind === "solana" && /solana/.test(haystack)) score -= 8;
+
+  // Avoid accidentally preferring mixed-use, LP, or trading wallets when a
+  // dedicated bridge/treasury/vault row exists.
+  if (/(mixed|multi[- ]?use|trading|pool|lp)/.test(haystack)) score += 25;
+
+  return score;
+}
+
+function bridgePickAddress(rows, kind, preferredAsset = "UTTT") {
   const arr = Array.isArray(rows) ? rows : [];
   const matches = arr.filter((row) => (kind === "hydration" ? bridgeIsHydrationAddressRow(row) : bridgeIsSolanaAddressRow(row)));
-  const preferred = matches.find((row) => String(row?.asset || row?.symbol || "").trim().toUpperCase() === "ALL") || matches[0];
+  const ranked = matches
+    .map((row, idx) => ({ row, idx, score: bridgeAddressRoleScore(row, kind, preferredAsset) }))
+    .sort((a, b) => (a.score - b.score) || (a.idx - b.idx));
+  const preferred = ranked[0]?.row || matches[0];
   const address = String(preferred?.address || preferred?.wallet_address || preferred?.pubkey || preferred?.owner || "").trim();
   return {
     row: preferred || null,
     address,
     label: String(preferred?.label || preferred?.name || "").trim(),
     count: matches.length,
+    selectionScore: ranked[0]?.score ?? null,
   };
 }
 
@@ -706,6 +843,207 @@ function bridgeTransferSupportStatus(transferStatus) {
   return "missing";
 }
 
+function bridgeMechanismLabel(value) {
+  const raw = String(value || "manual").trim().toLowerCase();
+  return BRIDGE_MECHANISM_OPTIONS.find((opt) => opt.value === raw)?.label || raw || "manual";
+}
+
+function bridgeRecordNormChain(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  const aliases = {
+    sol: "solana",
+    solana_jupiter: "solana",
+    hyd: "hydration",
+    hydradx: "hydration",
+    polkadot_hydration: "hydration",
+    assethub: "polkadot_asset_hub",
+    asset_hub: "polkadot_asset_hub",
+    polkadot_assethub: "polkadot_asset_hub",
+    "polkadot / asset hub": "polkadot_asset_hub",
+  };
+  return aliases[raw] || raw;
+}
+
+function bridgeTransferRecordAmount(row) {
+  const n = spreadNum(row?.amount ?? row?.qty ?? row?.quantity);
+  return n === null ? 0 : n;
+}
+
+function bridgeTransferRecordIsSolanaToHydration(row) {
+  if (typeof row?.isSolanaToHydration === "boolean") return row.isSolanaToHydration;
+  return bridgeRecordNormChain(row?.source_chain) === "solana" && bridgeRecordNormChain(row?.destination_chain) === "hydration";
+}
+
+function bridgeNormalizeTransferRecordSummary(rec) {
+  if (!rec || typeof rec !== "object") return null;
+  const items = Array.isArray(rec.items) ? rec.items : [];
+  const next = {
+    ...rec,
+    count: rec.count ?? items.length,
+    pendingAmount: 0,
+    linkedAmount: 0,
+    reconciledAmount: 0,
+    solanaToHydrationPendingAmount: 0,
+    solanaToHydrationLinkedAmount: 0,
+    solanaToHydrationReconciledAmount: 0,
+  };
+
+  for (const row of items) {
+    const status = String(row?.status || "").trim().toUpperCase();
+    const amount = bridgeTransferRecordAmount(row);
+    const isSolToHyd = bridgeTransferRecordIsSolanaToHydration(row);
+    if (status === "CANCELLED") continue;
+
+    if (status === "RECONCILED") {
+      next.reconciledAmount += amount;
+      if (isSolToHyd) next.solanaToHydrationReconciledAmount += amount;
+    } else if (status === "LINKED") {
+      next.linkedAmount += amount;
+      if (isSolToHyd) next.solanaToHydrationLinkedAmount += amount;
+    } else {
+      next.pendingAmount += amount;
+      if (isSolToHyd) next.solanaToHydrationPendingAmount += amount;
+    }
+  }
+
+  return next;
+}
+
+function bridgeTransferRecordSummary(supply) {
+  const rec = supply?.transferRecords;
+  if (!rec || typeof rec !== "object") return null;
+  return bridgeNormalizeTransferRecordSummary(rec);
+}
+
+function bridgeTreasuryContext(supply, transferRecordSummary) {
+  const direct = supply?.bridgeTreasury;
+  const rec = transferRecordSummary || bridgeTransferRecordSummary(supply);
+  const sourceReserveAmount = spreadNum(
+    direct?.sourceReserveAmount ??
+      direct?.source_reserve_amount ??
+      rec?.solanaToHydrationVaultMintXcmReconciledGrossAmount ??
+      rec?.vaultMintXcmReconciledGrossAmount
+  );
+  const destinationTreasuryAmount = spreadNum(
+    direct?.destinationTreasuryAmount ??
+      direct?.destination_treasury_amount ??
+      rec?.solanaToHydrationVaultMintXcmReconciledHydrationReceivedAmount ??
+      rec?.vaultMintXcmReconciledHydrationReceivedAmount
+  );
+  const xcmDeltaAmount = spreadNum(
+    direct?.xcmDeltaAmount ??
+      direct?.xcm_delta_amount ??
+      rec?.solanaToHydrationVaultMintXcmReconciledXcmDeltaAmount ??
+      rec?.vaultMintXcmReconciledXcmDeltaAmount
+  );
+  return {
+    sourceReserveAmount,
+    destinationTreasuryAmount,
+    xcmDeltaAmount,
+    source: String(direct?.source || "bridge_transfer_records:vault_deposit_mint_xcm:reconciled"),
+    note: String(
+      direct?.note ||
+        "Bridge treasury amounts are record-derived until live treasury balance sync is wired."
+    ),
+  };
+}
+
+function bridgeSourceEvidenceLabel(mechanism) {
+  const raw = String(mechanism || "").trim().toLowerCase();
+  if (raw === "vault_deposit_mint_xcm") return "Solana bridge-vault deposit tx/signature";
+  if (raw === "lock_mint") return "Solana lock txid/signature";
+  return "Source txid/signature fallback";
+}
+
+function bridgeDestinationEvidenceLabel(mechanism) {
+  const raw = String(mechanism || "").trim().toLowerCase();
+  if (raw === "vault_deposit_mint_xcm") return "Hydration receive / XCM tx/hash";
+  if (raw === "lock_mint") return "Hydration mint/receive txid";
+  return "Destination txid/hash fallback";
+}
+
+function bridgeIsVaultMintXcm(mechanism) {
+  return String(mechanism || "").trim().toLowerCase() === "vault_deposit_mint_xcm";
+}
+
+function bridgeRecordEvidence(row) {
+  if (!row || typeof row !== "object") return {};
+  const direct = row.evidenceSummary;
+  if (direct && typeof direct === "object") return direct;
+  const itemEvidence = row.evidence;
+  if (itemEvidence && typeof itemEvidence === "object" && itemEvidence.bridgeEvidence && typeof itemEvidence.bridgeEvidence === "object") {
+    return itemEvidence.bridgeEvidence;
+  }
+  const raw = row.raw;
+  if (raw && typeof raw === "object" && raw.bridgeEvidence && typeof raw.bridgeEvidence === "object") {
+    return raw.bridgeEvidence;
+  }
+  return {};
+}
+
+function bridgeRecordHasSourceLink(row) {
+  return !!(row?.source_withdrawal_id || row?.source_txid);
+}
+
+function bridgeRecordHasDestinationLink(row) {
+  return !!(row?.destination_deposit_id || row?.destination_txid);
+}
+
+function bridgeReplaceTransferRecordInSupply(currentSupply, item) {
+  if (!currentSupply || !item?.id) return currentSupply;
+  const rec = currentSupply.transferRecords;
+  if (!rec || typeof rec !== "object" || !Array.isArray(rec.items)) return currentSupply;
+
+  const bridgeEvidence = bridgeRecordEvidence(item);
+  const nextItems = rec.items.map((row) => {
+    if (row?.id !== item.id) return row;
+    const prevEvidence = row?.evidence && typeof row.evidence === "object" ? row.evidence : {};
+    return {
+      ...row,
+      ...item,
+      sourceLabel: item.sourceLabel || row.sourceLabel,
+      destinationLabel: item.destinationLabel || row.destinationLabel,
+      isSolanaToHydration: row.isSolanaToHydration,
+      evidence: {
+        ...prevEvidence,
+        sourceLinked: bridgeRecordHasSourceLink(item),
+        destinationLinked: bridgeRecordHasDestinationLink(item),
+        lockMintWorkflow: String(item.bridge_mechanism || "").trim().toLowerCase() === "lock_mint",
+        vaultMintXcmWorkflow: String(item.bridge_mechanism || "").trim().toLowerCase() === "vault_deposit_mint_xcm",
+        bridgeEvidence,
+      },
+    };
+  });
+
+  return {
+    ...currentSupply,
+    transferRecords: bridgeNormalizeTransferRecordSummary({
+      ...rec,
+      items: nextItems,
+    }),
+  };
+}
+
+function bridgeEvidenceString(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function bridgeEvidenceDecimalString(...values) {
+  const text = bridgeEvidenceString(...values);
+  if (!text) return "";
+  const n = Number(text);
+  if (!Number.isFinite(n)) return text;
+  if (/[eE]/.test(text)) {
+    return n.toFixed(12).replace(/0+$/, "").replace(/\.$/, "");
+  }
+  return text;
+}
+
 function bridgeSupplyPct(row, supply) {
   const qty = bridgeSupplyAmount(row);
   const total = spreadNum(supply?.totalCanonicalSupply ?? supply?.totalSupply ?? supply?.totalConicalSupply);
@@ -719,6 +1057,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   const [direction, setDirection] = useState(() => draft?.direction || "sol_to_hyd");
   const [asset, setAsset] = useState(() => draft?.asset || "UTTT");
   const [amount, setAmount] = useState(() => draft?.amount || "");
+  const [bridgeMechanism, setBridgeMechanism] = useState(() => draft?.bridgeMechanism || "lock_mint");
   const [snap, setSnap] = useState(() => (typeof window === "undefined" ? null : spreadReadCache()));
   const [supply, setSupply] = useState(null);
   const [transferStatus, setTransferStatus] = useState(null);
@@ -739,6 +1078,16 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   const [basisApplyPreviewErr, setBasisApplyPreviewErr] = useState("");
   const [transferSourceTxid, setTransferSourceTxid] = useState("");
   const [transferDestinationTxid, setTransferDestinationTxid] = useState("");
+  const [transferSourceVaultAddress, setTransferSourceVaultAddress] = useState("");
+  const [transferAssetHubMintTxid, setTransferAssetHubMintTxid] = useState("");
+  const [transferAssetHubXcmTxid, setTransferAssetHubXcmTxid] = useState("");
+  const [transferHydrationReceiveTxid, setTransferHydrationReceiveTxid] = useState("");
+  const [transferHydrationReceivedAmount, setTransferHydrationReceivedAmount] = useState("");
+  const [transferXcmDeltaAmount, setTransferXcmDeltaAmount] = useState("");
+  const [viewedCancelledRecordIds, setViewedCancelledRecordIds] = useState(() =>
+    typeof window === "undefined" ? [] : bridgeReadViewedCancelledIds()
+  );
+  const [showViewedCancelledRecords, setShowViewedCancelledRecords] = useState(false);
   const [addresses, setAddresses] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -754,8 +1103,8 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   const [panelPos, setPanelPos] = useState(() => (typeof window === "undefined" ? null : bridgeReadPanelPos()));
 
   useEffect(() => {
-    bridgeWriteDraft({ direction, asset, amount });
-  }, [direction, asset, amount]);
+    bridgeWriteDraft({ direction, asset, amount, bridgeMechanism });
+  }, [direction, asset, amount, bridgeMechanism]);
 
   useEffect(() => {
     setTransferPreview(null);
@@ -770,7 +1119,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     setBasisApplyPreviewErr("");
     setTransferSourceTxid("");
     setTransferDestinationTxid("");
-  }, [direction, asset, amount]);
+  }, [direction, asset, amount, bridgeMechanism]);
 
   const refresh = async () => {
     const base = spreadTrimApiBase(apiBase);
@@ -911,11 +1260,27 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     window.addEventListener("mouseup", onUp, true);
   };
 
-  const solWallet = useMemo(() => bridgePickAddress(addresses, "solana"), [addresses]);
-  const hydWallet = useMemo(() => bridgePickAddress(addresses, "hydration"), [addresses]);
+  const solWallet = useMemo(() => bridgePickAddress(addresses, "solana", asset || "UTTT"), [addresses, asset]);
+  const hydWallet = useMemo(() => bridgePickAddress(addresses, "hydration", asset || "UTTT"), [addresses, asset]);
   const solSupply = useMemo(() => bridgeFindSupplyRow(supply, ["solana", "solana_jupiter"]), [supply]);
   const polkaSupply = useMemo(() => bridgeFindSupplyRow(supply, ["polkadot_asset_hub", "asset_hub", "polkadot / asset hub", "polkadot"]), [supply]);
   const hydSupply = useMemo(() => bridgeFindSupplyRow(supply, ["hydration", "polkadot_hydration", "hydration route asset"]), [supply]);
+  const transferRecordSummary = useMemo(() => bridgeTransferRecordSummary(supply), [supply]);
+  const transferRecordItems = useMemo(() => {
+    const items = Array.isArray(transferRecordSummary?.items) ? transferRecordSummary.items : [];
+    const viewedSet = new Set((viewedCancelledRecordIds || []).map((id) => String(id || "").trim()).filter(Boolean));
+    return items.filter((row) => {
+      const status = String(row?.status || "").trim().toUpperCase();
+      const id = String(row?.id || "").trim();
+      if (status === "CANCELLED" && id && viewedSet.has(id) && !showViewedCancelledRecords) return false;
+      return true;
+    });
+  }, [transferRecordSummary, viewedCancelledRecordIds, showViewedCancelledRecords]);
+  const hiddenViewedCancelledCount = useMemo(() => {
+    const items = Array.isArray(transferRecordSummary?.items) ? transferRecordSummary.items : [];
+    const viewedSet = new Set((viewedCancelledRecordIds || []).map((id) => String(id || "").trim()).filter(Boolean));
+    return items.filter((row) => String(row?.status || "").trim().toUpperCase() === "CANCELLED" && viewedSet.has(String(row?.id || "").trim())).length;
+  }, [transferRecordSummary, viewedCancelledRecordIds]);
 
   const source = direction === "sol_to_hyd" ? solWallet : hydWallet;
   const dest = direction === "sol_to_hyd" ? hydWallet : solWallet;
@@ -923,6 +1288,8 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   const destLabel = direction === "sol_to_hyd" ? "Hydration" : "Solana";
   const sourceSupplyRow = direction === "sol_to_hyd" ? solSupply : polkaSupply;
   const destSupplyRow = direction === "sol_to_hyd" ? polkaSupply : solSupply;
+  const bridgeTreasury = useMemo(() => bridgeTreasuryContext(supply, transferRecordSummary), [supply, transferRecordSummary]);
+  const showBridgeTreasuryContext = direction === "sol_to_hyd" && bridgeIsVaultMintXcm(bridgeMechanism);
 
   const qty = spreadNum(amount);
   const solUsd = snap?.solPrice;
@@ -943,10 +1310,22 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   const destinationCloseCandidateId = bridgeFirstCloseCandidateId(transferPreview?.candidateLinks?.destination);
   const sourceTxidClean = String(transferSourceTxid || "").trim();
   const destinationTxidClean = String(transferDestinationTxid || "").trim();
+  const sourceVaultAddressClean = String(transferSourceVaultAddress || "").trim();
+  const assetHubMintTxidClean = String(transferAssetHubMintTxid || "").trim();
+  const assetHubXcmTxidClean = String(transferAssetHubXcmTxid || "").trim();
+  const hydrationReceiveTxidClean = String(transferHydrationReceiveTxid || "").trim();
+  const hydrationReceivedAmountClean = String(transferHydrationReceivedAmount || "").trim();
+  const xcmDeltaAmountClean = String(transferXcmDeltaAmount || "").trim();
+  const vaultMintXcmWorkflow = bridgeIsVaultMintXcm(bridgeMechanism);
   const recordHasSourceLink = !!(createdTransferRecord?.source_withdrawal_id || createdTransferRecord?.source_txid);
   const recordHasDestinationLink = !!(createdTransferRecord?.destination_deposit_id || createdTransferRecord?.destination_txid);
   const canLinkSourceRecord = !!createdTransferRecord?.id && !transferLinkBusy && !!(sourceCloseCandidateId || sourceTxidClean);
-  const canLinkDestinationRecord = !!createdTransferRecord?.id && !transferLinkBusy && !!(destinationCloseCandidateId || destinationTxidClean);
+  const canLinkDestinationRecord = !!createdTransferRecord?.id && !transferLinkBusy && !!(destinationCloseCandidateId || destinationTxidClean || assetHubMintTxidClean || assetHubXcmTxidClean || hydrationReceiveTxidClean);
+  const transferRecordStatus = String(createdTransferRecord?.status || "").toUpperCase();
+  const transferRecordMechanism = String(createdTransferRecord?.bridge_mechanism || "").trim().toLowerCase();
+  const canCancelReconciledManualRecord = transferRecordStatus === "RECONCILED" && transferRecordMechanism === "manual";
+  const canCancelTransferRecord = !!createdTransferRecord?.id && !transferLinkBusy && transferRecordStatus !== "CANCELLED" && (transferRecordStatus !== "RECONCILED" || canCancelReconciledManualRecord);
+  const canAmendTransferEvidence = !!createdTransferRecord?.id && !transferLinkBusy && transferRecordStatus !== "CANCELLED";
   const canReconcileTransferRecord = !!createdTransferRecord?.id && !transferLinkBusy && recordHasSourceLink && recordHasDestinationLink && createdTransferRecord?.status !== "RECONCILED";
   const canPreviewBasisTreatment = !!createdTransferRecord?.id && !basisPreviewBusy;
   const canPreviewBasisApply = !!createdTransferRecord?.id && !!basisPreview?.ok && !basisApplyPreviewBusy;
@@ -967,8 +1346,45 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
       destination_address: dest?.address || null,
       source_wallet_id: source?.row?.wallet_id || source?.row?.walletId || null,
       destination_wallet_id: dest?.row?.wallet_id || dest?.row?.walletId || null,
-      bridge_mechanism: "manual",
+      bridge_mechanism: bridgeMechanism || "manual",
+      gross_amount: nextQty,
+      destination_received_amount: spreadNum(transferHydrationReceivedAmount),
+      xcm_delta_amount: spreadNum(transferXcmDeltaAmount),
+      source_vault_address: sourceVaultAddressClean || null,
+      asset_hub_mint_txid: assetHubMintTxidClean || null,
+      asset_hub_xcm_txid: assetHubXcmTxidClean || null,
+      hydration_receive_txid: hydrationReceiveTxidClean || null,
+      note: bridgeIsVaultMintXcm(bridgeMechanism)
+        ? "UTTT Solana-to-Hydration vault-backed bridge record. Source evidence is Solana bridge-vault deposit; destination evidence is Asset Hub mint plus Asset Hub → Hydration receive/XCM."
+        : (bridgeMechanism === "lock_mint"
+          ? "UTTT Solana-to-Hydration lock/mint record. Source evidence should be the Solana lock transaction; destination evidence should be the Hydration mint/receive transaction."
+          : null),
     };
+  };
+
+  const applyBridge10mPreset = () => {
+    setDirection(BRIDGE_10M_PRESET.direction);
+    setAsset(BRIDGE_10M_PRESET.asset);
+    setAmount(BRIDGE_10M_PRESET.amount);
+    setBridgeMechanism(BRIDGE_10M_PRESET.bridgeMechanism);
+    setTransferPreview(null);
+    setTransferPreviewErr("");
+    setTransferCreateResult(null);
+    setTransferCreateErr("");
+    setTransferLinkResult(null);
+    setTransferLinkErr("");
+    setBasisPreview(null);
+    setBasisPreviewErr("");
+    setBasisApplyPreview(null);
+    setBasisApplyPreviewErr("");
+    setTransferSourceTxid("");
+    setTransferDestinationTxid("");
+    setTransferSourceVaultAddress("");
+    setTransferAssetHubMintTxid("");
+    setTransferAssetHubXcmTxid("");
+    setTransferHydrationReceiveTxid("");
+    setTransferHydrationReceivedAmount(BRIDGE_10M_PRESET.hydrationReceivedAmount || "");
+    setTransferXcmDeltaAmount(BRIDGE_10M_PRESET.xcmDeltaAmount || "");
   };
 
   const handlePreviewTransferRecord = async () => {
@@ -998,7 +1414,9 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
       const data = await bridgePostTransferRecordPreview(base, payload, controller.signal);
       if (!controller.signal?.aborted) {
         setTransferPreview(data);
-        setTransferCreateResult(null);
+        // Preserve a loaded/created local transfer record while previewing. Preview
+        // is dry-run only and should not disable Cancel/Link/Reconcile actions.
+        setTransferCreateResult((prev) => (prev?.item?.id ? prev : null));
         setTransferCreateErr("");
         setBasisPreview(null);
         setBasisPreviewErr("");
@@ -1044,6 +1462,10 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
       const data = await bridgePostTransferRecordCreate(base, payload, controller.signal);
       if (!controller.signal?.aborted) {
         setTransferCreateResult(data);
+        if (data?.item) {
+          setSupply((prev) => bridgeReplaceTransferRecordInSupply(prev, data.item));
+          hydrateTransferEvidenceFormFromRecord(data.item);
+        }
         setTransferLinkResult(null);
         setTransferLinkErr("");
         setBasisPreview(null);
@@ -1076,18 +1498,28 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
       ? {
           source_withdrawal_id: sourceCloseCandidateId || null,
           source_txid: sourceTxidClean || null,
+          source_evidence_type: vaultMintXcmWorkflow ? "solana_vault_deposit" : null,
+          source_vault_address: sourceVaultAddressClean || null,
+          source_amount: spreadNum(amount),
         }
       : {
           destination_deposit_id: destinationCloseCandidateId || null,
-          destination_txid: destinationTxidClean || null,
+          destination_txid: destinationTxidClean || hydrationReceiveTxidClean || assetHubXcmTxidClean || assetHubMintTxidClean || null,
+          destination_evidence_type: vaultMintXcmWorkflow ? "asset_hub_mint_xcm_receive" : null,
+          asset_hub_mint_txid: assetHubMintTxidClean || null,
+          asset_hub_mint_amount: vaultMintXcmWorkflow ? spreadNum(amount) : null,
+          asset_hub_xcm_txid: assetHubXcmTxidClean || null,
+          hydration_receive_txid: hydrationReceiveTxidClean || null,
+          hydration_received_amount: spreadNum(transferHydrationReceivedAmount),
+          xcm_delta_amount: spreadNum(transferXcmDeltaAmount),
         };
 
     if (isSource && !payload.source_withdrawal_id && !payload.source_txid) {
       setTransferLinkErr("Provide a source txid/signature or wait for a matching source withdrawal candidate.");
       return;
     }
-    if (!isSource && !payload.destination_deposit_id && !payload.destination_txid) {
-      setTransferLinkErr("Provide a destination txid/hash or wait for a matching destination deposit candidate.");
+    if (!isSource && !payload.destination_deposit_id && !payload.destination_txid && !payload.asset_hub_mint_txid && !payload.asset_hub_xcm_txid && !payload.hydration_receive_txid) {
+      setTransferLinkErr("Provide destination evidence: destination txid/hash, Asset Hub mint tx, Asset Hub XCM tx, or Hydration receive tx.");
       return;
     }
 
@@ -1107,6 +1539,8 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
         setTransferLinkResult(data);
         if (data?.item) {
           setTransferCreateResult((prev) => ({ ...(prev || {}), item: data.item, execution: data.execution || prev?.execution }));
+          setSupply((prev) => bridgeReplaceTransferRecordInSupply(prev, data.item));
+          hydrateTransferEvidenceFormFromRecord(data.item);
         }
         setBasisPreview(null);
         setBasisPreviewErr("");
@@ -1116,6 +1550,70 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     } catch (e) {
       if (controller.signal?.aborted) return;
       setTransferLinkErr(String(e?.message || e || "Transfer-record link failed"));
+    } finally {
+      if (!controller.signal?.aborted) setTransferLinkBusy("");
+    }
+  };
+
+  const buildTransferEvidencePayload = () => ({
+    source_txid: sourceTxidClean || null,
+    source_evidence_type: vaultMintXcmWorkflow ? "solana_vault_deposit" : null,
+    source_vault_address: sourceVaultAddressClean || null,
+    source_amount: spreadNum(amount),
+    destination_txid: destinationTxidClean || hydrationReceiveTxidClean || assetHubXcmTxidClean || assetHubMintTxidClean || null,
+    destination_evidence_type: vaultMintXcmWorkflow ? "asset_hub_mint_xcm_receive" : null,
+    asset_hub_mint_txid: assetHubMintTxidClean || null,
+    asset_hub_mint_amount: vaultMintXcmWorkflow ? spreadNum(amount) : null,
+    asset_hub_xcm_txid: assetHubXcmTxidClean || null,
+    hydration_receive_txid: hydrationReceiveTxidClean || null,
+    hydration_received_amount: spreadNum(transferHydrationReceivedAmount),
+    xcm_delta_amount: spreadNum(transferXcmDeltaAmount),
+    note: "Evidence amended from Spread / Bridge UI without changing record status.",
+  });
+
+  const handleAmendTransferEvidence = async () => {
+    const base = spreadTrimApiBase(apiBase);
+    const recordId = createdTransferRecord?.id;
+    if (!base) {
+      setTransferLinkErr("API base is not configured.");
+      return;
+    }
+    if (!recordId) {
+      setTransferLinkErr("Create or load a transfer record before amending evidence.");
+      return;
+    }
+    if (!canAmendTransferEvidence) {
+      setTransferLinkErr("Cancelled transfer records cannot be amended.");
+      return;
+    }
+
+    try {
+      linkAbortRef.current?.abort?.();
+    } catch {
+      // ignore
+    }
+
+    const controller = new AbortController();
+    linkAbortRef.current = controller;
+    setTransferLinkBusy("amend");
+    setTransferLinkErr("");
+    try {
+      const data = await bridgePostTransferRecordAmendEvidence(base, recordId, buildTransferEvidencePayload(), controller.signal);
+      if (!controller.signal?.aborted) {
+        setTransferLinkResult(data);
+        if (data?.item) {
+          setTransferCreateResult((prev) => ({ ...(prev || {}), item: data.item, execution: data.execution || prev?.execution }));
+          setSupply((prev) => bridgeReplaceTransferRecordInSupply(prev, data.item));
+          hydrateTransferEvidenceFormFromRecord(data.item);
+        }
+        setBasisPreview(null);
+        setBasisPreviewErr("");
+        setBasisApplyPreview(null);
+        setBasisApplyPreviewErr("");
+      }
+    } catch (e) {
+      if (controller.signal?.aborted) return;
+      setTransferLinkErr(String(e?.message || e || "Transfer-record evidence amendment failed"));
     } finally {
       if (!controller.signal?.aborted) setTransferLinkBusy("");
     }
@@ -1153,6 +1651,8 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
         setTransferLinkResult(data);
         if (data?.item) {
           setTransferCreateResult((prev) => ({ ...(prev || {}), item: data.item, execution: data.execution || prev?.execution }));
+          setSupply((prev) => bridgeReplaceTransferRecordInSupply(prev, data.item));
+          hydrateTransferEvidenceFormFromRecord(data.item);
         }
         setBasisPreview(null);
         setBasisPreviewErr("");
@@ -1166,6 +1666,115 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
       if (!controller.signal?.aborted) setTransferLinkBusy("");
     }
   };
+
+  const handleCancelTransferRecord = async () => {
+    const base = spreadTrimApiBase(apiBase);
+    const recordId = createdTransferRecord?.id;
+    if (!base) {
+      setTransferLinkErr("API base is not configured.");
+      return;
+    }
+    if (!recordId) {
+      setTransferLinkErr("Create or load a transfer record before cancelling.");
+      return;
+    }
+    if (!canCancelTransferRecord) {
+      setTransferLinkErr("Only non-cancelled local records can be cancelled. Reconciled records are protected unless they are manual/evidence-only local records.");
+      return;
+    }
+
+    try {
+      linkAbortRef.current?.abort?.();
+    } catch {
+      // ignore
+    }
+
+    const controller = new AbortController();
+    linkAbortRef.current = controller;
+    setTransferLinkBusy("cancel");
+    setTransferLinkErr("");
+    try {
+      const data = await bridgePostTransferRecordCancel(
+        base,
+        recordId,
+        {
+          note: canCancelReconciledManualRecord
+            ? "Cancelled reconciled manual/evidence-only local test record from Spread / Bridge UI."
+            : "Cancelled from Spread / Bridge UI.",
+          allow_reconciled_manual_cancel: canCancelReconciledManualRecord,
+        },
+        controller.signal
+      );
+      if (!controller.signal?.aborted) {
+        setTransferLinkResult(data);
+        if (data?.item) {
+          setTransferCreateResult((prev) => ({ ...(prev || {}), item: data.item, execution: data.execution || prev?.execution }));
+          setSupply((prev) => bridgeReplaceTransferRecordInSupply(prev, data.item));
+          hydrateTransferEvidenceFormFromRecord(data.item);
+        }
+        setBasisPreview(null);
+        setBasisPreviewErr("");
+        setBasisApplyPreview(null);
+        setBasisApplyPreviewErr("");
+      }
+    } catch (e) {
+      if (controller.signal?.aborted) return;
+      setTransferLinkErr(String(e?.message || e || "Transfer-record cancel failed"));
+    } finally {
+      if (!controller.signal?.aborted) setTransferLinkBusy("");
+    }
+  };
+
+
+  const hydrateTransferEvidenceFormFromRecord = (row) => {
+    if (!row || typeof row !== "object") return;
+    const ev = bridgeRecordEvidence(row);
+    const sourceEv = ev?.source || {};
+    const destEv = ev?.destination || {};
+    const plannedEv = ev?.planned || {};
+
+    setTransferSourceTxid(bridgeEvidenceString(row.source_txid, sourceEv.sourceTxid));
+    setTransferDestinationTxid(bridgeEvidenceString(row.destination_txid, destEv.destinationTxid, destEv.hydrationReceiveTxid, destEv.assetHubXcmTxid, destEv.assetHubMintTxid));
+    // Do not fall back to row.source_address here: that can be the sender wallet,
+    // not the dedicated Solana bridge reserve/vault address.
+    setTransferSourceVaultAddress(bridgeEvidenceString(sourceEv.sourceVaultAddress, plannedEv.sourceVaultAddress));
+    setTransferAssetHubMintTxid(bridgeEvidenceString(destEv.assetHubMintTxid, plannedEv.assetHubMintTxid));
+    setTransferAssetHubXcmTxid(bridgeEvidenceString(destEv.assetHubXcmTxid, plannedEv.assetHubXcmTxid));
+    setTransferHydrationReceiveTxid(bridgeEvidenceString(destEv.hydrationReceiveTxid, plannedEv.hydrationReceiveTxid));
+    setTransferHydrationReceivedAmount(bridgeEvidenceDecimalString(destEv.hydrationReceivedAmount, plannedEv.destinationReceivedAmount));
+    setTransferXcmDeltaAmount(bridgeEvidenceDecimalString(destEv.xcmDeltaAmount, plannedEv.xcmDeltaAmount));
+  };
+
+  const handleViewedCancelledRecordToggle = (recordId, checked) => {
+    const rid = String(recordId || "").trim();
+    if (!rid) return;
+    setViewedCancelledRecordIds((prev) => {
+      const current = Array.isArray(prev) ? prev : [];
+      const next = checked ? Array.from(new Set([...current, rid])) : current.filter((id) => id !== rid);
+      bridgeWriteViewedCancelledIds(next);
+      return next;
+    });
+  };
+
+  const handleLoadTransferRecord = (row) => {
+    if (!row || typeof row !== "object") return;
+    setTransferCreateResult({ ok: true, item: row, execution: { message: "Loaded existing local transfer record from supply summary. No chain action was executed." } });
+    setTransferPreview(null);
+    setTransferPreviewErr("");
+    setTransferCreateErr("");
+    setTransferLinkResult(null);
+    setTransferLinkErr("");
+    setBasisPreview(null);
+    setBasisPreviewErr("");
+    setBasisApplyPreview(null);
+    setBasisApplyPreviewErr("");
+    setAsset(row.asset || "UTTT");
+    setAmount(row.amount != null ? String(row.amount) : "");
+    setDirection(String(row.source_chain || "").toLowerCase() === "hydration" ? "hyd_to_sol" : "sol_to_hyd");
+    setBridgeMechanism(row.bridge_mechanism || "manual");
+    hydrateTransferEvidenceFormFromRecord(row);
+  };
+
 
   const handlePreviewBasisTreatment = async () => {
     const base = spreadTrimApiBase(apiBase);
@@ -1276,6 +1885,33 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     background: "rgba(255,255,255,0.04)",
     fontSize: 12,
   };
+  const transferPreviewHeaderStyle = {
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 8,
+    marginBottom: 6,
+    flexWrap: "wrap",
+  };
+  const transferActionRowStyle = {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    flexWrap: "wrap",
+    justifyContent: "flex-start",
+    minWidth: 0,
+    maxWidth: "100%",
+  };
+  const transferTwoColGridStyle = {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))",
+    gap: 8,
+  };
+  const transferThreeColGridStyle = {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+    gap: 8,
+  };
 
   return (
     <div ref={chipRef} style={{ position: "relative", display: "inline-block" }}>
@@ -1373,6 +2009,24 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
               />
             </label>
 
+            <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, marginBottom: 10, alignItems: "end" }}>
+              <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                Bridge recording workflow
+                <select value={bridgeMechanism} onChange={(e) => setBridgeMechanism(e.target.value)} style={inputStyle}>
+                  {BRIDGE_MECHANISM_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value} style={optionStyle}>{opt.label}</option>
+                  ))}
+                </select>
+              </label>
+              <button type="button" onClick={applyBridge10mPreset} style={{ ...smallBtnStyle, justifyContent: "center", minHeight: 36 }} title="Prepare the planned 10M UTTT Solana-to-Hydration vault/mint/XCM record. No transaction is executed.">
+                10M UTTT preset
+              </button>
+            </div>
+
+            <div style={{ marginBottom: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(88,166,255,0.25)", background: "rgba(88,166,255,0.08)", fontSize: 12, lineHeight: 1.35 }}>
+              Current tranche: record the additional 10,000,000 UTTT as a vault-backed bridge: Solana Bridge Reserve deposit → Asset Hub mint → Hydration receive/XCM. The earlier 30,000,000 UTTT tranche is recorded separately as initial allocation / pending evidence.
+            </div>
+
             <div style={{ display: "grid", gap: 6 }}>
               <div style={rowStyle}>
                 <span style={labelStyle}>Source</span>
@@ -1395,20 +2049,48 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                 <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtPct(snap?.spreadPct)}</span>
               </div>
               <div style={rowStyle}>
-                <span style={labelStyle}>Source value</span>
+                <span style={labelStyle}>Planned source value</span>
                 <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(sourceValue)}</span>
               </div>
               <div style={rowStyle}>
-                <span style={labelStyle}>Destination value</span>
+                <span style={labelStyle}>Planned destination value</span>
                 <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtUsd(destValue)}</span>
               </div>
-              <div style={rowStyle}>
-                <span style={labelStyle}>Source supply</span>
-                <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtQty(bridgeSupplyAmount(sourceSupplyRow))} UTTT</span>
-              </div>
-              <div style={rowStyle}>
-                <span style={labelStyle}>Destination supply</span>
-                <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtQty(bridgeSupplyAmount(destSupplyRow))} UTTT</span>
+              {showBridgeTreasuryContext ? (
+                <>
+                  <div style={rowStyle}>
+                    <span style={labelStyle}>Bridge source reserve</span>
+                    <span style={valueStyle}>
+                      {hideTableData ? "••••" : spreadFmtQty(bridgeTreasury.sourceReserveAmount)} UTTT
+                    </span>
+                  </div>
+                  <div style={rowStyle}>
+                    <span style={labelStyle}>Bridge destination treasury</span>
+                    <span style={valueStyle}>
+                      {hideTableData ? "••••" : spreadFmtQty(bridgeTreasury.destinationTreasuryAmount)} UTTT
+                    </span>
+                  </div>
+                  <div style={rowStyle}>
+                    <span style={labelStyle}>Bridge XCM/dust delta</span>
+                    <span style={valueStyle}>
+                      {hideTableData ? "••••" : spreadFmtQty(bridgeTreasury.xcmDeltaAmount)} UTTT
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={rowStyle}>
+                    <span style={labelStyle}>Canonical source supply</span>
+                    <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtQty(bridgeSupplyAmount(sourceSupplyRow))} UTTT</span>
+                  </div>
+                  <div style={rowStyle}>
+                    <span style={labelStyle}>Canonical destination supply</span>
+                    <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtQty(bridgeSupplyAmount(destSupplyRow))} UTTT</span>
+                  </div>
+                </>
+              )}
+              <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>
+                Values above use the entered transfer amount. Bridge treasury rows are record-derived until live treasury balance sync is wired; canonical supply is shown below.
               </div>
             </div>
 
@@ -1441,6 +2123,63 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
               <div style={{ marginTop: 6, opacity: 0.68, lineHeight: 1.35 }}>
                 Hydration is shown as route/liquidity context unless the backend marks it as separately counted, so the Polkadot-side supply is not double-counted.
               </div>
+              {transferRecordSummary ? (
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid rgba(255,255,255,0.10)", display: "grid", gap: 4 }}>
+                  <div style={{ fontWeight: 900 }}>Transfer records</div>
+                  <div style={rowStyle}>
+                    <span style={labelStyle}>Solana → Hydration pending</span>
+                    <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtQty(transferRecordSummary.solanaToHydrationPendingAmount)} UTTT</span>
+                  </div>
+                  <div style={rowStyle}>
+                    <span style={labelStyle}>Solana → Hydration reconciled</span>
+                    <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtQty(transferRecordSummary.solanaToHydrationReconciledAmount)} UTTT</span>
+                  </div>
+                  <div style={{ opacity: 0.64 }}>
+                    Records: {transferRecordSummary.count ?? 0} · linked amount {hideTableData ? "••••" : spreadFmtQty(transferRecordSummary.linkedAmount)} UTTT
+                    {hiddenViewedCancelledCount ? ` · ${hiddenViewedCancelledCount} viewed cancelled hidden` : ""}
+                  </div>
+                  {hiddenViewedCancelledCount ? (
+                    <label style={{ display: "inline-flex", alignItems: "center", gap: 6, opacity: 0.72, fontSize: 11 }}>
+                      <input
+                        type="checkbox"
+                        checked={showViewedCancelledRecords}
+                        onChange={(e) => setShowViewedCancelledRecords(e.target.checked)}
+                      />
+                      Show viewed cancelled
+                    </label>
+                  ) : null}
+                  {transferRecordItems.length ? (
+                    <div style={{ display: "grid", gap: 5, marginTop: 6 }}>
+                      {transferRecordItems.slice(0, 8).map((row) => {
+                        const rowStatus = String(row?.status || "").trim().toUpperCase();
+                        const rowId = String(row?.id || "").trim();
+                        const viewedCancelled = rowStatus === "CANCELLED" && viewedCancelledRecordIds.includes(rowId);
+                        return (
+                          <div key={row.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, alignItems: "center", padding: "5px 6px", borderRadius: 8, background: "rgba(255,255,255,0.04)" }}>
+                            <div style={{ minWidth: 0 }}>
+                              <div style={{ fontWeight: 800 }}>{row.sourceLabel || row.source_chain} → {row.destinationLabel || row.destination_chain} · {hideTableData ? "••••" : spreadFmtQty(row.amount)} {row.asset}</div>
+                              <div style={{ opacity: 0.62 }}>{row.status} · {bridgeMechanismLabel(row.bridge_mechanism)} · {hideTableData ? "••••" : bridgeShortAddress(row.id, 6, 6)}</div>
+                              {rowStatus === "CANCELLED" ? (
+                                <label style={{ display: "inline-flex", alignItems: "center", gap: 5, marginTop: 4, opacity: 0.76, fontSize: 11 }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={viewedCancelled}
+                                    onChange={(e) => handleViewedCancelledRecordToggle(rowId, e.target.checked)}
+                                  />
+                                  viewed
+                                </label>
+                              ) : null}
+                            </div>
+                            <button type="button" onClick={() => handleLoadTransferRecord(row)} style={{ ...smallBtnStyle, padding: "4px 7px", fontSize: 11 }}>
+                              Load
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
               {supply?.warnings?.length ? (
                 <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)" }}>
                   {supply.warnings.join(" ")}
@@ -1449,15 +2188,15 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
             </div>
 
             <div style={{ marginTop: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(247,185,85,0.35)", background: "rgba(247,185,85,0.10)", fontSize: 12 }}>
-              Execution is intentionally disabled here. Next backend work should choose the mechanism: treasury-mediated burn/mint, lock/release, XCM-style transfer, or external bridge integration.
+              Execution is intentionally disabled here. For the 10M UTTT tranche, use the vault/mint/XCM workflow to create a local planned record, then link Solana vault-deposit, Asset Hub mint, and Hydration receive evidence before reconciling.
             </div>
 
             <div style={{ ...panelCardStyle, marginTop: 10 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
-                <div style={{ fontWeight: 900 }}>Transfer Record Preview</div>
-                <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <div style={transferPreviewHeaderStyle}>
+                <div style={{ fontWeight: 900, minWidth: 160 }}>Transfer Record Preview</div>
+                <div style={transferActionRowStyle}>
                   {transferPreview ? (
-                    <button type="button" onClick={() => { setTransferPreview(null); setTransferPreviewErr(""); setTransferCreateResult(null); setTransferCreateErr(""); setTransferLinkResult(null); setTransferLinkErr(""); setBasisPreview(null); setBasisPreviewErr(""); setTransferSourceTxid(""); setTransferDestinationTxid(""); }} style={{ ...smallBtnStyle, padding: "5px 8px", fontSize: 11 }}>
+                    <button type="button" onClick={() => { setTransferPreview(null); setTransferPreviewErr(""); setTransferCreateResult(null); setTransferCreateErr(""); setTransferLinkResult(null); setTransferLinkErr(""); setBasisPreview(null); setBasisPreviewErr(""); setTransferSourceTxid(""); setTransferDestinationTxid(""); setTransferSourceVaultAddress(""); setTransferAssetHubMintTxid(""); setTransferAssetHubXcmTxid(""); setTransferHydrationReceiveTxid(""); setTransferHydrationReceivedAmount(""); setTransferXcmDeltaAmount(""); }} style={{ ...smallBtnStyle, padding: "5px 8px", fontSize: 11 }}>
                       Clear
                     </button>
                   ) : null}
@@ -1537,6 +2276,28 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                   </button>
                   <button
                     type="button"
+                    onClick={handleCancelTransferRecord}
+                    disabled={!canCancelTransferRecord}
+                    style={{
+                      ...smallBtnStyle,
+                      padding: "5px 8px",
+                      fontSize: 11,
+                      borderColor: "rgba(255,107,107,0.45)",
+                      opacity: canCancelTransferRecord ? 1 : 0.55,
+                      cursor: canCancelTransferRecord ? "pointer" : "not-allowed",
+                    }}
+                    title="Cancel a local transfer record. Reconciled records stay protected except manual/evidence-only local records. This does not delete it and does not mutate ledger/FIFO state."
+                  >
+                    {transferLinkBusy === "cancel"
+                      ? "Cancelling…"
+                      : createdTransferRecord?.status === "CANCELLED"
+                        ? "Cancelled"
+                        : canCancelReconciledManualRecord
+                          ? "Cancel Manual Test Record"
+                          : "Cancel Record"}
+                  </button>
+                  <button
+                    type="button"
                     onClick={handlePreviewBasisTreatment}
                     disabled={!canPreviewBasisTreatment}
                     style={{
@@ -1604,7 +2365,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
               {transferLinkResult?.ok ? (
                 <div style={{ marginBottom: 8, padding: 8, borderRadius: 9, border: "1px solid rgba(53,208,127,0.35)", background: "rgba(53,208,127,0.10)", lineHeight: 1.4 }}>
                   <div style={{ fontWeight: 900 }}>
-                    {transferLinkResult.mode === "reconcile" ? "Transfer record reconciled" : transferLinkResult.mode === "link_source" ? "Source evidence linked" : "Destination evidence linked"}
+                    {transferLinkResult.mode === "reconcile" ? "Transfer record reconciled" : transferLinkResult.mode === "cancel" ? "Transfer record cancelled" : transferLinkResult.mode === "link_source" ? "Source evidence linked" : "Destination evidence linked"}
                   </div>
                   <div>Status: {transferLinkResult?.item?.status || "LINKED"}</div>
                   {transferLinkResult?.execution?.message ? <div style={{ opacity: 0.72 }}>{transferLinkResult.execution.message}</div> : null}
@@ -1618,15 +2379,21 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                   <div>Status: {createdTransferRecord.status || "PLANNED"}</div>
                   <div>Source link: {createdTransferRecord.source_withdrawal_id || createdTransferRecord.source_txid ? "linked" : "missing"}</div>
                   <div>Destination link: {createdTransferRecord.destination_deposit_id || createdTransferRecord.destination_txid ? "linked" : "missing"}</div>
+                  {createdTransferRecord?.evidenceSummary?.destination?.hydrationReceivedAmount != null ? (
+                    <div>Hydration received: {hideTableData ? "••••" : spreadFmtQty(createdTransferRecord.evidenceSummary.destination.hydrationReceivedAmount, 8)} UTTT</div>
+                  ) : null}
+                  {createdTransferRecord?.evidenceSummary?.destination?.xcmDeltaAmount != null ? (
+                    <div>XCM/dust delta: {hideTableData ? "••••" : spreadFmtQty(createdTransferRecord.evidenceSummary.destination.xcmDeltaAmount, 8)} UTTT</div>
+                  ) : null}
                   {transferCreateResult?.execution?.message ? <div style={{ opacity: 0.72 }}>{transferCreateResult.execution.message}</div> : null}
                 </div>
               ) : null}
 
               {createdTransferRecord?.id ? (
                 <div style={{ marginBottom: 8, display: "grid", gap: 6 }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div style={transferTwoColGridStyle}>
                     <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
-                      <span>Source txid/signature fallback</span>
+                      <span>{bridgeSourceEvidenceLabel(bridgeMechanism)}</span>
                       <input
                         value={transferSourceTxid}
                         onChange={(e) => setTransferSourceTxid(e.target.value)}
@@ -1636,7 +2403,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                       />
                     </label>
                     <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
-                      <span>Destination txid/hash fallback</span>
+                      <span>{bridgeDestinationEvidenceLabel(bridgeMechanism)}</span>
                       <input
                         value={transferDestinationTxid}
                         onChange={(e) => setTransferDestinationTxid(e.target.value)}
@@ -1646,8 +2413,145 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                       />
                     </label>
                   </div>
+                  {vaultMintXcmWorkflow ? (
+                    <div style={{ display: "grid", gap: 6, padding: 8, borderRadius: 10, border: "1px solid rgba(88,166,255,0.22)", background: "rgba(88,166,255,0.06)" }}>
+                      <div style={{ fontWeight: 900, fontSize: 12 }}>Vault / Asset Hub / Hydration evidence</div>
+                      <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                        <span>Solana Bridge Reserve address</span>
+                        <input
+                          value={transferSourceVaultAddress}
+                          onChange={(e) => setTransferSourceVaultAddress(e.target.value)}
+                          placeholder="Solana bridge reserve / vault address"
+                          type={hideTableData ? "password" : "text"}
+                          style={{ padding: "7px 8px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(0,0,0,0.18)", color: "inherit", minWidth: 0 }}
+                        />
+                      </label>
+                      <div style={transferTwoColGridStyle}>
+                        <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                          <span>Asset Hub mint tx</span>
+                          <input
+                            value={transferAssetHubMintTxid}
+                            onChange={(e) => setTransferAssetHubMintTxid(e.target.value)}
+                            placeholder="Asset Hub mint extrinsic / URL"
+                            type={hideTableData ? "password" : "text"}
+                            style={{ padding: "7px 8px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(0,0,0,0.18)", color: "inherit", minWidth: 0 }}
+                          />
+                        </label>
+                        <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                          <span>Asset Hub → Hydration XCM tx</span>
+                          <input
+                            value={transferAssetHubXcmTxid}
+                            onChange={(e) => setTransferAssetHubXcmTxid(e.target.value)}
+                            placeholder="Asset Hub XCM extrinsic / URL"
+                            type={hideTableData ? "password" : "text"}
+                            style={{ padding: "7px 8px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(0,0,0,0.18)", color: "inherit", minWidth: 0 }}
+                          />
+                        </label>
+                      </div>
+                      <div style={transferThreeColGridStyle}>
+                        <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                          <span>Hydration receive tx / XCM message</span>
+                          <input
+                            value={transferHydrationReceiveTxid}
+                            onChange={(e) => setTransferHydrationReceiveTxid(e.target.value)}
+                            placeholder="Hydration receive tx / xcm_message URL"
+                            type={hideTableData ? "password" : "text"}
+                            style={{ padding: "7px 8px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(0,0,0,0.18)", color: "inherit", minWidth: 0 }}
+                          />
+                        </label>
+                        <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                          <span>Hydration received</span>
+                          <input
+                            value={transferHydrationReceivedAmount}
+                            onChange={(e) => setTransferHydrationReceivedAmount(e.target.value)}
+                            placeholder="9999999.999999"
+                            inputMode="decimal"
+                            style={{ padding: "7px 8px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(0,0,0,0.18)", color: "inherit", minWidth: 0 }}
+                          />
+                        </label>
+                        <label style={{ display: "grid", gap: 4, fontSize: 11, opacity: 0.88 }}>
+                          <span>XCM/dust delta</span>
+                          <input
+                            value={transferXcmDeltaAmount}
+                            onChange={(e) => setTransferXcmDeltaAmount(e.target.value)}
+                            placeholder="0.000001"
+                            inputMode="decimal"
+                            style={{ padding: "7px 8px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(0,0,0,0.18)", color: "inherit", minWidth: 0 }}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div style={{ display: "grid", gap: 6, padding: 8, borderRadius: 10, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.12)" }}>
+                    <div style={{ fontWeight: 900, fontSize: 12 }}>Save / link evidence to this record</div>
+                    <div style={transferActionRowStyle}>
+                      <button
+                        type="button"
+                        onClick={() => handleLinkTransferRecord("source")}
+                        disabled={!canLinkSourceRecord}
+                        style={{
+                          ...smallBtnStyle,
+                          padding: "6px 9px",
+                          fontSize: 11,
+                          opacity: canLinkSourceRecord ? 1 : 0.55,
+                          cursor: canLinkSourceRecord ? "pointer" : "not-allowed",
+                        }}
+                        title="Step 1: save the Solana source transaction/signature to this local transfer record."
+                      >
+                        {transferLinkBusy === "source" ? "Saving Source…" : recordHasSourceLink ? "Source Evidence Saved" : "1 · Save Source Evidence"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleLinkTransferRecord("destination")}
+                        disabled={!canLinkDestinationRecord}
+                        style={{
+                          ...smallBtnStyle,
+                          padding: "6px 9px",
+                          fontSize: 11,
+                          opacity: canLinkDestinationRecord ? 1 : 0.55,
+                          cursor: canLinkDestinationRecord ? "pointer" : "not-allowed",
+                        }}
+                        title="Step 2: save Asset Hub mint, Asset Hub XCM, and Hydration receive evidence to this local transfer record."
+                      >
+                        {transferLinkBusy === "destination" ? "Saving Destination…" : recordHasDestinationLink ? "Destination Evidence Saved" : "2 · Save Destination Evidence"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleAmendTransferEvidence}
+                        disabled={!canAmendTransferEvidence}
+                        style={{
+                          ...smallBtnStyle,
+                          padding: "6px 9px",
+                          fontSize: 11,
+                          opacity: canAmendTransferEvidence ? 1 : 0.55,
+                          cursor: canAmendTransferEvidence ? "pointer" : "not-allowed",
+                        }}
+                        title="Update the saved evidence fields without changing the current transfer-record status. Use this for corrections after reconciliation."
+                      >
+                        {transferLinkBusy === "amend" ? "Amending…" : "Amend Evidence"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleReconcileTransferRecord}
+                        disabled={!canReconcileTransferRecord}
+                        style={{
+                          ...smallBtnStyle,
+                          padding: "6px 9px",
+                          fontSize: 11,
+                          opacity: canReconcileTransferRecord ? 1 : 0.55,
+                          cursor: canReconcileTransferRecord ? "pointer" : "not-allowed",
+                        }}
+                        title="Step 3: mark the local transfer record reconciled after source and destination evidence are saved."
+                      >
+                        {transferLinkBusy === "reconcile" ? "Reconciling…" : createdTransferRecord?.status === "RECONCILED" ? "Reconciled" : "3 · Reconcile Record"}
+                      </button>
+                    </div>
+                    <div style={{ opacity: 0.68, fontSize: 11, lineHeight: 1.35 }}>
+                      Step 1 needs a Solana transfer tx/signature in the source field above. Step 2 uses the Asset Hub mint, Asset Hub XCM, Hydration receive, received amount, and delta fields. Use Amend Evidence for corrections after saving or reconciliation; it preserves the record status. Step 3 unlocks only after both evidence sides are saved.
+                    </div>
+                  </div>
                   <div style={{ opacity: 0.64, fontSize: 11, lineHeight: 1.35 }}>
-                    Link buttons use the first close amount candidate when available, otherwise they use the txid/hash you enter here.
+                    Link buttons use the first close amount candidate when available, otherwise they use the txid/hash you enter here. For vault/mint/XCM, source = Solana vault deposit; destination = Asset Hub mint + Asset Hub → Hydration receive evidence.
                   </div>
                 </div>
               ) : null}
@@ -1784,7 +2688,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                   </div>
                   <div style={rowStyle}>
                     <span style={labelStyle}>Mechanism</span>
-                    <span style={valueStyle}>{previewPlanned.bridge_mechanism || transferPreview.bridgeMechanism || "manual"}</span>
+                    <span style={valueStyle}>{bridgeMechanismLabel(previewPlanned.bridge_mechanism || transferPreview.bridgeMechanism || "manual")}</span>
                   </div>
                   <div style={rowStyle}>
                     <span style={labelStyle}>Record status</span>
@@ -1824,6 +2728,18 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                     <span style={labelStyle}>Destination candidates</span>
                     <span style={valueStyle}>{bridgeCandidateSummary(transferPreview.candidateLinks?.destination)}</span>
                   </div>
+                  {vaultMintXcmWorkflow ? (
+                    <>
+                      <div style={rowStyle}>
+                        <span style={labelStyle}>Hydration received</span>
+                        <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtQty(transferHydrationReceivedAmount, 8)} UTTT</span>
+                      </div>
+                      <div style={rowStyle}>
+                        <span style={labelStyle}>XCM/dust delta</span>
+                        <span style={valueStyle}>{hideTableData ? "••••" : spreadFmtQty(transferXcmDeltaAmount, 8)} UTTT</span>
+                      </div>
+                    </>
+                  ) : null}
 
                   {previewReadiness.length ? (
                     <div style={{ marginTop: 4 }}>

@@ -153,6 +153,45 @@ function spreadWriteCache(v) {
   }
 }
 
+
+function spreadMergeSnapshot(prev, next) {
+  const n = next && typeof next === "object" ? next : {};
+  const p = prev && typeof prev === "object" ? prev : null;
+
+  const solPrice = spreadNum(n.solPrice) ?? spreadNum(p?.solPrice);
+  const hydPrice = spreadNum(n.hydPrice) ?? spreadNum(p?.hydPrice);
+  const spreadPct = solPrice > 0 && hydPrice > 0 ? ((hydPrice - solPrice) / solPrice) * 100 : (spreadNum(n.spreadPct) ?? spreadNum(p?.spreadPct));
+  const absSpreadUsd = solPrice !== null && hydPrice !== null ? hydPrice - solPrice : (spreadNum(n.absSpreadUsd) ?? spreadNum(p?.absSpreadUsd));
+
+  const merged = {
+    ...(p || {}),
+    ...n,
+    sol: {
+      ...((p && p.sol) || {}),
+      ...((n && n.sol) || {}),
+    },
+    hyd: {
+      ...((p && p.hyd) || {}),
+      ...((n && n.hyd) || {}),
+    },
+    solPrice,
+    hydPrice,
+    spreadPct,
+    absSpreadUsd,
+    ok: solPrice > 0 && hydPrice > 0,
+    partialPriceRefresh: !(n?.ok) && !!(p?.ok) && (spreadNum(n.solPrice) === null || spreadNum(n.hydPrice) === null),
+    at: n.at || p?.at || new Date().toISOString(),
+    refreshedAt: new Date().toISOString(),
+  };
+
+  // Preserve the previous per-side price source/detail if the latest refresh returned
+  // a partial/missing price object. This keeps the bridge panel from blanking out
+  // the Hydration side during a transient price-cache/orderbook refresh miss.
+  if (spreadNum(n.solPrice) === null && p?.sol) merged.sol = p.sol;
+  if (spreadNum(n.hydPrice) === null && p?.hyd) merged.hyd = p.hyd;
+  return merged;
+}
+
 function bridgeReadViewedCancelledIds() {
   try {
     const raw = localStorage.getItem(BRIDGE_VIEWED_CANCELLED_KEY);
@@ -1140,12 +1179,14 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
         bridgeFetchUtttSupply(base, controller.signal),
         bridgeFetchTransferRecordStatus(base, controller.signal),
       ]);
-      setSnap(nextSnap);
+      const cachedSnap = spreadReadCache();
+      const mergedSnap = spreadMergeSnapshot(snap || cachedSnap, nextSnap);
+      setSnap(mergedSnap);
       setAddresses(rows);
       setSupply(nextSupply);
       setTransferStatus(nextTransferStatus);
-      if (nextSnap?.ok) spreadWriteCache(nextSnap);
-      if (nextSnap?.error) setErr(nextSnap.error);
+      if (mergedSnap?.ok) spreadWriteCache(mergedSnap);
+      if (nextSnap?.error && !mergedSnap?.partialPriceRefresh) setErr(nextSnap.error);
     } catch (e) {
       if (controller.signal?.aborted) return;
       setErr(String(e?.message || e || "Bridge dashboard refresh failed"));

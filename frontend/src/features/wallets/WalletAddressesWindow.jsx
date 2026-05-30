@@ -891,14 +891,14 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               </button>
               <div style={{ flexBasis: "100%", opacity: 0.75 }}>
                 Use one account-level Hydration row: <b>Asset</b> <code>ALL</code>, <b>Venue</b> <code>polkadot_hydration</code>, and <b>Network</b> <code>hydration</code>. The same SubWallet/Substrate address can be scanned for all supported Hydration assets; no per-asset address rows are needed.
-                For Solana bridge reserve / treasury rows, <b>Asset</b> <code>ALL</code> is metadata-only for address selection until Solana SPL-token balance refresh is wired.
+                For Solana bridge reserve / treasury rows, use <b>Asset</b> <code>UTTT</code> once the Token Registry has the Solana UTTT mint/decimals row. Use <code>ALL</code> only as metadata-only fallback.
               </div>
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "140px 1fr 140px 1fr", gap: 8 }}>
               <label>Asset / scope</label>
               <input
-                placeholder="e.g. BTC, SOL, UTTT, or ALL for Hydration"
+                placeholder="e.g. BTC, SOL, UTTT, or ALL for metadata-only rows"
                 value={form.asset}
                 onChange={(e) => setForm((p) => ({ ...p, asset: e.target.value.toUpperCase() }))}
               />
@@ -940,7 +940,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
                 </button>
               ) : null}
               <div style={{ opacity: 0.75 }}>
-                Hydration/SubWallet rows should normally use <b>Asset</b> <code>ALL</code>, <b>Venue</b> <code>polkadot_hydration</code>, and <b>Network</b> <code>hydration</code>. Blank venue remains self-custody.
+                Hydration/SubWallet rows should normally use <b>Asset</b> <code>ALL</code>, <b>Venue</b> <code>polkadot_hydration</code>, and <b>Network</b> <code>hydration</code>. Solana SPL treasury rows such as UTTT should use the token symbol when the mint is registered. Blank venue remains self-custody.
               </div>
             </div>
           </div>

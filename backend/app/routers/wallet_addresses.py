@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import WalletAddress, WalletAddressSnapshot, WalletAddressTx, AssetDeposit, AssetWithdrawal
+from ..models import WalletAddress, WalletAddressSnapshot, WalletAddressTx, AssetDeposit, AssetWithdrawal, TokenRegistry
 from ..schemas_wallet_addresses import (
     WalletAddressCreate,
     WalletAddressOut,
@@ -154,6 +154,106 @@ async def _fetch_solana_balance_lamports(address: str) -> Tuple[int, Dict]:
     js = await _solana_rpc("getBalance", [address, {"commitment": "confirmed"}])
     lamports = int(((js or {}).get("result") or {}).get("value") or 0)
     return lamports, js
+
+
+
+def _is_solana_network(network: str) -> bool:
+    n = str(network or "").strip().lower()
+    return n in {"solana", "mainnet", "mainnet-beta", "solana-mainnet", "solana_mainnet"}
+
+
+def _resolve_solana_spl_token(db: Optional[Session], asset: str) -> Tuple[Optional[str], Optional[int], Optional[Dict]]:
+    """Resolve a Solana SPL token symbol to (mint, decimals, registry_meta).
+
+    Primary source is Token Registry rows with chain='solana'. Env fallback is kept
+    only for local recovery/testing.
+    """
+    a = _norm_asset(asset)
+    if not a or a in {"SOL", "ALL", "*"}:
+        return None, None, None
+
+    if db is not None:
+        try:
+            rows = (
+                db.query(TokenRegistry)
+                .filter(TokenRegistry.chain == "solana", TokenRegistry.symbol == a)
+                .all()
+            )
+            # Prefer global Token Registry rows, then any venue-specific row with an address.
+            ordered = sorted(rows or [], key=lambda r: 0 if getattr(r, "venue", None) is None else 1)
+            for r in ordered:
+                mint = str(getattr(r, "address", None) or "").strip()
+                if mint:
+                    try:
+                        dec = int(getattr(r, "decimals", 0) or 0)
+                    except Exception:
+                        dec = None
+                    return mint, dec, {
+                        "source": "token_registry",
+                        "id": getattr(r, "id", None),
+                        "chain": getattr(r, "chain", None),
+                        "venue": getattr(r, "venue", None),
+                        "symbol": getattr(r, "symbol", None),
+                        "address": mint,
+                        "decimals": dec,
+                        "label": getattr(r, "label", None),
+                    }
+        except Exception:
+            pass
+
+    # Env fallback. Examples: UTT_SOLANA_UTTT_MINT, UTT_UTTT_SOLANA_MINT.
+    env_keys = [
+        f"UTT_SOLANA_{a}_MINT",
+        f"UTT_{a}_SOLANA_MINT",
+        f"UTT_TOKEN_{a}_SOLANA_MINT",
+    ]
+    for k in env_keys:
+        mint = str(os.getenv(k) or "").strip()
+        if mint:
+            dec = None
+            for dk in (f"UTT_SOLANA_{a}_DECIMALS", f"UTT_{a}_SOLANA_DECIMALS", f"UTT_TOKEN_{a}_SOLANA_DECIMALS"):
+                v = str(os.getenv(dk) or "").strip()
+                if v:
+                    try:
+                        dec = int(v)
+                        break
+                    except Exception:
+                        pass
+            return mint, dec, {"source": "env", "env_key": k, "symbol": a, "address": mint, "decimals": dec}
+
+    return None, None, None
+
+
+async def _fetch_solana_spl_token_balance_atomic(owner_address: str, mint_address: str) -> Tuple[int, Optional[int], Dict]:
+    """Return summed SPL token balance for owner+mint using Solana JSON-RPC.
+
+    getTokenAccountsByOwner returns all token accounts owned by the wallet for the
+    mint. A user can have multiple ATAs/accounts, so sum atomic amounts.
+    """
+    js = await _solana_rpc(
+        "getTokenAccountsByOwner",
+        [
+            owner_address,
+            {"mint": mint_address},
+            {"encoding": "jsonParsed", "commitment": "confirmed"},
+        ],
+    )
+    value = ((js or {}).get("result") or {}).get("value") or []
+    total_atomic = 0
+    decimals: Optional[int] = None
+    for item in value:
+        try:
+            info = (((item or {}).get("account") or {}).get("data") or {}).get("parsed", {}).get("info", {})
+            token_amount = info.get("tokenAmount") or {}
+            amt = token_amount.get("amount")
+            if amt is not None:
+                total_atomic += int(str(amt))
+            dec = token_amount.get("decimals")
+            if dec is not None and decimals is None:
+                decimals = int(dec)
+        except Exception:
+            continue
+    return int(total_atomic), decimals, js
 
 
 async def _fetch_solana_signatures(address: str, limit: int) -> List[Dict]:
@@ -517,12 +617,13 @@ async def _fetch_blockcypher_balance_atomic(chain: str, address: str) -> Tuple[i
     return int(bal), js
 
 
-async def _get_balance_atomic(asset: str, network: str, address: str) -> Tuple[int, int, Dict, str]:
+async def _get_balance_atomic(asset: str, network: str, address: str, db: Optional[Session] = None) -> Tuple[int, int, Dict, str]:
     """
     Return (atomic_balance, decimals, raw_json, source).
 
     Source is "blockcypher" for BTC/DOGE when used, otherwise "blockchair".
-    For SOL this is "solana_rpc".
+    For native SOL this is "solana_rpc". For Solana SPL tokens resolved via
+    Token Registry, this is "solana_spl_rpc".
     """
     a = _norm_asset(asset)
     decimals = _DECIMALS.get(a, 8)
@@ -531,6 +632,20 @@ async def _get_balance_atomic(asset: str, network: str, address: str) -> Tuple[i
     if a == "SOL":
         lamports, raw = await _fetch_solana_balance_lamports(address)
         return lamports, decimals, raw, "solana_rpc"
+
+    # Solana SPL token balances (e.g. UTTT). Resolve mint/decimals from Token Registry.
+    if _is_solana_network(network):
+        mint, reg_decimals, reg_meta = _resolve_solana_spl_token(db, a)
+        if mint:
+            atomic, rpc_decimals, raw = await _fetch_solana_spl_token_balance_atomic(address, mint)
+            dec = int(rpc_decimals if rpc_decimals is not None else (reg_decimals if reg_decimals is not None else decimals))
+            raw2 = {
+                "token_registry": reg_meta,
+                "mint": mint,
+                "owner": address,
+                "rpc": raw,
+            }
+            return atomic, dec, raw2, "solana_spl_rpc"
 
     # Prefer BlockCypher for BTC/DOGE (current strategy)
     if a in ("BTC", "DOGE"):
@@ -815,7 +930,7 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
             continue
 
         try:
-            atomic, decimals, raw, source = await _get_balance_atomic(a.asset, a.network, a.address)
+            atomic, decimals, raw, source = await _get_balance_atomic(a.asset, a.network, a.address, db=db)
             units = atomic / (10 ** decimals)
 
             snap = WalletAddressSnapshot(
@@ -1095,6 +1210,7 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
     cached = 0
     ledger_written = 0
     metadata_only_skipped = 0
+    solana_spl_tx_skipped = 0
 
     def _wa_tx_skip_reason(raw) -> Optional[str]:
         try:
@@ -1142,6 +1258,13 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
             # They are intentionally skipped by transaction ingest because they do
             # not identify a single asset-specific explorer/parser path.
             metadata_only_skipped += 1
+            continue
+
+        # Solana SPL token transfer ingest is handled later by a mint-aware parser.
+        # Balance snapshots for SPL tokens are supported above; do not emit generic
+        # unsupported-asset errors for UTTT treasury rows during broad tx ingest.
+        if _is_solana_network(a.network) and asset != "SOL":
+            solana_spl_tx_skipped += 1
             continue
 
         # enforce skip policy early
@@ -1685,6 +1808,8 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
 
     if metadata_only_skipped:
         skipped_by_reason["metadata_only_asset"] = skipped_by_reason.get("metadata_only_asset", 0) + metadata_only_skipped
+    if solana_spl_tx_skipped:
+        skipped_by_reason["solana_spl_tx_ingest_not_wired"] = skipped_by_reason.get("solana_spl_tx_ingest_not_wired", 0) + solana_spl_tx_skipped
 
     skipped_total = sum(skipped_by_reason.values())
 

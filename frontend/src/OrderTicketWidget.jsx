@@ -265,6 +265,73 @@ function hydrationRouteProbeView(payload, symbol) {
 }
 
 
+
+function hydrationExtractOrderbookPrice(row) {
+  try {
+    if (Array.isArray(row)) {
+      for (const v of row) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+      return null;
+    }
+    if (!row || typeof row !== "object") return null;
+    const candidates = [
+      row.price,
+      row.px,
+      row.rate,
+      row.levelPrice,
+      row.level_price,
+      row.limitPrice,
+      row.limit_price,
+      row.displayPrice,
+      row.display_price,
+    ];
+    for (const v of candidates) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  } catch {
+    // ignore malformed orderbook row
+  }
+  return null;
+}
+
+function hydrationOrderbookSideGuardView(payload, symbol) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const cfg = (p.orderbookConfig && typeof p.orderbookConfig === "object") ? p.orderbookConfig : {};
+  const cfgSnake = (p.orderbook_config && typeof p.orderbook_config === "object") ? p.orderbook_config : {};
+  const rawAsks =
+    Array.isArray(p.asks) ? p.asks :
+    Array.isArray(p.askLevels) ? p.askLevels :
+    Array.isArray(p.ask_levels) ? p.ask_levels :
+    Array.isArray(p.sell) ? p.sell :
+    Array.isArray(p.sells) ? p.sells :
+    [];
+  const rawBids =
+    Array.isArray(p.bids) ? p.bids :
+    Array.isArray(p.bidLevels) ? p.bidLevels :
+    Array.isArray(p.bid_levels) ? p.bid_levels :
+    Array.isArray(p.buy) ? p.buy :
+    Array.isArray(p.buys) ? p.buys :
+    [];
+  const asks = rawAsks.map(hydrationExtractOrderbookPrice).filter((n) => Number.isFinite(n) && n > 0);
+  const bids = rawBids.map(hydrationExtractOrderbookPrice).filter((n) => Number.isFinite(n) && n > 0);
+  const bestAsk = asks.length ? Math.min(...asks) : null;
+  const bestBid = bids.length ? Math.max(...bids) : null;
+  return {
+    symbol: String(p.resolvedSymbol || p.resolved_symbol || symbol || "").trim().toUpperCase(),
+    bestAsk,
+    bestBid,
+    askCount: asks.length,
+    bidCount: bids.length,
+    router: String(p.router || cfg.router || cfgSnake.router || "").trim(),
+    routeModeEffective: String(p.routeModeEffective || p.route_mode_effective || cfg.routeModeEffective || cfgSnake.route_mode_effective || "").trim(),
+    source: String(p.source || cfg.source || cfgSnake.source || "").trim(),
+  };
+}
+
+
 function hydrationSwapTxProbeView(payload, symbol) {
   const p = payload && typeof payload === "object" ? payload : {};
   const manual = (p.manualCustomSwap && typeof p.manualCustomSwap === "object") ? p.manualCustomSwap : {};
@@ -1727,6 +1794,7 @@ export default function OrderTicketWidget({
   const [polkadotManualRouteAvailable, setPolkadotManualRouteAvailable] = useState(false);
   const [polkadotHydrationRouteProbe, setPolkadotHydrationRouteProbe] = useState(null);
   const [polkadotHydrationSwapTxProbe, setPolkadotHydrationSwapTxProbe] = useState(null);
+  const [polkadotOrderbookSideGuard, setPolkadotOrderbookSideGuard] = useState(null);
   const polkadotHydrationStatusReqRef = useRef(0);
   const polkadotPriceStatusReqRef = useRef(0);
   const polkadotLiquidityReqRef = useRef(0);
@@ -2316,6 +2384,7 @@ export default function OrderTicketWidget({
       setPolkadotManualRouteAvailable(false);
       setPolkadotHydrationRouteProbe(null);
       setPolkadotHydrationSwapTxProbe(null);
+      setPolkadotOrderbookSideGuard(null);
       return;
     }
 
@@ -2355,6 +2424,7 @@ export default function OrderTicketWidget({
           setPolkadotManualRouteAvailable(false);
           setPolkadotHydrationRouteProbe(null);
           setPolkadotHydrationSwapTxProbe(null);
+          setPolkadotOrderbookSideGuard(null);
           return;
         }
 
@@ -2362,12 +2432,14 @@ export default function OrderTicketWidget({
         setPolkadotLiquidityWarning(buildHydrationLowLiquidityWarning(lastPayload));
         setPolkadotManualRouteAvailable(routeProbe.manualRouteAvailable === true);
         setPolkadotHydrationRouteProbe(routeProbe);
+        setPolkadotOrderbookSideGuard(hydrationOrderbookSideGuardView(lastPayload, sym));
       } catch {
         if (!cancelled && polkadotLiquidityReqRef.current === reqId) {
           setPolkadotLiquidityWarning(null);
           setPolkadotManualRouteAvailable(false);
           setPolkadotHydrationRouteProbe(null);
           setPolkadotHydrationSwapTxProbe(null);
+          setPolkadotOrderbookSideGuard(null);
         }
       }
     }, 450);
@@ -3735,6 +3807,53 @@ export default function OrderTicketWidget({
     autoCalcWriteGuardRef.current.total = null;
   }, [totalQuote]);
 
+  const hydrationManualRouterPriceGuard = useMemo(() => {
+    if (!isPolkadotDexVenue || !polkadotManualRouterFallbackAvailable) return null;
+    const bestAsk = Number(polkadotOrderbookSideGuard?.bestAsk);
+    const bestBid = Number(polkadotOrderbookSideGuard?.bestBid);
+    const hasAsk = Number.isFinite(bestAsk) && bestAsk > 0;
+    const hasBid = Number.isFinite(bestBid) && bestBid > 0;
+    if (!hasAsk && !hasBid) return null;
+
+    const impliedPx =
+      pxNum !== null
+        ? pxNum
+        : (qtyNum !== null && totalQuoteNum !== null && qtyNum > 0)
+          ? totalQuoteNum / qtyNum
+          : null;
+    const recommendedPrice = side === "buy" ? (hasAsk ? bestAsk : null) : (hasBid ? bestBid : null);
+    const recommendedLabel = side === "buy" ? "best ask / lowest sell" : "best bid / highest buy";
+    const mismatch =
+      impliedPx !== null &&
+      recommendedPrice !== null &&
+      (
+        side === "buy"
+          ? impliedPx + 1e-18 < recommendedPrice
+          : impliedPx - 1e-18 > recommendedPrice
+      );
+
+    return {
+      show: true,
+      side,
+      bestAsk: hasAsk ? bestAsk : null,
+      bestBid: hasBid ? bestBid : null,
+      impliedPrice: impliedPx,
+      recommendedPrice,
+      recommendedLabel,
+      mismatch,
+      symbol: polkadotOrderbookSideGuard?.symbol || String(otSymbol || "").trim().toUpperCase(),
+    };
+  }, [isPolkadotDexVenue, polkadotManualRouterFallbackAvailable, polkadotOrderbookSideGuard, side, pxNum, qtyNum, totalQuoteNum, otSymbol]);
+
+  function applyHydrationBookSideLimit() {
+    const px = hydrationManualRouterPriceGuard?.recommendedPrice;
+    if (!Number.isFinite(Number(px)) || Number(px) <= 0) return;
+    const next = fmtPlain(Number(px), { maxFrac: 18 });
+    if (!next) return;
+    limitSourceRef.current = "hydration_book_side_guard";
+    setLimitPrice(next);
+  }
+
   // ─────────────────────────────────────────────────────────────
   // Pre-trade checks
   // ─────────────────────────────────────────────────────────────
@@ -3830,6 +3949,26 @@ export default function OrderTicketWidget({
       ) {
         lines.push("Hydration BUY swaps are disabled until UTT_HYDRATION_ENABLE_EXACT_BUY=1. SELL swaps remain available.");
         fails.push("hydration_buy_swaps_disabled");
+      }
+
+      if (hydrationManualRouterPriceGuard?.mismatch) {
+        const rec = hydrationManualRouterPriceGuard.recommendedPrice;
+        const recStr = Number.isFinite(Number(rec)) ? fmtPlain(Number(rec), { maxFrac: 18 }) : "current book price";
+        if (side === "buy") {
+          lines.push(
+            hideTableData
+              ? "BUY limit is below best ask."
+              : `BUY exact-out should use the best ask / lowest sell price. Current limit is below ${recStr}; this can fail on-chain with Router.TradingLimitReached.`
+          );
+          fails.push("hydration_buy_below_best_ask");
+        } else {
+          lines.push(
+            hideTableData
+              ? "SELL limit is above best bid."
+              : `SELL exact-in should use the best bid / highest buy price. Current limit is above ${recStr}; this can fail on-chain with Router.TradingLimitReached.`
+          );
+          fails.push("hydration_sell_above_best_bid");
+        }
       }
 
       if (polkadotLiquidityWarning) {
@@ -3986,6 +4125,7 @@ export default function OrderTicketWidget({
     polkadotEffectiveStatusReason,
     polkadotStatusReason,
     polkadotLiquidityWarning,
+    hydrationManualRouterPriceGuard,
   ]);
 
   const preTradeStyle = useMemo(() => {
@@ -5470,6 +5610,55 @@ async function submitLimitOrder() {
               preTrade.lines.map((ln, i) => (
                 <div key={i}>• {ln}</div>
               ))}
+          </div>
+        )}
+
+        {hydrationManualRouterPriceGuard?.show && (
+          <div
+            style={{
+              marginTop: 6,
+              padding: "6px 8px",
+              borderRadius: 10,
+              fontSize: 11,
+              lineHeight: 1.18,
+              whiteSpace: "pre-wrap",
+              border: hydrationManualRouterPriceGuard.mismatch
+                ? "1px solid rgba(245, 158, 11, 0.55)"
+                : "1px solid rgba(59, 130, 246, 0.35)",
+              background: hydrationManualRouterPriceGuard.mismatch
+                ? "rgba(120, 72, 16, 0.18)"
+                : "rgba(30, 64, 175, 0.10)",
+              color: hydrationManualRouterPriceGuard.mismatch ? "#ffe2a6" : "#bfdbfe",
+            }}
+            title="Hydration manual Router uses synthetic/reference orderbook levels. BUY should use asks; SELL should use bids."
+          >
+            <div style={{ fontWeight: 900, marginBottom: 4 }}>
+              Hydration Router price guard
+            </div>
+            <div>
+              {side === "buy"
+                ? "BUY exact-out should use the lowest sell / best ask."
+                : "SELL exact-in should use the highest buy / best bid."}
+            </div>
+            <div>
+              Best ask: <b>{hydrationManualRouterPriceGuard.bestAsk === null ? "—" : fmtPlain(hydrationManualRouterPriceGuard.bestAsk, { maxFrac: 18 })}</b>
+              {" "}• Best bid: <b>{hydrationManualRouterPriceGuard.bestBid === null ? "—" : fmtPlain(hydrationManualRouterPriceGuard.bestBid, { maxFrac: 18 })}</b>
+            </div>
+            {hydrationManualRouterPriceGuard.mismatch && (
+              <div style={{ marginTop: 4, fontWeight: 800 }}>
+                Current limit is on the wrong side of the book and may fail with Router.TradingLimitReached.
+              </div>
+            )}
+            {hydrationManualRouterPriceGuard.recommendedPrice !== null && (
+              <button
+                type="button"
+                style={{ ...safeButton, padding: "5px 8px", marginTop: 6 }}
+                onClick={applyHydrationBookSideLimit}
+                title={`Set limit to ${hydrationManualRouterPriceGuard.recommendedLabel}`}
+              >
+                Use {side === "buy" ? "best ask" : "best bid"}
+              </button>
+            )}
           </div>
         )}
 

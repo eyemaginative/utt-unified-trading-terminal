@@ -511,6 +511,184 @@ async function bridgeFetchWalletAddresses(base, signal) {
   return [];
 }
 
+async function bridgeFetchWalletLatestBalances(base, signal) {
+  const tryUrls = [
+    "/api/wallet_addresses/balances/latest?asset=UTTT&limit=500",
+    "/api/wallet_addresses/balances/latest?limit=500",
+    "/api/wallet_addresses/balances/latest",
+  ];
+
+  for (const u of tryUrls) {
+    try {
+      const data = await spreadFetchJson(base, u, signal, 10_000);
+      const items = Array.isArray(data)
+        ? data
+        : data?.items || data?.rows || data?.balances || data?.snapshots || data?.data || [];
+      if (Array.isArray(items)) return items;
+    } catch {
+      // try next shape
+    }
+  }
+  return [];
+}
+
+
+function bridgeIsHydrationAddressRow(row) {
+  const walletId = String(row?.wallet_id ?? row?.walletId ?? row?.venue ?? row?.venue_override ?? "").trim().toLowerCase();
+  const network = String(row?.network ?? row?.chain ?? row?.network_name ?? "").trim().toLowerCase();
+  const label = String(row?.label ?? row?.name ?? "").trim().toLowerCase();
+  return (
+    walletId === "polkadot_hydration" ||
+    walletId === "hydration" ||
+    walletId.includes("hydration") ||
+    network === "hydration" ||
+    network === "polkadot_hydration" ||
+    network.includes("hydration") ||
+    label.includes("hydration")
+  );
+}
+
+function bridgeHydrationCanonicalSymbol(symbol, assetId) {
+  const s = String(symbol || "").trim();
+  const id = String(assetId || "").trim();
+  const key = (s || id).toLowerCase();
+  const byId = {
+    "0": "HDX",
+    native: "HDX",
+    hdx: "HDX",
+    "5": "DOT",
+    dot: "DOT",
+    "10": "USDT",
+    usdt: "USDT",
+    "222": "HOLLAR",
+    hollar: "HOLLAR",
+    "1001331": "UTTT",
+    "50000456": "UTTT",
+    uttt: "UTTT",
+  };
+  return byId[key] || s || id;
+}
+
+function bridgeHydrationBalanceNum(v) {
+  if (v == null || v === "") return null;
+  const n = Number(String(v).replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function bridgeNormalizeHydrationBalanceRows(data, sourceRow) {
+  const address = String(sourceRow?.address || data?.address || "").trim();
+  const label = String(sourceRow?.label || "Hydration SubWallet").trim();
+  const fetchedAt = data?.fetched_at || data?.fetchedAt || new Date().toISOString();
+
+  let rawItems = Array.isArray(data?.items)
+    ? data.items
+    : Array.isArray(data?.balances)
+      ? data.balances
+      : Array.isArray(data?.tokens)
+        ? data.tokens
+        : Array.isArray(data?.assets)
+          ? data.assets
+          : data?.balances && typeof data.balances === "object"
+            ? Object.entries(data.balances).map(([asset, value]) => ({ asset, ...(value && typeof value === "object" ? value : { total: value }) }))
+            : data?.items && typeof data.items === "object"
+              ? Object.entries(data.items).map(([asset, value]) => ({ asset, ...(value && typeof value === "object" ? value : { total: value }) }))
+              : [];
+
+  const out = [];
+  for (const it of rawItems || []) {
+    const rawAsset = String(
+      it?.symbol ??
+      it?.asset ??
+      it?.ticker ??
+      it?.currency ??
+      it?.assetSymbol ??
+      it?.asset_symbol ??
+      ""
+    ).trim();
+    const assetId = String(
+      it?.asset_id ??
+      it?.assetId ??
+      it?.id ??
+      it?.token_id ??
+      it?.tokenId ??
+      ""
+    ).trim();
+    const asset = bridgeHydrationCanonicalSymbol(rawAsset, assetId);
+
+    const free = bridgeHydrationBalanceNum(
+      it?.free_ui ??
+      it?.freeUi ??
+      it?.available_ui ??
+      it?.availableUi ??
+      it?.available ??
+      it?.free ??
+      it?.spendable ??
+      it?.amount_ui ??
+      it?.amountUi ??
+      it?.uiAmount ??
+      it?.ui_amount
+    );
+
+    const reserved = bridgeHydrationBalanceNum(
+      it?.reserved_ui ??
+      it?.reservedUi ??
+      it?.reserved ??
+      it?.hold_ui ??
+      it?.holdUi ??
+      it?.hold ??
+      it?.locked ??
+      0
+    );
+
+    const totalExplicit = bridgeHydrationBalanceNum(
+      it?.total_ui ??
+      it?.totalUi ??
+      it?.balance_ui ??
+      it?.balanceUi ??
+      it?.total ??
+      it?.balance ??
+      it?.amount
+    );
+
+    const balance = totalExplicit ?? ((free ?? 0) + (reserved ?? 0));
+    if (!asset && balance == null) continue;
+
+    out.push({
+      id: `hydration:${sourceRow?.id || address}:${asset || out.length}`,
+      wallet_address_id: sourceRow?.id,
+      wallet_id: sourceRow?.wallet_id,
+      owner_scope: sourceRow?.owner_scope,
+      asset: asset || "Hydration",
+      network: "hydration",
+      address,
+      label,
+      balance: balance ?? "",
+      usd_price: it?.usd_price ?? it?.price_usd ?? it?.priceUsd ?? "",
+      usd_value: it?.usd_value ?? it?.total_usd ?? it?.value_usd ?? "",
+      fetched_at: fetchedAt,
+      source: data?.source || data?.venue || "polkadot_dex/balances",
+    });
+  }
+  return out;
+}
+
+async function bridgeFetchHydrationLiveBalances(base, addressRows, signal) {
+  const rows = (Array.isArray(addressRows) ? addressRows : []).filter(bridgeIsHydrationAddressRow);
+  const out = [];
+  for (const row of rows) {
+    const address = String(row?.address || "").trim();
+    if (!address) continue;
+    try {
+      const data = await spreadFetchJson(base, `/api/polkadot_dex/balances?address=${encodeURIComponent(address)}`, signal, 15_000);
+      if (data?.ok === false) continue;
+      out.push(...bridgeNormalizeHydrationBalanceRows(data, row));
+    } catch {
+      // Keep Spread / Bridge refresh tolerant: missing Hydration balance rows should not break prices/records.
+    }
+  }
+  return out;
+}
+
 async function bridgeFetchUtttSupply(base, signal) {
   try {
     const data = await spreadFetchJson(base, "/api/bridge/uttt_supply?asset=UTTT", signal, 10_000);
@@ -783,11 +961,6 @@ function bridgePreviewStatusLabel(status) {
   return s || "unknown";
 }
 
-function bridgeIsHydrationAddressRow(row) {
-  const venue = String(row?.venue || row?.wallet_id || row?.walletId || row?.source || "").trim().toLowerCase();
-  const network = String(row?.network || row?.chain || row?.chain_id || row?.chainId || "").trim().toLowerCase();
-  return venue === "polkadot_hydration" || venue === "hydration" || network === "hydration";
-}
 
 function bridgeIsSolanaAddressRow(row) {
   const venue = String(row?.venue || row?.wallet_id || row?.walletId || row?.source || "").trim().toLowerCase();
@@ -987,6 +1160,132 @@ function bridgeTreasuryContext(supply, transferRecordSummary) {
   };
 }
 
+function bridgeBalanceAddress(row) {
+  return String(
+    row?.address ??
+      row?.wallet_address ??
+      row?.walletAddress ??
+      row?.owner ??
+      row?.pubkey ??
+      row?.account ??
+      row?.wallet?.address ??
+      row?.walletAddressRow?.address ??
+      ""
+  ).trim();
+}
+
+function bridgeBalanceLabel(row) {
+  return String(
+    row?.label ??
+      row?.name ??
+      row?.wallet_label ??
+      row?.walletLabel ??
+      row?.wallet?.label ??
+      row?.walletAddressRow?.label ??
+      ""
+  ).trim();
+}
+
+function bridgeBalanceAsset(row) {
+  return String(row?.asset ?? row?.symbol ?? row?.token ?? row?.currency ?? "").trim().toUpperCase();
+}
+
+function bridgeBalanceNetwork(row) {
+  return String(row?.network ?? row?.chain ?? row?.venue ?? row?.wallet?.network ?? row?.walletAddressRow?.network ?? "").trim().toLowerCase();
+}
+
+function bridgeBalanceAmount(row) {
+  return spreadNum(
+    row?.balance_ui ??
+      row?.balanceUi ??
+      row?.balance ??
+      row?.qty ??
+      row?.quantity ??
+      row?.amount ??
+      row?.free ??
+      row?.total ??
+      row?.uiAmount ??
+      row?.ui_amount
+  );
+}
+
+function bridgeBalanceSource(row) {
+  return String(row?.source ?? row?.balance_source ?? row?.balanceSource ?? row?.provider ?? "").trim();
+}
+
+function bridgeFindLiveBalance(rows, { address, network, asset = "UTTT", labelIncludes = [], labelExcludes = [] } = {}) {
+  const arr = Array.isArray(rows) ? rows : [];
+  const addr = String(address || "").trim();
+  const assetU = String(asset || "UTTT").trim().toUpperCase();
+  const networkLc = String(network || "").trim().toLowerCase();
+  const includes = (labelIncludes || []).map((x) => String(x || "").toLowerCase()).filter(Boolean);
+  const excludes = (labelExcludes || []).map((x) => String(x || "").toLowerCase()).filter(Boolean);
+
+  const ranked = [];
+  arr.forEach((row, idx) => {
+    const rowAddr = bridgeBalanceAddress(row);
+    const rowAsset = bridgeBalanceAsset(row);
+    const rowNetwork = bridgeBalanceNetwork(row);
+    const rowLabel = bridgeBalanceLabel(row).toLowerCase();
+    const amt = bridgeBalanceAmount(row);
+    if (assetU && rowAsset && rowAsset !== assetU) return;
+    if (networkLc && rowNetwork && rowNetwork !== networkLc && !(networkLc === "hydration" && rowNetwork === "polkadot_hydration")) return;
+    if (addr && rowAddr && rowAddr !== addr) return;
+    if (excludes.some((needle) => rowLabel.includes(needle))) return;
+
+    let score = 100;
+    if (addr && rowAddr === addr) score -= 75;
+    if (rowAsset === assetU) score -= 35;
+    if (networkLc && (rowNetwork === networkLc || (networkLc === "hydration" && rowNetwork === "polkadot_hydration"))) score -= 20;
+    includes.forEach((needle) => {
+      if (rowLabel.includes(needle)) score -= 15;
+    });
+    if (amt !== null) score -= 10;
+    ranked.push({ row, idx, score, amount: amt });
+  });
+
+  ranked.sort((a, b) => (a.score - b.score) || (a.idx - b.idx));
+  const best = ranked[0];
+  if (!best) return { ok: false, amount: null, row: null, source: null, label: "", address: addr || "" };
+  return {
+    ok: best.amount !== null,
+    amount: best.amount,
+    row: best.row,
+    source: bridgeBalanceSource(best.row),
+    label: bridgeBalanceLabel(best.row),
+    address: bridgeBalanceAddress(best.row),
+  };
+}
+
+function bridgeLiveTreasuryBalances(balanceRows, source, dest) {
+  const sourceLive = bridgeFindLiveBalance(balanceRows, {
+    address: source?.address,
+    network: "solana",
+    asset: "UTTT",
+    labelIncludes: ["bridge", "reserve", "vault"],
+    labelExcludes: ["mixed", "trading", "pool", "lp"],
+  });
+  const destLive = bridgeFindLiveBalance(balanceRows, {
+    address: dest?.address,
+    network: "hydration",
+    asset: "UTTT",
+    labelIncludes: ["bridge", "treasury"],
+    labelExcludes: ["initial", "allocation", "mixed", "trading", "pool", "lp"],
+  });
+  const initialAllocationLive = bridgeFindLiveBalance(balanceRows, {
+    network: "hydration",
+    asset: "UTTT",
+    labelIncludes: ["initial", "allocation", "treasury"],
+    labelExcludes: ["bridge", "pool", "lp"],
+  });
+  return {
+    sourceReserve: sourceLive,
+    destinationTreasury: destLive,
+    initialAllocation: initialAllocationLive,
+    hasAnyLive: !!(sourceLive.ok || destLive.ok || initialAllocationLive.ok),
+  };
+}
+
 function bridgeSourceEvidenceLabel(mechanism) {
   const raw = String(mechanism || "").trim().toLowerCase();
   if (raw === "vault_deposit_mint_xcm") return "Solana bridge-vault deposit tx/signature";
@@ -1128,6 +1427,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   );
   const [showViewedCancelledRecords, setShowViewedCancelledRecords] = useState(false);
   const [addresses, setAddresses] = useState([]);
+  const [walletBalanceRows, setWalletBalanceRows] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const abortRef = useRef(null);
@@ -1173,16 +1473,20 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     setBusy(true);
     setErr("");
     try {
-      const [nextSnap, rows, nextSupply, nextTransferStatus] = await Promise.all([
+      const [nextSnap, rows, latestBalances, nextSupply, nextTransferStatus] = await Promise.all([
         spreadFetchSnapshot(base, controller.signal).catch((e) => ({ ok: false, error: String(e?.message || e) })),
         bridgeFetchWalletAddresses(base, controller.signal),
+        bridgeFetchWalletLatestBalances(base, controller.signal),
         bridgeFetchUtttSupply(base, controller.signal),
         bridgeFetchTransferRecordStatus(base, controller.signal),
       ]);
+      const hydrationLiveBalances = await bridgeFetchHydrationLiveBalances(base, rows, controller.signal);
+      const mergedBalances = [...(hydrationLiveBalances || []), ...(latestBalances || [])];
       const cachedSnap = spreadReadCache();
       const mergedSnap = spreadMergeSnapshot(snap || cachedSnap, nextSnap);
       setSnap(mergedSnap);
       setAddresses(rows);
+      setWalletBalanceRows(mergedBalances);
       setSupply(nextSupply);
       setTransferStatus(nextTransferStatus);
       if (mergedSnap?.ok) spreadWriteCache(mergedSnap);
@@ -1330,6 +1634,10 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   const sourceSupplyRow = direction === "sol_to_hyd" ? solSupply : polkaSupply;
   const destSupplyRow = direction === "sol_to_hyd" ? polkaSupply : solSupply;
   const bridgeTreasury = useMemo(() => bridgeTreasuryContext(supply, transferRecordSummary), [supply, transferRecordSummary]);
+  const liveTreasury = useMemo(
+    () => bridgeLiveTreasuryBalances(walletBalanceRows, source, dest),
+    [walletBalanceRows, source, dest]
+  );
   const showBridgeTreasuryContext = direction === "sol_to_hyd" && bridgeIsVaultMintXcm(bridgeMechanism);
 
   const qty = spreadNum(amount);
@@ -2100,15 +2408,30 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
               {showBridgeTreasuryContext ? (
                 <>
                   <div style={rowStyle}>
-                    <span style={labelStyle}>Bridge source reserve</span>
+                    <span style={labelStyle}>Live source reserve</span>
                     <span style={valueStyle}>
-                      {hideTableData ? "••••" : spreadFmtQty(bridgeTreasury.sourceReserveAmount)} UTTT
+                      {hideTableData ? "••••" : spreadFmtQty(liveTreasury.sourceReserve.ok ? liveTreasury.sourceReserve.amount : bridgeTreasury.sourceReserveAmount)} UTTT
+                      <span style={{ color: "#9ca3af", marginLeft: 6 }}>
+                        {liveTreasury.sourceReserve.ok ? "live" : "record-derived"}
+                      </span>
                     </span>
                   </div>
                   <div style={rowStyle}>
-                    <span style={labelStyle}>Bridge destination treasury</span>
+                    <span style={labelStyle}>Live destination treasury</span>
                     <span style={valueStyle}>
-                      {hideTableData ? "••••" : spreadFmtQty(bridgeTreasury.destinationTreasuryAmount)} UTTT
+                      {hideTableData ? "••••" : spreadFmtQty(liveTreasury.destinationTreasury.ok ? liveTreasury.destinationTreasury.amount : bridgeTreasury.destinationTreasuryAmount)} UTTT
+                      <span style={{ color: "#9ca3af", marginLeft: 6 }}>
+                        {liveTreasury.destinationTreasury.ok ? "live" : "record-derived"}
+                      </span>
+                    </span>
+                  </div>
+                  <div style={rowStyle}>
+                    <span style={labelStyle}>Live initial allocation treasury</span>
+                    <span style={valueStyle}>
+                      {hideTableData ? "••••" : spreadFmtQty(liveTreasury.initialAllocation.amount)} UTTT
+                      <span style={{ color: "#9ca3af", marginLeft: 6 }}>
+                        {liveTreasury.initialAllocation.ok ? "live" : "not loaded"}
+                      </span>
                     </span>
                   </div>
                   <div style={rowStyle}>
@@ -2131,7 +2454,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                 </>
               )}
               <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>
-                Values above use the entered transfer amount. Bridge treasury rows are record-derived until live treasury balance sync is wired; canonical supply is shown below.
+                Values above use the entered transfer amount. Treasury rows use live Wallet Address balance snapshots when available and fall back to reconciled bridge records; canonical supply is shown below.
               </div>
             </div>
 

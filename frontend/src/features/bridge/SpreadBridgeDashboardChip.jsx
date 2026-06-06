@@ -708,6 +708,15 @@ async function bridgeFetchTransferRecordStatus(base, signal) {
   }
 }
 
+async function bridgeFetchTreasuryRegistry(base, signal) {
+  try {
+    const data = await spreadFetchJson(base, "/api/bridge/uttt_treasury_registry?asset=UTTT", signal, 10_000);
+    return data && typeof data === "object" ? data : { ok: false, error: "bridge_treasury_registry_unexpected_response", roles: [] };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e || "Treasury registry unavailable"), roles: [] };
+  }
+}
+
 function bridgeApiErrorMessage(data, fallback) {
   const detail = data?.detail ?? data?.error ?? data?.message;
   if (!detail) return fallback;
@@ -1286,6 +1295,32 @@ function bridgeLiveTreasuryBalances(balanceRows, source, dest) {
   };
 }
 
+function bridgeTreasuryRegistryRoles(registry) {
+  return Array.isArray(registry?.roles) ? registry.roles : [];
+}
+
+function bridgeTreasuryRegistryStatusLabel(role) {
+  if (!role || typeof role !== "object") return "missing";
+  if (role.ready && role.addressMatches) return "configured + registered";
+  if (role.ready && role.inferredFromWallet) return "registered";
+  if (role.registered && role.configured && !role.addressMatches) return "address mismatch";
+  if (role.registered) return "registered";
+  if (role.configured) return "configured only";
+  return "missing";
+}
+
+function bridgeTreasuryRegistryStatusColor(role) {
+  const label = bridgeTreasuryRegistryStatusLabel(role);
+  if (label === "configured + registered" || label === "registered") return "#7ee787";
+  if (label === "address mismatch") return "#ffb86b";
+  if (label === "configured only") return "#f7b955";
+  return "#ff7b72";
+}
+
+function bridgeTreasuryRegistryAddress(role) {
+  return String(role?.address || role?.registeredAddress || role?.configuredAddress || "").trim();
+}
+
 function bridgeSourceEvidenceLabel(mechanism) {
   const raw = String(mechanism || "").trim().toLowerCase();
   if (raw === "vault_deposit_mint_xcm") return "Solana bridge-vault deposit tx/signature";
@@ -1428,6 +1463,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   const [showViewedCancelledRecords, setShowViewedCancelledRecords] = useState(false);
   const [addresses, setAddresses] = useState([]);
   const [walletBalanceRows, setWalletBalanceRows] = useState([]);
+  const [treasuryRegistry, setTreasuryRegistry] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const abortRef = useRef(null);
@@ -1473,12 +1509,13 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     setBusy(true);
     setErr("");
     try {
-      const [nextSnap, rows, latestBalances, nextSupply, nextTransferStatus] = await Promise.all([
+      const [nextSnap, rows, latestBalances, nextSupply, nextTransferStatus, nextTreasuryRegistry] = await Promise.all([
         spreadFetchSnapshot(base, controller.signal).catch((e) => ({ ok: false, error: String(e?.message || e) })),
         bridgeFetchWalletAddresses(base, controller.signal),
         bridgeFetchWalletLatestBalances(base, controller.signal),
         bridgeFetchUtttSupply(base, controller.signal),
         bridgeFetchTransferRecordStatus(base, controller.signal),
+        bridgeFetchTreasuryRegistry(base, controller.signal),
       ]);
       const hydrationLiveBalances = await bridgeFetchHydrationLiveBalances(base, rows, controller.signal);
       const mergedBalances = [...(hydrationLiveBalances || []), ...(latestBalances || [])];
@@ -1489,6 +1526,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
       setWalletBalanceRows(mergedBalances);
       setSupply(nextSupply);
       setTransferStatus(nextTransferStatus);
+      setTreasuryRegistry(nextTreasuryRegistry);
       if (mergedSnap?.ok) spreadWriteCache(mergedSnap);
       if (nextSnap?.error && !mergedSnap?.partialPriceRefresh) setErr(nextSnap.error);
     } catch (e) {
@@ -1626,6 +1664,7 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     const viewedSet = new Set((viewedCancelledRecordIds || []).map((id) => String(id || "").trim()).filter(Boolean));
     return items.filter((row) => String(row?.status || "").trim().toUpperCase() === "CANCELLED" && viewedSet.has(String(row?.id || "").trim())).length;
   }, [transferRecordSummary, viewedCancelledRecordIds]);
+  const treasuryRegistryRoles = useMemo(() => bridgeTreasuryRegistryRoles(treasuryRegistry), [treasuryRegistry]);
 
   const source = direction === "sol_to_hyd" ? solWallet : hydWallet;
   const dest = direction === "sol_to_hyd" ? hydWallet : solWallet;
@@ -2550,6 +2589,45 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                 </div>
               ) : null}
             </div>
+
+            {treasuryRegistryRoles.length ? (
+              <div style={{ ...panelCardStyle, marginTop: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline", marginBottom: 6 }}>
+                  <div style={{ fontWeight: 900 }}>Official UTTT treasury registry</div>
+                  <div style={{ fontSize: 11, color: treasuryRegistry?.ready ? "#7ee787" : "#f7b955" }}>
+                    {treasuryRegistry?.ready ? "ready for review sync" : "needs address review"}
+                  </div>
+                </div>
+                <div style={{ display: "grid", gap: 6 }}>
+                  {treasuryRegistryRoles.map((role) => {
+                    const statusLabel = bridgeTreasuryRegistryStatusLabel(role);
+                    const addr = bridgeTreasuryRegistryAddress(role);
+                    return (
+                      <div key={role.role || role.label} style={{ display: "grid", gridTemplateColumns: "minmax(150px, 1fr) minmax(150px, 1fr) auto", gap: 8, alignItems: "center", padding: "6px 7px", borderRadius: 8, background: "rgba(255,255,255,0.035)" }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontWeight: 800 }}>{role.label || role.role}</div>
+                          <div style={{ opacity: 0.62 }}>{role.chainLabel || role.chain} · {role.asset || "UTTT"}</div>
+                        </div>
+                        <div style={{ minWidth: 0, opacity: 0.84 }}>
+                          {hideTableData ? "••••" : bridgeShortAddress(addr, 8, 7)}
+                        </div>
+                        <div style={{ fontSize: 11, color: bridgeTreasuryRegistryStatusColor(role), whiteSpace: "nowrap" }}>
+                          {statusLabel}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{ marginTop: 7, fontSize: 11, color: "#9ca3af", lineHeight: 1.35 }}>
+                  Registry is read-only. It defines the treasury roles that future bridge auto-detection should use; candidate creation and reconciliation stay review-only.
+                </div>
+                {treasuryRegistry?.warnings?.length ? (
+                  <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                    {treasuryRegistry.warnings.join(" ")}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
 
             <div style={{ marginTop: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(247,185,85,0.35)", background: "rgba(247,185,85,0.10)", fontSize: 12 }}>
               Execution is intentionally disabled here. For the 10M UTTT tranche, use the vault/mint/XCM workflow to create a local planned record, then link Solana vault-deposit, Asset Hub mint, and Hydration receive evidence before reconciling.

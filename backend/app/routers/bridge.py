@@ -32,6 +32,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    return text or default
+
+
 def _token_registry_rows(db: Optional[Session], symbol: str) -> List[TokenRegistry]:
     if db is None:
         return []
@@ -118,6 +126,54 @@ _BRIDGE_TRANSFER_MECHANISMS = {
     "xcm_transfer",
     "external_bridge",
 }
+
+
+_UTTT_TREASURY_ROLE_DEFINITIONS: List[Dict[str, Any]] = [
+    {
+        "role": "solana_bridge_reserve",
+        "label": "UTTT Solana Bridge Reserve",
+        "chain": "solana",
+        "asset": "UTTT",
+        "env": "UTT_UTTT_SOLANA_BRIDGE_RESERVE_ADDRESS",
+        "defaultAddress": "4zW3sGbsrCVYYAbuDM2QgtU1Xe9qnpYPFxZSprnkTPDJ",
+        "requiredTerms": ["solana", "bridge", "reserve"],
+        "avoidTerms": ["mixed", "trading", "pool", "lp", "initial"],
+        "purpose": "Canonical Solana-side bridge reserve backing the current Hydration bridge tranche.",
+    },
+    {
+        "role": "hydration_bridge_treasury",
+        "label": "UTTT Hydration Bridge Treasury",
+        "chain": "hydration",
+        "asset": "UTTT",
+        "env": "UTT_UTTT_HYDRATION_BRIDGE_TREASURY_ADDRESS",
+        "defaultAddress": None,
+        "requiredTerms": ["hydration", "bridge", "treasury"],
+        "avoidTerms": ["initial", "allocation", "mixed", "trading", "pool", "lp"],
+        "purpose": "Hydration-side bridge treasury for the reconciled vault/mint/XCM tranche.",
+    },
+    {
+        "role": "hydration_initial_allocation_treasury",
+        "label": "UTTT Hydration Initial Allocation Treasury",
+        "chain": "hydration",
+        "asset": "UTTT",
+        "env": "UTT_UTTT_HYDRATION_INITIAL_ALLOCATION_TREASURY_ADDRESS",
+        "defaultAddress": None,
+        "requiredTerms": ["hydration", "initial", "allocation", "treasury"],
+        "avoidTerms": ["bridge", "pool", "lp", "mixed", "trading"],
+        "purpose": "Hydration treasury holding the deferred 29M initial allocation tranche.",
+    },
+    {
+        "role": "asset_hub_issuer_staging",
+        "label": "UTTT Asset Hub Issuer / Staging",
+        "chain": "polkadot_asset_hub",
+        "asset": "UTTT",
+        "env": "UTT_UTTT_ASSET_HUB_ISSUER_STAGING_ADDRESS",
+        "defaultAddress": None,
+        "requiredTerms": ["asset", "hub", "issuer"],
+        "avoidTerms": ["mixed", "trading", "pool", "lp"],
+        "purpose": "Polkadot Asset Hub issuer/staging account used for mint/XCM evidence.",
+    },
+]
 
 
 class BridgeTransferPreviewRequest(BaseModel):
@@ -285,6 +341,169 @@ def _bridge_wallet_payload(row: Optional[WalletAddress]) -> Optional[Dict[str, A
         "wallet_id": row.wallet_id,
         "address": row.address,
         "label": row.label,
+    }
+
+
+def _bridge_wallet_haystack(row: Optional[WalletAddress]) -> str:
+    if row is None:
+        return ""
+    return " ".join(
+        str(x or "").strip().lower()
+        for x in [
+            row.label,
+            row.wallet_id,
+            row.owner_scope,
+            row.network,
+            row.asset,
+            row.address,
+        ]
+        if str(x or "").strip()
+    )
+
+
+def _bridge_wallet_role_match_score(row: WalletAddress, definition: Dict[str, Any]) -> Optional[int]:
+    asset_u = _bridge_norm_asset(definition.get("asset") or "UTTT")
+    row_asset = str(row.asset or "").strip().upper()
+    if row_asset and row_asset not in {asset_u, "ALL", "*"}:
+        return None
+
+    aliases = set(_bridge_wallet_network_aliases(str(definition.get("chain") or "")))
+    row_network = str(row.network or "").strip().lower()
+    if aliases and row_network and row_network not in aliases:
+        return None
+
+    configured_address = _bridge_clean_str(definition.get("address"))
+    row_address = _bridge_clean_str(row.address)
+    haystack = _bridge_wallet_haystack(row)
+
+    score = 100
+    if configured_address and row_address and row_address == configured_address:
+        score -= 100
+    elif configured_address and row_address and row_address != configured_address:
+        score += 45
+
+    if row_asset == asset_u:
+        score -= 35
+    elif row_asset in {"ALL", "*"}:
+        score -= 8
+
+    if aliases and row_network in aliases:
+        score -= 20
+
+    for term in definition.get("requiredTerms") or []:
+        text = str(term or "").strip().lower()
+        if text and text in haystack:
+            score -= 12
+
+    for term in definition.get("avoidTerms") or []:
+        text = str(term or "").strip().lower()
+        if text and text in haystack:
+            score += 18
+
+    return score
+
+
+def _bridge_pick_treasury_wallet(db: Session, definition: Dict[str, Any]) -> tuple[Optional[WalletAddress], Optional[int]]:
+    try:
+        aliases = _bridge_wallet_network_aliases(str(definition.get("chain") or ""))
+        q = db.query(WalletAddress)
+        if aliases:
+            q = q.filter(WalletAddress.network.in_(aliases))
+        configured_address = _bridge_clean_str(definition.get("address"))
+        if configured_address:
+            direct = q.filter(WalletAddress.address == configured_address).order_by(WalletAddress.created_at.desc()).first()
+            if direct is not None:
+                return direct, _bridge_wallet_role_match_score(direct, definition)
+        rows = q.order_by(WalletAddress.created_at.desc()).limit(250).all()
+    except Exception:
+        return None, None
+
+    ranked: List[tuple[int, WalletAddress]] = []
+    for row in rows:
+        score = _bridge_wallet_role_match_score(row, definition)
+        if score is not None:
+            ranked.append((score, row))
+    ranked.sort(key=lambda x: x[0])
+    return ranked[0] if ranked else (None, None)
+
+
+def _bridge_treasury_registry_payload(db: Session, *, asset: str = "UTTT") -> Dict[str, Any]:
+    asset_u = _bridge_norm_asset(asset)
+    roles: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    for base_definition in _UTTT_TREASURY_ROLE_DEFINITIONS:
+        definition = dict(base_definition)
+        configured_address = _env_str(str(definition.get("env") or ""), definition.get("defaultAddress"))
+        definition["address"] = configured_address
+
+        wallet, score = _bridge_pick_treasury_wallet(db, definition)
+        wallet_payload = _bridge_wallet_payload(wallet)
+        registered_address = _bridge_clean_str(wallet_payload.get("address") if wallet_payload else None)
+        expected_address = _bridge_clean_str(configured_address)
+        address_matches = bool(expected_address and registered_address and expected_address == registered_address)
+        inferred_from_wallet = bool(wallet_payload and not expected_address)
+        configured = bool(expected_address)
+        registered = bool(wallet_payload)
+        ready = bool(registered and (address_matches or inferred_from_wallet or not expected_address))
+
+        if not registered:
+            warnings.append(f"{definition.get('label')} is not registered in Wallet Addresses yet.")
+        elif expected_address and not address_matches:
+            warnings.append(f"{definition.get('label')} registered address does not match configured official address.")
+
+        roles.append({
+            "role": definition.get("role"),
+            "label": definition.get("label"),
+            "asset": asset_u,
+            "chain": _bridge_norm_chain(definition.get("chain")),
+            "chainLabel": _bridge_chain_label(str(definition.get("chain") or "")),
+            "env": definition.get("env"),
+            "configuredAddress": expected_address,
+            "registeredAddress": registered_address,
+            "address": expected_address or registered_address,
+            "registered": registered,
+            "configured": configured,
+            "addressMatches": address_matches,
+            "inferredFromWallet": inferred_from_wallet,
+            "ready": ready,
+            "wallet": wallet_payload,
+            "matchScore": score,
+            "purpose": definition.get("purpose"),
+            "requiredTerms": definition.get("requiredTerms") or [],
+            "avoidTerms": definition.get("avoidTerms") or [],
+        })
+
+    ready_count = sum(1 for r in roles if r.get("ready"))
+    configured_count = sum(1 for r in roles if r.get("configured"))
+    registered_count = sum(1 for r in roles if r.get("registered"))
+
+    return {
+        "ok": True,
+        "asset": asset_u,
+        "model": "official_uttt_treasury_registry_v1",
+        "roles": roles,
+        "count": len(roles),
+        "readyCount": ready_count,
+        "configuredCount": configured_count,
+        "registeredCount": registered_count,
+        "ready": ready_count >= 3,
+        "warnings": warnings,
+        "sync": {
+            "autoDetectEnabled": False,
+            "candidateBuilderEnabled": False,
+            "reviewRequired": True,
+            "message": "Treasury registry is read-only. Address sync/candidate creation remains review-only and is not yet enabled.",
+            "next": [
+                "Use these official treasury roles as the source of truth for bridge detection.",
+                "Detect Solana reserve movements, Asset Hub mint/XCM events, and Hydration treasury receives.",
+                "Build review-only candidate transfer records before enabling any automated reconciliation.",
+            ],
+        },
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "ledgerFifoMutation": False,
+        },
     }
 
 
@@ -937,6 +1156,7 @@ def bridge_transfer_records_status() -> Dict[str, Any]:
         },
         "endpoints": {
             "status": "GET /api/bridge/transfer_records/status",
+            "treasury_registry": "GET /api/bridge/uttt_treasury_registry",
             "list": "GET /api/bridge/transfer_records",
             "preview": "POST /api/bridge/transfer_records/preview",
             "create": "POST /api/bridge/transfer_records",
@@ -974,6 +1194,20 @@ def bridge_transfer_records_status() -> Dict[str, Any]:
         },
         "nextRequired": "Use vault_deposit_mint_xcm for the 10M Solana-to-Hydration UTTT record. Apply-basis-transfer preview remains read-only and the actual apply endpoint remains disabled until a real bridge transfer is ready for testing.",
     }
+
+
+@router.get("/uttt_treasury_registry")
+def bridge_uttt_treasury_registry(
+    asset: str = Query("UTTT", description="Asset symbol. Currently optimized for UTTT."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Read-only official UTTT treasury registry for bridge/spread detection.
+
+    This endpoint does not scan chains, create transfer records, execute bridge
+    actions, or mutate ledger/FIFO state. It resolves the configured/registered
+    treasury roles that later auto-detection should use as source-of-truth.
+    """
+    return _bridge_treasury_registry_payload(db, asset=asset)
 
 
 @router.get("/transfer_records")

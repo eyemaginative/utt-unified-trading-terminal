@@ -1033,7 +1033,6 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         validation,
         normalizedRoute: reversedRoute,
         errors: Array.isArray(validation?.errors) ? validation.errors : [],
-        warnings: Array.isArray(validation?.warnings) ? validation.warnings : [],
         original: j?.original || null,
         template: {
           source: "reverse_preview",

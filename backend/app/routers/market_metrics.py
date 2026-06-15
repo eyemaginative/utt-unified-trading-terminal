@@ -3,7 +3,33 @@ from __future__ import annotations
 
 from typing import Optional
 
+import os
+
 from fastapi import APIRouter, Query
+
+
+def _install_certifi_ca_env() -> None:
+    """Point stdlib/requests-style HTTPS clients at certifi when available.
+
+    Market metrics may be fetched by service code through urllib/urlopen, which
+    does not always use the same certifi bundle that requests/httpx use.  Keep
+    verification enabled, but make the CA bundle explicit before importing the
+    service module.
+    """
+    try:
+        import certifi  # type: ignore
+
+        ca_path = certifi.where()
+    except Exception:
+        return
+
+    if ca_path:
+        os.environ.setdefault("SSL_CERT_FILE", ca_path)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_path)
+        os.environ.setdefault("CURL_CA_BUNDLE", ca_path)
+
+
+_install_certifi_ca_env()
 
 from ..services.market_metrics import get_market_metrics_summary
 

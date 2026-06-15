@@ -99,6 +99,31 @@ function cellTitle(v) {
   return String(v);
 }
 
+function volumeRowHasData(row) {
+  return [row?.volume_24h_usd, row?.volume_24h_base, row?.liquidity_usd].some((v) => toNum(v) !== null);
+}
+
+function metricMessageText(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return v;
+  return String(v?.message || v?.error || v?.detail || "");
+}
+
+function volumeRefreshLooksFailed(rows, errors) {
+  const rowList = Array.isArray(rows) ? rows : [];
+  const errorList = Array.isArray(errors) ? errors : [];
+  if (!rowList.length) return false;
+  const anyData = rowList.some(volumeRowHasData);
+  if (anyData) return false;
+  const text = [
+    ...errorList.map(metricMessageText),
+    ...rowList.flatMap((r) => (Array.isArray(r?.warnings) ? r.warnings : [])),
+  ]
+    .join(" ")
+    .toLowerCase();
+  return Boolean(text.match(/ssl|certificate|urlopen|coingecko|unavailable|failed|timeout|rate/));
+}
+
 export default function VolumeWindow({
   apiBase,
   selectedSymbol = "",
@@ -224,12 +249,22 @@ export default function VolumeWindow({
       const json = await fetchJson(`${base}/api/market_metrics/summary?${p.toString()}`);
       if (!mountedRef.current || requestSeqRef.current !== seq) return;
       const nextRows = Array.isArray(json?.items) ? json.items : [];
+      const nextErrors = Array.isArray(json?.errors) ? json.errors : [];
+      if (rows.length && volumeRefreshLooksFailed(nextRows, nextErrors)) {
+        setErr("Volume refresh failed; keeping last good snapshot.");
+        setErrors([
+          { message: "Last good volume snapshot retained because the refresh returned no usable metric data." },
+          ...nextErrors,
+        ]);
+        return;
+      }
       setRows(nextRows);
-      setErrors(Array.isArray(json?.errors) ? json.errors : []);
+      setErrors(nextErrors);
       setLastUpdated(json?.updated_at || new Date().toISOString());
     } catch (e) {
       if (!mountedRef.current || requestSeqRef.current !== seq || isAbortLikeError(e)) return;
-      setErr(String(e?.message || e || "Volume refresh failed"));
+      const priorNote = rows.length ? "; keeping last good snapshot" : "";
+      setErr(`${String(e?.message || e || "Volume refresh failed")}${priorNote}`);
     } finally {
       if (mountedRef.current && requestSeqRef.current === seq) setBusy(false);
     }

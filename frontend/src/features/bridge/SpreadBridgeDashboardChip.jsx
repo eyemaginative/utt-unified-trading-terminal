@@ -717,6 +717,54 @@ async function bridgeFetchTreasuryRegistry(base, signal) {
   }
 }
 
+
+async function bridgeFetchSolanaReserveMovements(base, signal) {
+  try {
+    const data = await spreadFetchJson(base, "/api/bridge/uttt_solana_reserve_movements?asset=UTTT&limit=12&tx_limit=8&cache_limit=100&use_cache=true&fail_soft=true", signal, 25_000);
+    return data && typeof data === "object"
+      ? data
+      : { ok: false, error: "bridge_solana_reserve_movements_unexpected_response", movements: [] };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e || "Solana reserve movement preview unavailable"), movements: [] };
+  }
+}
+
+
+async function bridgeFetchAssetHubEvidence(base, signal) {
+  try {
+    const data = await spreadFetchJson(base, "/api/bridge/uttt_asset_hub_evidence_preview?asset=UTTT&limit=50", signal, 15_000);
+    return data && typeof data === "object"
+      ? data
+      : { ok: false, error: "bridge_asset_hub_evidence_unexpected_response", groups: [], events: [] };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e || "Asset Hub evidence preview unavailable"), groups: [], events: [] };
+  }
+}
+
+
+async function bridgeFetchHydrationTreasuryMovements(base, signal) {
+  try {
+    const data = await spreadFetchJson(base, "/api/bridge/uttt_hydration_treasury_movements_preview?asset=UTTT&limit=50", signal, 15_000);
+    return data && typeof data === "object"
+      ? data
+      : { ok: false, error: "bridge_hydration_treasury_movements_unexpected_response", movements: [] };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e || "Hydration treasury movement preview unavailable"), movements: [] };
+  }
+}
+
+
+async function bridgeFetchBridgeCandidatePreview(base, signal) {
+  try {
+    const data = await spreadFetchJson(base, "/api/bridge/uttt_bridge_candidate_preview?asset=UTTT&limit=50", signal, 15_000);
+    return data && typeof data === "object"
+      ? data
+      : { ok: false, error: "bridge_candidate_preview_unexpected_response", evidenceSets: [], reviewCandidates: [] };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e || "Bridge candidate preview unavailable"), evidenceSets: [], reviewCandidates: [] };
+  }
+}
+
 function bridgeApiErrorMessage(data, fallback) {
   const detail = data?.detail ?? data?.error ?? data?.message;
   if (!detail) return fallback;
@@ -1321,6 +1369,258 @@ function bridgeTreasuryRegistryAddress(role) {
   return String(role?.address || role?.registeredAddress || role?.configuredAddress || "").trim();
 }
 
+
+function bridgeSolanaReserveMovementItems(data) {
+  return Array.isArray(data?.movements) ? data.movements : [];
+}
+
+function bridgeSolanaReserveCandidateItems(data) {
+  return Array.isArray(data?.candidateEvidence) ? data.candidateEvidence : [];
+}
+
+function bridgeSolanaReserveMovementPreviewDetail(data) {
+  if (!data || data.ok) return "";
+  const detail = data.detail || data.error || data.message;
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (typeof detail?.message === "string") return detail.message;
+  if (typeof detail?.error === "string") return detail.error;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return String(data.message || data.error || "preview unavailable");
+  }
+}
+
+function bridgeSolanaReserveMovementLabel(row) {
+  const c = String(row?.classification || row?.direction || "").trim().toLowerCase();
+  if (c === "inbound_reserve_deposit" || c === "inbound") return "inbound reserve deposit";
+  if (c === "outbound_reserve_release" || c === "outbound") return "outbound reserve release";
+  return c || "movement";
+}
+
+function bridgeSolanaReserveMovementColor(row) {
+  if (row?.matchedTransferRecord) return "#7ee787";
+  const dir = String(row?.direction || "").trim().toLowerCase();
+  if (dir === "inbound") return "#58a6ff";
+  if (dir === "outbound") return "#f7b955";
+  return "#9ca3af";
+}
+
+function bridgeSolanaReserveMovementTime(row) {
+  const t = Number(row?.blockTime || 0);
+  if (!Number.isFinite(t) || t <= 0) return "time unknown";
+  try {
+    return new Date(t * 1000).toLocaleString();
+  } catch {
+    return String(t);
+  }
+}
+
+
+function bridgeSolanaReserveMovementCacheLabel(data) {
+  const cache = data?.cache || {};
+  if (!cache?.enabled) return "live only";
+  if (cache?.servedFromCache) return "cached fallback";
+  if (cache?.writeOk === false) return "live · cache write failed";
+  if (Number(cache?.cachedMovementCountBefore || 0) > 0 && Number(data?.freshMovementCount || 0) >= 0) return "live + cache";
+  return "live cached";
+}
+
+function bridgeSolanaReserveMovementCacheTime(data) {
+  const raw = data?.cache?.updatedAtUtc;
+  if (!raw) return "";
+  try {
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toLocaleString();
+  } catch {
+    return "";
+  }
+}
+
+
+function bridgeSolanaReserveMovementMatchLabel(row) {
+  const matched = row?.matchedTransferRecord;
+  if (!matched) return "unmatched";
+  const matchedBy = String(matched.matchedBy || "").trim();
+  const confidence = String(matched.matchConfidence || "").trim();
+  const id = matched.id ? bridgeShortAddress(matched.id, 5, 5) : "";
+  const method =
+    matchedBy === "source_signature" ? "signature" :
+    matchedBy === "amount_vault_workflow" ? "amount+vault" :
+    matchedBy || "record";
+  const status = matched.status ? String(matched.status).trim().toUpperCase() : "MATCHED";
+  return `${status} · ${method}${confidence ? ` · ${confidence}` : ""}${id ? ` · ${id}` : ""}`;
+}
+
+function bridgeSolanaReserveMovementMatchTitle(row) {
+  const matched = row?.matchedTransferRecord;
+  if (!matched) return "No local bridge transfer record matched this movement.";
+  return matched.matchReason || "Movement matched a local bridge transfer record.";
+}
+
+
+function bridgeAssetHubEvidenceGroups(data) {
+  return Array.isArray(data?.groups) ? data.groups : [];
+}
+
+function bridgeAssetHubEvidenceEvents(data) {
+  return Array.isArray(data?.events) ? data.events : [];
+}
+
+function bridgeAssetHubEvidenceLabel(row) {
+  const kind = String(row?.kind || row?.classification || "").trim().toLowerCase();
+  if (kind === "asset_hub_mint") return "Asset Hub mint";
+  if (kind === "asset_hub_xcm_send") return "Asset Hub → Hydration XCM";
+  if (kind === "hydration_receive_reference") return "Hydration receive reference";
+  return kind || "evidence";
+}
+
+function bridgeAssetHubEvidenceColor(row) {
+  const matched = row?.matchedTransferRecord;
+  if (matched) return "#7ee787";
+  return "#f7b955";
+}
+
+function bridgeAssetHubEvidenceStatusLabel(row) {
+  const matched = row?.matchedTransferRecord;
+  if (!matched) return "review";
+  const status = matched.status ? String(matched.status).trim().toUpperCase() : "MATCHED";
+  const confidence = matched.matchConfidence ? ` · ${matched.matchConfidence}` : "";
+  const id = matched.id ? ` · ${bridgeShortAddress(matched.id, 5, 5)}` : "";
+  return `${status}${confidence}${id}`;
+}
+
+function bridgeAssetHubEvidenceStatusTitle(row) {
+  const matched = row?.matchedTransferRecord;
+  return matched?.matchReason || "Asset Hub evidence is display-only and must be reviewed before any future candidate action.";
+}
+
+function bridgeAssetHubEvidencePreviewDetail(data) {
+  if (!data || data.ok) return "";
+  const detail = data.detail || data.error || data.message;
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (typeof detail?.message === "string") return detail.message;
+  if (typeof detail?.error === "string") return detail.error;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return String(data.message || data.error || "preview unavailable");
+  }
+}
+
+
+function bridgeHydrationTreasuryMovementItems(data) {
+  return Array.isArray(data?.movements) ? data.movements : [];
+}
+
+function bridgeHydrationTreasuryMovementLabel(row) {
+  const kind = String(row?.kind || row?.classification || "").trim().toLowerCase();
+  if (kind === "hydration_treasury_receive" || kind === "hydration_bridge_treasury_receive") return "Hydration treasury receive";
+  if (kind === "hydration_treasury_outbound" || kind === "hydration_bridge_treasury_transfer") return "Hydration treasury transfer";
+  return kind || "Hydration movement";
+}
+
+function bridgeHydrationTreasuryMovementColor(row) {
+  const dir = String(row?.direction || "").trim().toLowerCase();
+  if (dir === "inbound") return "#7ee787";
+  if (dir === "outbound") return "#f7b955";
+  return row?.matchedTransferRecord ? "#7ee787" : "#9ca3af";
+}
+
+function bridgeHydrationTreasuryMovementStatusLabel(row) {
+  const matched = row?.matchedTransferRecord;
+  if (!matched) return "review";
+  const status = matched.status ? String(matched.status).trim().toUpperCase() : "MATCHED";
+  const confidence = matched.matchConfidence ? ` · ${matched.matchConfidence}` : "";
+  const id = matched.id ? ` · ${bridgeShortAddress(matched.id, 5, 5)}` : "";
+  return `${status}${confidence}${id}`;
+}
+
+function bridgeHydrationTreasuryMovementStatusTitle(row) {
+  const matched = row?.matchedTransferRecord;
+  return matched?.matchReason || "Hydration treasury movement is display-only and must be reviewed before any future candidate action.";
+}
+
+function bridgeHydrationTreasuryPreviewDetail(data) {
+  if (!data || data.ok) return "";
+  const detail = data.detail || data.error || data.message;
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (typeof detail?.message === "string") return detail.message;
+  if (typeof detail?.error === "string") return detail.error;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return String(data.message || data.error || "preview unavailable");
+  }
+}
+
+
+function bridgeCandidatePreviewMatchedSets(data) {
+  return Array.isArray(data?.matchedEvidenceSets) ? data.matchedEvidenceSets : [];
+}
+
+function bridgeCandidatePreviewReviewCandidates(data) {
+  return Array.isArray(data?.reviewCandidates) ? data.reviewCandidates : [];
+}
+
+function bridgeCandidateEvidenceSetLabel(row) {
+  const status = String(row?.status || "").trim().toLowerCase();
+  if (status === "matched_existing_record") return "Matched bridge evidence set";
+  if (status === "source_only_candidate") return "Source-only bridge candidate";
+  if (status === "ignored_cancelled_record") return "Ignored cancelled bridge record";
+  return "Bridge evidence set";
+}
+
+function bridgeCandidateEvidenceSetColor(row) {
+  if (row?.ignored) return "#9ca3af";
+  if (row?.complete && row?.matchedTransferRecord) return "#7ee787";
+  if (row?.complete) return "#58a6ff";
+  return "#f7b955";
+}
+
+function bridgeCandidateEvidenceSetStatusLabel(row) {
+  const matched = row?.matchedTransferRecord;
+  if (matched) {
+    const status = matched.status ? String(matched.status).trim().toUpperCase() : "MATCHED";
+    const confidence = matched.matchConfidence ? ` · ${matched.matchConfidence}` : "";
+    const id = matched.id ? ` · ${bridgeShortAddress(matched.id, 5, 5)}` : "";
+    return `${status}${confidence}${id}`;
+  }
+  if (row?.complete) return "REVIEW-ONLY · complete";
+  return "REVIEW-ONLY · incomplete";
+}
+
+function bridgeCandidateEvidenceSetStatusTitle(row) {
+  return row?.matchedTransferRecord?.matchReason || row?.recommendedNextAction || "Bridge candidate preview is display-only; no record is created automatically.";
+}
+
+function bridgeCandidateEvidenceSetLegSummary(row) {
+  const parts = [];
+  if (row?.sourceEvidence?.sourceTxid) parts.push("source");
+  if (row?.assetHubEvidence?.assetHubMintTxid) parts.push("mint");
+  if (row?.assetHubEvidence?.assetHubXcmTxid) parts.push("xcm");
+  if (row?.hydrationEvidence?.hydrationReceiveTxid) parts.push("receive");
+  return parts.length ? parts.join(" + ") : "no complete evidence legs";
+}
+
+function bridgeCandidatePreviewDetail(data) {
+  if (!data || data.ok) return "";
+  const detail = data.detail || data.error || data.message;
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (typeof detail?.message === "string") return detail.message;
+  if (typeof detail?.error === "string") return detail.error;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return String(data.message || data.error || "preview unavailable");
+  }
+}
+
 function bridgeSourceEvidenceLabel(mechanism) {
   const raw = String(mechanism || "").trim().toLowerCase();
   if (raw === "vault_deposit_mint_xcm") return "Solana bridge-vault deposit tx/signature";
@@ -1464,6 +1764,10 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
   const [addresses, setAddresses] = useState([]);
   const [walletBalanceRows, setWalletBalanceRows] = useState([]);
   const [treasuryRegistry, setTreasuryRegistry] = useState(null);
+  const [solanaReserveMovements, setSolanaReserveMovements] = useState(null);
+  const [assetHubEvidence, setAssetHubEvidence] = useState(null);
+  const [hydrationTreasuryMovements, setHydrationTreasuryMovements] = useState(null);
+  const [bridgeCandidatePreview, setBridgeCandidatePreview] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const abortRef = useRef(null);
@@ -1509,13 +1813,17 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     setBusy(true);
     setErr("");
     try {
-      const [nextSnap, rows, latestBalances, nextSupply, nextTransferStatus, nextTreasuryRegistry] = await Promise.all([
+      const [nextSnap, rows, latestBalances, nextSupply, nextTransferStatus, nextTreasuryRegistry, nextSolanaReserveMovements, nextAssetHubEvidence, nextHydrationTreasuryMovements, nextBridgeCandidatePreview] = await Promise.all([
         spreadFetchSnapshot(base, controller.signal).catch((e) => ({ ok: false, error: String(e?.message || e) })),
         bridgeFetchWalletAddresses(base, controller.signal),
         bridgeFetchWalletLatestBalances(base, controller.signal),
         bridgeFetchUtttSupply(base, controller.signal),
         bridgeFetchTransferRecordStatus(base, controller.signal),
         bridgeFetchTreasuryRegistry(base, controller.signal),
+        bridgeFetchSolanaReserveMovements(base, controller.signal),
+        bridgeFetchAssetHubEvidence(base, controller.signal),
+        bridgeFetchHydrationTreasuryMovements(base, controller.signal),
+        bridgeFetchBridgeCandidatePreview(base, controller.signal),
       ]);
       const hydrationLiveBalances = await bridgeFetchHydrationLiveBalances(base, rows, controller.signal);
       const mergedBalances = [...(hydrationLiveBalances || []), ...(latestBalances || [])];
@@ -1527,6 +1835,10 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
       setSupply(nextSupply);
       setTransferStatus(nextTransferStatus);
       setTreasuryRegistry(nextTreasuryRegistry);
+      setSolanaReserveMovements(nextSolanaReserveMovements);
+      setAssetHubEvidence(nextAssetHubEvidence);
+      setHydrationTreasuryMovements(nextHydrationTreasuryMovements);
+      setBridgeCandidatePreview(nextBridgeCandidatePreview);
       if (mergedSnap?.ok) spreadWriteCache(mergedSnap);
       if (nextSnap?.error && !mergedSnap?.partialPriceRefresh) setErr(nextSnap.error);
     } catch (e) {
@@ -1665,6 +1977,13 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
     return items.filter((row) => String(row?.status || "").trim().toUpperCase() === "CANCELLED" && viewedSet.has(String(row?.id || "").trim())).length;
   }, [transferRecordSummary, viewedCancelledRecordIds]);
   const treasuryRegistryRoles = useMemo(() => bridgeTreasuryRegistryRoles(treasuryRegistry), [treasuryRegistry]);
+  const solanaReserveMovementItems = useMemo(() => bridgeSolanaReserveMovementItems(solanaReserveMovements), [solanaReserveMovements]);
+  const solanaReserveCandidateItems = useMemo(() => bridgeSolanaReserveCandidateItems(solanaReserveMovements), [solanaReserveMovements]);
+  const assetHubEvidenceGroups = useMemo(() => bridgeAssetHubEvidenceGroups(assetHubEvidence), [assetHubEvidence]);
+  const assetHubEvidenceEvents = useMemo(() => bridgeAssetHubEvidenceEvents(assetHubEvidence), [assetHubEvidence]);
+  const hydrationTreasuryMovementItems = useMemo(() => bridgeHydrationTreasuryMovementItems(hydrationTreasuryMovements), [hydrationTreasuryMovements]);
+  const bridgeCandidateMatchedSets = useMemo(() => bridgeCandidatePreviewMatchedSets(bridgeCandidatePreview), [bridgeCandidatePreview]);
+  const bridgeCandidateReviewCandidates = useMemo(() => bridgeCandidatePreviewReviewCandidates(bridgeCandidatePreview), [bridgeCandidatePreview]);
 
   const source = direction === "sol_to_hyd" ? solWallet : hydWallet;
   const dest = direction === "sol_to_hyd" ? hydWallet : solWallet;
@@ -2628,6 +2947,240 @@ export default function SpreadBridgeDashboardChip({ apiBase, hideTableData = fal
                 ) : null}
               </div>
             ) : null}
+
+            <div style={{ ...panelCardStyle, marginTop: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline", marginBottom: 6 }}>
+                <div style={{ fontWeight: 900 }}>Detected Solana reserve movements</div>
+                <div style={{ fontSize: 11, color: solanaReserveMovements?.ok ? "#7ee787" : "#f7b955" }}>
+                  {solanaReserveMovements?.ok ? `${solanaReserveMovementItems.length} movement${solanaReserveMovementItems.length === 1 ? "" : "s"}${solanaReserveCandidateItems.length ? ` · ${solanaReserveCandidateItems.length} candidate${solanaReserveCandidateItems.length === 1 ? "" : "s"}` : ""} · ${bridgeSolanaReserveMovementCacheLabel(solanaReserveMovements)}` : "preview unavailable"}
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: "#9ca3af", lineHeight: 1.35, marginBottom: 7 }}>
+                Read-only preview from the official Solana Bridge Reserve. Exact signature, amount+vault matches, and unmatched source-evidence candidates are display-only; candidate creation and reconciliation remain manual/review-only.
+              </div>
+              {solanaReserveMovements?.reserveAddress ? (
+                <div style={{ fontSize: 11, opacity: 0.75, marginBottom: 7 }}>
+                  Reserve {hideTableData ? "••••" : bridgeShortAddress(solanaReserveMovements.reserveAddress, 8, 7)} · mint {hideTableData ? "••••" : bridgeShortAddress(solanaReserveMovements.mint, 8, 7)}
+                </div>
+              ) : null}
+              {solanaReserveMovements?.cache?.enabled ? (
+                <div style={{ fontSize: 11, opacity: 0.72, marginBottom: 7 }}>
+                  Cache {bridgeSolanaReserveMovementCacheLabel(solanaReserveMovements)}{bridgeSolanaReserveMovementCacheTime(solanaReserveMovements) ? ` · ${bridgeSolanaReserveMovementCacheTime(solanaReserveMovements)}` : ""}
+                </div>
+              ) : null}
+              {solanaReserveMovementItems.length ? (
+                <div style={{ display: "grid", gap: 6 }}>
+                  {solanaReserveMovementItems.slice(0, 6).map((row) => {
+                    const matched = row?.matchedTransferRecord;
+                    return (
+                      <div key={row.signature || `${row.slot}-${row.amount}`} style={{ display: "grid", gridTemplateColumns: "minmax(160px, 1fr) minmax(120px, auto) auto", gap: 8, alignItems: "center", padding: "6px 7px", borderRadius: 8, background: "rgba(255,255,255,0.035)" }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontWeight: 800, color: bridgeSolanaReserveMovementColor(row) }}>
+                            {bridgeSolanaReserveMovementLabel(row)}
+                          </div>
+                          <div style={{ opacity: 0.62, fontSize: 11 }}>
+                            {bridgeSolanaReserveMovementTime(row)} · {hideTableData ? "••••" : bridgeShortAddress(row.signature, 8, 7)}
+                          </div>
+                        </div>
+                        <div style={{ fontWeight: 800, whiteSpace: "nowrap" }}>
+                          {hideTableData ? "••••" : spreadFmtQty(row.amount)} {row.asset || "UTTT"}
+                        </div>
+                        <div
+                          style={{ fontSize: 11, color: matched ? "#7ee787" : "#f7b955", whiteSpace: "nowrap" }}
+                          title={bridgeSolanaReserveMovementMatchTitle(row)}
+                        >
+                          {bridgeSolanaReserveMovementMatchLabel(row)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, opacity: 0.72 }}>
+                  {solanaReserveMovements?.ok ? "No recent UTTT reserve movements detected." : (solanaReserveMovements?.message || solanaReserveMovements?.error || "Movement preview has not loaded yet.")}
+                </div>
+              )}
+              {solanaReserveCandidateItems.length ? (
+                <div style={{ marginTop: 8, paddingTop: 7, borderTop: "1px solid rgba(255,255,255,0.08)", display: "grid", gap: 5 }}>
+                  <div style={{ fontSize: 11, fontWeight: 900, color: "#f7b955" }}>Review-only unmatched source candidates</div>
+                  {solanaReserveCandidateItems.slice(0, 4).map((cand) => (
+                    <div key={cand.sourceTxid || `${cand.amount}-${cand.sourceVaultAddress}`} style={{ fontSize: 11, lineHeight: 1.35, opacity: 0.84 }}>
+                      {hideTableData ? "••••" : spreadFmtQty(cand.amount)} {cand.asset || "UTTT"} · {hideTableData ? "••••" : bridgeShortAddress(cand.sourceTxid, 8, 7)} · review before create/link
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {!solanaReserveMovements?.ok && bridgeSolanaReserveMovementPreviewDetail(solanaReserveMovements) ? (
+                <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                  {bridgeSolanaReserveMovementPreviewDetail(solanaReserveMovements)}
+                </div>
+              ) : null}
+              {solanaReserveMovements?.warnings?.length ? (
+                <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                  {solanaReserveMovements.warnings.join(" ")}
+                </div>
+              ) : null}
+            </div>
+
+
+            <div style={{ ...panelCardStyle, marginTop: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline", marginBottom: 6 }}>
+                <div style={{ fontWeight: 900 }}>Detected Asset Hub mint/XCM evidence</div>
+                <div style={{ fontSize: 11, color: assetHubEvidence?.ok ? "#7ee787" : "#f7b955" }}>
+                  {assetHubEvidence?.ok ? `${assetHubEvidenceGroups.length} record${assetHubEvidenceGroups.length === 1 ? "" : "s"} · ${assetHubEvidenceEvents.length} evidence item${assetHubEvidenceEvents.length === 1 ? "" : "s"}` : "preview unavailable"}
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: "#9ca3af", lineHeight: 1.35, marginBottom: 7 }}>
+                Read-only preview from local vault/mint/XCM records. Asset Hub mint, Asset Hub → Hydration XCM, and Hydration receive references are display-only; candidate creation and reconciliation remain manual/review-only.
+              </div>
+              {assetHubEvidenceEvents.length ? (
+                <div style={{ display: "grid", gap: 6 }}>
+                  {assetHubEvidenceEvents.slice(0, 8).map((row) => (
+                    <div key={`${row.kind || "evidence"}-${row.txid || row.proofUrl}`} style={{ display: "grid", gridTemplateColumns: "minmax(150px, 1fr) minmax(110px, auto) auto", gap: 8, alignItems: "center", padding: "6px 7px", borderRadius: 8, background: "rgba(255,255,255,0.035)" }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 800, color: bridgeAssetHubEvidenceColor(row) }}>{bridgeAssetHubEvidenceLabel(row)}</div>
+                        <div style={{ opacity: 0.62, fontSize: 11 }}>
+                          {row.chainLabel || row.chain || "Asset Hub"} · {hideTableData ? "••••" : bridgeShortAddress(row.txid || row.proofUrl, 8, 7)}
+                        </div>
+                      </div>
+                      <div style={{ fontWeight: 800, whiteSpace: "nowrap" }}>
+                        {hideTableData ? "••••" : spreadFmtQty(row.amount)} {row.asset || "UTTT"}
+                      </div>
+                      <div
+                        style={{ fontSize: 11, color: row?.matchedTransferRecord ? "#7ee787" : "#f7b955", whiteSpace: "nowrap" }}
+                        title={bridgeAssetHubEvidenceStatusTitle(row)}
+                      >
+                        {bridgeAssetHubEvidenceStatusLabel(row)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, opacity: 0.72 }}>
+                  {assetHubEvidence?.ok ? "No recorded Asset Hub mint/XCM evidence detected yet." : (assetHubEvidence?.message || assetHubEvidence?.error || "Asset Hub evidence preview has not loaded yet.")}
+                </div>
+              )}
+              {!assetHubEvidence?.ok && bridgeAssetHubEvidencePreviewDetail(assetHubEvidence) ? (
+                <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                  {bridgeAssetHubEvidencePreviewDetail(assetHubEvidence)}
+                </div>
+              ) : null}
+              {assetHubEvidence?.warnings?.length ? (
+                <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                  {assetHubEvidence.warnings.join(" ")}
+                </div>
+              ) : null}
+            </div>
+
+            <div style={{ ...panelCardStyle, marginTop: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline", marginBottom: 6 }}>
+                <div style={{ fontWeight: 900 }}>Detected Hydration treasury movements</div>
+                <div style={{ fontSize: 11, color: hydrationTreasuryMovements?.ok ? "#7ee787" : "#f7b955" }}>
+                  {hydrationTreasuryMovements?.ok ? `${hydrationTreasuryMovementItems.length} movement${hydrationTreasuryMovementItems.length === 1 ? "" : "s"}` : "preview unavailable"}
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: "#9ca3af", lineHeight: 1.35, marginBottom: 7 }}>
+                Read-only preview from local Hydration receive evidence and official treasury roles. Hydration treasury receives/transfers are display-only; candidate creation and reconciliation remain manual/review-only.
+              </div>
+              {hydrationTreasuryMovementItems.length ? (
+                <div style={{ display: "grid", gap: 6 }}>
+                  {hydrationTreasuryMovementItems.slice(0, 8).map((row) => (
+                    <div key={`${row.kind || "hydration"}-${row.txid || row.proofUrl || row.amount}`} style={{ display: "grid", gridTemplateColumns: "minmax(150px, 1fr) minmax(110px, auto) auto", gap: 8, alignItems: "center", padding: "6px 7px", borderRadius: 8, background: "rgba(255,255,255,0.035)" }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 800, color: bridgeHydrationTreasuryMovementColor(row) }}>{bridgeHydrationTreasuryMovementLabel(row)}</div>
+                        <div style={{ opacity: 0.62, fontSize: 11 }}>
+                          {row.treasuryLabel || row.chainLabel || "Hydration"} · {hideTableData ? "••••" : bridgeShortAddress(row.txid || row.proofUrl || row.treasuryAddress, 8, 7)}
+                        </div>
+                      </div>
+                      <div style={{ fontWeight: 800, whiteSpace: "nowrap" }}>
+                        {hideTableData ? "••••" : spreadFmtQty(row.amount)} {row.asset || "UTTT"}
+                      </div>
+                      <div
+                        style={{ fontSize: 11, color: row?.matchedTransferRecord ? "#7ee787" : "#f7b955", whiteSpace: "nowrap" }}
+                        title={bridgeHydrationTreasuryMovementStatusTitle(row)}
+                      >
+                        {bridgeHydrationTreasuryMovementStatusLabel(row)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, opacity: 0.72 }}>
+                  {hydrationTreasuryMovements?.ok ? "No recorded Hydration treasury receive evidence detected yet." : (hydrationTreasuryMovements?.message || hydrationTreasuryMovements?.error || "Hydration treasury preview has not loaded yet.")}
+                </div>
+              )}
+              {hydrationTreasuryMovements?.xcmDeltaAmount ? (
+                <div style={{ marginTop: 6, fontSize: 11, opacity: 0.76 }}>
+                  Recorded XCM/dust delta: {hideTableData ? "••••" : spreadFmtQty(hydrationTreasuryMovements.xcmDeltaAmount)} {hydrationTreasuryMovements.asset || "UTTT"}
+                </div>
+              ) : null}
+              {!hydrationTreasuryMovements?.ok && bridgeHydrationTreasuryPreviewDetail(hydrationTreasuryMovements) ? (
+                <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                  {bridgeHydrationTreasuryPreviewDetail(hydrationTreasuryMovements)}
+                </div>
+              ) : null}
+              {hydrationTreasuryMovements?.warnings?.length ? (
+                <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                  {hydrationTreasuryMovements.warnings.join(" ")}
+                </div>
+              ) : null}
+            </div>
+
+            <div style={{ ...panelCardStyle, marginTop: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline", marginBottom: 6 }}>
+                <div style={{ fontWeight: 900 }}>Bridge candidate preview</div>
+                <div style={{ fontSize: 11, color: bridgeCandidatePreview?.ok ? "#7ee787" : "#f7b955" }}>
+                  {bridgeCandidatePreview?.ok
+                    ? `${bridgeCandidateMatchedSets.length} matched set${bridgeCandidateMatchedSets.length === 1 ? "" : "s"} · ${bridgeCandidateReviewCandidates.length} review candidate${bridgeCandidateReviewCandidates.length === 1 ? "" : "s"}`
+                    : "preview unavailable"}
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: "#9ca3af", lineHeight: 1.35, marginBottom: 7 }}>
+                Combined review-only candidate builder from Solana reserve, Asset Hub mint/XCM, and Hydration receive evidence. It does not create, link, reconcile, execute, or mutate ledger/FIFO state.
+              </div>
+              {bridgeCandidateMatchedSets.length || bridgeCandidateReviewCandidates.length ? (
+                <div style={{ display: "grid", gap: 6 }}>
+                  {[...bridgeCandidateMatchedSets, ...bridgeCandidateReviewCandidates].slice(0, 8).map((row) => (
+                    <div key={`${row.status || "candidate"}-${row?.matchedTransferRecord?.id || row?.sourceEvidence?.sourceTxid || row.amount}`} style={{ display: "grid", gridTemplateColumns: "minmax(160px, 1fr) minmax(110px, auto) auto", gap: 8, alignItems: "center", padding: "6px 7px", borderRadius: 8, background: "rgba(255,255,255,0.035)" }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 800, color: bridgeCandidateEvidenceSetColor(row) }}>{bridgeCandidateEvidenceSetLabel(row)}</div>
+                        <div style={{ opacity: 0.62, fontSize: 11 }}>
+                          {bridgeCandidateEvidenceSetLegSummary(row)} · {hideTableData ? "••••" : bridgeShortAddress(row?.sourceEvidence?.sourceTxid || row?.hydrationEvidence?.hydrationReceiveTxid || row?.assetHubEvidence?.assetHubMintTxid, 8, 7)}
+                        </div>
+                      </div>
+                      <div style={{ fontWeight: 800, whiteSpace: "nowrap" }}>
+                        {hideTableData ? "••••" : spreadFmtQty(row.amount)} {row.asset || "UTTT"}
+                      </div>
+                      <div
+                        style={{ fontSize: 11, color: row?.complete ? "#7ee787" : "#f7b955", whiteSpace: "nowrap" }}
+                        title={bridgeCandidateEvidenceSetStatusTitle(row)}
+                      >
+                        {bridgeCandidateEvidenceSetStatusLabel(row)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, opacity: 0.72 }}>
+                  {bridgeCandidatePreview?.ok ? "No unmatched bridge candidates detected. Existing complete evidence sets remain matched/display-only." : (bridgeCandidatePreview?.message || bridgeCandidatePreview?.error || "Bridge candidate preview has not loaded yet.")}
+                </div>
+              )}
+              {bridgeCandidatePreview?.ignoredEvidenceSetCount ? (
+                <div style={{ marginTop: 6, fontSize: 11, opacity: 0.76 }}>
+                  Ignored cancelled local records: {bridgeCandidatePreview.ignoredEvidenceSetCount}
+                </div>
+              ) : null}
+              {!bridgeCandidatePreview?.ok && bridgeCandidatePreviewDetail(bridgeCandidatePreview) ? (
+                <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                  {bridgeCandidatePreviewDetail(bridgeCandidatePreview)}
+                </div>
+              ) : null}
+              {bridgeCandidatePreview?.warnings?.length ? (
+                <div style={{ marginTop: 6, color: "var(--utt-warn, #f7b955)", fontSize: 11, lineHeight: 1.35 }}>
+                  {bridgeCandidatePreview.warnings.join(" ")}
+                </div>
+              ) : null}
+            </div>
 
             <div style={{ marginTop: 10, padding: 9, borderRadius: 10, border: "1px solid rgba(247,185,85,0.35)", background: "rgba(247,185,85,0.10)", fontSize: 12 }}>
               Execution is intentionally disabled here. For the 10M UTTT tranche, use the vault/mint/XCM workflow to create a local planned record, then link Solana vault-deposit, Asset Hub mint, and Hydration receive evidence before reconciling.

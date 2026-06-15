@@ -1,7 +1,9 @@
 # backend/app/routers/bridge.py
 from __future__ import annotations
 
+import json
 import os
+import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -424,7 +426,10 @@ def _bridge_pick_treasury_wallet(db: Session, definition: Dict[str, Any]) -> tup
         if score is not None:
             ranked.append((score, row))
     ranked.sort(key=lambda x: x[0])
-    return ranked[0] if ranked else (None, None)
+    if not ranked:
+        return None, None
+    best_score, best_wallet = ranked[0]
+    return best_wallet, best_score
 
 
 def _bridge_treasury_registry_payload(db: Session, *, asset: str = "UTTT") -> Dict[str, Any]:
@@ -503,6 +508,1600 @@ def _bridge_treasury_registry_payload(db: Session, *, asset: str = "UTTT") -> Di
         "execution": {
             "bridgeExecutionEnabled": False,
             "ledgerFifoMutation": False,
+        },
+    }
+
+
+
+def _bridge_solana_rpc_url() -> str:
+    return (
+        _env_str("UTT_SOLANA_RPC_URL")
+        or _env_str("SOLANA_RPC_URL")
+        or _env_str("UTT_SOLANA_MAINNET_RPC_URL")
+        or "https://api.mainnet-beta.solana.com"
+    )
+
+
+def _bridge_solana_rpc_call(method: str, params: List[Any], *, timeout_s: float = 14.0) -> Dict[str, Any]:
+    url = _bridge_solana_rpc_url()
+    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"content-type": "application/json", "accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_s)) as res:
+            body = res.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "solana_rpc_request_failed",
+                "method": method,
+                "rpcUrl": url,
+                "exc": type(e).__name__,
+                "message": str(e),
+            },
+        )
+    try:
+        data = json.loads(body)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "solana_rpc_invalid_json",
+                "method": method,
+                "rpcUrl": url,
+                "exc": type(e).__name__,
+                "message": str(e),
+            },
+        )
+    if isinstance(data, dict) and data.get("error"):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "solana_rpc_error",
+                "method": method,
+                "rpcUrl": url,
+                "rpcError": data.get("error"),
+            },
+        )
+    return data if isinstance(data, dict) else {"result": data}
+
+
+def _bridge_resolve_solana_token_registry_row(db: Session, *, asset: str = "UTTT") -> Optional[TokenRegistry]:
+    rows = _token_registry_rows(db, _bridge_norm_asset(asset))
+    return _pick_registry_row(rows, chain_aliases=["solana"], venue_aliases=["solana", "solana_jupiter"])
+
+
+def _bridge_resolve_solana_mint(db: Session, *, asset: str = "UTTT") -> Optional[str]:
+    row = _bridge_resolve_solana_token_registry_row(db, asset=asset)
+    return _bridge_clean_str(getattr(row, "address", None))
+
+
+def _bridge_parse_solana_ui_token_amount(raw: Any) -> float:
+    if not isinstance(raw, dict):
+        return 0.0
+    amt = raw.get("uiAmountString")
+    if amt is None:
+        amt = raw.get("uiAmount")
+    if amt is None:
+        amount = raw.get("amount")
+        decimals = raw.get("decimals")
+        try:
+            return float(amount) / (10 ** int(decimals or 0))
+        except Exception:
+            return 0.0
+    try:
+        return float(str(amt).replace(",", "").strip())
+    except Exception:
+        return 0.0
+
+
+def _bridge_solana_account_key_at(tx: Dict[str, Any], index: Any) -> str:
+    try:
+        idx = int(index)
+    except Exception:
+        return ""
+    keys = (((tx or {}).get("transaction") or {}).get("message") or {}).get("accountKeys") or []
+    if idx < 0 or idx >= len(keys):
+        return ""
+    entry = keys[idx]
+    if isinstance(entry, dict):
+        return str(entry.get("pubkey") or "").strip()
+    return str(entry or "").strip()
+
+
+def _bridge_solana_token_balance_sum(
+    tx: Dict[str, Any],
+    balances: Any,
+    *,
+    mint: str,
+    reserve_address: str,
+    token_account_set: set[str],
+) -> float:
+    total = 0.0
+    mint_s = str(mint or "").strip()
+    reserve_s = str(reserve_address or "").strip()
+    for bal in balances or []:
+        if not isinstance(bal, dict):
+            continue
+        if str(bal.get("mint") or "").strip() != mint_s:
+            continue
+        owner = str(bal.get("owner") or "").strip()
+        account_key = _bridge_solana_account_key_at(tx, bal.get("accountIndex"))
+        if owner != reserve_s and account_key not in token_account_set:
+            continue
+        total += _bridge_parse_solana_ui_token_amount(bal.get("uiTokenAmount") or {})
+    return total
+
+
+def _bridge_record_bridge_evidence(row: BridgeTransferRecord) -> Dict[str, Any]:
+    raw = row.raw if isinstance(row.raw, dict) else {}
+    evidence = raw.get("bridgeEvidence") if isinstance(raw.get("bridgeEvidence"), dict) else {}
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def _bridge_record_source_vault_address(row: BridgeTransferRecord) -> Optional[str]:
+    evidence = _bridge_record_bridge_evidence(row)
+    source = evidence.get("source") if isinstance(evidence.get("source"), dict) else {}
+    planned = evidence.get("planned") if isinstance(evidence.get("planned"), dict) else {}
+    return (
+        _bridge_clean_str(source.get("sourceVaultAddress"))
+        or _bridge_clean_str(source.get("vaultAddress"))
+        or _bridge_clean_str(planned.get("sourceVaultAddress"))
+        or _bridge_clean_str(row.source_address)
+    )
+
+
+def _bridge_solana_signature_matches_existing_record(
+    db: Session,
+    *,
+    asset: str,
+    signature: str,
+    amount: float,
+    reserve_address: Optional[str] = None,
+    direction: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort read-only match between a Solana reserve movement and local bridge records.
+
+    Exact source signature match wins. If a historical record used explorer/account
+    proof rather than the exact SPL transfer signature, fall back to a strong
+    amount + Solana reserve-vault + vault/mint/XCM workflow match. This only
+    annotates the preview; it never links or reconciles records.
+    """
+    sig = str(signature or "").strip()
+    reserve = _bridge_clean_str(reserve_address)
+    direction_s = str(direction or "").strip().lower()
+    try:
+        rows = (
+            db.query(BridgeTransferRecord)
+            .filter(BridgeTransferRecord.asset == _bridge_norm_asset(asset))
+            .order_by(BridgeTransferRecord.created_at.desc())
+            .limit(250)
+            .all()
+        )
+    except Exception:
+        return None
+
+    best_fallback: Optional[Dict[str, Any]] = None
+    best_fallback_score = 999
+
+    for row in rows:
+        raw = row.raw if isinstance(row.raw, dict) else {}
+        evidence = _bridge_record_bridge_evidence(row)
+        source = evidence.get("source") if isinstance(evidence.get("source"), dict) else {}
+        row_sigs = {
+            _bridge_clean_str(row.source_txid),
+            _bridge_clean_str(source.get("sourceTxid")),
+            _bridge_clean_str(source.get("txid")),
+            _bridge_clean_str(source.get("signature")),
+        }
+        amount_close = _bridge_amount_close(amount, row.amount)
+        mechanism = str(row.bridge_mechanism or "").strip().lower()
+        status = str(row.status or "").strip().upper()
+        source_chain = _bridge_norm_chain(row.source_chain)
+        dest_chain = _bridge_norm_chain(row.destination_chain)
+        row_vault = _bridge_record_source_vault_address(row)
+        vault_matches = bool(reserve and row_vault and reserve == row_vault)
+
+        if sig and sig in {x for x in row_sigs if x}:
+            return {
+                "id": row.id,
+                "status": row.status,
+                "amount": row.amount,
+                "amountClose": amount_close,
+                "bridgeMechanism": row.bridge_mechanism,
+                "sourceVaultAddress": row_vault,
+                "matchedBy": "source_signature",
+                "matchConfidence": "exact",
+                "matchReason": "Solana reserve movement signature matches local bridge source evidence.",
+            }
+
+        is_expected_bridge_direction = source_chain == "solana" and dest_chain == "hydration"
+        is_expected_workflow = mechanism == "vault_deposit_mint_xcm"
+        is_inbound_deposit = direction_s in {"inbound", "inbound_reserve_deposit", ""}
+
+        if not (is_inbound_deposit and is_expected_bridge_direction and is_expected_workflow and amount_close):
+            continue
+
+        score = 50
+        reasons = ["amount matches vault/mint/XCM bridge record"]
+        if vault_matches:
+            score -= 30
+            reasons.append("source vault matches official reserve")
+        elif reserve and row_vault:
+            score += 40
+            reasons.append("source vault differs from official reserve")
+        else:
+            score += 10
+            reasons.append("source vault not present on record")
+
+        if status == "RECONCILED":
+            score -= 10
+            reasons.append("record is reconciled")
+        elif status == "LINKED":
+            score -= 5
+            reasons.append("record is linked")
+        elif status == "CANCELLED":
+            score += 80
+            reasons.append("record is cancelled")
+
+        if score < best_fallback_score:
+            best_fallback_score = score
+            best_fallback = {
+                "id": row.id,
+                "status": row.status,
+                "amount": row.amount,
+                "amountClose": amount_close,
+                "bridgeMechanism": row.bridge_mechanism,
+                "sourceVaultAddress": row_vault,
+                "matchedBy": "amount_vault_workflow",
+                "matchConfidence": "strong" if vault_matches and status in {"RECONCILED", "LINKED"} else "possible",
+                "matchReason": "; ".join(reasons),
+            }
+
+    return best_fallback
+
+
+def _bridge_solana_reserve_movement_candidate_evidence(movement: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build a review-only source-evidence candidate from an unmatched reserve movement."""
+    if not isinstance(movement, dict):
+        return None
+    if movement.get("matchedTransferRecord"):
+        return None
+    if not movement.get("ok", True):
+        return None
+    direction = str(movement.get("direction") or "").strip().lower()
+    if direction != "inbound":
+        return None
+    signature = _bridge_clean_str(movement.get("signature"))
+    amount = _bridge_clean_float(movement.get("amount"))
+    reserve_address = _bridge_clean_str(movement.get("reserveAddress"))
+    if not signature or amount is None or amount <= 0 or not reserve_address:
+        return None
+    return {
+        "kind": "solana_reserve_source_evidence",
+        "classification": movement.get("classification") or "inbound_reserve_deposit",
+        "asset": _bridge_norm_asset(movement.get("asset") or "UTTT"),
+        "amount": amount,
+        "sourceChain": "solana",
+        "destinationChain": "hydration",
+        "bridgeMechanism": "vault_deposit_mint_xcm",
+        "sourceTxid": signature,
+        "sourceEvidenceType": "solana_vault_deposit",
+        "sourceVaultAddress": reserve_address,
+        "sourceProofUrl": movement.get("explorerUrl"),
+        "reviewOnly": True,
+        "canAutoCreateRecord": False,
+        "canAutoReconcile": False,
+        "recommendedNextAction": "Review the unmatched Solana reserve deposit before creating or linking any bridge transfer record.",
+    }
+
+
+
+
+def _bridge_known_solana_reserve_record_sources(
+    db: Session,
+    *,
+    asset: str,
+    reserve_address: Optional[str],
+    limit: int = 25,
+) -> List[Dict[str, Any]]:
+    """Return local bridge records that already contain Solana reserve source evidence.
+
+    This is a read-only seed list for the movement preview. It helps the scanner
+    surface older known reserve deposits even when the recent Solana signature
+    window no longer contains them or RPC transaction parsing is unavailable.
+    """
+    asset_u = _bridge_norm_asset(asset)
+    reserve = _bridge_clean_str(reserve_address)
+    try:
+        rows = (
+            db.query(BridgeTransferRecord)
+            .filter(BridgeTransferRecord.asset == asset_u)
+            .filter(BridgeTransferRecord.bridge_mechanism == "vault_deposit_mint_xcm")
+            .order_by(BridgeTransferRecord.created_at.desc())
+            .limit(max(1, min(int(limit or 25), 100)))
+            .all()
+        )
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        source_chain = _bridge_norm_chain(row.source_chain)
+        destination_chain = _bridge_norm_chain(row.destination_chain)
+        if source_chain != "solana" or destination_chain != "hydration":
+            continue
+        signature = _bridge_clean_str(row.source_txid)
+        if not signature:
+            continue
+        row_vault = _bridge_record_source_vault_address(row)
+        if reserve and row_vault and reserve != row_vault:
+            continue
+        try:
+            block_time = int(row.created_at.timestamp()) if isinstance(row.created_at, datetime) else 0
+        except Exception:
+            block_time = 0
+        out.append({
+            "signature": signature,
+            "blockTime": block_time,
+            "slot": 0,
+            "scanAddress": "local_bridge_record_source_evidence",
+            "knownBridgeTransferRecord": {
+                "id": row.id,
+                "status": row.status,
+                "amount": float(row.amount or 0.0),
+                "bridgeMechanism": row.bridge_mechanism,
+                "sourceVaultAddress": row_vault,
+                "matchedBy": "source_signature",
+                "matchConfidence": "exact",
+                "matchReason": "Local reconciled bridge source evidence contains this Solana reserve signature.",
+            },
+        })
+    return out
+
+
+def _bridge_solana_record_source_movement(
+    *,
+    row: Dict[str, Any],
+    asset: str,
+    reserve_address: str,
+    mint: str,
+    reason: str,
+) -> Optional[Dict[str, Any]]:
+    """Build a display-only reserve movement from existing bridge source evidence."""
+    known = row.get("knownBridgeTransferRecord") if isinstance(row, dict) else None
+    if not isinstance(known, dict):
+        return None
+    signature = _bridge_clean_str(row.get("signature"))
+    amount = _bridge_clean_float(known.get("amount"))
+    if not signature or amount is None or amount <= 0:
+        return None
+    return {
+        "signature": signature,
+        "slot": row.get("slot") or 0,
+        "blockTime": row.get("blockTime") or 0,
+        "err": None,
+        "ok": True,
+        "asset": _bridge_norm_asset(asset),
+        "mint": mint,
+        "reserveAddress": reserve_address,
+        "amount": amount,
+        "signedDelta": amount,
+        "direction": "inbound",
+        "classification": "inbound_reserve_deposit",
+        "preReserveBalance": None,
+        "postReserveBalance": None,
+        "scanAddress": row.get("scanAddress") or "local_bridge_record_source_evidence",
+        "matchedTransferRecord": known,
+        "explorerUrl": f"https://solscan.io/tx/{signature}",
+        "reviewOnly": True,
+        "source": "local_bridge_record_source_evidence",
+        "parseFallback": True,
+        "parseFallbackReason": reason,
+    }
+
+
+
+def _bridge_evidence_url(value: Any, *, default_kind: str = "extrinsic") -> Optional[str]:
+    text = _bridge_clean_str(value)
+    if not text:
+        return None
+    lower = text.lower()
+    if lower.startswith("http://") or lower.startswith("https://"):
+        return text
+    if default_kind == "hydration_xcm" or text.startswith("polkadot-"):
+        return f"https://hydration.subscan.io/xcm_message/{text}"
+    return f"https://assethub-polkadot.subscan.io/extrinsic/{text}"
+
+
+def _bridge_destination_evidence_from_record(row: BridgeTransferRecord) -> Dict[str, Any]:
+    evidence = _bridge_record_bridge_evidence(row)
+    destination = evidence.get("destination") if isinstance(evidence.get("destination"), dict) else {}
+    planned = evidence.get("planned") if isinstance(evidence.get("planned"), dict) else {}
+    return {
+        "assetHubMintTxid": _bridge_clean_str(destination.get("assetHubMintTxid")) or _bridge_clean_str(planned.get("assetHubMintTxid")),
+        "assetHubMintAmount": _bridge_clean_float(destination.get("assetHubMintAmount")) or _bridge_clean_float(planned.get("grossAmount")) or float(row.amount or 0.0),
+        "assetHubXcmTxid": _bridge_clean_str(destination.get("assetHubXcmTxid")) or _bridge_clean_str(planned.get("assetHubXcmTxid")),
+        "hydrationReceiveTxid": _bridge_clean_str(destination.get("hydrationReceiveTxid")) or _bridge_clean_str(planned.get("hydrationReceiveTxid")) or _bridge_clean_str(row.destination_txid),
+        "hydrationReceivedAmount": _bridge_clean_float(destination.get("hydrationReceivedAmount")) or _bridge_clean_float(planned.get("destinationReceivedAmount")),
+        "xcmDeltaAmount": _bridge_clean_float(destination.get("xcmDeltaAmount")) or _bridge_clean_float(planned.get("xcmDeltaAmount")),
+        "destinationProofUrl": _bridge_clean_str(destination.get("destinationProofUrl")) or _bridge_clean_str(planned.get("destinationProofUrl")),
+    }
+
+
+def _bridge_asset_hub_event_from_record(
+    row: BridgeTransferRecord,
+    *,
+    kind: str,
+    txid: Optional[str],
+    amount: Optional[float],
+    role: str,
+    proof_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    tx = _bridge_clean_str(txid)
+    if not tx:
+        return None
+    status = str(row.status or "").strip().upper()
+    mechanism = str(row.bridge_mechanism or "").strip().lower()
+    return {
+        "kind": kind,
+        "role": role,
+        "asset": _bridge_norm_asset(row.asset),
+        "amount": amount if amount is not None else float(row.amount or 0.0),
+        "txid": tx,
+        "proofUrl": proof_url or _bridge_evidence_url(tx, default_kind=("hydration_xcm" if kind == "hydration_receive_reference" else "extrinsic")),
+        "chain": "hydration" if kind == "hydration_receive_reference" else "polkadot_asset_hub",
+        "chainLabel": "Hydration" if kind == "hydration_receive_reference" else "Polkadot / Asset Hub",
+        "classification": kind,
+        "matchedTransferRecord": {
+            "id": row.id,
+            "status": row.status,
+            "amount": row.amount,
+            "bridgeMechanism": row.bridge_mechanism,
+            "matchedBy": "local_bridge_destination_evidence",
+            "matchConfidence": "exact" if status == "RECONCILED" else "recorded",
+            "matchReason": "Local bridge transfer record contains this Asset Hub / Hydration destination evidence.",
+        },
+        "reviewOnly": True,
+        "source": "local_bridge_record_destination_evidence",
+        "ok": bool(status != "CANCELLED" and mechanism == "vault_deposit_mint_xcm"),
+    }
+
+
+def _bridge_asset_hub_evidence_preview_payload(
+    db: Session,
+    *,
+    asset: str = "UTTT",
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Read-only Asset Hub mint/XCM evidence preview.
+
+    This first Asset Hub detection slice is intentionally conservative. It
+    extracts already-recorded mint/XCM/receive evidence from local bridge
+    transfer records and presents it as matched evidence. It does not call
+    Subscan, create candidate records, reconcile, or mutate ledger/FIFO state.
+    """
+    asset_u = _bridge_norm_asset(asset)
+    safe_limit = max(1, min(int(limit or 50), 250))
+    registry = _bridge_treasury_registry_payload(db, asset=asset_u)
+    warnings: List[str] = []
+    groups: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+
+    try:
+        rows = (
+            db.query(BridgeTransferRecord)
+            .filter(BridgeTransferRecord.asset == asset_u)
+            .filter(BridgeTransferRecord.bridge_mechanism == "vault_deposit_mint_xcm")
+            .order_by(BridgeTransferRecord.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "asset": asset_u,
+            "model": "asset_hub_mint_xcm_evidence_preview_v1",
+            "error": "asset_hub_evidence_preview_failed",
+            "message": str(e),
+            "exc": type(e).__name__,
+            "groups": [],
+            "events": [],
+            "warnings": ["Asset Hub evidence preview failed before any records were changed."],
+            "registry": registry,
+            "readOnly": True,
+            "execution": {"bridgeExecutionEnabled": False, "candidateBuilderEnabled": False, "autoReconcile": False, "ledgerFifoMutation": False},
+        }
+
+    for row in rows:
+        if _bridge_norm_chain(row.source_chain) != "solana" or _bridge_norm_chain(row.destination_chain) != "hydration":
+            continue
+        ev = _bridge_destination_evidence_from_record(row)
+        row_events = [
+            _bridge_asset_hub_event_from_record(
+                row,
+                kind="asset_hub_mint",
+                txid=ev.get("assetHubMintTxid"),
+                amount=ev.get("assetHubMintAmount") or float(row.amount or 0.0),
+                role="asset_hub_mint",
+                proof_url=_bridge_evidence_url(ev.get("assetHubMintTxid")),
+            ),
+            _bridge_asset_hub_event_from_record(
+                row,
+                kind="asset_hub_xcm_send",
+                txid=ev.get("assetHubXcmTxid"),
+                amount=float(row.amount or 0.0),
+                role="asset_hub_to_hydration_xcm",
+                proof_url=_bridge_evidence_url(ev.get("assetHubXcmTxid")),
+            ),
+            _bridge_asset_hub_event_from_record(
+                row,
+                kind="hydration_receive_reference",
+                txid=ev.get("hydrationReceiveTxid"),
+                amount=ev.get("hydrationReceivedAmount"),
+                role="hydration_receive_reference",
+                proof_url=ev.get("destinationProofUrl") or _bridge_evidence_url(ev.get("hydrationReceiveTxid"), default_kind="hydration_xcm"),
+            ),
+        ]
+        row_events = [x for x in row_events if x]
+        if not row_events:
+            continue
+        events.extend(row_events)
+        groups.append({
+            "id": row.id,
+            "asset": row.asset,
+            "amount": float(row.amount or 0.0),
+            "status": row.status,
+            "bridgeMechanism": row.bridge_mechanism,
+            "sourceChain": _bridge_norm_chain(row.source_chain),
+            "destinationChain": _bridge_norm_chain(row.destination_chain),
+            "assetHubMintTxid": ev.get("assetHubMintTxid"),
+            "assetHubMintAmount": ev.get("assetHubMintAmount"),
+            "assetHubXcmTxid": ev.get("assetHubXcmTxid"),
+            "hydrationReceiveTxid": ev.get("hydrationReceiveTxid"),
+            "hydrationReceivedAmount": ev.get("hydrationReceivedAmount"),
+            "xcmDeltaAmount": ev.get("xcmDeltaAmount"),
+            "eventCount": len(row_events),
+            "events": row_events,
+            "matchedTransferRecord": {
+                "id": row.id,
+                "status": row.status,
+                "amount": row.amount,
+                "bridgeMechanism": row.bridge_mechanism,
+                "matchedBy": "local_destination_evidence_group",
+                "matchConfidence": "exact" if str(row.status or "").strip().upper() == "RECONCILED" else "recorded",
+                "matchReason": "This local bridge transfer record already contains Asset Hub mint/XCM and Hydration receive evidence.",
+            },
+            "reviewOnly": True,
+        })
+
+    if not groups:
+        warnings.append("No local vault/mint/XCM records currently contain Asset Hub mint/XCM evidence.")
+
+    return {
+        "ok": True,
+        "asset": asset_u,
+        "model": "asset_hub_mint_xcm_evidence_preview_v1",
+        "groupCount": len(groups),
+        "eventCount": len(events),
+        "groups": groups,
+        "events": events,
+        "warnings": warnings,
+        "registry": registry,
+        "readOnly": True,
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "candidateBuilderEnabled": False,
+            "candidateBuilderMode": "preview_only_matched_destination_evidence",
+            "autoReconcile": False,
+            "ledgerFifoMutation": False,
+            "message": "Asset Hub evidence preview is read-only. It surfaces recorded mint/XCM evidence but does not create records, reconcile, submit transactions, or mutate ledger/FIFO state.",
+        },
+    }
+
+
+def _bridge_registry_role_by_name(registry: Dict[str, Any], role: str) -> Optional[Dict[str, Any]]:
+    roles = registry.get("roles") if isinstance(registry, dict) else []
+    wanted = str(role or "").strip().lower()
+    for row in roles or []:
+        if isinstance(row, dict) and str(row.get("role") or "").strip().lower() == wanted:
+            return row
+    return None
+
+
+def _bridge_hydration_treasury_movement_from_record(
+    row: BridgeTransferRecord,
+    *,
+    registry: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build a read-only Hydration treasury movement preview from local bridge evidence.
+
+    This first Hydration detection slice intentionally uses already-recorded
+    bridge evidence. It does not query Hydration/Subscan history yet and never
+    creates, links, reconciles, executes, or mutates ledger/FIFO state.
+    """
+    if _bridge_norm_chain(row.source_chain) != "solana" or _bridge_norm_chain(row.destination_chain) != "hydration":
+        return None
+    if str(row.bridge_mechanism or "").strip().lower() != "vault_deposit_mint_xcm":
+        return None
+
+    ev = _bridge_destination_evidence_from_record(row)
+    txid = _bridge_clean_str(ev.get("hydrationReceiveTxid")) or _bridge_clean_str(row.destination_txid)
+    received_amount = _bridge_clean_float(ev.get("hydrationReceivedAmount"))
+    if received_amount is None:
+        received_amount = float(row.amount or 0.0)
+    xcm_delta = _bridge_clean_float(ev.get("xcmDeltaAmount"))
+    gross_amount = float(row.amount or 0.0)
+    bridge_role = _bridge_registry_role_by_name(registry, "hydration_bridge_treasury") or {}
+    initial_role = _bridge_registry_role_by_name(registry, "hydration_initial_allocation_treasury") or {}
+    treasury_address = _bridge_clean_str(bridge_role.get("address") or bridge_role.get("registeredAddress") or row.destination_address)
+    status = str(row.status or "").strip().upper()
+
+    if not txid and not (received_amount and received_amount > 0):
+        return None
+
+    return {
+        "kind": "hydration_treasury_receive",
+        "classification": "hydration_bridge_treasury_receive",
+        "asset": _bridge_norm_asset(row.asset),
+        "amount": received_amount,
+        "grossAmount": gross_amount,
+        "xcmDeltaAmount": xcm_delta if xcm_delta is not None else max(0.0, gross_amount - received_amount),
+        "txid": txid,
+        "proofUrl": ev.get("destinationProofUrl") or _bridge_evidence_url(txid, default_kind="hydration_xcm"),
+        "chain": "hydration",
+        "chainLabel": "Hydration",
+        "treasuryRole": "hydration_bridge_treasury",
+        "treasuryLabel": bridge_role.get("label") or "UTTT Hydration Bridge Treasury",
+        "treasuryAddress": treasury_address,
+        "initialAllocationTreasuryAddress": _bridge_clean_str(initial_role.get("address") or initial_role.get("registeredAddress")),
+        "direction": "inbound",
+        "ok": status != "CANCELLED",
+        "matchedTransferRecord": {
+            "id": row.id,
+            "status": row.status,
+            "amount": row.amount,
+            "bridgeMechanism": row.bridge_mechanism,
+            "matchedBy": "local_hydration_receive_evidence",
+            "matchConfidence": "exact" if status == "RECONCILED" else "recorded",
+            "matchReason": "Local vault/mint/XCM bridge transfer record contains Hydration receive evidence for this treasury movement.",
+        },
+        "reviewOnly": True,
+        "source": "local_bridge_record_hydration_receive_evidence",
+    }
+
+
+def _bridge_hydration_treasury_movements_preview_payload(
+    db: Session,
+    *,
+    asset: str = "UTTT",
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Read-only Hydration treasury receive/transfer preview.
+
+    This slice surfaces Hydration treasury receives already recorded in local
+    vault/mint/XCM bridge evidence. It is the Hydration-side counterpart to the
+    Solana reserve and Asset Hub evidence previews. No chain history scan,
+    candidate creation, auto-linking, reconciliation, bridge execution, or
+    ledger/FIFO mutation is performed.
+    """
+    asset_u = _bridge_norm_asset(asset)
+    safe_limit = max(1, min(int(limit or 50), 250))
+    registry = _bridge_treasury_registry_payload(db, asset=asset_u)
+    warnings: List[str] = []
+    movements: List[Dict[str, Any]] = []
+
+    try:
+        rows = (
+            db.query(BridgeTransferRecord)
+            .filter(BridgeTransferRecord.asset == asset_u)
+            .filter(BridgeTransferRecord.bridge_mechanism == "vault_deposit_mint_xcm")
+            .order_by(BridgeTransferRecord.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "asset": asset_u,
+            "model": "hydration_treasury_movement_preview_v1",
+            "error": "hydration_treasury_preview_failed",
+            "message": str(e),
+            "exc": type(e).__name__,
+            "movements": [],
+            "warnings": ["Hydration treasury movement preview failed before any records were changed."],
+            "registry": registry,
+            "readOnly": True,
+            "execution": {"bridgeExecutionEnabled": False, "candidateBuilderEnabled": False, "autoReconcile": False, "ledgerFifoMutation": False},
+        }
+
+    for row in rows:
+        movement = _bridge_hydration_treasury_movement_from_record(row, registry=registry)
+        if movement:
+            movements.append(movement)
+
+    inbound_amount = sum(float(x.get("amount") or 0.0) for x in movements if x.get("direction") == "inbound" and x.get("ok", True))
+    outbound_amount = sum(float(x.get("amount") or 0.0) for x in movements if x.get("direction") == "outbound" and x.get("ok", True))
+    xcm_delta_amount = sum(float(x.get("xcmDeltaAmount") or 0.0) for x in movements if x.get("ok", True))
+
+    if not movements:
+        warnings.append("No local vault/mint/XCM records currently contain Hydration treasury receive evidence.")
+
+    return {
+        "ok": True,
+        "asset": asset_u,
+        "model": "hydration_treasury_movement_preview_v1",
+        "movementCount": len(movements),
+        "inboundAmount": inbound_amount,
+        "outboundAmount": outbound_amount,
+        "netAmount": inbound_amount - outbound_amount,
+        "xcmDeltaAmount": xcm_delta_amount,
+        "movements": movements,
+        "warnings": warnings,
+        "registry": registry,
+        "readOnly": True,
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "candidateBuilderEnabled": False,
+            "candidateBuilderMode": "preview_only_matched_hydration_treasury_evidence",
+            "autoReconcile": False,
+            "ledgerFifoMutation": False,
+            "message": "Hydration treasury movement preview is read-only. It surfaces recorded receive evidence but does not create records, reconcile, submit transactions, or mutate ledger/FIFO state.",
+        },
+    }
+
+
+def _bridge_candidate_readiness_item(key: str, label: str, ready: bool, message: str) -> Dict[str, Any]:
+    return {
+        "key": key,
+        "label": label,
+        "status": "ready" if ready else "missing",
+        "ready": bool(ready),
+        "message": message,
+    }
+
+
+def _bridge_candidate_evidence_set_from_record(
+    row: BridgeTransferRecord,
+    *,
+    registry: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build one review-only bridge candidate/evidence set from a local record.
+
+    This is intentionally display-only. It gives the UI one normalized object
+    that combines source Solana reserve evidence, Asset Hub mint/XCM evidence,
+    and Hydration receive evidence. It never creates, links, reconciles, or
+    mutates ledger/FIFO state.
+    """
+    if _bridge_norm_chain(row.source_chain) != "solana" or _bridge_norm_chain(row.destination_chain) != "hydration":
+        return None
+    if str(row.bridge_mechanism or "").strip().lower() != "vault_deposit_mint_xcm":
+        return None
+
+    evidence = _bridge_record_bridge_evidence(row)
+    source_evidence = evidence.get("source") if isinstance(evidence.get("source"), dict) else {}
+    planned_evidence = evidence.get("planned") if isinstance(evidence.get("planned"), dict) else {}
+    dest = _bridge_destination_evidence_from_record(row)
+    status = str(row.status or "").strip().upper()
+    amount = float(row.amount or 0.0)
+    source_txid = (
+        _bridge_clean_str(row.source_txid)
+        or _bridge_clean_str(source_evidence.get("sourceTxid"))
+        or _bridge_clean_str(source_evidence.get("txid"))
+        or _bridge_clean_str(source_evidence.get("signature"))
+    )
+    source_vault = _bridge_record_source_vault_address(row)
+    asset_hub_mint_txid = _bridge_clean_str(dest.get("assetHubMintTxid"))
+    asset_hub_xcm_txid = _bridge_clean_str(dest.get("assetHubXcmTxid"))
+    hydration_receive_txid = _bridge_clean_str(dest.get("hydrationReceiveTxid")) or _bridge_clean_str(row.destination_txid)
+    minted_amount = _bridge_clean_float(dest.get("assetHubMintAmount")) or amount
+    hydration_received_amount = _bridge_clean_float(dest.get("hydrationReceivedAmount"))
+    xcm_delta_amount = _bridge_clean_float(dest.get("xcmDeltaAmount"))
+    if hydration_received_amount is None and xcm_delta_amount is not None:
+        hydration_received_amount = max(0.0, amount - xcm_delta_amount)
+    if xcm_delta_amount is None and hydration_received_amount is not None:
+        xcm_delta_amount = max(0.0, amount - hydration_received_amount)
+
+    readiness = [
+        _bridge_candidate_readiness_item(
+            "source_reserve_evidence",
+            "Solana reserve source evidence",
+            bool(source_txid and source_vault),
+            "Solana bridge-reserve tx/signature and vault address are present." if source_txid and source_vault else "Missing Solana source signature or bridge-reserve address.",
+        ),
+        _bridge_candidate_readiness_item(
+            "asset_hub_mint_evidence",
+            "Asset Hub mint evidence",
+            bool(asset_hub_mint_txid),
+            "Asset Hub mint tx/hash is present." if asset_hub_mint_txid else "Missing Asset Hub mint tx/hash.",
+        ),
+        _bridge_candidate_readiness_item(
+            "asset_hub_xcm_evidence",
+            "Asset Hub → Hydration XCM evidence",
+            bool(asset_hub_xcm_txid),
+            "Asset Hub → Hydration XCM tx/hash is present." if asset_hub_xcm_txid else "Missing Asset Hub → Hydration XCM tx/hash.",
+        ),
+        _bridge_candidate_readiness_item(
+            "hydration_receive_evidence",
+            "Hydration receive evidence",
+            bool(hydration_receive_txid and hydration_received_amount is not None),
+            "Hydration receive tx/reference and amount are present." if hydration_receive_txid and hydration_received_amount is not None else "Missing Hydration receive reference or received amount.",
+        ),
+        _bridge_candidate_readiness_item(
+            "amount_consistency",
+            "Amount consistency",
+            bool(_bridge_amount_close(minted_amount, amount) and (hydration_received_amount is None or hydration_received_amount <= amount + 0.000001)),
+            "Minted/received amounts are internally consistent." if _bridge_amount_close(minted_amount, amount) and (hydration_received_amount is None or hydration_received_amount <= amount + 0.000001) else "Review amount mismatch before candidate action.",
+        ),
+    ]
+    complete = all(bool(x.get("ready")) for x in readiness[:4])
+    ignored = status == "CANCELLED"
+    review_status = "ignored_cancelled_record" if ignored else ("matched_existing_record" if row.id else "review_candidate")
+
+    return {
+        "kind": "bridge_candidate_evidence_set",
+        "asset": _bridge_norm_asset(row.asset),
+        "amount": amount,
+        "grossAmount": amount,
+        "hydrationReceivedAmount": hydration_received_amount,
+        "xcmDeltaAmount": xcm_delta_amount,
+        "sourceChain": _bridge_norm_chain(row.source_chain),
+        "destinationChain": _bridge_norm_chain(row.destination_chain),
+        "bridgeMechanism": row.bridge_mechanism,
+        "status": review_status,
+        "complete": bool(complete),
+        "ignored": bool(ignored),
+        "reviewOnly": True,
+        "canCreateRecord": False,
+        "canAutoLink": False,
+        "canAutoReconcile": False,
+        "sourceEvidence": {
+            "sourceTxid": source_txid,
+            "sourceVaultAddress": source_vault,
+            "sourceProofUrl": _bridge_clean_str(source_evidence.get("sourceProofUrl")) or _bridge_clean_str(planned_evidence.get("sourceProofUrl")) or (f"https://solscan.io/tx/{source_txid}" if source_txid else None),
+            "amount": _bridge_clean_float(source_evidence.get("sourceAmount")) or amount,
+            "evidenceType": _bridge_clean_str(source_evidence.get("evidenceType")) or "solana_vault_deposit",
+        },
+        "assetHubEvidence": {
+            "assetHubMintTxid": asset_hub_mint_txid,
+            "assetHubMintAmount": minted_amount,
+            "assetHubMintProofUrl": _bridge_evidence_url(asset_hub_mint_txid),
+            "assetHubXcmTxid": asset_hub_xcm_txid,
+            "assetHubXcmProofUrl": _bridge_evidence_url(asset_hub_xcm_txid),
+        },
+        "hydrationEvidence": {
+            "hydrationReceiveTxid": hydration_receive_txid,
+            "hydrationReceivedAmount": hydration_received_amount,
+            "hydrationProofUrl": dest.get("destinationProofUrl") or _bridge_evidence_url(hydration_receive_txid, default_kind="hydration_xcm"),
+            "treasuryRole": "hydration_bridge_treasury",
+        },
+        "matchedTransferRecord": {
+            "id": row.id,
+            "status": row.status,
+            "amount": row.amount,
+            "bridgeMechanism": row.bridge_mechanism,
+            "matchedBy": "local_complete_bridge_evidence" if complete else "local_partial_bridge_evidence",
+            "matchConfidence": "complete" if complete else "partial",
+            "matchReason": "Local bridge transfer record contains source, Asset Hub, XCM, and Hydration receive evidence." if complete else "Local bridge transfer record exists but one or more evidence legs are missing.",
+        },
+        "readiness": readiness,
+        "recommendedNextAction": "Display only; matched transfer records remain manual/review-only. No automatic record creation or reconciliation is enabled.",
+    }
+
+
+def _bridge_source_only_candidate_from_solana_evidence(cand: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(cand, dict):
+        return None
+    amount = _bridge_clean_float(cand.get("amount"))
+    txid = _bridge_clean_str(cand.get("sourceTxid"))
+    vault = _bridge_clean_str(cand.get("sourceVaultAddress"))
+    if amount is None or amount <= 0 or not txid or not vault:
+        return None
+    return {
+        "kind": "bridge_candidate_evidence_set",
+        "asset": _bridge_norm_asset(cand.get("asset") or "UTTT"),
+        "amount": amount,
+        "grossAmount": amount,
+        "sourceChain": "solana",
+        "destinationChain": "hydration",
+        "bridgeMechanism": "vault_deposit_mint_xcm",
+        "status": "source_only_candidate",
+        "complete": False,
+        "ignored": False,
+        "reviewOnly": True,
+        "canCreateRecord": False,
+        "canAutoLink": False,
+        "canAutoReconcile": False,
+        "sourceEvidence": {
+            "sourceTxid": txid,
+            "sourceVaultAddress": vault,
+            "sourceProofUrl": cand.get("sourceProofUrl"),
+            "amount": amount,
+            "evidenceType": cand.get("sourceEvidenceType") or "solana_vault_deposit",
+        },
+        "assetHubEvidence": {},
+        "hydrationEvidence": {},
+        "matchedTransferRecord": None,
+        "readiness": [
+            _bridge_candidate_readiness_item("source_reserve_evidence", "Solana reserve source evidence", True, "Unmatched Solana reserve source evidence is available."),
+            _bridge_candidate_readiness_item("asset_hub_mint_evidence", "Asset Hub mint evidence", False, "Missing matching Asset Hub mint evidence."),
+            _bridge_candidate_readiness_item("asset_hub_xcm_evidence", "Asset Hub → Hydration XCM evidence", False, "Missing matching Asset Hub → Hydration XCM evidence."),
+            _bridge_candidate_readiness_item("hydration_receive_evidence", "Hydration receive evidence", False, "Missing matching Hydration receive evidence."),
+        ],
+        "recommendedNextAction": "Review-only source candidate. Wait for matching Asset Hub and Hydration evidence before creating or linking a transfer record.",
+    }
+
+
+def _bridge_cached_solana_source_candidates(asset: str) -> List[Dict[str, Any]]:
+    cache_path = _bridge_solana_reserve_movements_cache_path(asset)
+    cached = _bridge_read_json_file(cache_path) or {}
+    movements = cached.get("movements") if isinstance(cached.get("movements"), list) else []
+    out: List[Dict[str, Any]] = []
+    for movement in movements:
+        if not isinstance(movement, dict) or movement.get("matchedTransferRecord"):
+            continue
+        cand = _bridge_solana_reserve_movement_candidate_evidence(movement)
+        if cand:
+            out.append(cand)
+    return out
+
+
+def _bridge_candidate_preview_payload(
+    db: Session,
+    *,
+    asset: str = "UTTT",
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Read-only combined bridge candidate preview.
+
+    This combines the already-built Solana reserve, Asset Hub mint/XCM, and
+    Hydration receive evidence streams into normalized review-only candidate
+    sets. It does not create records, link evidence, reconcile, submit bridge
+    transactions, or mutate ledger/FIFO state.
+    """
+    asset_u = _bridge_norm_asset(asset)
+    safe_limit = max(1, min(int(limit or 50), 250))
+    registry = _bridge_treasury_registry_payload(db, asset=asset_u)
+    warnings: List[str] = []
+
+    try:
+        rows = (
+            db.query(BridgeTransferRecord)
+            .filter(BridgeTransferRecord.asset == asset_u)
+            .filter(BridgeTransferRecord.bridge_mechanism == "vault_deposit_mint_xcm")
+            .order_by(BridgeTransferRecord.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "asset": asset_u,
+            "model": "bridge_candidate_preview_v1",
+            "error": "bridge_candidate_preview_failed",
+            "message": str(e),
+            "exc": type(e).__name__,
+            "evidenceSets": [],
+            "reviewCandidates": [],
+            "warnings": ["Bridge candidate preview failed before any records were changed."],
+            "registry": registry,
+            "readOnly": True,
+            "execution": {"bridgeExecutionEnabled": False, "candidateBuilderEnabled": False, "autoReconcile": False, "ledgerFifoMutation": False},
+        }
+
+    evidence_sets = [x for x in (_bridge_candidate_evidence_set_from_record(row, registry=registry) for row in rows) if x]
+    active_sets = [x for x in evidence_sets if not x.get("ignored")]
+    ignored_sets = [x for x in evidence_sets if x.get("ignored")]
+    complete_sets = [x for x in active_sets if x.get("complete")]
+
+    source_only_candidates = [
+        x for x in (_bridge_source_only_candidate_from_solana_evidence(c) for c in _bridge_cached_solana_source_candidates(asset_u))
+        if x
+    ]
+    review_candidates = [x for x in source_only_candidates if not x.get("complete")]
+
+    if not evidence_sets and not review_candidates:
+        warnings.append("No bridge candidate evidence sets are available yet.")
+    if ignored_sets:
+        warnings.append(f"{len(ignored_sets)} cancelled local bridge record(s) were ignored by the candidate builder.")
+    if review_candidates:
+        warnings.append("One or more unmatched Solana source candidates are incomplete; wait for Asset Hub and Hydration evidence before creating records.")
+
+    return {
+        "ok": True,
+        "asset": asset_u,
+        "model": "bridge_candidate_preview_v1",
+        "evidenceSetCount": len(evidence_sets),
+        "matchedEvidenceSetCount": len(active_sets),
+        "completeEvidenceSetCount": len(complete_sets),
+        "ignoredEvidenceSetCount": len(ignored_sets),
+        "reviewCandidateCount": len(review_candidates),
+        "completeCandidateCount": len([x for x in review_candidates if x.get("complete")]),
+        "evidenceSets": evidence_sets,
+        "matchedEvidenceSets": active_sets,
+        "ignoredEvidenceSets": ignored_sets,
+        "reviewCandidates": review_candidates,
+        "warnings": warnings,
+        "registry": registry,
+        "readOnly": True,
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "candidateBuilderEnabled": True,
+            "candidateBuilderMode": "preview_only_combined_bridge_evidence",
+            "candidateCreationEnabled": False,
+            "autoLink": False,
+            "autoReconcile": False,
+            "ledgerFifoMutation": False,
+            "message": "Bridge candidate preview is read-only. It normalizes evidence into review-only candidate sets but does not create records, link evidence, reconcile, submit transactions, or mutate ledger/FIFO state.",
+        },
+    }
+
+def _bridge_solana_unavailable_response(
+    *,
+    asset: str,
+    reserve_address: Optional[str] = None,
+    mint: Optional[str] = None,
+    decimals: int = 6,
+    registry: Optional[Dict[str, Any]] = None,
+    cache_path: Optional[str] = None,
+    cached: Optional[Dict[str, Any]] = None,
+    error: str = "solana_reserve_preview_unavailable",
+    message: str = "Solana reserve movement preview is temporarily unavailable.",
+    detail: Optional[Any] = None,
+) -> Dict[str, Any]:
+    cached_movements = (cached or {}).get("movements") if isinstance((cached or {}).get("movements"), list) else []
+    if cached_movements:
+        resp = _bridge_solana_cached_response(
+            asset=asset,
+            reserve_address=reserve_address or (cached or {}).get("reserveAddress") or "",
+            mint=mint or (cached or {}).get("mint") or "",
+            decimals=decimals or int((cached or {}).get("decimals") or 6),
+            cache_path=cache_path or _bridge_solana_reserve_movements_cache_path(asset),
+            cached=cached or {},
+            registry=registry or {},
+            warning=message,
+        )
+        resp["error"] = error
+        resp["detail"] = detail
+        return resp
+    return {
+        "ok": False,
+        "asset": _bridge_norm_asset(asset),
+        "model": "solana_reserve_movement_preview_v1",
+        "error": error,
+        "message": message,
+        "detail": detail,
+        "reserveAddress": reserve_address,
+        "mint": mint,
+        "decimals": int(decimals or 6),
+        "rpcUrl": _bridge_solana_rpc_url(),
+        "tokenAccounts": [],
+        "tokenAccountCount": 0,
+        "scanAddressCount": 0,
+        "scannedSignatureCount": 0,
+        "freshMovementCount": 0,
+        "movementCount": 0,
+        "unmatchedMovementCount": 0,
+        "candidateEvidenceCount": 0,
+        "candidateEvidence": [],
+        "inboundAmount": 0.0,
+        "outboundAmount": 0.0,
+        "netAmount": 0.0,
+        "movements": [],
+        "warnings": [message],
+        "signatureErrors": [],
+        "transactionErrors": [],
+        "registry": registry or {},
+        "readOnly": True,
+        "cache": {
+            "enabled": bool(cache_path),
+            "servedFromCache": False,
+            "stale": False,
+            "path": os.path.basename(cache_path) if cache_path else None,
+            "updatedAtUtc": None,
+            "movementCount": 0,
+            "writeOk": None,
+        },
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "candidateBuilderEnabled": False,
+            "autoReconcile": False,
+            "ledgerFifoMutation": False,
+            "message": "Solana reserve movement preview failed open. No records were created and ledger/FIFO state was not mutated.",
+        },
+    }
+
+
+def _bridge_cache_root_dir() -> str:
+    raw = _env_str("UTT_BRIDGE_CACHE_DIR")
+    if raw:
+        return raw
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "bridge_cache"))
+
+
+def _bridge_cache_safe_asset(asset: str) -> str:
+    text = "".join(ch.lower() for ch in str(asset or "uttt") if ch.isalnum() or ch in {"_", "-"}).strip("_- ")
+    return text or "uttt"
+
+
+def _bridge_solana_reserve_movements_cache_path(asset: str) -> str:
+    raw = _env_str("UTT_BRIDGE_SOLANA_RESERVE_MOVEMENTS_CACHE_PATH")
+    if raw:
+        return raw
+    return os.path.join(_bridge_cache_root_dir(), f"{_bridge_cache_safe_asset(asset)}_solana_reserve_movements.json")
+
+
+def _bridge_read_json_file(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        if not path or not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _bridge_write_json_file(path: str, data: Dict[str, Any]) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+        return True
+    except Exception:
+        return False
+
+
+def _bridge_movement_sort_key(row: Dict[str, Any]) -> tuple[int, int, str]:
+    try:
+        block_time = int(row.get("blockTime") or 0)
+    except Exception:
+        block_time = 0
+    try:
+        slot = int(row.get("slot") or 0)
+    except Exception:
+        slot = 0
+    return (block_time, slot, str(row.get("signature") or ""))
+
+
+def _bridge_merge_solana_reserve_movements(
+    cached: List[Dict[str, Any]],
+    fresh: List[Dict[str, Any]],
+    *,
+    max_items: int,
+) -> List[Dict[str, Any]]:
+    by_sig: Dict[str, Dict[str, Any]] = {}
+    now = datetime.utcnow().isoformat()
+    for row in cached or []:
+        if not isinstance(row, dict):
+            continue
+        sig = _bridge_clean_str(row.get("signature"))
+        if not sig:
+            continue
+        by_sig[sig] = {**row, "fromCache": True, "cachedFirstSeenUtc": row.get("cachedFirstSeenUtc") or row.get("cachedAtUtc") or now}
+    for row in fresh or []:
+        if not isinstance(row, dict):
+            continue
+        sig = _bridge_clean_str(row.get("signature"))
+        if not sig:
+            continue
+        old = by_sig.get(sig) or {}
+        by_sig[sig] = {
+            **old,
+            **row,
+            "fromCache": False,
+            "cachedFirstSeenUtc": old.get("cachedFirstSeenUtc") or now,
+            "cachedLastSeenUtc": now,
+        }
+    merged = sorted(by_sig.values(), key=_bridge_movement_sort_key, reverse=True)
+    return merged[: max(1, int(max_items or 100))]
+
+
+def _bridge_solana_reserve_movements_cache_envelope(
+    *,
+    asset: str,
+    reserve_address: str,
+    mint: str,
+    decimals: int,
+    movements: List[Dict[str, Any]],
+    token_accounts: Optional[List[Dict[str, Any]]] = None,
+    previous: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    now = datetime.utcnow().isoformat()
+    return {
+        "version": 1,
+        "asset": _bridge_norm_asset(asset),
+        "reserveAddress": reserve_address,
+        "mint": mint,
+        "decimals": int(decimals or 6),
+        "updatedAtUtc": now,
+        "createdAtUtc": (previous or {}).get("createdAtUtc") or now,
+        "movementCount": len(movements or []),
+        "movements": movements or [],
+        "tokenAccounts": token_accounts if token_accounts is not None else (previous or {}).get("tokenAccounts") or [],
+        "readOnly": True,
+    }
+
+
+def _bridge_solana_cached_response(
+    *,
+    asset: str,
+    reserve_address: str,
+    mint: str,
+    decimals: int,
+    cache_path: str,
+    cached: Dict[str, Any],
+    registry: Dict[str, Any],
+    warning: str,
+) -> Dict[str, Any]:
+    movements = cached.get("movements") if isinstance(cached.get("movements"), list) else []
+    inbound = sum(float(x.get("amount") or 0.0) for x in movements if isinstance(x, dict) and x.get("direction") == "inbound" and x.get("ok", True))
+    outbound = sum(float(x.get("amount") or 0.0) for x in movements if isinstance(x, dict) and x.get("direction") == "outbound" and x.get("ok", True))
+    candidate_evidence = [c for c in (_bridge_solana_reserve_movement_candidate_evidence(x) for x in movements if isinstance(x, dict) and not x.get("matchedTransferRecord")) if c]
+    return {
+        "ok": True,
+        "asset": _bridge_norm_asset(asset),
+        "model": "solana_reserve_movement_preview_v1",
+        "reserveAddress": reserve_address,
+        "mint": mint,
+        "decimals": int(decimals or 6),
+        "rpcUrl": _bridge_solana_rpc_url(),
+        "tokenAccounts": cached.get("tokenAccounts") or [],
+        "tokenAccountCount": len(cached.get("tokenAccounts") or []),
+        "scanAddressCount": 0,
+        "scannedSignatureCount": 0,
+        "freshMovementCount": 0,
+        "movementCount": len(movements),
+        "unmatchedMovementCount": len([x for x in movements if isinstance(x, dict) and not x.get("matchedTransferRecord")]),
+        "candidateEvidenceCount": len(candidate_evidence),
+        "candidateEvidence": candidate_evidence,
+        "inboundAmount": inbound,
+        "outboundAmount": outbound,
+        "netAmount": inbound - outbound,
+        "movements": movements,
+        "warnings": [warning],
+        "signatureErrors": [],
+        "transactionErrors": [],
+        "registry": registry,
+        "readOnly": True,
+        "cache": {
+            "enabled": True,
+            "servedFromCache": True,
+            "stale": True,
+            "path": os.path.basename(cache_path),
+            "updatedAtUtc": cached.get("updatedAtUtc"),
+            "movementCount": len(movements),
+            "writeOk": None,
+        },
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "candidateBuilderEnabled": True,
+            "candidateBuilderMode": "preview_only_unmatched_source_evidence",
+            "autoReconcile": False,
+            "ledgerFifoMutation": False,
+            "message": "Serving cached Solana reserve movement preview. Candidate evidence is display-only; no records were created and ledger/FIFO state was not mutated.",
+        },
+    }
+
+def _bridge_solana_reserve_movements_payload(
+    db: Session,
+    *,
+    asset: str = "UTTT",
+    limit: int = 25,
+    use_cache: bool = True,
+    cache_limit: int = 100,
+    tx_limit: int = 8,
+    fail_soft: bool = True,
+) -> Dict[str, Any]:
+    asset_u = _bridge_norm_asset(asset)
+    safe_limit = max(1, min(int(limit or 25), 50))
+    safe_cache_limit = max(safe_limit, min(int(cache_limit or 100), 500))
+    safe_tx_limit = max(1, min(int(tx_limit or 8), safe_limit, 25))
+    cache_enabled = bool(use_cache) and _env_bool("UTT_BRIDGE_SOLANA_RESERVE_MOVEMENT_CACHE_ENABLED", True)
+    cache_path = _bridge_solana_reserve_movements_cache_path(asset_u)
+    cached_payload = _bridge_read_json_file(cache_path) if cache_enabled else None
+    cached_movements = cached_payload.get("movements") if isinstance(cached_payload, dict) and isinstance(cached_payload.get("movements"), list) else []
+    registry = _bridge_treasury_registry_payload(db, asset=asset_u)
+    roles = registry.get("roles") if isinstance(registry, dict) else []
+    sol_role = next((r for r in roles or [] if r.get("role") == "solana_bridge_reserve"), None)
+    reserve_address = _bridge_clean_str((sol_role or {}).get("address") or (sol_role or {}).get("registeredAddress") or (sol_role or {}).get("configuredAddress"))
+    mint = _bridge_resolve_solana_mint(db, asset=asset_u)
+    token_row = _bridge_resolve_solana_token_registry_row(db, asset=asset_u)
+    decimals = int(getattr(token_row, "decimals", 6) or 6)
+    warnings: List[str] = []
+
+    if not reserve_address:
+        return {
+            "ok": False,
+            "asset": asset_u,
+            "error": "solana_bridge_reserve_missing",
+            "message": "Official Solana Bridge Reserve address is not configured/registered.",
+            "registry": registry,
+            "movements": [],
+            "readOnly": True,
+            "execution": {"bridgeExecutionEnabled": False, "ledgerFifoMutation": False},
+        }
+    if not mint:
+        return {
+            "ok": False,
+            "asset": asset_u,
+            "reserveAddress": reserve_address,
+            "error": "solana_uttt_mint_missing",
+            "message": "Token Registry does not have a Solana mint/address for UTTT.",
+            "registry": registry,
+            "movements": [],
+            "readOnly": True,
+            "execution": {"bridgeExecutionEnabled": False, "ledgerFifoMutation": False},
+        }
+
+    try:
+        token_accounts_resp = _bridge_solana_rpc_call(
+            "getTokenAccountsByOwner",
+            [reserve_address, {"mint": mint}, {"encoding": "jsonParsed"}],
+            timeout_s=14.0,
+        )
+    except HTTPException as e:
+        if cache_enabled and cached_movements:
+            return _bridge_solana_cached_response(
+                asset=asset_u,
+                reserve_address=reserve_address,
+                mint=mint,
+                decimals=decimals,
+                cache_path=cache_path,
+                cached=cached_payload or {},
+                registry=registry,
+                warning="Solana RPC token-account scan failed; serving cached Solana reserve movements.",
+            )
+        if fail_soft:
+            return _bridge_solana_unavailable_response(
+                asset=asset_u,
+                reserve_address=reserve_address,
+                mint=mint,
+                decimals=decimals,
+                registry=registry,
+                cache_path=cache_path if cache_enabled else None,
+                cached=cached_payload if isinstance(cached_payload, dict) else None,
+                error="solana_token_account_scan_failed",
+                message="Solana reserve token-account scan failed; preview remains unavailable until RPC responds or cache is populated.",
+                detail=e.detail,
+            )
+        raise e
+    token_values = (((token_accounts_resp or {}).get("result") or {}).get("value") or [])
+    token_accounts: List[Dict[str, Any]] = []
+    for it in token_values or []:
+        if not isinstance(it, dict):
+            continue
+        pubkey = _bridge_clean_str(it.get("pubkey"))
+        parsed = (((it.get("account") or {}).get("data") or {}).get("parsed") or {})
+        token_amount = (((parsed.get("info") or {}).get("tokenAmount") or {}))
+        bal = _bridge_parse_solana_ui_token_amount(token_amount)
+        if pubkey:
+            token_accounts.append({"address": pubkey, "balance": bal})
+
+    token_account_set = {x.get("address") for x in token_accounts if x.get("address")}
+    scan_addresses = [reserve_address, *[x for x in token_account_set if x]]
+    signature_map: Dict[str, Dict[str, Any]] = {}
+    signature_errors: List[Dict[str, Any]] = []
+
+    known_source_rows = _bridge_known_solana_reserve_record_sources(
+        db,
+        asset=asset_u,
+        reserve_address=reserve_address,
+        limit=safe_cache_limit,
+    )
+    for known_row in known_source_rows:
+        sig = _bridge_clean_str(known_row.get("signature"))
+        if sig:
+            signature_map[sig] = known_row
+
+    for addr in scan_addresses:
+        try:
+            sig_resp = _bridge_solana_rpc_call(
+                "getSignaturesForAddress",
+                [addr, {"limit": safe_limit}],
+                timeout_s=14.0,
+            )
+            for sig_row in (sig_resp.get("result") or []):
+                if not isinstance(sig_row, dict):
+                    continue
+                sig = _bridge_clean_str(sig_row.get("signature"))
+                if not sig:
+                    continue
+                current = signature_map.get(sig)
+                if current is None or (sig_row.get("blockTime") or 0) > (current.get("blockTime") or 0):
+                    signature_map[sig] = {**sig_row, "scanAddress": addr}
+        except HTTPException as e:
+            signature_errors.append({"address": addr, "error": e.detail})
+        except Exception as e:
+            signature_errors.append({"address": addr, "error": {"exc": type(e).__name__, "message": str(e)}})
+
+    sig_rows = sorted(signature_map.values(), key=lambda x: int(x.get("blockTime") or 0), reverse=True)[:safe_limit]
+    tx_rows = sig_rows[:safe_tx_limit]
+    movements: List[Dict[str, Any]] = []
+    tx_errors: List[Dict[str, Any]] = []
+    epsilon = 1 / (10 ** max(0, decimals))
+
+    for sig_row in tx_rows:
+        sig = _bridge_clean_str(sig_row.get("signature"))
+        if not sig:
+            continue
+        try:
+            tx_resp = _bridge_solana_rpc_call(
+                "getTransaction",
+                [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+                timeout_s=18.0,
+            )
+            tx = tx_resp.get("result") or {}
+            if not tx:
+                fallback = _bridge_solana_record_source_movement(
+                    row=sig_row,
+                    asset=asset_u,
+                    reserve_address=reserve_address,
+                    mint=mint,
+                    reason="Solana getTransaction returned no parsed result; showing matched local bridge source evidence instead.",
+                )
+                if fallback:
+                    movements.append(fallback)
+                continue
+            meta = tx.get("meta") or {}
+            pre = _bridge_solana_token_balance_sum(
+                tx,
+                meta.get("preTokenBalances") or [],
+                mint=mint,
+                reserve_address=reserve_address,
+                token_account_set=token_account_set,
+            )
+            post = _bridge_solana_token_balance_sum(
+                tx,
+                meta.get("postTokenBalances") or [],
+                mint=mint,
+                reserve_address=reserve_address,
+                token_account_set=token_account_set,
+            )
+            delta = post - pre
+            if abs(delta) < epsilon:
+                fallback = _bridge_solana_record_source_movement(
+                    row=sig_row,
+                    asset=asset_u,
+                    reserve_address=reserve_address,
+                    mint=mint,
+                    reason="Parsed transaction did not expose a reserve token-balance delta; showing matched local bridge source evidence instead.",
+                )
+                if fallback:
+                    movements.append(fallback)
+                continue
+            classification = "inbound_reserve_deposit" if delta > 0 else "outbound_reserve_release"
+            amount = abs(delta)
+            matched = _bridge_solana_signature_matches_existing_record(db, asset=asset_u, signature=sig, amount=amount, reserve_address=reserve_address, direction=("inbound" if delta > 0 else "outbound"))
+            movements.append({
+                "signature": sig,
+                "slot": tx.get("slot") or sig_row.get("slot"),
+                "blockTime": tx.get("blockTime") or sig_row.get("blockTime"),
+                "err": meta.get("err") or sig_row.get("err"),
+                "ok": not bool(meta.get("err") or sig_row.get("err")),
+                "asset": asset_u,
+                "mint": mint,
+                "reserveAddress": reserve_address,
+                "amount": amount,
+                "signedDelta": delta,
+                "direction": "inbound" if delta > 0 else "outbound",
+                "classification": classification,
+                "preReserveBalance": pre,
+                "postReserveBalance": post,
+                "scanAddress": sig_row.get("scanAddress"),
+                "matchedTransferRecord": matched,
+                "explorerUrl": f"https://solscan.io/tx/{sig}",
+                "reviewOnly": True,
+            })
+        except HTTPException as e:
+            fallback = _bridge_solana_record_source_movement(
+                row=sig_row,
+                asset=asset_u,
+                reserve_address=reserve_address,
+                mint=mint,
+                reason="Solana transaction parse failed; showing matched local bridge source evidence instead.",
+            )
+            if fallback:
+                movements.append(fallback)
+            tx_errors.append({"signature": sig, "error": e.detail})
+        except Exception as e:
+            fallback = _bridge_solana_record_source_movement(
+                row=sig_row,
+                asset=asset_u,
+                reserve_address=reserve_address,
+                mint=mint,
+                reason="Solana transaction parse raised an exception; showing matched local bridge source evidence instead.",
+            )
+            if fallback:
+                movements.append(fallback)
+            tx_errors.append({"signature": sig, "error": {"exc": type(e).__name__, "message": str(e)}})
+
+    movements.sort(key=lambda x: int(x.get("blockTime") or 0), reverse=True)
+    fresh_movement_count = len(movements)
+    cache_write_ok: Optional[bool] = None
+    served_from_cache = False
+    if cache_enabled:
+        merged_movements = _bridge_merge_solana_reserve_movements(cached_movements, movements, max_items=safe_cache_limit)
+        cache_envelope = _bridge_solana_reserve_movements_cache_envelope(
+            asset=asset_u,
+            reserve_address=reserve_address,
+            mint=mint,
+            decimals=decimals,
+            movements=merged_movements,
+            token_accounts=token_accounts,
+            previous=cached_payload if isinstance(cached_payload, dict) else None,
+        )
+        cache_write_ok = _bridge_write_json_file(cache_path, cache_envelope)
+        movements = merged_movements
+        served_from_cache = bool(cached_movements and fresh_movement_count == 0)
+        if cached_movements and len(movements) > fresh_movement_count:
+            warnings.append("Cached Solana reserve movements are included with the latest live scan.")
+        if cache_write_ok is False:
+            warnings.append("Solana reserve movement scan completed, but cache write failed.")
+    inbound = sum(float(x.get("amount") or 0.0) for x in movements if x.get("direction") == "inbound" and x.get("ok"))
+    outbound = sum(float(x.get("amount") or 0.0) for x in movements if x.get("direction") == "outbound" and x.get("ok"))
+    unmatched = [x for x in movements if not x.get("matchedTransferRecord")]
+    candidate_evidence = [c for c in (_bridge_solana_reserve_movement_candidate_evidence(x) for x in unmatched) if c]
+    if signature_errors:
+        warnings.append("One or more Solana signature scans failed; preview may be partial.")
+    if tx_errors:
+        warnings.append("One or more Solana transaction parses failed; preview may be partial.")
+    if any(isinstance(x, dict) and x.get("parseFallback") for x in movements):
+        warnings.append("One or more matched Solana reserve movements were shown from local bridge evidence because RPC transaction parsing was incomplete.")
+
+    return {
+        "ok": True,
+        "asset": asset_u,
+        "model": "solana_reserve_movement_preview_v1",
+        "reserveAddress": reserve_address,
+        "mint": mint,
+        "decimals": decimals,
+        "rpcUrl": _bridge_solana_rpc_url(),
+        "tokenAccounts": token_accounts,
+        "tokenAccountCount": len(token_accounts),
+        "scanAddressCount": len(scan_addresses),
+        "knownSourceSignatureCount": len(known_source_rows),
+        "scannedSignatureCount": len(sig_rows),
+        "parsedTransactionCount": len(tx_rows),
+        "txLimit": safe_tx_limit,
+        "freshMovementCount": fresh_movement_count,
+        "movementCount": len(movements),
+        "unmatchedMovementCount": len(unmatched),
+        "candidateEvidenceCount": len(candidate_evidence),
+        "candidateEvidence": candidate_evidence,
+        "inboundAmount": inbound,
+        "outboundAmount": outbound,
+        "netAmount": inbound - outbound,
+        "movements": movements,
+        "warnings": warnings,
+        "signatureErrors": signature_errors,
+        "transactionErrors": tx_errors,
+        "registry": registry,
+        "readOnly": True,
+        "cache": {
+            "enabled": bool(cache_enabled),
+            "servedFromCache": bool(served_from_cache),
+            "stale": False,
+            "path": os.path.basename(cache_path) if cache_enabled else None,
+            "updatedAtUtc": datetime.utcnow().isoformat() if cache_enabled else None,
+            "cachedMovementCountBefore": len(cached_movements or []),
+            "movementCount": len(movements),
+            "writeOk": cache_write_ok,
+        },
+        "execution": {
+            "bridgeExecutionEnabled": False,
+            "candidateBuilderEnabled": True,
+            "candidateBuilderMode": "preview_only_unmatched_source_evidence",
+            "autoReconcile": False,
+            "ledgerFifoMutation": False,
+            "message": "Solana reserve movement scanner is preview-only. It can suggest unmatched source-evidence candidates but does not create records, reconcile, submit transactions, or mutate ledger/FIFO state.",
         },
     }
 
@@ -1157,6 +2756,10 @@ def bridge_transfer_records_status() -> Dict[str, Any]:
         "endpoints": {
             "status": "GET /api/bridge/transfer_records/status",
             "treasury_registry": "GET /api/bridge/uttt_treasury_registry",
+            "solana_reserve_movements": "GET /api/bridge/uttt_solana_reserve_movements",
+            "asset_hub_evidence_preview": "GET /api/bridge/uttt_asset_hub_evidence_preview",
+            "hydration_treasury_movements": "GET /api/bridge/uttt_hydration_treasury_movements_preview",
+            "bridge_candidate_preview": "GET /api/bridge/uttt_bridge_candidate_preview",
             "list": "GET /api/bridge/transfer_records",
             "preview": "POST /api/bridge/transfer_records/preview",
             "create": "POST /api/bridge/transfer_records",
@@ -1209,6 +2812,76 @@ def bridge_uttt_treasury_registry(
     """
     return _bridge_treasury_registry_payload(db, asset=asset)
 
+
+
+
+@router.get("/uttt_solana_reserve_movements")
+def bridge_uttt_solana_reserve_movements(
+    asset: str = Query("UTTT", description="Asset symbol. Currently optimized for UTTT."),
+    limit: int = Query(25, ge=1, le=50, description="Maximum recent Solana signatures to inspect."),
+    cache_limit: int = Query(100, ge=1, le=500, description="Maximum cached Solana reserve movements to return after merge."),
+    use_cache: bool = Query(True, description="Read/write local preview cache for scanned Solana reserve movements."),
+    tx_limit: int = Query(8, ge=1, le=25, description="Maximum recent signatures to fetch full transaction metadata for during this preview refresh."),
+    fail_soft: bool = Query(True, description="Return an ok=false preview payload instead of raising when Solana RPC is unavailable and cache is empty."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Read-only Solana Bridge Reserve SPL-token movement preview.
+
+    This endpoint uses the official UTTT treasury registry, resolves the UTTT
+    Solana mint from Token Registry, inspects recent SPL token-account
+    signatures, and classifies inbound/outbound reserve movements. It does not
+    create bridge records, reconcile, submit transactions, or mutate ledger/FIFO
+    state.
+    """
+    return _bridge_solana_reserve_movements_payload(db, asset=asset, limit=limit, use_cache=use_cache, cache_limit=cache_limit, tx_limit=tx_limit, fail_soft=fail_soft)
+
+
+@router.get("/uttt_asset_hub_evidence_preview")
+def bridge_uttt_asset_hub_evidence_preview(
+    asset: str = Query("UTTT", description="Asset symbol. Currently optimized for UTTT."),
+    limit: int = Query(50, ge=1, le=250, description="Maximum local bridge records to inspect for Asset Hub mint/XCM evidence."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Read-only Asset Hub mint/XCM evidence preview.
+
+    This endpoint surfaces existing local vault/mint/XCM bridge evidence for the
+    Asset Hub mint, Asset Hub → Hydration XCM send, and Hydration receive leg.
+    It does not query Subscan yet, create transfer records, reconcile, submit
+    transactions, or mutate ledger/FIFO state.
+    """
+    return _bridge_asset_hub_evidence_preview_payload(db, asset=asset, limit=limit)
+
+
+
+@router.get("/uttt_hydration_treasury_movements_preview")
+def bridge_uttt_hydration_treasury_movements_preview(
+    asset: str = Query("UTTT", description="Asset symbol. Currently optimized for UTTT."),
+    limit: int = Query(50, ge=1, le=250, description="Maximum local bridge records to inspect for Hydration treasury receive evidence."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Read-only Hydration treasury receive/transfer preview.
+
+    This endpoint surfaces existing local vault/mint/XCM bridge evidence for
+    Hydration-side treasury receives. It does not query Hydration history yet,
+    create transfer records, reconcile, submit transactions, or mutate
+    ledger/FIFO state.
+    """
+    return _bridge_hydration_treasury_movements_preview_payload(db, asset=asset, limit=limit)
+
+@router.get("/uttt_bridge_candidate_preview")
+def bridge_uttt_bridge_candidate_preview(
+    asset: str = Query("UTTT", description="Asset symbol. Currently optimized for UTTT."),
+    limit: int = Query(50, ge=1, le=250, description="Maximum local bridge records to inspect for review-only candidate evidence sets."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Read-only combined bridge candidate preview.
+
+    This endpoint combines Solana source, Asset Hub mint/XCM, and Hydration
+    receive evidence into normalized review-only candidate/evidence sets. It
+    does not create transfer records, link evidence, reconcile, submit
+    transactions, or mutate ledger/FIFO state.
+    """
+    return _bridge_candidate_preview_payload(db, asset=asset, limit=limit)
 
 @router.get("/transfer_records")
 def bridge_transfer_records_list(

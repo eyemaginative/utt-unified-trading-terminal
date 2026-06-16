@@ -200,6 +200,96 @@ const HYDRATION_BUILTIN_ROUTE_TEMPLATES = [
     direction: { label: "HDX → UTTT" },
     note: "Built-in reverse manual XYK snapshot template. Add or verify pool account before relying on live reserves; confirm only after a tiny live on-chain success.",
   },
+  {
+    id: "builtin:HDX-USDT:manual_router",
+    source: "builtin",
+    label: "HDX-USDT manual Router · HDX → USDT",
+    symbol: "HDX-USDT",
+    routeMode: "manual_router",
+    poolType: "Router",
+    baseReserve: "",
+    quoteReserve: "",
+    feeBps: 30,
+    poolAccount: "",
+    routeJson: [
+      { pool: { type: "Omnipool" }, assetIn: 0, assetOut: 10 },
+    ],
+    direction: { label: "HDX → USDT" },
+    liquidityClass: "high_liquidity_candidate",
+    templateNotes: [
+      "High-liquidity candidate template using Hydration Omnipool HDX/USDT routing.",
+      "USDT is expected to be Hydration asset 10 with 6 decimals; verify Token Registry metadata before confirming.",
+    ],
+    note: "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+  },
+  {
+    id: "builtin:USDT-HDX:manual_router",
+    source: "builtin",
+    label: "USDT-HDX manual Router · USDT → HDX",
+    symbol: "USDT-HDX",
+    routeMode: "manual_router",
+    poolType: "Router",
+    baseReserve: "",
+    quoteReserve: "",
+    feeBps: 30,
+    poolAccount: "",
+    routeJson: [
+      { pool: { type: "Omnipool" }, assetIn: 10, assetOut: 0 },
+    ],
+    direction: { label: "USDT → HDX" },
+    liquidityClass: "high_liquidity_candidate",
+    templateNotes: [
+      "High-liquidity candidate template using Hydration Omnipool USDT/HDX routing.",
+      "USDT is expected to be Hydration asset 10 with 6 decimals; verify Token Registry metadata before confirming.",
+    ],
+    note: "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+  },
+  {
+    id: "builtin:DOT-USDT:manual_router",
+    source: "builtin",
+    label: "DOT-USDT manual Router · DOT → aDOT → USDT",
+    symbol: "DOT-USDT",
+    routeMode: "manual_router",
+    poolType: "Router",
+    baseReserve: "",
+    quoteReserve: "",
+    feeBps: 30,
+    poolAccount: "",
+    routeJson: [
+      { pool: { type: "Aave" }, assetIn: 5, assetOut: 1001 },
+      { pool: { type: "Omnipool" }, assetIn: 1001, assetOut: 10 },
+    ],
+    direction: { label: "DOT → aDOT → USDT" },
+    liquidityClass: "high_liquidity_candidate",
+    templateNotes: [
+      "High-liquidity candidate template using DOT/aDOT wrapping plus Omnipool routing into USDT.",
+      "USDT is expected to be Hydration asset 10 with 6 decimals; verify Token Registry metadata before confirming.",
+    ],
+    note: "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+  },
+  {
+    id: "builtin:USDT-DOT:manual_router",
+    source: "builtin",
+    label: "USDT-DOT manual Router · USDT → aDOT → DOT",
+    symbol: "USDT-DOT",
+    routeMode: "manual_router",
+    poolType: "Router",
+    baseReserve: "",
+    quoteReserve: "",
+    feeBps: 30,
+    poolAccount: "",
+    routeJson: [
+      { pool: { type: "Omnipool" }, assetIn: 10, assetOut: 1001 },
+      { pool: { type: "Aave" }, assetIn: 1001, assetOut: 5 },
+    ],
+    direction: { label: "USDT → aDOT → DOT" },
+    liquidityClass: "high_liquidity_candidate",
+    templateNotes: [
+      "High-liquidity candidate template using Omnipool routing into aDOT plus DOT unwrap through Aave.",
+      "USDT is expected to be Hydration asset 10 with 6 decimals; verify Token Registry metadata before confirming.",
+    ],
+    note: "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+  },
 ];
 
 function routeTemplateSourceLabel(sourceType) {
@@ -220,6 +310,46 @@ function routeTemplateSourceBadgeSeverity(tpl) {
   return "warn";
 }
 
+function routeWarningMessage(raw) {
+  if (raw && typeof raw === "object") {
+    return String(raw.message || raw.warning || raw.error || raw.note || JSON.stringify(raw)).trim();
+  }
+  return String(raw || "").trim();
+}
+
+function routeWarningKind(raw, fallback = "template_source_warning") {
+  if (raw && typeof raw === "object") {
+    return String(raw.warning || raw.error || raw.kind || fallback).trim();
+  }
+  return fallback;
+}
+
+function normalizeRouteWarningList(rawWarnings) {
+  if (!Array.isArray(rawWarnings)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of rawWarnings) {
+    const message = routeWarningMessage(raw);
+    if (!message || seen.has(message)) continue;
+    seen.add(message);
+    out.push({ warning: routeWarningKind(raw), message });
+  }
+  return out;
+}
+
+function normalizeRouteNoteList(rawNotes) {
+  if (!Array.isArray(rawNotes)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of rawNotes) {
+    const message = routeWarningMessage(raw);
+    if (!message || seen.has(message)) continue;
+    seen.add(message);
+    out.push(message);
+  }
+  return out;
+}
+
 function normalizeHydrationRouteTemplate(raw, index = 0) {
   const t = raw && typeof raw === "object" ? raw : {};
   const symbol = String(t.symbol || "").trim().toUpperCase();
@@ -234,7 +364,8 @@ function normalizeHydrationRouteTemplate(raw, index = 0) {
   const sourceType = sourceTypeRaw === "builtin" || sourceTypeRaw === "built-in" ? "built_in" : sourceTypeRaw;
   const id = String(t.id || `${source}:${symbol || "route"}:${routeMode}:${index}`).trim();
   const label = String(t.label || [symbol, routeMode === "manual_router" ? "manual Router" : "manual XYK", t.routeDirection || t.direction?.label].filter(Boolean).join(" · ")).trim();
-  const warnings = Array.isArray(t.warnings) ? t.warnings.filter(Boolean).map((x) => String(x)) : [];
+  const warnings = normalizeRouteWarningList(t.warnings);
+  const templateNotes = normalizeRouteNoteList(t.templateNotes || t.template_notes || []);
   return {
     id,
     source,
@@ -258,6 +389,9 @@ function normalizeHydrationRouteTemplate(raw, index = 0) {
     sourceExecutable: !!(t.sourceExecutable || t.source_executable),
     warningLevel: String(t.warningLevel || t.warning_level || (sourceType === "saved_registry" && (t.sourceConfirmed || t.source_confirmed) ? "info" : "warn")).trim().toLowerCase(),
     warnings,
+    warningCount: Number(t.warningCount ?? t.warning_count ?? warnings.length) || warnings.length,
+    templateNotes,
+    routeHazards: t.routeHazards || t.route_hazards || null,
     recommendedNextAction: String(t.recommendedNextAction || t.recommended_next_action || "Validate before saving. Keep Confirmed unchecked until this exact direction is live-tested.").trim(),
     loadSafety: t.loadSafety || t.load_safety || {
       clearsConfirmed: true,
@@ -924,7 +1058,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       direction: tpl.direction || (tpl.routeDirection ? { label: tpl.routeDirection } : null),
       normalizedRoute: Array.isArray(tpl.routeJson) ? tpl.routeJson : [],
       template: tpl,
-      warnings: Array.isArray(tpl.warnings) ? tpl.warnings.map((message) => ({ warning: "template_source_warning", message })) : [],
+      warnings: Array.isArray(tpl.warnings) ? tpl.warnings : [],
       message: action === "clone"
         ? "Template cloned into the form. No DB write happened. Validate before saving; Confirmed stays unchecked until explicitly restored after a live test."
         : "Template loaded. Validate before saving; Confirmed stays unchecked until explicitly restored after a live test.",
@@ -1356,7 +1490,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
               <option value="" style={selectOptionStyle}>Template for current pair / blank</option>
               {routeTemplateOptions.map((tpl) => (
                 <option key={tpl.id} value={tpl.id} style={selectOptionStyle}>
-                  {tpl.sourceType === "saved_registry" || tpl.source === "saved_route_registry" ? "Saved · " : (tpl.sourceType === "fallback" ? "Fallback · " : "Built-in · ")}{tpl.label}
+                  {(tpl.warningCount || tpl.warnings?.length) ? "⚠ " : ""}{tpl.sourceType === "saved_registry" || tpl.source === "saved_route_registry" ? "Saved · " : (tpl.sourceType === "fallback" ? "Fallback · " : "Built-in · ")}{tpl.label}
                 </option>
               ))}
             </select>
@@ -1424,10 +1558,27 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                 <b>{selectedRouteTemplate.symbol || "—"}</b>
                 {selectedRouteTemplate.routeDirection ? <span style={{ opacity: 0.8 }}>{selectedRouteTemplate.routeDirection}</span> : null}
                 {selectedRouteTemplate.sourceConfirmed ? <span style={{ color: "#b8f7c7" }}>source confirmed</span> : <span style={{ color: "#ffe2a6" }}>source not confirmed</span>}
+                {selectedRouteTemplate.liquidityClass === "high_liquidity_candidate" ? <span style={{ color: "#b8f7c7" }}>high-liquidity candidate</span> : null}
               </div>
               <div style={{ marginTop: 5, color: "#c7d2fe" }}>
                 {selectedRouteTemplate.recommendedNextAction || "Load/clone, validate, then confirm only after a tiny live test."}
               </div>
+              {selectedRouteTemplate.warnings?.length ? (
+                <div style={{ marginTop: 6, display: "grid", gap: 4 }}>
+                  {selectedRouteTemplate.warnings.slice(0, 5).map((warning, idx) => (
+                    <div key={`${selectedRouteTemplate.id}-warning-${idx}`} style={{ padding: "4px 6px", borderRadius: 8, border: "1px solid rgba(245,158,11,0.40)", background: "rgba(120,72,16,0.16)", color: "#ffe2a6" }}>
+                      ⚠ {routeWarningMessage(warning)}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {selectedRouteTemplate.templateNotes?.length ? (
+                <div style={{ marginTop: 6, display: "grid", gap: 3, color: "rgba(226,232,240,0.78)" }}>
+                  {selectedRouteTemplate.templateNotes.slice(0, 4).map((note, idx) => (
+                    <div key={`${selectedRouteTemplate.id}-note-${idx}`}>• {note}</div>
+                  ))}
+                </div>
+              ) : null}
             </div>
           ) : null}
           {routeMode === "manual_router" && (
@@ -1442,7 +1593,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
             </div>
           )}
           <div style={{ marginTop: 6, fontSize: 12, opacity: 0.72 }}>
-            Manual XYK reserves are human units. Manual Router rows do not use the reserve fields — they use the route JSON box instead. For DOT-HDX use DOT(5) → Aave → aDOT(1001) → Omnipool → HDX(0); for HDX-DOT use the reverse route. Click “Load route template” after entering the pair, then mark Confirmed only after a tiny live on-chain success.
+            Manual XYK reserves are human units. Manual Router rows do not use the reserve fields — they use the route JSON box instead. DOT routes use DOT(5) ↔ aDOT(1001) through Aave, then Omnipool; USDT templates use Hydration asset 10. Click “Load route template” after entering the pair, then mark Confirmed only after a tiny live on-chain success.
           </div>
           {routeErr && <div style={{ marginTop: 8, color: "#ffb3b3", fontSize: 12 }}>{routeErr}</div>}
           {routeTestResult && (
@@ -1479,7 +1630,11 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                   {routeTestResult.warnings?.length ? (
                     <div style={{ gridColumn: "1 / -1", padding: 6, borderRadius: 8, border: "1px solid rgba(245,158,11,0.45)", background: "rgba(120,72,16,0.18)", color: "#ffe2a6" }}>
                       <b>Warnings</b>
-                      <pre style={routeValidationPreStyle}>{safeJsonPretty(routeTestResult.warnings)}</pre>
+                      <div style={{ display: "grid", gap: 4, marginTop: 4 }}>
+                        {routeTestResult.warnings.map((warning, idx) => (
+                          <div key={`route-warning-${idx}`}>⚠ {routeWarningMessage(warning)}</div>
+                        ))}
+                      </div>
                     </div>
                   ) : null}
                   {routeTestResult.errors?.length ? (

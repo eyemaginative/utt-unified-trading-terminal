@@ -1373,6 +1373,10 @@ def _hydration_router_quote_status(
             "/api/polkadot_dex/hydration/orderbook SDK getBestSell sampling only when UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES=1 or global override is enabled",
             "/api/polkadot_dex/hydration/orderbook route_mode=sdk_spot only when UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK=1",
             "/api/polkadot_dex/hydration/sdk_path_diagnostics for explicit spot/sell/swap path separation",
+            "/api/polkadot_dex/hydration/sdk_recovery_diagnostics for bounded recovery diagnostics",
+            "/api/polkadot_dex/hydration/sdk_recovery_state_call_compare for disabled-by-default state_call probing",
+            "/api/polkadot_dex/hydration/sdk_recovery_metadata_method_hunt for metadata-guided method hunting",
+            "/api/polkadot_dex/hydration/sdk_recovery_closeout for the current no-SDK-quote decision",
             "/api/polkadot_dex/hydration/swap_tx SDK build only when UTT_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES=1 plus UTT_HYDRATION_ENABLE_SDK_SWAP_TX=1 or global override is enabled",
         ],
         "blockedMethods": [] if quotes_available else [
@@ -6050,6 +6054,7 @@ async def polkadot_dex_debug() -> Dict[str, Any]:
         "buy_probe_path": str(_hydration_buy_probe_path()),
         "buy_probe_exists": _hydration_buy_probe_path().exists(),
         "state_call_quote_method": _HYDRATION_STATE_CALL_QUOTE_METHOD,
+        "sdk_recovery_closeout": _hydration_sdk_recovery_closeout_payload(),
         "router_quote_status": _hydration_router_quote_status(),
         "sdk_price_cache": {
             "enabled": bool(_HYDRATION_ENABLE_SDK_PRICE_CACHE),
@@ -6408,6 +6413,154 @@ def _hydration_builtin_route_templates() -> List[Dict[str, Any]]:
             "requiresConfirmation": True,
             "note": "Built-in reverse manual XYK snapshot template. Add or verify pool account before relying on live reserves; confirm only after a tiny live on-chain success.",
         },
+        {
+            "id": "builtin:HDX-USDT:manual_router",
+            "source": "builtin",
+            "label": "HDX-USDT manual Router · HDX → USDT",
+            "symbol": "HDX-USDT",
+            "routeMode": "manual_router",
+            "route_mode": "manual_router",
+            "poolType": "Router",
+            "pool_type": "Router",
+            "baseReserve": None,
+            "quoteReserve": None,
+            "base_reserve": None,
+            "quote_reserve": None,
+            "feeBps": 30,
+            "fee_bps": 30,
+            "poolAccount": None,
+            "pool_account": None,
+            "routeJson": [
+                {"pool": {"type": "Omnipool"}, "assetIn": 0, "assetOut": 10},
+            ],
+            "route_json": [
+                {"pool": {"type": "Omnipool"}, "assetIn": 0, "assetOut": 10},
+            ],
+            "direction": {"label": "HDX → USDT", "assetIds": [0, 10], "labels": ["HDX", "USDT"]},
+            "routeDirection": "HDX → USDT",
+            "enabled": True,
+            "confirmed": False,
+            "templateConfirmedDefault": False,
+            "requiresConfirmation": True,
+            "liquidityClass": "high_liquidity_candidate",
+            "templateNotes": [
+                "High-liquidity candidate template using Hydration Omnipool HDX/USDT routing.",
+                "USDT is expected to be Hydration asset 10 with 6 decimals; verify Token Registry metadata before confirming.",
+            ],
+            "note": "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+        },
+        {
+            "id": "builtin:USDT-HDX:manual_router",
+            "source": "builtin",
+            "label": "USDT-HDX manual Router · USDT → HDX",
+            "symbol": "USDT-HDX",
+            "routeMode": "manual_router",
+            "route_mode": "manual_router",
+            "poolType": "Router",
+            "pool_type": "Router",
+            "baseReserve": None,
+            "quoteReserve": None,
+            "base_reserve": None,
+            "quote_reserve": None,
+            "feeBps": 30,
+            "fee_bps": 30,
+            "poolAccount": None,
+            "pool_account": None,
+            "routeJson": [
+                {"pool": {"type": "Omnipool"}, "assetIn": 10, "assetOut": 0},
+            ],
+            "route_json": [
+                {"pool": {"type": "Omnipool"}, "assetIn": 10, "assetOut": 0},
+            ],
+            "direction": {"label": "USDT → HDX", "assetIds": [10, 0], "labels": ["USDT", "HDX"]},
+            "routeDirection": "USDT → HDX",
+            "enabled": True,
+            "confirmed": False,
+            "templateConfirmedDefault": False,
+            "requiresConfirmation": True,
+            "liquidityClass": "high_liquidity_candidate",
+            "templateNotes": [
+                "High-liquidity candidate template using Hydration Omnipool USDT/HDX routing.",
+                "USDT is expected to be Hydration asset 10 with 6 decimals; verify Token Registry metadata before confirming.",
+            ],
+            "note": "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+        },
+        {
+            "id": "builtin:DOT-USDT:manual_router",
+            "source": "builtin",
+            "label": "DOT-USDT manual Router · DOT → aDOT → USDT",
+            "symbol": "DOT-USDT",
+            "routeMode": "manual_router",
+            "route_mode": "manual_router",
+            "poolType": "Router",
+            "pool_type": "Router",
+            "baseReserve": None,
+            "quoteReserve": None,
+            "base_reserve": None,
+            "quote_reserve": None,
+            "feeBps": 30,
+            "fee_bps": 30,
+            "poolAccount": None,
+            "pool_account": None,
+            "routeJson": [
+                {"pool": {"type": "Aave"}, "assetIn": 5, "assetOut": 1001},
+                {"pool": {"type": "Omnipool"}, "assetIn": 1001, "assetOut": 10},
+            ],
+            "route_json": [
+                {"pool": {"type": "Aave"}, "assetIn": 5, "assetOut": 1001},
+                {"pool": {"type": "Omnipool"}, "assetIn": 1001, "assetOut": 10},
+            ],
+            "direction": {"label": "DOT → aDOT → USDT", "assetIds": [5, 1001, 10], "labels": ["DOT", "aDOT", "USDT"]},
+            "routeDirection": "DOT → aDOT → USDT",
+            "enabled": True,
+            "confirmed": False,
+            "templateConfirmedDefault": False,
+            "requiresConfirmation": True,
+            "liquidityClass": "high_liquidity_candidate",
+            "templateNotes": [
+                "High-liquidity candidate template using DOT/aDOT wrapping plus Omnipool routing into USDT.",
+                "USDT is expected to be Hydration asset 10 with 6 decimals; verify Token Registry metadata before confirming.",
+            ],
+            "note": "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+        },
+        {
+            "id": "builtin:USDT-DOT:manual_router",
+            "source": "builtin",
+            "label": "USDT-DOT manual Router · USDT → aDOT → DOT",
+            "symbol": "USDT-DOT",
+            "routeMode": "manual_router",
+            "route_mode": "manual_router",
+            "poolType": "Router",
+            "pool_type": "Router",
+            "baseReserve": None,
+            "quoteReserve": None,
+            "base_reserve": None,
+            "quote_reserve": None,
+            "feeBps": 30,
+            "fee_bps": 30,
+            "poolAccount": None,
+            "pool_account": None,
+            "routeJson": [
+                {"pool": {"type": "Omnipool"}, "assetIn": 10, "assetOut": 1001},
+                {"pool": {"type": "Aave"}, "assetIn": 1001, "assetOut": 5},
+            ],
+            "route_json": [
+                {"pool": {"type": "Omnipool"}, "assetIn": 10, "assetOut": 1001},
+                {"pool": {"type": "Aave"}, "assetIn": 1001, "assetOut": 5},
+            ],
+            "direction": {"label": "USDT → aDOT → DOT", "assetIds": [10, 1001, 5], "labels": ["USDT", "aDOT", "DOT"]},
+            "routeDirection": "USDT → aDOT → DOT",
+            "enabled": True,
+            "confirmed": False,
+            "templateConfirmedDefault": False,
+            "requiresConfirmation": True,
+            "liquidityClass": "high_liquidity_candidate",
+            "templateNotes": [
+                "High-liquidity candidate template using Omnipool routing into aDOT plus DOT unwrap through Aave.",
+                "USDT is expected to be Hydration asset 10 with 6 decimals; verify Token Registry metadata before confirming.",
+            ],
+            "note": "Built-in manual Router template. Confirm only after a tiny live on-chain success for this exact direction.",
+        },
     ]
 
 
@@ -6482,6 +6635,87 @@ def _hydration_route_template_source_label(source_type: str) -> str:
     return "Route template"
 
 
+def _append_unique_message(items: List[str], message: str) -> None:
+    msg = str(message or "").strip()
+    if msg and msg not in items:
+        items.append(msg)
+
+
+def _hydration_route_template_route_legs(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    for key in ("routeJson", "route_json", "route"):
+        value = (item or {}).get(key)
+        if isinstance(value, list):
+            return [dict(x) for x in value if isinstance(x, dict)]
+    return []
+
+
+def _hydration_route_template_pool_types(item: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    for leg in _hydration_route_template_route_legs(item):
+        pool = _manual_router_pool_type_canonical(leg.get("pool"))
+        if pool and pool not in out:
+            out.append(pool)
+    return out
+
+
+def _hydration_route_template_warning_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str((item or {}).get("symbol") or "").strip().upper()
+    source_type = _hydration_route_template_source_type(item or {})
+    route_mode = str((item or {}).get("routeMode") or (item or {}).get("route_mode") or "manual_xyk").strip().lower()
+    confirmed = bool((item or {}).get("sourceConfirmed") or (item or {}).get("source_confirmed") or (item or {}).get("confirmed"))
+    enabled = (item or {}).get("enabled") is not False
+    pool_types = _hydration_route_template_pool_types(item or {})
+    pool_account = str((item or {}).get("poolAccount") or (item or {}).get("pool_account") or "").strip()
+    route_asset_ids = {str(asset_id) for asset_id in _hydration_route_asset_sequence(
+        _hydration_route_template_route_legs(item or {}),
+        fallback_asset_in_id=0,
+        fallback_asset_out_id=0,
+    )}
+
+    warnings: List[str] = []
+    notes: List[str] = []
+
+    if source_type == "built_in":
+        _append_unique_message(warnings, "Built-in template: starter only. Validate before saving and confirm only after a tiny live on-chain success for this exact direction.")
+    elif source_type == "saved_registry" and confirmed:
+        _append_unique_message(warnings, "Saved source row is confirmed, but loading/cloning still clears Confirmed so executable routes cannot be copied accidentally.")
+    elif source_type == "saved_registry":
+        _append_unique_message(warnings, "Saved source row is not confirmed. Keep Confirmed unchecked until this exact direction has a tiny live on-chain success.")
+    elif source_type == "fallback":
+        _append_unique_message(warnings, "Fallback template: local helper only. Validate route shape carefully before saving.")
+    elif source_type == "reverse_preview":
+        _append_unique_message(warnings, "Reverse preview clears Confirmed intentionally. Validate and live-test the reversed direction before marking it confirmed.")
+
+    if route_mode == "manual_router":
+        _append_unique_message(warnings, "Manual Router route: direction-specific execution. BUY/SELL and exact-in/exact-out paths must be tested separately before relying on the row.")
+        if "Aave" in pool_types:
+            _append_unique_message(notes, "Aave leg detected: this route uses the DOT/aDOT wrapper path.")
+        if "Omnipool" in pool_types:
+            _append_unique_message(warnings, "Omnipool leg detected: live liquidity, routing, and price impact can change between validation and execution.")
+        if "Stableswap" in pool_types:
+            _append_unique_message(warnings, "Stableswap leg detected: keep diagnostic-only until the manual route builder preserves Stableswap payload shape.")
+        if "USDT" in symbol or "10" in route_asset_ids:
+            _append_unique_message(warnings, "USDT route detected: verify Hydration asset ID 10 and 6-decimal Token Registry metadata before marking this direction confirmed.")
+    elif route_mode == "manual_xyk":
+        _append_unique_message(warnings, "Manual XYK route: pricing depends on live pool reserves/TVL; stale reserve snapshots can mislead orderbook and limit checks.")
+        if not pool_account:
+            _append_unique_message(warnings, "No pool_account is set, so live reserve checks cannot confirm this XYK pool account yet.")
+        if "UTTT" in symbol and "HDX" in symbol:
+            _append_unique_message(warnings, "UTTT-HDX isolated pool: monitor TVL, slippage, and price impact; use small controlled tests only.")
+
+    if not enabled:
+        _append_unique_message(warnings, "Source route is disabled. Loading it is allowed for editing, but it is not executable while disabled.")
+
+    _append_unique_message(notes, "Loading or cloning a template is read-only and never signs, submits, creates an order, or mutates ledger/FIFO state.")
+    _append_unique_message(notes, "The UI intentionally leaves Confirmed unchecked after template load/clone; re-check only after validating and live-testing the exact direction.")
+
+    return {
+        "poolTypes": pool_types,
+        "warnings": warnings,
+        "notes": notes,
+    }
+
+
 def _hydration_route_template_enrich(item: Dict[str, Any]) -> Dict[str, Any]:
     """Add source/safety metadata used by the Route Registry UI.
 
@@ -6495,21 +6729,28 @@ def _hydration_route_template_enrich(item: Dict[str, Any]) -> Dict[str, Any]:
     enabled = out.get("enabled") is not False
     executable = bool(source_type == "saved_registry" and confirmed and enabled)
 
+    warning_meta = _hydration_route_template_warning_metadata(out)
     warnings: List[str] = []
     if isinstance(out.get("warnings"), list):
-        warnings.extend([str(w) for w in out.get("warnings") if str(w).strip()])
-    if source_type == "built_in":
-        warnings.append("Built-in templates are starters only; validate before saving and confirm only after a tiny live on-chain success.")
-    elif source_type == "saved_registry" and confirmed:
-        warnings.append("Source row is confirmed, but loading this template still clears Confirmed so cloned routes cannot become signable accidentally.")
-    elif source_type == "saved_registry":
-        warnings.append("Source row is not confirmed; validate and live-test before marking any clone confirmed.")
-    elif source_type == "fallback":
-        warnings.append("Fallback templates are local UI helpers; validate carefully before saving.")
-    if route_mode == "manual_router":
-        warnings.append("Manual Router rows use route JSON only; reserve and pool-account fields are not execution inputs.")
-    elif route_mode == "manual_xyk":
-        warnings.append("Manual XYK rows depend on reserve/pool-account data; verify live reserves before relying on pricing.")
+        for raw_warning in out.get("warnings"):
+            if isinstance(raw_warning, dict):
+                _append_unique_message(warnings, raw_warning.get("message") or raw_warning.get("warning"))
+            else:
+                _append_unique_message(warnings, str(raw_warning))
+    for warning in warning_meta.get("warnings") or []:
+        _append_unique_message(warnings, warning)
+
+    notes: List[str] = []
+    if isinstance(out.get("templateNotes"), list):
+        for raw_note in out.get("templateNotes"):
+            _append_unique_message(notes, str(raw_note))
+    if isinstance(out.get("template_notes"), list):
+        for raw_note in out.get("template_notes"):
+            _append_unique_message(notes, str(raw_note))
+    if out.get("note"):
+        _append_unique_message(notes, str(out.get("note")))
+    for note in warning_meta.get("notes") or []:
+        _append_unique_message(notes, note)
 
     if source_type == "saved_registry" and executable:
         warning_level = "info"
@@ -6537,6 +6778,22 @@ def _hydration_route_template_enrich(item: Dict[str, Any]) -> Dict[str, Any]:
         "warningLevel": warning_level,
         "warning_level": warning_level,
         "warnings": warnings,
+        "warningCount": len(warnings),
+        "warning_count": len(warnings),
+        "templateNotes": notes,
+        "template_notes": notes,
+        "routeHazards": {
+            "poolTypes": warning_meta.get("poolTypes") or [],
+            "requiresExactDirectionLiveTest": bool(route_mode == "manual_router"),
+            "requiresLiveReserveReview": bool(route_mode == "manual_xyk"),
+            "clearsConfirmedOnLoad": True,
+        },
+        "route_hazards": {
+            "pool_types": warning_meta.get("poolTypes") or [],
+            "requires_exact_direction_live_test": bool(route_mode == "manual_router"),
+            "requires_live_reserve_review": bool(route_mode == "manual_xyk"),
+            "clears_confirmed_on_load": True,
+        },
         "recommendedNextAction": next_action,
         "recommended_next_action": next_action,
         "loadSafety": {
@@ -7476,8 +7733,9 @@ async def hydration_state_call_quote_probe(
             status_code=503,
             detail={
                 "error": "hydration_state_call_quotes_disabled",
-                "message": "State-call quote probing is disabled. Set UTT_HYDRATION_ENABLE_STATE_CALL_QUOTES=1 for one controlled test.",
+                "message": "State-call quote probing is disabled. H-SDK.3C/3D found no usable exported quote method; leave UTT_HYDRATION_ENABLE_STATE_CALL_QUOTES=0 unless running one explicit diagnostic.",
                 "safeMode": True,
+                "sdkRecoveryCloseout": _hydration_sdk_recovery_closeout_payload(),
                 "method": _HYDRATION_STATE_CALL_QUOTE_METHOD,
             },
         )
@@ -7839,6 +8097,1521 @@ async def _hydration_synthetic_spot_orderbook_response(
         "bids": bids,
         "asks": asks,
         "sampleErrors": sample_errors or [],
+    }
+
+
+async def _run_hydration_helper_sdk_recovery(
+    payload: Dict[str, Any],
+    *,
+    timeout_s: float,
+) -> Dict[str, Any]:
+    """Run the Hydration JS helper for one explicit recovery diagnostic stage.
+
+    This deliberately bypasses normal UI SDK quote gates, but only inside this
+    diagnostic endpoint and only through a short-lived helper process.  It does
+    not sign, submit, save routes, write ledger rows, or mutate FIFO state.
+    """
+    payload = dict(payload or {})
+    payload["wsUrl"] = _hydration_ws_url()
+    if not payload.get("wsUrl"):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "hydration_ws_not_configured",
+                "message": "Set UTT_HYDRATION_WS_URL, or configure the Dwellir Hydration API key so the diagnostic helper can use WebSocket RPC.",
+            },
+        )
+
+    helper = _hydration_helper_path()
+    if not helper.exists():
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "error": "hydration_helper_missing",
+                "message": "Hydration JS helper is not installed.",
+                "helperPath": str(helper),
+            },
+        )
+
+    payload.setdefault("venue", "polkadot_hydration")
+    payload["enableRouterQuotes"] = True
+    payload["sdkRecoveryDiagnostics"] = True
+    payload["forceIsolatedHelper"] = True
+
+    run_timeout_s = max(8.0, float(timeout_s) + 8.0)
+
+    def _call_node() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [_HYDRATION_NODE_BIN, str(helper)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=run_timeout_s,
+        )
+
+    try:
+        proc = await asyncio.to_thread(_call_node)
+    except subprocess.TimeoutExpired as e:
+        partial_stdout = e.stdout or ""
+        partial_stderr = e.stderr or ""
+        if not isinstance(partial_stdout, str):
+            partial_stdout = partial_stdout.decode("utf-8", errors="replace") if hasattr(partial_stdout, "decode") else str(partial_stdout)
+        if not isinstance(partial_stderr, str):
+            partial_stderr = partial_stderr.decode("utf-8", errors="replace") if hasattr(partial_stderr, "decode") else str(partial_stderr)
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "hydration_sdk_recovery_helper_timeout",
+                "timeout_s": run_timeout_s,
+                "step_timeout_s": payload.get("stepTimeoutS"),
+                "helperPath": str(helper),
+                "partial_stdout": partial_stdout[-3000:],
+                "partial_stderr": partial_stderr[-3000:],
+            },
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "hydration_sdk_recovery_helper_spawn_failed",
+                "exc": type(e).__name__,
+                "message": str(e),
+                "helperPath": str(helper),
+            },
+        )
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    try:
+        data = json.loads(stdout) if stdout else {}
+    except Exception:
+        data = {}
+
+    if proc.returncode != 0 or not isinstance(data, dict):
+        detail = data if isinstance(data, dict) and data else {
+            "error": "hydration_sdk_recovery_helper_failed",
+            "stderr": stderr[-3000:],
+            "stdout": stdout[-3000:],
+        }
+        if isinstance(detail, dict):
+            detail.setdefault("returncode", proc.returncode)
+            detail.setdefault("helperPath", str(helper))
+            detail.setdefault("stderr", stderr[-3000:])
+        raise HTTPException(status_code=int(detail.get("status") or 502), detail=detail)
+
+    if not data.get("ok"):
+        detail = dict(data)
+        detail.setdefault("error", "hydration_sdk_recovery_helper_not_ok")
+        detail.setdefault("helperPath", str(helper))
+        detail.setdefault("stderr", stderr[-3000:])
+        raise HTTPException(status_code=int(detail.get("status") or 502), detail=detail)
+    return data
+
+
+def _hydration_node_version_probe() -> Dict[str, Any]:
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [_HYDRATION_NODE_BIN, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=5.0,
+        )
+        raw = (proc.stdout or proc.stderr or "").strip()
+        major = None
+        try:
+            major = int(str(raw).lstrip("v").split(".")[0])
+        except Exception:
+            major = None
+        return {
+            "ok": proc.returncode == 0,
+            "elapsed_s": round(time.monotonic() - t0, 4),
+            "node_bin": _HYDRATION_NODE_BIN,
+            "version": raw,
+            "major": major,
+            "meetsSdkReadmeMinimum": bool(major is not None and major >= 25),
+            "warning": None if (major is not None and major >= 25) else "Current Galactic SDK helper code requires Node 25+ before relying on sdk-next live quote diagnostics.",
+            "stderr": (proc.stderr or "")[-1000:],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "elapsed_s": round(time.monotonic() - t0, 4),
+            "node_bin": _HYDRATION_NODE_BIN,
+            "error": type(e).__name__,
+            "message": str(e),
+        }
+
+
+def _hydration_sdk_recovery_nested_state(result: Any) -> str:
+    if isinstance(result, dict):
+        if bool(result.get("skipped")):
+            return "skipped"
+        if result.get("ok") is False:
+            return "failed"
+    return "passed"
+
+
+async def _hydration_sdk_recovery_stage(name: str, fn) -> Dict[str, Any]:
+    t0 = time.monotonic()
+    try:
+        result = await fn()
+        state = _hydration_sdk_recovery_nested_state(result)
+        out: Dict[str, Any] = {
+            "ok": state == "passed",
+            "name": name,
+            "elapsed_s": round(time.monotonic() - t0, 4),
+            "result": result,
+        }
+        if state == "skipped":
+            out["skipped"] = True
+            out["reason"] = (
+                (result or {}).get("reason")
+                or (result or {}).get("message")
+                or (result or {}).get("error")
+                or "skipped"
+            )
+        elif state == "failed":
+            out["error"] = (result or {}).get("error") or "hydration_sdk_recovery_inner_failed"
+            out["detail"] = result
+        return out
+    except HTTPException as e:
+        return {
+            "ok": False,
+            "name": name,
+            "elapsed_s": round(time.monotonic() - t0, 4),
+            "status_code": e.status_code,
+            "detail": e.detail,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "name": name,
+            "elapsed_s": round(time.monotonic() - t0, 4),
+            "error": type(e).__name__,
+            "message": str(e),
+        }
+
+
+def _hydration_sdk_recovery_stage_text(stage: Dict[str, Any]) -> str:
+    try:
+        return json.dumps(stage or {}, default=str).lower()
+    except Exception:
+        return str(stage or "").lower()
+
+
+def _hydration_sdk_recovery_stage_classification(name: str, stage: Dict[str, Any]) -> Dict[str, Any]:
+    name_s = str(name or "")
+    txt = _hydration_sdk_recovery_stage_text(stage)
+    ok = bool((stage or {}).get("ok"))
+    skipped = bool((stage or {}).get("skipped"))
+
+    if skipped:
+        if name_s == "sidecar_health":
+            return {
+                "status": "skipped",
+                "classification": "sidecar_disabled_or_not_required",
+                "meaning": "The persistent sidecar was not used for this standalone recovery run.",
+                "action": "No action required unless you intentionally want to test the sidecar path.",
+            }
+        return {
+            "status": "skipped",
+            "classification": "stage_skipped",
+            "meaning": str((stage or {}).get("reason") or "The stage was intentionally skipped."),
+            "action": None,
+        }
+
+    if ok:
+        if name_s == "get_best_buy_probe":
+            result = (stage or {}).get("result") or {}
+            success_count = int((result or {}).get("successCount") or 0) if isinstance(result, dict) else 0
+            failure_count = int((result or {}).get("failureCount") or 0) if isinstance(result, dict) else 0
+            return {
+                "status": "passed",
+                "classification": "get_best_buy_probe_completed",
+                "meaning": f"getBestBuy probe returned {success_count} successful attempt(s) and {failure_count} failed attempt(s).",
+                "action": "Keep BUY diagnostics isolated from normal UI quote paths until spot/sell recovery is stable.",
+            }
+        return {
+            "status": "passed",
+            "classification": "passed",
+            "meaning": "Stage completed.",
+            "action": None,
+        }
+
+    if name_s == "get_best_buy_probe":
+        result = (stage or {}).get("detail") or (stage or {}).get("result") or {}
+        success_count = int((result or {}).get("successCount") or 0) if isinstance(result, dict) else 0
+        failure_count = int((result or {}).get("failureCount") or 0) if isinstance(result, dict) else 0
+        if success_count <= 0 and failure_count > 0:
+            return {
+                "status": "failed",
+                "classification": "get_best_buy_probe_no_successful_attempts",
+                "meaning": f"getBestBuy probe completed, but returned {success_count} successful attempt(s) and {failure_count} failed attempt(s).",
+                "action": "Keep exact BUY diagnostics isolated and keep OrderTicket SDK BUY/swap gates disabled.",
+            }
+
+    if "node_version_below_sdk_minimum" in txt:
+        return {
+            "status": "failed",
+            "classification": "node_version_below_sdk_minimum",
+            "meaning": "Node is below the sdk-next runtime requirement.",
+            "action": "Use Node 25+ before relying on Hydration SDK quote diagnostics.",
+        }
+
+    if "direct_get_spot_price" in txt or "hydration_direct_spot_failed" in txt:
+        return {
+            "status": "failed",
+            "classification": "sdk_direct_spot_timeout_after_context_init",
+            "meaning": "SDK package import, provider setup, and sdk context creation reached getSpotPrice, but direct getSpotPrice did not return before the stage timeout.",
+            "action": "Keep sdk_spot/orderbook spot paths disabled; test a different RPC/provider or a non-router state_call/indexer price source before enabling this path.",
+        }
+
+    if "get_spot_price" in txt:
+        return {
+            "status": "failed",
+            "classification": "sdk_context_spot_timeout_after_context_init",
+            "meaning": "The normal sdk context path reached router.getSpotPrice, then timed out.",
+            "action": "Do not enable UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK yet.",
+        }
+
+    if "get_best_sell" in txt or "quote_sell" in txt or "getbestsell" in txt:
+        return {
+            "status": "failed",
+            "classification": "sdk_get_best_sell_timeout_or_unavailable",
+            "meaning": "The sdk-next getBestSell/sell-quote path is not independently stable.",
+            "action": "Keep UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES=0 and continue using confirmed manual Router/XYK routes plus synthetic display fallback.",
+        }
+
+    if "get_best_buy" in txt or "getbestbuy" in txt:
+        return {
+            "status": "failed",
+            "classification": "sdk_get_best_buy_timeout_or_unavailable",
+            "meaning": "The isolated getBestBuy probe did not complete cleanly.",
+            "action": "Keep exact-out BUY on manual route guardrails only.",
+        }
+
+    if "hydration_rpc" in txt or "rpc_" in txt:
+        return {
+            "status": "failed",
+            "classification": "hydration_rpc_failure",
+            "meaning": "The HTTP RPC sanity stage failed.",
+            "action": "Check Dwellir Profile API key, HTTP URL template, and rate limits before running SDK diagnostics.",
+        }
+
+    return {
+        "status": "failed",
+        "classification": "failed_unclassified",
+        "meaning": "Stage failed; inspect detail/stderr for the exact failing SDK call.",
+        "action": "Keep normal SDK quote gates disabled until this failure is classified.",
+    }
+
+
+
+def _hydration_sdk_recovery_mark_buy_probe_no_success(stage: Dict[str, Any]) -> Dict[str, Any]:
+    """Treat a completed getBestBuy probe with zero successes as a failed recovery stage."""
+    if not isinstance(stage, dict):
+        return stage
+    result = stage.get("result")
+    if not isinstance(result, dict):
+        return stage
+    try:
+        success_count = int(result.get("successCount") or 0)
+    except Exception:
+        success_count = 0
+    try:
+        failure_count = int(result.get("failureCount") or 0)
+    except Exception:
+        failure_count = 0
+    if success_count <= 0 and failure_count > 0:
+        stage["ok"] = False
+        stage["error"] = "hydration_get_best_buy_probe_no_successful_attempts"
+        stage["detail"] = result
+        stage["recoveryMeaning"] = "The getBestBuy probe process completed, but no exact-buy attempt returned a usable SDK route."
+    return stage
+
+def _hydration_sdk_recovery_analysis(
+    *,
+    stages: Dict[str, Any],
+    classifications: Dict[str, Any],
+) -> Dict[str, Any]:
+    env_stage_names = ["node_version", "files", "ws_config", "rpc_system_chain"]
+    environment_ok = all(bool((stages.get(k) or {}).get("ok")) for k in env_stage_names if k in stages)
+    first_failed = next(
+        (
+            k
+            for k, v in (stages or {}).items()
+            if isinstance(v, dict) and not bool(v.get("ok")) and not bool(v.get("skipped"))
+        ),
+        None,
+    )
+    spot_failures = [
+        k
+        for k, v in (classifications or {}).items()
+        if str((v or {}).get("classification") or "").startswith("sdk_")
+        and "spot" in str((v or {}).get("classification") or "")
+        and str((v or {}).get("status") or "") == "failed"
+    ]
+    sell_failures = [
+        k
+        for k, v in (classifications or {}).items()
+        if "sell" in str((v or {}).get("classification") or "")
+        and str((v or {}).get("status") or "") == "failed"
+    ]
+    buy_stage = stages.get("get_best_buy_probe") or {}
+    buy_result = buy_stage.get("result") if isinstance(buy_stage, dict) else {}
+    buy_success_count = 0
+    if isinstance(buy_result, dict):
+        try:
+            buy_success_count = int(buy_result.get("successCount") or 0)
+        except Exception:
+            buy_success_count = 0
+
+    if environment_ok and (spot_failures or sell_failures):
+        finding = "Environment and RPC are healthy, but sdk-next router quote methods still hang or fail at the router call layer."
+    elif environment_ok:
+        finding = "Environment and RPC sanity checks are healthy."
+    else:
+        finding = "One or more environment/RPC prerequisites failed before SDK router recovery could be trusted."
+
+    recommendations: List[str] = []
+    if spot_failures:
+        recommendations.append("Keep UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK=0; direct/context spot getSpotPrice is not recovered yet.")
+    if sell_failures:
+        recommendations.append("Keep UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES=0; getBestSell is not recovered yet.")
+    if buy_success_count > 0:
+        recommendations.append("getBestBuy can be probed in an isolated helper, but do not promote it into normal OrderTicket flow until spot/sell quote paths are stable.")
+    if environment_ok and (spot_failures or sell_failures):
+        recommendations.append("Next recovery step should compare RPC providers or test a non-router state_call/indexer price source instead of reopening background sdk-next polling.")
+    if not recommendations:
+        recommendations.append("Review individual stage classifications before changing SDK gates.")
+
+    return {
+        "environmentOk": bool(environment_ok),
+        "firstFailedStage": first_failed,
+        "spotFailures": spot_failures,
+        "sellFailures": sell_failures,
+        "getBestBuySuccessCount": buy_success_count,
+        "normalSdkQuoteGatesShouldRemainDisabled": bool(spot_failures or sell_failures),
+        "finding": finding,
+        "recommendations": recommendations,
+    }
+
+
+@router.get("/hydration/sdk_recovery_diagnostics")
+async def hydration_sdk_recovery_diagnostics(
+    symbol: str = Query("DOT-HDX", description="Symbol pair to diagnose, e.g. DOT-HDX or HDX-DOT."),
+    amount_ui: float = Query(1.0, gt=0, description="Human amount used for exact-in getBestSell diagnostics."),
+    buy_amount_ui: Optional[float] = Query(None, gt=0, description="Human output amount used for getBestBuy diagnostics. Defaults to amount_ui."),
+    step_timeout_s: float = Query(10.0, ge=3.0, le=60.0, description="Per-stage JS SDK timeout."),
+    include_sidecar_health: bool = Query(True),
+    include_spot_direct: bool = Query(True),
+    include_spot_context: bool = Query(True),
+    include_get_best_sell: bool = Query(True),
+    include_get_best_buy: bool = Query(True),
+    include_swap_tx_build: bool = Query(False, description="Unsigned SDK swap_tx build only; requires user_pubkey."),
+    user_pubkey: Optional[str] = Query(None, description="Required only when include_swap_tx_build=true."),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Standalone, bounded Hydration sdk-next recovery diagnostics.
+
+    This endpoint is explicit and read-only.  It uses short-lived helper probes
+    so recovery testing cannot poison the persistent sidecar or background price
+    paths.  No signing, submission, route-registry writes, ledger writes, or
+    FIFO mutations occur here.
+    """
+    base, quote = _parse_symbol(symbol)
+    base_meta = _resolve_asset(base, db=db)
+    quote_meta = _resolve_asset(quote, db=db)
+    timeout_s = float(step_timeout_s)
+    buy_amount = float(buy_amount_ui if buy_amount_ui is not None else amount_ui)
+    ws_url = _hydration_ws_url()
+    helper = _hydration_helper_path()
+    sidecar_script = _hydration_sidecar_script_path()
+    buy_probe = _hydration_buy_probe_path()
+
+    stages: Dict[str, Any] = {}
+    stages["node_version"] = _hydration_node_version_probe()
+    stages["files"] = {
+        "ok": bool(helper.exists() and sidecar_script.exists()),
+        "helper": {"path": str(helper), "exists": bool(helper.exists())},
+        "sidecarScript": {"path": str(sidecar_script), "exists": bool(sidecar_script.exists())},
+        "getBestBuyProbe": {
+            "path": str(buy_probe),
+            "exists": bool(buy_probe.exists()),
+            "requiredOnlyFor": "include_get_best_buy=true or legacy /hydration/getbestbuy_probe endpoint",
+        },
+    }
+    stages["ws_config"] = {
+        "ok": bool(ws_url),
+        "wsConfigured": bool(ws_url),
+        "wsUrl": _redact_url(ws_url or ""),
+        "keySource": _dwellir_hydration_key_source(),
+        "message": None if ws_url else "Hydration WebSocket URL is not configured.",
+    }
+
+    stages["rpc_system_chain"] = await _hydration_sdk_recovery_stage(
+        "rpc_system_chain",
+        lambda: _rpc_probe("system_chain", []),
+    )
+
+    if include_sidecar_health:
+        stages["sidecar_health"] = await _hydration_sdk_recovery_stage(
+            "sidecar_health",
+            lambda: _sidecar_health(),
+        )
+
+    common = {
+        "venue": "polkadot_hydration",
+        "rawSymbol": symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+        "base": base,
+        "quote": quote,
+        "stepTimeoutS": timeout_s,
+        "sdkUseCase": "diagnostic",
+        "routeMode": "sdk_recovery",
+    }
+
+    if include_spot_direct:
+        stages["spot_direct_forward"] = await _hydration_sdk_recovery_stage(
+            "spot_direct_forward",
+            lambda: _run_hydration_helper_sdk_recovery(
+                {
+                    **common,
+                    "mode": "price_spot_direct",
+                    "assetIn": _helper_asset_payload(base_meta),
+                    "assetOut": _helper_asset_payload(quote_meta),
+                },
+                timeout_s=timeout_s,
+            ),
+        )
+        stages["spot_direct_reverse"] = await _hydration_sdk_recovery_stage(
+            "spot_direct_reverse",
+            lambda: _run_hydration_helper_sdk_recovery(
+                {
+                    **common,
+                    "mode": "price_spot_direct",
+                    "rawSymbol": f"{quote}-{base}",
+                    "resolvedSymbol": f"{quote}-{base}",
+                    "base": quote,
+                    "quote": base,
+                    "assetIn": _helper_asset_payload(quote_meta),
+                    "assetOut": _helper_asset_payload(base_meta),
+                },
+                timeout_s=timeout_s,
+            ),
+        )
+
+    if include_spot_context:
+        stages["spot_context_forward"] = await _hydration_sdk_recovery_stage(
+            "spot_context_forward",
+            lambda: _run_hydration_helper_sdk_recovery(
+                {
+                    **common,
+                    "mode": "price_spot",
+                    "assetIn": _helper_asset_payload(base_meta),
+                    "assetOut": _helper_asset_payload(quote_meta),
+                },
+                timeout_s=timeout_s,
+            ),
+        )
+        stages["spot_context_reverse"] = await _hydration_sdk_recovery_stage(
+            "spot_context_reverse",
+            lambda: _run_hydration_helper_sdk_recovery(
+                {
+                    **common,
+                    "mode": "price_spot",
+                    "rawSymbol": f"{quote}-{base}",
+                    "resolvedSymbol": f"{quote}-{base}",
+                    "base": quote,
+                    "quote": base,
+                    "assetIn": _helper_asset_payload(quote_meta),
+                    "assetOut": _helper_asset_payload(base_meta),
+                },
+                timeout_s=timeout_s,
+            ),
+        )
+
+    if include_get_best_sell:
+        stages["get_best_sell_forward"] = await _hydration_sdk_recovery_stage(
+            "get_best_sell_forward",
+            lambda: _run_hydration_helper_sdk_recovery(
+                {
+                    **common,
+                    "mode": "quote_sell",
+                    "assetIn": _helper_asset_payload(base_meta),
+                    "assetOut": _helper_asset_payload(quote_meta),
+                    "amountInAtomic": str(_ui_to_atomic(float(amount_ui), int(base_meta.get("decimals") or 0))),
+                    "amountInUi": float(amount_ui),
+                },
+                timeout_s=timeout_s,
+            ),
+        )
+        stages["get_best_sell_reverse"] = await _hydration_sdk_recovery_stage(
+            "get_best_sell_reverse",
+            lambda: _run_hydration_helper_sdk_recovery(
+                {
+                    **common,
+                    "mode": "quote_sell",
+                    "rawSymbol": f"{quote}-{base}",
+                    "resolvedSymbol": f"{quote}-{base}",
+                    "base": quote,
+                    "quote": base,
+                    "assetIn": _helper_asset_payload(quote_meta),
+                    "assetOut": _helper_asset_payload(base_meta),
+                    "amountInAtomic": str(_ui_to_atomic(float(amount_ui), int(quote_meta.get("decimals") or 0))),
+                    "amountInUi": float(amount_ui),
+                },
+                timeout_s=timeout_s,
+            ),
+        )
+
+    if include_get_best_buy:
+        async def _buy_probe_stage() -> Dict[str, Any]:
+            if not buy_probe.exists():
+                return {
+                    "ok": False,
+                    "skipped": True,
+                    "error": "hydration_getbestbuy_probe_missing",
+                    "message": "The getBestBuy probe file is missing. Save backend/app/services/hydration_getbestbuy_probe_p1_8h1.mjs from this patch to enable this stage.",
+                    "probePath": str(buy_probe),
+                }
+            attempts = [
+                {
+                    "name": "buy_base_with_quote",
+                    "assetInSymbol": quote,
+                    "assetOutSymbol": base,
+                    "assetInId": _hydration_sdk_asset_id(quote_meta),
+                    "assetOutId": _hydration_sdk_asset_id(base_meta),
+                    "amountOutUi": buy_amount,
+                    "amountOutAtomic": str(_ui_to_atomic(buy_amount, int(base_meta.get("decimals") or 0))),
+                    "meaning": f"Spend {quote} to receive exactly {buy_amount} {base}.",
+                },
+                {
+                    "name": "buy_quote_with_base",
+                    "assetInSymbol": base,
+                    "assetOutSymbol": quote,
+                    "assetInId": _hydration_sdk_asset_id(base_meta),
+                    "assetOutId": _hydration_sdk_asset_id(quote_meta),
+                    "amountOutUi": buy_amount,
+                    "amountOutAtomic": str(_ui_to_atomic(buy_amount, int(quote_meta.get("decimals") or 0))),
+                    "meaning": f"Spend {base} to receive exactly {buy_amount} {quote}. Reverse diagnostic only.",
+                },
+            ]
+            return await _run_hydration_buy_probe(
+                {
+                    "mode": "getbestbuy_probe",
+                    "venue": "polkadot_hydration",
+                    "rawSymbol": symbol,
+                    "resolvedSymbol": f"{base}-{quote}",
+                    "base": base_meta,
+                    "quote": quote_meta,
+                    "wsUrl": ws_url,
+                    "stepTimeoutS": timeout_s,
+                    "attempts": attempts,
+                },
+                timeout_s=timeout_s * len(attempts),
+            )
+        stages["get_best_buy_probe"] = _hydration_sdk_recovery_mark_buy_probe_no_success(
+            await _hydration_sdk_recovery_stage("get_best_buy_probe", _buy_probe_stage)
+        )
+
+    if include_swap_tx_build:
+        if not str(user_pubkey or "").strip():
+            stages["swap_tx_build_exact_in"] = {
+                "ok": False,
+                "skipped": True,
+                "reason": "user_pubkey_required",
+                "message": "Pass user_pubkey only for deliberate unsigned SDK swap_tx build diagnostics.",
+            }
+        else:
+            stages["swap_tx_build_exact_in"] = await _hydration_sdk_recovery_stage(
+                "swap_tx_build_exact_in",
+                lambda: _run_hydration_helper_sdk_recovery(
+                    {
+                        **common,
+                        "mode": "swap_tx",
+                        "side": "sell",
+                        "assetIn": _helper_asset_payload(base_meta),
+                        "assetOut": _helper_asset_payload(quote_meta),
+                        "amountMode": "exact_in",
+                        "amountInAtomic": str(_ui_to_atomic(float(amount_ui), int(base_meta.get("decimals") or 0))),
+                        "beneficiary": str(user_pubkey or "").strip(),
+                        "slippageBps": 50,
+                    },
+                    timeout_s=max(timeout_s * 4.0, timeout_s + 15.0),
+                ),
+            )
+
+    stage_values = [v for v in stages.values() if isinstance(v, dict)]
+    failed = [k for k, v in stages.items() if isinstance(v, dict) and not bool(v.get("ok")) and not bool(v.get("skipped"))]
+    skipped = [k for k, v in stages.items() if isinstance(v, dict) and bool(v.get("skipped"))]
+    passed = [k for k, v in stages.items() if isinstance(v, dict) and bool(v.get("ok"))]
+    stage_classifications = {
+        k: _hydration_sdk_recovery_stage_classification(k, v)
+        for k, v in stages.items()
+        if isinstance(v, dict)
+    }
+    analysis = _hydration_sdk_recovery_analysis(
+        stages=stages,
+        classifications=stage_classifications,
+    )
+
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "network": "hydration",
+        "diagnosticOnly": True,
+        "mutation": False,
+        "signing": False,
+        "submission": False,
+        "rawSymbol": symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+        "base": base_meta,
+        "quote": quote_meta,
+        "amountUi": float(amount_ui),
+        "buyAmountUi": buy_amount,
+        "stepTimeoutS": timeout_s,
+        "summary": {
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "totalStages": len(stage_values),
+            "firstFailedStage": analysis.get("firstFailedStage"),
+            "normalSdkQuoteGatesShouldRemainDisabled": bool(analysis.get("normalSdkQuoteGatesShouldRemainDisabled")),
+            "recommendation": " ".join(analysis.get("recommendations") or []),
+        },
+        "analysis": analysis,
+        "stageClassifications": stage_classifications,
+        "sdkScopes": {
+            "globalRouterQuotesEnabled": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+            "sdkOrderbookQuotesEnabled": bool(_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES),
+            "sdkSpotOrderbookEnabled": bool(_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK),
+            "sdkOrderTicketQuotesEnabled": bool(_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES),
+            "sdkSwapTxEnabled": bool(_HYDRATION_ENABLE_SDK_SWAP_TX),
+            "backgroundSdkPricesEnabled": bool(_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES),
+            "diagnosticBypassesUiQuoteGates": True,
+        },
+        "safety": {
+            "readOnly": True,
+            "usesShortLivedHelper": True,
+            "doesNotStartBackgroundPolling": True,
+            "doesNotSign": True,
+            "doesNotSubmit": True,
+            "doesNotMutateRouteRegistry": True,
+            "doesNotMutateLedgerOrFifo": True,
+        },
+        "stages": stages,
+    }
+
+
+
+
+def _hydration_sdk_recovery_state_call_methods(raw_csv: Optional[str], *, max_methods: int) -> List[str]:
+    raw = str(raw_csv or "").strip()
+    if raw:
+        methods = [m.strip() for m in raw.split(",") if m.strip()]
+    else:
+        methods = [
+            "OmnipoolApi_quotePrice",
+            "OmnipoolApi_quote_price",
+            "OmnipoolRuntimeApi_quotePrice",
+            "OmnipoolRuntimeApi_quote_price",
+            "RouterApi_quotePrice",
+            "RouterApi_quote_price",
+            "TradeRouterApi_quotePrice",
+            "TradeRouterApi_quote_price",
+            "TradeExecutionApi_quotePrice",
+            "TradeExecutionApi_quote_price",
+        ]
+
+    out: List[str] = []
+    for method in methods:
+        if method and method not in out:
+            out.append(method)
+        if len(out) >= max(1, int(max_methods)):
+            break
+    return out
+
+
+def _hydration_sdk_recovery_extra_rpc_urls(raw_csv: Optional[str]) -> List[str]:
+    out: List[str] = []
+
+    def _add(value: Any) -> None:
+        s = str(value or "").strip()
+        if not s or _looks_placeholder_secret(s):
+            return
+        if not (s.startswith("http://") or s.startswith("https://")):
+            return
+        if s not in out:
+            out.append(s)
+
+    for env_name in ("UTT_HYDRATION_RECOVERY_RPC_URLS_JSON", "UTT_HYDRATION_RECOVERY_RPC_URLS"):
+        raw_env = os.getenv(env_name)
+        if not raw_env:
+            continue
+        try:
+            parsed = json.loads(raw_env)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    _add(item)
+            elif isinstance(parsed, str):
+                for part in parsed.split(","):
+                    _add(part)
+        except Exception:
+            for part in str(raw_env or "").split(","):
+                _add(part)
+
+    for part in str(raw_csv or "").split(","):
+        _add(part)
+
+    return out
+
+
+def _hydration_sdk_recovery_rpc_candidates(
+    *,
+    include_current_rpc: bool,
+    extra_rpc_urls_csv: Optional[str],
+    max_rpc_candidates: int,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(label: str, url: Optional[str], source: str) -> None:
+        clean = str(url or "").strip()
+        if not clean or clean in seen or _looks_placeholder_secret(clean):
+            return
+        if not (clean.startswith("http://") or clean.startswith("https://")):
+            return
+        seen.add(clean)
+        out.append({
+            "label": label,
+            "url": clean,
+            "source": source,
+            "redactedUrl": _redact_url(clean),
+        })
+
+    if include_current_rpc:
+        try:
+            _add("current", _hydration_rpc_url(), _dwellir_hydration_key_source() or "current_config")
+        except Exception:
+            pass
+
+    for idx, url in enumerate(_hydration_sdk_recovery_extra_rpc_urls(extra_rpc_urls_csv), start=1):
+        _add(f"extra_{idx}", url, "query_or_env")
+
+    return out[: max(1, int(max_rpc_candidates))]
+
+
+async def _rpc_probe_url(
+    url: str,
+    method: str,
+    params: Optional[List[Any]] = None,
+    *,
+    timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    clean_url = str(url or "").strip()
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
+    try:
+        async with httpx.AsyncClient(timeout=float(timeout_s or _HYDRATION_TIMEOUT_S)) as client:
+            r = await client.post(clean_url, json=payload, headers={"content-type": "application/json"})
+    except httpx.RequestError as e:
+        return {
+            "ok": False,
+            "error": "hydration_rpc_probe_request_failed",
+            "method": method,
+            "exc": type(e).__name__,
+            "message": str(e),
+            "rpc_url": _redact_url(clean_url),
+        }
+
+    out: Dict[str, Any] = {
+        "ok": r.status_code < 400,
+        "httpStatus": r.status_code,
+        "rpc_url": _redact_url(clean_url),
+    }
+    try:
+        data = r.json() or {}
+    except Exception:
+        out.update({"ok": False, "error": "hydration_rpc_probe_non_json", "body": (r.text or "")[:1000]})
+        return out
+
+    if isinstance(data, dict) and data.get("error") is not None:
+        out.update({"ok": False, "error": "hydration_rpc_probe_error", "rpc_error": data.get("error")})
+        return out
+
+    out["result"] = data.get("result") if isinstance(data, dict) else data
+    return out
+
+
+async def _state_call_probe_method_at_url(url: str, method: str, data: str = "0x") -> Dict[str, Any]:
+    clean = _clean_hex(data or "0x")
+    rpc_result = await _rpc_probe_url(url, "state_call", [method, clean])
+    return {
+        "method": method,
+        "data": clean,
+        "classification": _classify_state_call_probe(method, rpc_result),
+        "rpc": rpc_result,
+    }
+
+
+def _hydration_sdk_recovery_sides(raw_side: str) -> List[str]:
+    side_norm = str(raw_side or "sell").strip().lower()
+    if side_norm in {"both", "all"}:
+        return ["sell", "buy"]
+    if side_norm not in {"sell", "buy"}:
+        raise HTTPException(status_code=422, detail={"error": "invalid_side", "side": raw_side, "expected": "sell|buy|both"})
+    return [side_norm]
+
+
+def _hydration_sdk_recovery_quote_candidates(
+    *,
+    candidate: str,
+    raw_data: Optional[str],
+    asset_in_id: int,
+    asset_out_id: int,
+    amount_atomic: int,
+) -> List[Dict[str, Any]]:
+    if raw_data:
+        return [{"name": "raw", "data": _clean_hex(raw_data), "note": "caller-provided raw SCALE input"}]
+
+    all_candidates = _state_call_quote_candidate_payloads(asset_in_id, asset_out_id, amount_atomic)
+    cand = str(candidate or "auto").strip()
+    if cand == "auto":
+        return all_candidates
+
+    selected = [c for c in all_candidates if c.get("name") == cand]
+    if not selected:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unknown_state_call_candidate",
+                "candidate": candidate,
+                "available": ["auto"] + [c.get("name") for c in all_candidates] + ["raw"],
+            },
+        )
+    return selected
+
+
+async def _hydration_sdk_recovery_state_call_attempts_for_rpc(
+    *,
+    rpc_url: str,
+    symbol: str,
+    amount: float,
+    sides: List[str],
+    methods: List[str],
+    candidate: str,
+    raw_data: Optional[str],
+    base_meta: Dict[str, Any],
+    quote_meta: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    attempts: List[Dict[str, Any]] = []
+    base_symbol, quote_symbol = _parse_symbol(symbol)
+
+    for side_norm in sides:
+        if side_norm == "sell":
+            asset_in_meta = base_meta
+            asset_out_meta = quote_meta
+        else:
+            asset_in_meta = quote_meta
+            asset_out_meta = base_meta
+
+        asset_in_id = _hydration_sdk_asset_id(asset_in_meta)
+        asset_out_id = _hydration_sdk_asset_id(asset_out_meta)
+        amount_atomic = _ui_to_atomic(float(amount), int(asset_in_meta.get("decimals") or 0))
+        candidates = _hydration_sdk_recovery_quote_candidates(
+            candidate=candidate,
+            raw_data=raw_data,
+            asset_in_id=asset_in_id,
+            asset_out_id=asset_out_id,
+            amount_atomic=amount_atomic,
+        )
+
+        for call_method in methods:
+            for c in candidates:
+                rpc_result = await _rpc_probe_url(rpc_url, "state_call", [call_method, c["data"]])
+                classification = _classify_state_call_probe(call_method, rpc_result)
+                attempt = {
+                    "side": side_norm,
+                    "method": call_method,
+                    "candidate": c.get("name"),
+                    "candidateNote": c.get("note"),
+                    "data": c.get("data"),
+                    "classification": classification,
+                    "assetIn": asset_in_meta,
+                    "assetOut": asset_out_meta,
+                    "assetInId": asset_in_id,
+                    "assetOutId": asset_out_id,
+                    "amountUi": float(amount),
+                    "amountAtomic": str(amount_atomic),
+                    "rpc": rpc_result,
+                }
+                if rpc_result.get("ok") and rpc_result.get("result") is not None:
+                    attempt["decodeProbe"] = _decode_state_call_probe_result(
+                        rpc_result.get("result"),
+                        int(asset_out_meta.get("decimals") or 0),
+                    )
+                attempts.append(attempt)
+
+    return attempts
+
+
+def _hydration_sdk_recovery_state_call_summary(attempts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    accepted = [a for a in attempts if a.get("classification") == "accepted"]
+    exported = [
+        a for a in attempts
+        if a.get("classification") in {"exported_decode_or_input_error", "exported_execution_error"}
+    ]
+    not_found = [a for a in attempts if a.get("classification") == "not_found"]
+    unknown = [a for a in attempts if a.get("classification") == "unknown_error"]
+
+    accepted_methods = []
+    exported_methods = []
+    for item in accepted:
+        m = item.get("method")
+        if m and m not in accepted_methods:
+            accepted_methods.append(m)
+    for item in exported:
+        m = item.get("method")
+        if m and m not in exported_methods:
+            exported_methods.append(m)
+
+    if accepted:
+        finding = "At least one state_call quote candidate returned a runtime result. Decode the accepted shape before using it as a price source."
+        next_action = "Inspect decodeProbe for the accepted candidate and compare against a known UI quote before any trading use."
+    elif exported:
+        finding = "One or more runtime API names appear exported, but the SCALE input shape is still wrong or incomplete."
+        next_action = "Use metadata_v15_focused_scan around the exported method/pallet names, then add the exact SCALE shape as a later candidate."
+    else:
+        finding = "No tested quote method/payload shape returned a usable runtime result."
+        next_action = "Do not enable state_call quotes from this run; compare another RPC/provider or add better method names from metadata scan."
+
+    return {
+        "acceptedCandidateCount": len(accepted),
+        "exportedButNeedsSignatureCount": len(exported),
+        "notFoundCount": len(not_found),
+        "unknownErrorCount": len(unknown),
+        "acceptedMethods": accepted_methods,
+        "exportedButNeedsSignatureMethods": exported_methods,
+        "finding": finding,
+        "nextAction": next_action,
+    }
+
+
+def _hydration_runtime_method_hunt_terms(raw_csv: Optional[str]) -> List[str]:
+    raw = str(raw_csv or "").strip()
+    if raw:
+        terms = [p.strip() for p in raw.split(",") if p.strip()]
+    else:
+        terms = [
+            "quote",
+            "price",
+            "sell",
+            "buy",
+            "trade",
+            "spot",
+            "amount",
+            "router",
+            "omnipool",
+            "RuntimeApi",
+            "Api",
+        ]
+
+    out: List[str] = []
+    for term in terms:
+        clean = str(term or "").strip()
+        if clean and clean not in out:
+            out.append(clean)
+    return out
+
+
+def _hydration_metadata_identifier_like(value: Any) -> bool:
+    s = str(value or "").strip()
+    if not s or len(s) > 96:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+    return bool(any(ch.isalpha() for ch in s) and all(ch in allowed for ch in s))
+
+
+def _hydration_camel_to_snake(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    out: List[str] = []
+    prev = ""
+    for ch in s:
+        if ch.isupper() and prev and (prev.islower() or prev.isdigit()):
+            out.append("_")
+        out.append(ch.lower())
+        prev = ch
+    return "".join(out)
+
+
+def _hydration_metadata_runtime_method_candidates(
+    strings: List[Dict[str, Any]],
+    *,
+    terms: List[str],
+    max_candidates: int,
+) -> Dict[str, Any]:
+    term_lowers = [str(t or "").strip().lower() for t in (terms or []) if str(t or "").strip()]
+    api_like: List[str] = []
+    method_like: List[str] = []
+    direct_method_like: List[str] = []
+    matched_strings: List[Dict[str, Any]] = []
+
+    def _add_unique(items: List[str], value: Any) -> None:
+        clean = str(value or "").strip()
+        if clean and clean not in items:
+            items.append(clean)
+
+    for item in strings or []:
+        text_value = str((item or {}).get("text") or "").strip()
+        text_lower = text_value.lower()
+        if not _hydration_metadata_identifier_like(text_value):
+            continue
+
+        if "api" in text_lower or "runtimeapi" in text_lower:
+            _add_unique(api_like, text_value)
+
+        if any(term and term in text_lower for term in term_lowers):
+            matched_strings.append(item)
+            if "api_" in text_lower or text_lower.endswith("_api"):
+                _add_unique(direct_method_like, text_value)
+            if not text_lower.endswith("api") and "runtimeapi" not in text_lower:
+                _add_unique(method_like, text_value)
+
+    # Prefer concrete quote/trade/price words before generic router strings.
+    def _method_rank(value: str) -> Tuple[int, str]:
+        lo = value.lower()
+        score = 50
+        for idx, needle in enumerate(["quote", "price", "sell", "buy", "trade", "spot", "amount"]):
+            if needle in lo:
+                score = min(score, idx)
+        if lo in {"router", "omnipool", "runtime", "api"}:
+            score += 20
+        return (score, lo)
+
+    api_like = sorted(api_like, key=lambda x: (0 if x.endswith("Api") else 1, x.lower()))
+    method_like = sorted(method_like, key=_method_rank)
+
+    candidates: List[str] = []
+    for method in direct_method_like:
+        _add_unique(candidates, method)
+
+    # Generate state_call-style RuntimeApi_methodName candidates from metadata
+    # strings.  This is intentionally speculative and diagnostic-only; any hit
+    # still needs a real SCALE signature confirmation before use.
+    for api_name in api_like[:24]:
+        for method_name in method_like[:48]:
+            if method_name == api_name:
+                continue
+            raw = method_name
+            snake = _hydration_camel_to_snake(method_name)
+            for variant in (raw, snake):
+                if not variant:
+                    continue
+                _add_unique(candidates, f"{api_name}_{variant}")
+                # Some runtime APIs use lower snake method names while metadata
+                # nearby strings may expose CamelCase names.
+                if variant != variant.lower():
+                    _add_unique(candidates, f"{api_name}_{variant.lower()}")
+            if len(candidates) >= int(max_candidates):
+                break
+        if len(candidates) >= int(max_candidates):
+            break
+
+    # Keep the older hand-written candidates at the end for regression context,
+    # but do not let them crowd out metadata-derived candidates.
+    for method in _runtime_api_default_method_candidates():
+        if method not in {"Core_version", "Metadata_metadata_versions", "Metadata_metadata_at_version"}:
+            _add_unique(candidates, method)
+
+    return {
+        "apiLikeStrings": api_like[:80],
+        "methodLikeStrings": method_like[:120],
+        "matchedStrings": matched_strings[:120],
+        "candidateMethods": candidates[: max(0, int(max_candidates))],
+        "generationNotes": [
+            "Candidates are generated from bounded ASCII strings inside Metadata v15.",
+            "A state_call candidate is useful only if the method probe is accepted or returns a decode/input error instead of not_found.",
+            "Even accepted/exported candidates remain diagnostic-only until the exact SCALE signature and output decode are confirmed.",
+        ],
+    }
+
+
+def _hydration_runtime_method_hunt_summary(probes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    accepted = [p for p in probes if p.get("classification") == "accepted"]
+    exported = [
+        p for p in probes
+        if p.get("classification") in {"exported_decode_or_input_error", "exported_execution_error"}
+    ]
+    not_found = [p for p in probes if p.get("classification") == "not_found"]
+    unknown = [p for p in probes if p.get("classification") == "unknown_error"]
+
+    accepted_methods = [str(p.get("method") or "") for p in accepted if p.get("method")]
+    exported_methods = [str(p.get("method") or "") for p in exported if p.get("method")]
+
+    if accepted:
+        finding = "Metadata-guided method hunt found at least one accepted state_call method."
+        next_action = "Use sdk_recovery_state_call_compare with methods_csv set to the accepted method and candidate/raw_data variants, then decode against a known UI quote."
+    elif exported:
+        finding = "Metadata-guided method hunt found exported runtime method names, but the empty probe payload is not a valid signature."
+        next_action = "Use metadata windows around the exported names to derive the exact SCALE input type before testing quote payloads."
+    else:
+        finding = "Metadata-guided method hunt did not find a callable quote/runtime method name from the bounded candidate set."
+        next_action = "Keep state_call quotes disabled; either broaden metadata terms/max_method_probes or move to an indexer/manual confirmed route price source."
+
+    return {
+        "acceptedCount": len(accepted),
+        "exportedButNeedsSignatureCount": len(exported),
+        "notFoundCount": len(not_found),
+        "unknownErrorCount": len(unknown),
+        "acceptedMethods": accepted_methods,
+        "exportedButNeedsSignatureMethods": exported_methods,
+        "finding": finding,
+        "nextAction": next_action,
+    }
+
+
+@router.get("/hydration/sdk_recovery_metadata_method_hunt")
+async def hydration_sdk_recovery_metadata_method_hunt(
+    terms_csv: Optional[str] = Query(None, description="Comma-separated metadata terms used to generate runtime method candidates."),
+    method_candidates_csv: Optional[str] = Query(None, description="Optional explicit method candidates to prepend before metadata-generated candidates."),
+    probe_data: str = Query("0x", description="Raw hex payload for method-name probes. Empty SCALE input is safest for discovery."),
+    include_method_probes: bool = Query(True, description="If true, run state_call probes for generated method names."),
+    max_ascii_strings: int = Query(5000, ge=250, le=12000),
+    max_candidates: int = Query(120, ge=10, le=300),
+    max_method_probes: int = Query(60, ge=0, le=150),
+) -> Dict[str, Any]:
+    """Metadata-guided runtime method discovery for H-SDK recovery.
+
+    This is the follow-up for state_call compare runs where every tested quote
+    method returned not_found.  It fetches Metadata v15, extracts bounded
+    identifier-like strings around quote/price/trade terms, generates possible
+    state_call method names, and optionally probes those names with empty input.
+
+    It remains diagnostic-only: no sdk-next router, no WebSocket chainHead,
+    no signing/submission, and no DB mutation.
+    """
+    terms = _hydration_runtime_method_hunt_terms(terms_csv)
+    metadata_probe = await _state_call_probe_method("Metadata_metadata_at_version", _metadata_v15_probe_payload())
+    metadata_hex = _metadata_result_hex_from_probe(metadata_probe)
+    if not metadata_hex or metadata_probe.get("classification") != "accepted":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "hydration_metadata_v15_fetch_failed",
+                "message": "Metadata_metadata_at_version did not return an accepted Metadata v15 blob.",
+                "probe": metadata_probe,
+                "probeData": _metadata_v15_probe_payload(),
+            },
+        )
+
+    metadata_bytes = _bytes_from_hex_result(metadata_hex)
+    metadata_strings = _metadata_ascii_strings(metadata_bytes, min_len=3, max_strings=int(max_ascii_strings))
+    generated = _hydration_metadata_runtime_method_candidates(
+        metadata_strings,
+        terms=terms,
+        max_candidates=int(max_candidates),
+    )
+
+    candidates: List[str] = []
+    def _add_candidate(value: Any) -> None:
+        clean = str(value or "").strip()
+        if clean and clean not in candidates:
+            candidates.append(clean)
+
+    for part in str(method_candidates_csv or "").split(","):
+        _add_candidate(part)
+
+    for method in generated.get("candidateMethods") or []:
+        _add_candidate(method)
+
+    probe_candidates = candidates[: max(0, int(max_method_probes))]
+    method_probes: List[Dict[str, Any]] = []
+    clean_probe_data = _clean_hex(probe_data or "0x")
+    if include_method_probes and probe_candidates:
+        for method in probe_candidates:
+            method_probes.append(await _state_call_probe_method(method, clean_probe_data))
+
+    summary = _hydration_runtime_method_hunt_summary(method_probes)
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "network": "hydration",
+        "diagnosticOnly": True,
+        "mutation": False,
+        "signing": False,
+        "submission": False,
+        "usesSdkNextRouter": False,
+        "usesWebSocketChainHead": False,
+        "rpc_url": _redact_url(_hydration_rpc_url()),
+        "metadata": {
+            "method": "Metadata_metadata_at_version",
+            "probeData": _metadata_v15_probe_payload(),
+            "classification": metadata_probe.get("classification"),
+            "byteLen": len(metadata_bytes),
+            "asciiStringCountReturned": len(metadata_strings),
+        },
+        "huntConfig": {
+            "terms": terms,
+            "probeData": clean_probe_data,
+            "includeMethodProbes": bool(include_method_probes),
+            "maxAsciiStrings": int(max_ascii_strings),
+            "maxCandidates": int(max_candidates),
+            "maxMethodProbes": int(max_method_probes),
+            "explicitCandidateCount": len([p for p in str(method_candidates_csv or "").split(",") if p.strip()]),
+            "candidateCount": len(candidates),
+            "probedCandidateCount": len(probe_candidates) if include_method_probes else 0,
+        },
+        "candidateGeneration": generated,
+        "candidateMethods": candidates[: max(0, int(max_candidates))],
+        "methodProbeSummary": summary,
+        "methodProbes": method_probes,
+        "safety": {
+            "readOnly": True,
+            "doesNotUseSdkNextRouter": True,
+            "doesNotUseWsChainHead": True,
+            "doesNotSign": True,
+            "doesNotSubmit": True,
+            "doesNotMutateRouteRegistry": True,
+            "doesNotMutateLedgerOrFifo": True,
+        },
+        "recommendation": (
+            "If this hunt returns exportedButNeedsSignatureMethods, use those names in sdk_recovery_state_call_compare "
+            "with candidate/raw_data variants. If all candidates are not_found, leave state_call quotes disabled and use "
+            "confirmed manual routes plus external/cached prices until a reliable runtime/indexer source is identified."
+        ),
+    }
+
+
+def _hydration_sdk_recovery_closeout_payload() -> Dict[str, Any]:
+    """Summarize the current Hydration SDK recovery decision.
+
+    H-SDK.3A-D proved that the local environment/RPC are healthy, but the
+    sdk-next router quote path and guessed RuntimeApi state_call quote names are
+    not reliable enough to reopen live quote gates.  This payload is deliberately
+    static/config-derived: it does not run Node, state_call probes, signing, or
+    any DB mutation.
+    """
+    recommended_disabled = {
+        "UTT_HYDRATION_ENABLE_ROUTER_QUOTES": bool(_HYDRATION_ENABLE_ROUTER_QUOTES),
+        "UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES": bool(_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES),
+        "UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK": bool(_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK),
+        "UTT_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES": bool(_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES),
+        "UTT_HYDRATION_ENABLE_SDK_SWAP_TX": bool(_HYDRATION_ENABLE_SDK_SWAP_TX),
+        "UTT_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES": bool(_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES),
+        "UTT_HYDRATION_ENABLE_STATE_CALL_QUOTES": bool(_HYDRATION_ENABLE_STATE_CALL_QUOTES),
+        "UTT_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK": bool(_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK),
+    }
+    unexpectedly_enabled = [name for name, enabled in recommended_disabled.items() if bool(enabled)]
+    safe_enabled = {
+        "UTT_HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK": bool(_HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK),
+        "UTT_HYDRATION_ENABLE_MANUAL_POOL_FALLBACK": bool(_HYDRATION_ENABLE_MANUAL_POOL_FALLBACK),
+        "UTT_HYDRATION_MANUAL_POOL_LIVE_RESERVES": bool(_HYDRATION_MANUAL_POOL_LIVE_RESERVES),
+        "UTT_HYDRATION_ENABLE_ORDERBOOK_SYNTHETIC_FALLBACK": bool(_HYDRATION_ENABLE_ORDERBOOK_SYNTHETIC_FALLBACK),
+        "UTT_HYDRATION_ENABLE_EXTERNAL_USD_PRICES": bool(_HYDRATION_ENABLE_EXTERNAL_USD_PRICES),
+    }
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "network": "hydration",
+        "diagnosticOnly": True,
+        "mutation": False,
+        "signing": False,
+        "submission": False,
+        "decision": "manual_confirmed_routes_plus_external_cached_prices",
+        "status": "sdk_router_and_state_call_recovery_closed_for_now",
+        "normalSdkQuoteGatesShouldRemainDisabled": True,
+        "stateCallQuotesShouldRemainDisabled": True,
+        "routerQuotesShouldRemainDisabled": True,
+        "sdkPriceFallbackShouldRemainDisabled": True,
+        "manualRoutesRemainPrimary": True,
+        "syntheticOrderbooksRemainVisualOnly": True,
+        "findingSummary": [
+            {
+                "id": "H-SDK.3A",
+                "finding": "Node, helper files, WebSocket configuration, Hydration RPC, and basic environment checks passed.",
+            },
+            {
+                "id": "H-SDK.3A.2",
+                "finding": "Diagnostic classification now correctly distinguishes skipped, failed, and nested ok:false stages.",
+            },
+            {
+                "id": "H-SDK.3A.3",
+                "finding": "getBestBuy probe completion without successful attempts is treated as failed recovery, not success.",
+            },
+            {
+                "id": "H-SDK.3C",
+                "finding": "Non-router state_call quote candidates returned no accepted/exported quote method names.",
+            },
+            {
+                "id": "H-SDK.3D",
+                "finding": "Metadata-guided method hunt still found no callable quote/runtime method name in the bounded candidate set.",
+            },
+        ],
+        "safeProductionPriceSources": [
+            "confirmed hydration_route_registry manual_router rows",
+            "manual XYK/live-reserve fallback for configured custom pools",
+            "external/cached USD prices for portfolio and synthetic visual books",
+            "synthetic orderbook fallback marked visual/price-only unless an execution preflight succeeds",
+        ],
+        "disabledUntil": [
+            "sdk-next router getSpotPrice/getBestSell/getBestBuy returns bounded successful quotes through the selected RPC/provider",
+            "or a state_call RuntimeApi method is accepted/exported and its exact SCALE input/output is confirmed against a known UI quote",
+            "or a supported indexer/API quote source is selected and cached behind TTL/backoff guards",
+        ],
+        "recommendedEnv": {
+            "keepOff": [
+                "UTT_HYDRATION_ENABLE_ROUTER_QUOTES=0",
+                "UTT_HYDRATION_ENABLE_SDK_ORDERBOOK_QUOTES=0",
+                "UTT_HYDRATION_ENABLE_SDK_SPOT_ORDERBOOK=0 unless running one visible diagnostic",
+                "UTT_HYDRATION_ENABLE_SDK_ORDER_TICKET_QUOTES=0",
+                "UTT_HYDRATION_ENABLE_SDK_SWAP_TX=0",
+                "UTT_HYDRATION_ENABLE_BACKGROUND_SDK_PRICES=0",
+                "UTT_HYDRATION_ENABLE_STATE_CALL_QUOTES=0",
+                "UTT_HYDRATION_PRICE_CACHE_USE_SDK_FALLBACK=0",
+            ],
+            "safeOn": [
+                "UTT_HYDRATION_ENABLE_MANUAL_ROUTER_FALLBACK=1",
+                "UTT_HYDRATION_ENABLE_MANUAL_POOL_FALLBACK=1 for confirmed custom pools",
+                "UTT_HYDRATION_MANUAL_POOL_LIVE_RESERVES=1 where pool accounts are configured",
+                "UTT_HYDRATION_ENABLE_ORDERBOOK_SYNTHETIC_FALLBACK=1",
+                "UTT_HYDRATION_ENABLE_EXTERNAL_USD_PRICES=1",
+            ],
+        },
+        "currentGateState": {
+            "recommendedDisabledGates": recommended_disabled,
+            "recommendedSafeEnabledGates": safe_enabled,
+            "unexpectedlyEnabledSdkRecoveryGates": unexpectedly_enabled,
+            "safeMode": len(unexpectedly_enabled) == 0,
+        },
+        "nextAction": (
+            "Stop Hydration SDK/runtime quote recovery here for now. Keep confirmed manual routes and cached/external price sources active, "
+            "then move to the next roadmap item unless a new Hydration SDK/RPC/indexer source is selected."
+        ),
+        "safeDiagnosticEndpoints": [
+            "/api/polkadot_dex/hydration/sdk_recovery_diagnostics",
+            "/api/polkadot_dex/hydration/sdk_recovery_state_call_compare",
+            "/api/polkadot_dex/hydration/sdk_recovery_metadata_method_hunt",
+            "/api/polkadot_dex/hydration/sdk_recovery_closeout",
+        ],
+    }
+
+
+@router.get("/hydration/sdk_recovery_closeout")
+async def hydration_sdk_recovery_closeout() -> Dict[str, Any]:
+    """Return the H-SDK.3 recovery closeout decision without running probes."""
+    return _hydration_sdk_recovery_closeout_payload()
+
+
+@router.get("/hydration/sdk_recovery_state_call_compare")
+async def hydration_sdk_recovery_state_call_compare(
+    symbol: str = Query("DOT-HDX", description="Symbol pair to diagnose, e.g. DOT-HDX or HDX-DOT."),
+    amount: float = Query(1.0, gt=0, description="Human amount used to build state_call quote probe payloads."),
+    side: str = Query("sell", description="sell, buy, or both."),
+    methods_csv: Optional[str] = Query(None, description="Comma-separated runtime API quote method candidates. Defaults to common Hydration/Router names."),
+    candidate: str = Query("auto", description="auto, u32_u32_u128, u32_u32_u128_order_0, u32_u32_u128_order_1, or raw."),
+    raw_data: Optional[str] = Query(None, description="Optional raw hex SCALE input. If supplied, candidate=raw is used."),
+    include_current_rpc: bool = Query(True),
+    extra_rpc_urls_csv: Optional[str] = Query(None, description="Optional comma-separated extra HTTP RPC URLs to compare. Returned redacted."),
+    max_rpc_candidates: int = Query(3, ge=1, le=5),
+    max_methods: int = Query(6, ge=1, le=12),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Compare non-router state_call quote candidates across HTTP RPC endpoints.
+
+    This is a read-only recovery diagnostic.  It deliberately avoids sdk-next
+    router methods, WebSocket chainHead subscriptions, signing, submission, and
+    any DB mutation.  It is meant to answer whether a lighter runtime state_call
+    quote source is viable before reopening sdk-next quote polling.
+    """
+    base, quote = _parse_symbol(symbol)
+    base_meta = _resolve_asset(base, db=db)
+    quote_meta = _resolve_asset(quote, db=db)
+    sides = _hydration_sdk_recovery_sides(side)
+    methods = _hydration_sdk_recovery_state_call_methods(methods_csv, max_methods=int(max_methods))
+    rpc_candidates = _hydration_sdk_recovery_rpc_candidates(
+        include_current_rpc=bool(include_current_rpc),
+        extra_rpc_urls_csv=extra_rpc_urls_csv,
+        max_rpc_candidates=int(max_rpc_candidates),
+    )
+    if not rpc_candidates:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "hydration_recovery_no_rpc_candidates",
+                "message": "No usable HTTP RPC candidates were available. Configure the Profile Dwellir key or pass extra_rpc_urls_csv.",
+            },
+        )
+
+    rpc_results: List[Dict[str, Any]] = []
+    total_attempts: List[Dict[str, Any]] = []
+    for candidate_rpc in rpc_candidates:
+        url = str(candidate_rpc.get("url") or "")
+        sanity = {
+            "system_chain": await _rpc_probe_url(url, "system_chain", []),
+            "state_getRuntimeVersion": await _rpc_probe_url(url, "state_getRuntimeVersion", []),
+            "Core_version": await _state_call_probe_method_at_url(url, "Core_version", "0x"),
+            "Metadata_metadata_versions": await _state_call_probe_method_at_url(url, "Metadata_metadata_versions", "0x"),
+        }
+        attempts = await _hydration_sdk_recovery_state_call_attempts_for_rpc(
+            rpc_url=url,
+            symbol=f"{base}-{quote}",
+            amount=float(amount),
+            sides=sides,
+            methods=methods,
+            candidate=candidate,
+            raw_data=raw_data,
+            base_meta=base_meta,
+            quote_meta=quote_meta,
+        )
+        summary = _hydration_sdk_recovery_state_call_summary(attempts)
+        total_attempts.extend([{**a, "rpcLabel": candidate_rpc.get("label"), "rpcUrl": candidate_rpc.get("redactedUrl")} for a in attempts])
+        rpc_results.append({
+            "label": candidate_rpc.get("label"),
+            "source": candidate_rpc.get("source"),
+            "rpc_url": candidate_rpc.get("redactedUrl"),
+            "sanity": sanity,
+            "summary": summary,
+            "attempts": attempts,
+        })
+
+    total_summary = _hydration_sdk_recovery_state_call_summary(total_attempts)
+    return {
+        "ok": True,
+        "venue": "polkadot_hydration",
+        "network": "hydration",
+        "diagnosticOnly": True,
+        "mutation": False,
+        "signing": False,
+        "submission": False,
+        "usesSdkNextRouter": False,
+        "usesWebSocketChainHead": False,
+        "rawSymbol": symbol,
+        "resolvedSymbol": f"{base}-{quote}",
+        "side": side,
+        "amountUi": float(amount),
+        "base": base_meta,
+        "quote": quote_meta,
+        "methods": methods,
+        "candidate": "raw" if raw_data else candidate,
+        "rpcCandidateCount": len(rpc_candidates),
+        "summary": total_summary,
+        "rpcResults": rpc_results,
+        "safety": {
+            "readOnly": True,
+            "doesNotUseSdkNextRouter": True,
+            "doesNotUseWsChainHead": True,
+            "doesNotSign": True,
+            "doesNotSubmit": True,
+            "doesNotMutateRouteRegistry": True,
+            "doesNotMutateLedgerOrFifo": True,
+        },
+        "recommendation": (
+            "Use this only to identify a possible non-router runtime state_call quote source. "
+            "Do not enable state_call quotes or trading from accepted probes until the SCALE input/output shape is confirmed against a known Hydration UI quote."
+        ),
     }
 
 

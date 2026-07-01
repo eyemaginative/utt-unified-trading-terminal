@@ -18,6 +18,7 @@ const LS_OT_SOL_ROUTER = "utt_ot_sol_router_v1";
 const LS_OT_DOT_WALLET = "utt_ot_dot_wallet_v1";
 const LS_OT_HYDRATION_ROUTE = "utt_ot_hydration_route_mode_v1";
 const POLKADOT_APP_NAME = "UTT Unified Trading Terminal";
+const HYDRATION_ROUTER_BOOK_SIDE_TOLERANCE_BPS = 2;
 
 function getPreferredSolanaWalletKey() {
   try { return localStorage.getItem(LS_OT_SOL_WALLET) || "solflare"; } catch { return "solflare"; }
@@ -269,23 +270,35 @@ function hydrationRouteProbeView(payload, symbol) {
 function hydrationExtractOrderbookPrice(row) {
   try {
     if (Array.isArray(row)) {
-      for (const v of row) {
-        const n = Number(v);
-        if (Number.isFinite(n) && n > 0) return n;
-      }
-      return null;
+      const nums = row.map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0);
+      if (!nums.length) return null;
+      if (nums.length === 1) return nums[0];
+      // Hydration pseudo-orderbook rows can arrive as [price, size] or [size, price].
+      // For these router guard levels, sizes are usually whole-token amounts while prices
+      // are fractional. Prefer the smallest positive numeric value so the guard mirrors
+      // the displayed lowest ask / highest bid instead of accidentally reading the size.
+      const fractional = nums.filter((n) => n > 0 && n < 1);
+      if (fractional.length) return Math.min(...fractional);
+      return nums[0];
     }
     if (!row || typeof row !== "object") return null;
     const candidates = [
-      row.price,
-      row.px,
-      row.rate,
+      // Prefer UI/display fields first. Some manual-router payloads also carry
+      // raw/inverse/internal price fields; using those can make the guard appear
+      // to require the highest ask or lowest bid instead of the visible best side.
+      row.displayPrice,
+      row.display_price,
+      row.uiPrice,
+      row.ui_price,
+      row.priceUi,
+      row.price_ui,
       row.levelPrice,
       row.level_price,
       row.limitPrice,
       row.limit_price,
-      row.displayPrice,
-      row.display_price,
+      row.price,
+      row.px,
+      row.rate,
     ];
     for (const v of candidates) {
       const n = Number(v);
@@ -296,6 +309,7 @@ function hydrationExtractOrderbookPrice(row) {
   }
   return null;
 }
+
 
 function hydrationOrderbookSideGuardView(payload, symbol) {
   const p = payload && typeof payload === "object" ? payload : {};
@@ -3077,9 +3091,13 @@ export default function OrderTicketWidget({
   const [balAvail, setBalAvail] = useState({});
   const [balLoading, setBalLoading] = useState(false);
   const [balErr, setBalErr] = useState(null);
+  const [balNotice, setBalNotice] = useState(null);
 
   useEffect(() => {
-    if (!isDexSwapVenue) setBalErr(null);
+    if (!isDexSwapVenue) {
+      setBalErr(null);
+      setBalNotice(null);
+    }
   }, [isDexSwapVenue]);
 
   useEffect(() => {
@@ -3333,6 +3351,7 @@ export default function OrderTicketWidget({
     if (!silent) {
       setBalLoading(true);
       setBalErr(null);
+      setBalNotice(null);
     }
 
     try {
@@ -3358,6 +3377,19 @@ export default function OrderTicketWidget({
 
         const j = await r.json();
         const nextAvail = {};
+
+        const balanceStale = !!(j?.balanceStale || j?.balanceStatus === "stale_fallback");
+        const providerLabel = String(j?.rpcProviderLabel || j?.balanceSource || "Solana RPC");
+        const balanceErr = String(j?.balanceError || "").trim();
+        if (balanceStale) {
+          setBalNotice(
+            hideTableData
+              ? "Solana balances are stale; verify before sizing a live trade."
+              : `Solana balances are stale from ${providerLabel}; verify before sizing a live trade.${balanceErr ? ` Last live error: ${balanceErr}` : ""}`
+          );
+        } else {
+          setBalNotice(null);
+        }
 
         const sol = Number(j?.sol);
         if (Number.isFinite(sol)) {
@@ -3823,13 +3855,16 @@ export default function OrderTicketWidget({
           : null;
     const recommendedPrice = side === "buy" ? (hasAsk ? bestAsk : null) : (hasBid ? bestBid : null);
     const recommendedLabel = side === "buy" ? "best ask / lowest sell" : "best bid / highest buy";
+    const toleranceRatio = HYDRATION_ROUTER_BOOK_SIDE_TOLERANCE_BPS / 10_000;
+    const buyMinAllowed = recommendedPrice !== null ? recommendedPrice * (1 - toleranceRatio) : null;
+    const sellMaxAllowed = recommendedPrice !== null ? recommendedPrice * (1 + toleranceRatio) : null;
     const mismatch =
       impliedPx !== null &&
       recommendedPrice !== null &&
       (
         side === "buy"
-          ? impliedPx + 1e-18 < recommendedPrice
-          : impliedPx - 1e-18 > recommendedPrice
+          ? impliedPx + 1e-18 < buyMinAllowed
+          : impliedPx - 1e-18 > sellMaxAllowed
       );
 
     return {
@@ -3840,6 +3875,7 @@ export default function OrderTicketWidget({
       impliedPrice: impliedPx,
       recommendedPrice,
       recommendedLabel,
+      toleranceBps: HYDRATION_ROUTER_BOOK_SIDE_TOLERANCE_BPS,
       mismatch,
       symbol: polkadotOrderbookSideGuard?.symbol || String(otSymbol || "").trim().toUpperCase(),
     };
@@ -3958,14 +3994,14 @@ export default function OrderTicketWidget({
           lines.push(
             hideTableData
               ? "BUY limit is below best ask."
-              : `BUY exact-out should use the best ask / lowest sell price. Current limit is below ${recStr}; this can fail on-chain with Router.TradingLimitReached.`
+              : `BUY exact-out should use the best ask / lowest sell price. Current limit is meaningfully below ${recStr}; this can fail on-chain with Router.TradingLimitReached.`
           );
           fails.push("hydration_buy_below_best_ask");
         } else {
           lines.push(
             hideTableData
               ? "SELL limit is above best bid."
-              : `SELL exact-in should use the best bid / highest buy price. Current limit is above ${recStr}; this can fail on-chain with Router.TradingLimitReached.`
+              : `SELL exact-in should use the best bid / highest buy price. Current limit is meaningfully above ${recStr}; this can fail on-chain with Router.TradingLimitReached.`
           );
           fails.push("hydration_sell_above_best_bid");
         }
@@ -5643,10 +5679,11 @@ async function submitLimitOrder() {
             <div>
               Best ask: <b>{hydrationManualRouterPriceGuard.bestAsk === null ? "—" : fmtPlain(hydrationManualRouterPriceGuard.bestAsk, { maxFrac: 18 })}</b>
               {" "}• Best bid: <b>{hydrationManualRouterPriceGuard.bestBid === null ? "—" : fmtPlain(hydrationManualRouterPriceGuard.bestBid, { maxFrac: 18 })}</b>
+              {" "}• tolerance: <b>{hydrationManualRouterPriceGuard.toleranceBps} bps</b>
             </div>
             {hydrationManualRouterPriceGuard.mismatch && (
               <div style={{ marginTop: 4, fontWeight: 800 }}>
-                Current limit is on the wrong side of the book and may fail with Router.TradingLimitReached.
+                Current limit is meaningfully on the wrong side of the book and may fail with Router.TradingLimitReached.
               </div>
             )}
             {hydrationManualRouterPriceGuard.recommendedPrice !== null && (
@@ -6185,6 +6222,11 @@ async function submitLimitOrder() {
           {balErr && (isDexSwapVenue || !String(balErr).includes("429")) && (
             <div style={{ ...safeMuted, fontSize: 11, color: "#ff6b6b", lineHeight: 1.1 }}>
               Bal: {hideTableData ? "Hidden" : balErr}
+            </div>
+          )}
+          {balNotice && (
+            <div style={{ ...safeMuted, fontSize: 11, color: "#f2e6b7", lineHeight: 1.15 }}>
+              Bal notice: {hideTableData ? "Hidden" : balNotice}
             </div>
           )}
         </div>

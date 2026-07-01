@@ -197,6 +197,24 @@ _JUP_PRICES_TTL_S = float(os.getenv('UTT_JUP_PRICES_TTL_S', '12'))
 _JUP_PRICES_CACHE: Dict[str, Any] = {'ts': 0.0, 'key': '', 'items': {}}
 _JUP_PRICES_LOCK = asyncio.Lock()
 
+# Solana balance cache (in-process) to keep Helius/public RPC timeouts from
+# blocking every caller (/balances is used by TerminalTables, OrderTicket, and App totals).
+try:
+    _SOL_BALANCES_TIMEOUT_S = float(os.getenv("UTT_SOLANA_BALANCES_TIMEOUT_S") or os.getenv("SOLANA_BALANCES_TIMEOUT_S") or "8")
+except Exception:
+    _SOL_BALANCES_TIMEOUT_S = 8.0
+try:
+    _SOL_BALANCES_CACHE_TTL_S = float(os.getenv("UTT_SOLANA_BALANCES_CACHE_TTL_S") or "20")
+except Exception:
+    _SOL_BALANCES_CACHE_TTL_S = 20.0
+try:
+    _SOL_BALANCES_STALE_MAX_S = float(os.getenv("UTT_SOLANA_BALANCES_STALE_MAX_S") or "86400")
+except Exception:
+    _SOL_BALANCES_STALE_MAX_S = 86400.0
+_SOL_BALANCES_CACHE: Dict[str, Dict[str, Any]] = {}
+_SOL_BALANCES_LOCKS: Dict[str, asyncio.Lock] = {}
+_SOL_BALANCES_LOCKS_GUARD = asyncio.Lock()
+
 # Minimal curated mint map (MVP). We can expand / move to DB later.
 _SOL_MINTS = {
     # Wrapped SOL mint (used by most Solana programs / aggregators)
@@ -568,6 +586,85 @@ async def _jup_ultra_order(input_mint: str, output_mint: str, amount_atomic: int
 def _solana_rpc_url() -> str:
     # Default to public mainnet-beta RPC (free, rate-limited).
     return (os.getenv("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com").strip()
+
+
+def _solana_rpc_provider_label(url: Optional[str] = None) -> str:
+    u = (url or _solana_rpc_url() or "").strip().lower()
+    if not u:
+        return "unknown"
+    if "helius" in u:
+        return "helius"
+    if "mainnet-beta.solana.com" in u:
+        return "public_mainnet_beta"
+    if "quicknode" in u:
+        return "quicknode"
+    if "alchemy" in u:
+        return "alchemy"
+    if "ankr" in u:
+        return "ankr"
+    return "custom_solana_rpc"
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _solana_balances_cache_key(address: str) -> str:
+    return str(address or "").strip()
+
+
+def _solana_cached_balance_response(address: str) -> Optional[Dict[str, Any]]:
+    key = _solana_balances_cache_key(address)
+    if not key:
+        return None
+    entry = _SOL_BALANCES_CACHE.get(key)
+    if not isinstance(entry, dict):
+        return None
+    data = entry.get("data")
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _solana_balance_age_s(data: Dict[str, Any]) -> Optional[float]:
+    try:
+        fetched_ts = float(data.get("_balanceFetchedTs") or 0.0)
+        if fetched_ts <= 0:
+            return None
+        return max(0.0, time.time() - fetched_ts)
+    except Exception:
+        return None
+
+
+def _solana_balance_response_with_status(
+    data: Dict[str, Any],
+    *,
+    status: str,
+    cached: bool,
+    stale: bool,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    out = dict(data or {})
+    age_s = _solana_balance_age_s(out)
+    out["balanceSource"] = out.get("balanceSource") or "solana_rpc"
+    out["balanceStatus"] = status
+    out["balanceCached"] = bool(cached)
+    out["balanceStale"] = bool(stale)
+    out["balanceAgeS"] = age_s
+    out["balanceError"] = error
+    out["rpcProviderLabel"] = _solana_rpc_provider_label(out.get("rpc_url"))
+    out.pop("_balanceFetchedTs", None)
+    return out
+
+
+async def _solana_balance_lock_for(address: str) -> asyncio.Lock:
+    key = _solana_balances_cache_key(address)
+    async with _SOL_BALANCES_LOCKS_GUARD:
+        lock = _SOL_BALANCES_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _SOL_BALANCES_LOCKS[key] = lock
+        return lock
 
 
 async def _rpc(method: str, params: Optional[list] = None) -> Dict[str, Any]:
@@ -1523,18 +1620,80 @@ async def jupiter_record_submit(req: RecordSubmitRequest, db: Session = Depends(
 @router.get("/balances")
 async def solana_balances(
     address: str = Query(..., min_length=32, max_length=64, description="Solana public key (base58)"),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
     Returns SOL balance + SPL token balances for `address`.
 
     This is a READ-ONLY endpoint. It uses SOLANA_RPC_URL if set, else public mainnet-beta RPC.
+    It is centrally cached/timeout-guarded because TerminalTables, OrderTicket, and
+    App-level portfolio totals all call this endpoint.
+    """
+    cache_key = _solana_balances_cache_key(address)
+    if not cache_key:
+        raise HTTPException(status_code=422, detail="Missing Solana address")
+
+    cached = _solana_cached_balance_response(cache_key)
+    if cached is not None:
+        age_s = _solana_balance_age_s(cached)
+        if age_s is not None and age_s <= _SOL_BALANCES_CACHE_TTL_S:
+            return _solana_balance_response_with_status(cached, status="cached_fresh", cached=True, stale=False)
+
+    lock = await _solana_balance_lock_for(cache_key)
+    async with lock:
+        cached = _solana_cached_balance_response(cache_key)
+        if cached is not None:
+            age_s = _solana_balance_age_s(cached)
+            if age_s is not None and age_s <= _SOL_BALANCES_CACHE_TTL_S:
+                return _solana_balance_response_with_status(cached, status="cached_fresh", cached=True, stale=False)
+
+        try:
+            data = await asyncio.wait_for(
+                _solana_balances_live(address=cache_key, db=db),
+                timeout=max(1.0, float(_SOL_BALANCES_TIMEOUT_S)),
+            )
+            fetched_ts = time.time()
+            data["_balanceFetchedTs"] = fetched_ts
+            data["balanceFetchedAt"] = _utc_iso_now()
+            _SOL_BALANCES_CACHE[cache_key] = {"ts": fetched_ts, "data": dict(data)}
+            return _solana_balance_response_with_status(data, status="fresh", cached=False, stale=False)
+        except Exception as e:
+            cached = _solana_cached_balance_response(cache_key)
+            if cached is not None:
+                age_s = _solana_balance_age_s(cached)
+                if age_s is None or age_s <= _SOL_BALANCES_STALE_MAX_S:
+                    msg = str(e)[:300] if str(e) else type(e).__name__
+                    return _solana_balance_response_with_status(
+                        cached,
+                        status="stale_fallback",
+                        cached=True,
+                        stale=True,
+                        error=msg,
+                    )
+            if isinstance(e, HTTPException):
+                raise e
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "error": "solana_balance_fetch_failed",
+                    "message": str(e)[:500] if str(e) else type(e).__name__,
+                    "balanceSource": "solana_rpc",
+                    "rpcProviderLabel": _solana_rpc_provider_label(),
+                    "timeoutS": float(_SOL_BALANCES_TIMEOUT_S),
+                },
+            )
+
+
+async def _solana_balances_live(address: str, db: Optional[Session] = None) -> Dict[str, Any]:
+    """Live Solana balance fetch used by /balances.
+
+    Kept separate so /balances can wrap it with cache, single-flight, and timeout fallback.
     """
     # SOL balance (lamports)
     b = await _rpc("getBalance", [address, {"commitment": "confirmed"}])
     lamports = int((b.get("result") or {}).get("value") or 0)
     sol = lamports / 1_000_000_000
 
-    
     # SPL tokens (query BOTH classic SPL Token + Token-2022, aggregate by mint)
     PROGRAM_TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
     PROGRAM_TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
@@ -1617,7 +1776,7 @@ async def solana_balances(
     # Attach symbols from Token Registry (match on any mint-like field; blank venue = global)
     try:
         mints = [t.get("mint") for t in tokens if t.get("mint")]
-        if mints:
+        if mints and db is not None:
             mint_cols = []
             for col in ("mint", "address", "contract_address", "mint_address"):
                 if hasattr(TokenRegistry, col):
@@ -1667,13 +1826,13 @@ async def solana_balances(
     return {
         "ok": True,
         "rpc_url": _solana_rpc_url(),
+        "balanceSource": "solana_rpc",
+        "rpcProviderLabel": _solana_rpc_provider_label(),
         "address": address,
         "sol": sol,
         "lamports": lamports,
         "tokens": tokens,
     }
-
-
 
 
 @router.get("/resolve")

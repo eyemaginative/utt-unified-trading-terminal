@@ -942,12 +942,19 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       loading: false,
       err: "",
       fetchedAt: null,
+      balanceStatus: "",
+      balanceCached: false,
+      balanceStale: false,
+      balanceFetchedAt: null,
+      balanceError: "",
+      rpcProviderLabel: "",
     }));
 
   // Solana Token Registry: mint/address -> symbol (UI-only enrichment for balances)
   const [solanaTokenRegistryMap, setSolanaTokenRegistryMap] = useState(() => ({}));
 
   const [solanaPrices, setSolanaPrices] = useState({ ok: false, items: {}, ts: 0 });
+  const [expandedBalanceGroups, setExpandedBalanceGroups] = useState(() => ({}));
   // Canonical wrapped SOL mint (for Jupiter pricing lookups)
   const SOL_MINT = "So11111111111111111111111111111111111111112";
   // Solana venues do NOT use the CEX balances refresh pipeline
@@ -1421,6 +1428,110 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       return out;
     }
 
+    function balanceNumberOrZero(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    function balanceNumberOrNull(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function balanceGroupKeyForRow(row) {
+      const symbol = String(row?.symbol || row?.asset || "").trim().toUpperCase();
+      const mint = String(row?.mint || row?.address || row?.contract_address || row?.contractAddress || "").trim();
+
+      // All Venues is an asset-level rollup. If a row has a clean symbol, group
+      // by that symbol so Solana/Jupiter wallet rows (which include a mint) merge
+      // with CEX/self-custody rows for the same asset instead of creating a
+      // second parent such as SOL:So111... next to SOL. Only fall back to the
+      // mint/address when the asset is unresolved or mint-only.
+      const symbolLooksResolved =
+        !!symbol &&
+        symbol !== "—" &&
+        symbol !== "UNKNOWN" &&
+        symbol !== "SPL" &&
+        !symbol.includes("…");
+      if (symbolLooksResolved) return symbol;
+      if (mint) return `mint:${mint}`;
+      return symbol || "UNKNOWN";
+    }
+
+    function buildAllVenuesBalanceDisplayRows(rows, expandedMap) {
+      const groups = new Map();
+      for (const row of rows || []) {
+        const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase() || "—";
+        const key = balanceGroupKeyForRow(row);
+        let g = groups.get(key);
+        if (!g) {
+          g = {
+            key,
+            first: row,
+            asset,
+            total: 0,
+            available: 0,
+            hold: 0,
+            totalUsd: 0,
+            hasTotalUsd: false,
+            priceUsd: null,
+            venues: new Set(),
+            sources: new Set(),
+            children: [],
+          };
+          groups.set(key, g);
+        }
+
+        const venueName = String(row?.venue || "").trim() || "—";
+        g.venues.add(venueName);
+        if (row?.usd_source_symbol) g.sources.add(String(row.usd_source_symbol));
+
+        g.total += balanceNumberOrZero(row?.total);
+        g.available += balanceNumberOrZero(row?.available);
+        g.hold += balanceNumberOrZero(row?.hold);
+
+        const tu = balanceNumberOrNull(row?.total_usd);
+        if (tu !== null) {
+          g.totalUsd += tu;
+          g.hasTotalUsd = true;
+        }
+
+        const px = balanceNumberOrNull(row?.px_usd);
+        if (g.priceUsd === null && px !== null) g.priceUsd = px;
+
+        g.children.push({
+          ...row,
+          __balanceGroupChild: true,
+          __balanceGroupKey: key,
+        });
+      }
+
+      const out = [];
+      for (const g of groups.values()) {
+        const totalUsd = g.hasTotalUsd ? g.totalUsd : null;
+        const weightedPx = totalUsd !== null && g.total > 0 ? totalUsd / g.total : g.priceUsd;
+        const expanded = !!expandedMap?.[g.key];
+        const parent = {
+          ...(g.first || {}),
+          venue: `${g.venues.size} venue${g.venues.size === 1 ? "" : "s"}`,
+          asset: g.asset,
+          total: g.total,
+          available: g.available,
+          hold: g.hold,
+          px_usd: weightedPx,
+          total_usd: totalUsd,
+          usd_source_symbol: g.sources.size > 0 ? Array.from(g.sources).slice(0, 3).join(", ") : g.first?.usd_source_symbol || "—",
+          __balanceGroupParent: true,
+          __balanceGroupKey: g.key,
+          __balanceGroupExpanded: expanded,
+          __balanceGroupChildren: g.children,
+        };
+        out.push(parent);
+        if (expanded) out.push(...g.children);
+      }
+      return out;
+    }
+
     const balancesFiltered = useMemo(() => {
       let rows = balancesSorted || [];
       if (isSolanaVenue) {
@@ -1477,6 +1588,11 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         return a.includes(q);
       });
     }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, isPolkadotHydrationVenue, solanaOnchain, hydrationOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
+
+    const balancesDisplayRows = useMemo(() => {
+      if (venue !== ALL_VENUES_VALUE) return balancesFiltered || [];
+      return buildAllVenuesBalanceDisplayRows(balancesFiltered || [], expandedBalanceGroups);
+    }, [balancesFiltered, expandedBalanceGroups, venue, ALL_VENUES_VALUE]);
 
   const solanaPortfolioTotalUsd = useMemo(() => {
     if (!isSolanaVenue) return null;
@@ -2027,12 +2143,22 @@ async function refreshSolanaOnchainBalances() {
           items.push({ asset, amount: amt, mint, symbol: sym || "" });
         }
 
+        const balanceStale = !!(data?.balanceStale || data?.balanceStatus === "stale_fallback");
+        const balanceStatus = String(data?.balanceStatus || (data?.balanceCached ? "cached" : "fresh"));
+        const balanceErr = String(data?.balanceError || "").trim();
+
         setSolanaOnchain({
           address,
           items,
           loading: false,
           err: "",
           fetchedAt: Date.now(),
+          balanceStatus,
+          balanceCached: !!data?.balanceCached,
+          balanceStale,
+          balanceFetchedAt: data?.balanceFetchedAt || null,
+          balanceError: balanceErr,
+          rpcProviderLabel: data?.rpcProviderLabel || data?.balanceSource || "solana_rpc",
         });
 
         // Solana pricing (Jupiter): fetch USDC-ish prices for displayed mints
@@ -5831,47 +5957,85 @@ function renderFillToasts() {
               </tr>
             </thead>
             <tbody>
-              {(balancesFiltered || []).map((b, i) => (
-                <tr key={`${b.venue || ""}:${b.asset || ""}:${i}`}>
-                  {venue === ALL_VENUES_VALUE && <td style={sx.td}>{hideVenueNames ? "••••" : b.venue || "—"}</td>}
-
-                  {/* UPDATED: Asset cell is clickable + hover overlib */}
-                  {renderBalanceAssetCell(b)}
-
-                  {/* UPDATED: high-precision numeric formatting */}
-                  <td style={sx.td}>{mask?.(fmtBal(b.total))}</td>
-                  <td style={sx.td}>{mask?.(fmtBal(b.available))}</td>
-                  <td style={sx.td}>{mask?.(fmtBal(b.hold))}</td>
-
-
-                  <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.px_usd === null ? "—" : fmtPxUsd?.(b.px_usd)}</td>
-                  <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.total_usd === null ? "—" : fmtUsd?.(b.total_usd)}</td>
-                  <td
-                    style={{
-                      ...sx.td,
-                      width: 220,
-                      maxWidth: 220,
-                      minWidth: 120,
-                    }}
-                    title={hideTableDataGlobal ? "" : String(b.usd_source_symbol || "—")}
+              {(balancesDisplayRows || []).map((b, i) => {
+                const isGroupedParent = !!b.__balanceGroupParent;
+                const isGroupedChild = !!b.__balanceGroupChild;
+                const groupKey = b.__balanceGroupKey;
+                return (
+                  <tr
+                    key={`${b.venue || ""}:${b.asset || ""}:${groupKey || ""}:${i}`}
+                    style={isGroupedChild ? { background: "rgba(255,255,255,0.025)" } : undefined}
                   >
-                    <span
-                      style={{
-                        display: "inline-block",
-                        maxWidth: "100%",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                        verticalAlign: "bottom",
-                      }}
-                    >
-                      {hideTableDataGlobal ? "••••" : b.usd_source_symbol || "—"}
-                    </span>
-                  </td>
-                </tr>
-              ))}
+                    {venue === ALL_VENUES_VALUE && (
+                      <td style={sx.td}>
+                        {hideVenueNames
+                          ? "••••"
+                          : isGroupedChild
+                            ? `↳ ${b.venue || "—"}`
+                            : b.venue || "—"}
+                      </td>
+                    )}
 
-              {(balancesFiltered || []).length === 0 && (
+                    {isGroupedParent ? (
+                      <td
+                        style={{ ...sx.td, cursor: "pointer", fontWeight: 800 }}
+                        title="Expand/collapse venue balances for this asset"
+                        onClick={() => {
+                          if (!groupKey) return;
+                          setExpandedBalanceGroups((p) => ({ ...p, [groupKey]: !p?.[groupKey] }));
+                        }}
+                      >
+                        <span data-no-drag="1" style={{ marginRight: 8 }}>
+                          {b.__balanceGroupExpanded ? "▾" : "▸"}
+                        </span>
+                        {hideTableDataGlobal ? "••••" : b.asset || "—"}
+                        <span style={{ marginLeft: 8, fontSize: 11, opacity: 0.7 }}>
+                          {hideTableDataGlobal ? "" : `${(b.__balanceGroupChildren || []).length} source${(b.__balanceGroupChildren || []).length === 1 ? "" : "s"}`}
+                        </span>
+                      </td>
+                    ) : isGroupedChild ? (
+                      <td style={{ ...sx.td, paddingLeft: 22, opacity: 0.92 }}>
+                        {hideTableDataGlobal ? "••••" : b.asset || "—"}
+                      </td>
+                    ) : (
+                      renderBalanceAssetCell(b)
+                    )}
+
+                    {/* UPDATED: high-precision numeric formatting */}
+                    <td style={sx.td}>{mask?.(fmtBal(b.total))}</td>
+                    <td style={sx.td}>{mask?.(fmtBal(b.available))}</td>
+                    <td style={sx.td}>{mask?.(fmtBal(b.hold))}</td>
+
+
+                    <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.px_usd === null ? "—" : fmtPxUsd?.(b.px_usd)}</td>
+                    <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.total_usd === null ? "—" : fmtUsd?.(b.total_usd)}</td>
+                    <td
+                      style={{
+                        ...sx.td,
+                        width: 220,
+                        maxWidth: 220,
+                        minWidth: 120,
+                      }}
+                      title={hideTableDataGlobal ? "" : String(b.usd_source_symbol || "—")}
+                    >
+                      <span
+                        style={{
+                          display: "inline-block",
+                          maxWidth: "100%",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                          verticalAlign: "bottom",
+                        }}
+                      >
+                        {hideTableDataGlobal ? "••••" : b.usd_source_symbol || "—"}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+
+              {(balancesDisplayRows || []).length === 0 && (
                 <tr>
                   <td style={sx.td} colSpan={balancesColSpan || 7}>
                     <span style={sx.muted}>
@@ -5892,7 +6056,18 @@ function renderFillToasts() {
           <div style={{ marginTop: 12, borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: 10 }}>
             <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
               <div style={{ fontWeight: 800 }}>On-chain (Solana)</div>
-              <span style={{ ...sx.muted, fontSize: 12 }}>Source: Solana RPC (live)</span>
+              <span style={{ ...sx.muted, fontSize: 12 }}>
+                Source: {solanaOnchain.rpcProviderLabel || "Solana RPC"}
+                {solanaOnchain.balanceCached ? " cache" : " live"}
+              </span>
+              {solanaOnchain.balanceStale && (
+                <span style={{ ...sx.badge, background: "rgba(255,190,80,0.18)", color: pal.warn }}>
+                  stale balance
+                </span>
+              )}
+              {solanaOnchain.balanceStatus && !solanaOnchain.balanceStale && solanaOnchain.balanceCached && (
+                <span style={{ ...sx.badge, background: "rgba(90,160,255,0.16)" }}>cached</span>
+              )}
               <button
                 data-no-drag="1"
                 style={btn?.(solanaOnchain.loading) ?? smallBtn(solanaOnchain.loading)}
@@ -5917,6 +6092,11 @@ function renderFillToasts() {
               )}
 
               {solanaOnchain.err && <span style={{ ...sx.badge, background: "rgba(255,80,80,0.18)" }}>{solanaOnchain.err}</span>}
+              {solanaOnchain.balanceStale && solanaOnchain.balanceError && (
+                <span style={{ ...sx.badge, background: "rgba(255,190,80,0.12)", color: pal.warn }} title={solanaOnchain.balanceError}>
+                  live refresh failed; showing last good
+                </span>
+              )}
             </div>
 
             {showSolanaOnchainDetails ? (

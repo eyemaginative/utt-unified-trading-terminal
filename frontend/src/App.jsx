@@ -845,41 +845,80 @@ function appSolanaUsdPriceFromMap(pricePayload, mint) {
 }
 
 async function appFetchSolanaAddressPortfolioTotalUsd(address) {
+  const rows = await appFetchSolanaAddressPortfolioBalanceRows(address);
+  if (!rows.length) return null;
+  let totalUsd = 0;
+  let hasUsd = false;
+  for (const row of rows) {
+    const tu = appFiniteNumberOrNull(row?.total_usd);
+    if (tu !== null) {
+      totalUsd += tu;
+      hasUsd = true;
+    }
+  }
+  return hasUsd ? totalUsd : null;
+}
+
+async function appFetchSolanaAddressPortfolioBalanceRows(address) {
   const addr = String(address || "").trim();
-  if (!addr) return null;
+  if (!addr) return [];
 
   try {
     const data = await appFetchJson(`/api/solana_dex/balances?address=${encodeURIComponent(addr)}`);
     const items = [];
     const sol = appFiniteNumberOrNull(data?.sol ?? data?.sol_ui ?? data?.sol_balance);
-    if (sol !== null) items.push({ amount: sol, mint: APP_SOL_MINT });
+    if (sol !== null) items.push({ asset: "SOL", symbol: "SOL", amount: sol, mint: APP_SOL_MINT });
     const lamports = appFiniteNumberOrNull(data?.sol_lamports ?? data?.lamports);
-    if (sol === null && lamports !== null) items.push({ amount: lamports / 1e9, mint: APP_SOL_MINT });
+    if (sol === null && lamports !== null) items.push({ asset: "SOL", symbol: "SOL", amount: lamports / 1e9, mint: APP_SOL_MINT });
 
     const toks = Array.isArray(data?.tokens) ? data.tokens : [];
     for (const t of toks) {
       const mint = String(t?.mint || "").trim();
       const amount = appFiniteNumberOrNull(t?.uiAmount ?? t?.ui_amount ?? t?.amount_ui);
-      if (mint && amount !== null) items.push({ amount, mint });
+      if (!mint || amount === null) continue;
+      const symbol = String(t?.symbol || t?.asset || t?.ticker || "").trim().toUpperCase();
+      const asset = symbol || `${mint.slice(0, 6)}…`;
+      items.push({ asset, symbol, amount, mint });
     }
 
     const mints = Array.from(new Set(items.map((it) => String(it?.mint || "").trim()).filter(Boolean))).slice(0, 100);
-    if (!mints.length) return 0;
+    const prices = mints.length
+      ? await appFetchJson(`/api/solana_dex/jupiter/prices?ids=${encodeURIComponent(mints.join(","))}`)
+      : null;
 
-    const prices = await appFetchJson(`/api/solana_dex/jupiter/prices?ids=${encodeURIComponent(mints.join(","))}`);
-    let totalUsd = 0;
-    let hasUsd = false;
-    for (const it of items) {
+    const balanceStatus = String(data?.balanceStatus || "");
+    const balanceStale = !!(data?.balanceStale || balanceStatus === "stale_fallback");
+    const rpcProviderLabel = String(data?.rpcProviderLabel || data?.balanceSource || "solana_rpc");
+
+    return items.map((it) => {
       const px = appSolanaUsdPriceFromMap(prices, it.mint);
-      const amount = appFiniteNumberOrNull(it.amount);
-      if (px !== null && amount !== null) {
-        totalUsd += amount * px;
-        hasUsd = true;
-      }
-    }
-    return hasUsd ? totalUsd : null;
+      const amount = appFiniteNumberOrNull(it.amount) || 0;
+      return {
+        venue: "solana_jupiter",
+        source_type: "DEX wallet",
+        network: "solana",
+        address: addr,
+        wallet_address: addr,
+        asset: String(it.asset || "").toUpperCase(),
+        symbol: it.symbol || null,
+        mint: it.mint,
+        mint_short: it.mint ? `${String(it.mint).slice(0, 6)}…` : null,
+        total: amount,
+        available: amount,
+        hold: 0,
+        px_usd: px,
+        total_usd: px !== null ? amount * px : null,
+        available_usd: px !== null ? amount * px : null,
+        hold_usd: 0,
+        usd_source_symbol: px !== null ? "Jupiter" : "—",
+        balance_status: balanceStatus || (data?.balanceCached ? "cached" : "fresh"),
+        balance_stale: balanceStale,
+        rpc_provider_label: rpcProviderLabel,
+        fetched_at: data?.balanceFetchedAt || null,
+      };
+    });
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -887,6 +926,12 @@ async function appFetchSolanaDexPortfolioTotalUsd() {
   const address = appGetSolanaConnectedAddressNoPrompt();
   if (!address) return null;
   return appFetchSolanaAddressPortfolioTotalUsd(address);
+}
+
+async function appFetchSolanaDexPortfolioBalanceRows() {
+  const address = appGetSolanaConnectedAddressNoPrompt();
+  if (!address) return [];
+  return appFetchSolanaAddressPortfolioBalanceRows(address);
 }
 
 async function appLoadSolanaWalletAddressesFromRegistry() {
@@ -945,26 +990,31 @@ async function appLoadSolanaWalletAddressesFromRegistry() {
 }
 
 async function appFetchSolanaRegisteredWalletPortfolioTotalUsd() {
+  const rows = await appFetchSolanaRegisteredWalletPortfolioBalanceRows();
+  if (!rows.length) return null;
+  let totalUsd = 0;
+  let hasAny = false;
+  for (const row of rows) {
+    const n = appFiniteNumberOrNull(row?.total_usd);
+    if (n !== null) {
+      totalUsd += n;
+      hasAny = true;
+    }
+  }
+  return hasAny ? totalUsd : null;
+}
+
+async function appFetchSolanaRegisteredWalletPortfolioBalanceRows() {
   try {
     const addrs = await appLoadSolanaWalletAddressesFromRegistry();
-    if (!addrs.length) return null;
+    if (!addrs.length) return [];
 
-    // Keep this bounded so the header total cannot hammer public Solana RPC.
+    // Keep this bounded so the header/table cannot hammer public Solana RPC.
     const limited = addrs.slice(0, 5);
-    const vals = await Promise.all(limited.map((addr) => appFetchSolanaAddressPortfolioTotalUsd(addr)));
-
-    let totalUsd = 0;
-    let hasAny = false;
-    for (const v of vals) {
-      const n = appFiniteNumberOrNull(v);
-      if (n !== null) {
-        totalUsd += n;
-        hasAny = true;
-      }
-    }
-    return hasAny ? totalUsd : null;
+    const nested = await Promise.all(limited.map((addr) => appFetchSolanaAddressPortfolioBalanceRows(addr)));
+    return nested.flat();
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -1008,6 +1058,21 @@ function appWalletBalanceBucket(row) {
   return "other";
 }
 
+function appWalletSnapshotIsUserPortfolioRow(row) {
+  const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+  if (!asset || asset === "ALL" || asset === "*") return false;
+
+  const ownerScope = String(row?.owner_scope || row?.ownerScope || "user").trim().toLowerCase();
+  if (ownerScope && !["user", "self", "self_custody", "personal"].includes(ownerScope)) return false;
+
+  const walletId = String(row?.wallet_id || row?.walletId || row?.venue || "").trim().toLowerCase();
+  const label = String(row?.label || row?.name || "").trim().toLowerCase();
+  const combined = `${walletId} ${label}`;
+  if (combined.includes("bridge") || combined.includes("treasury") || combined.includes("reserve")) return false;
+
+  return true;
+}
+
 async function appFetchWalletAddressSnapshotPortfolioTotalsUsd() {
   try {
     const data = await appFetchJson("/api/wallet_addresses/balances/latest?with_prices=1&limit=5000");
@@ -1040,6 +1105,7 @@ async function appFetchWalletAddressSnapshotPortfolioTotalsUsd() {
     };
 
     for (const row of rows || []) {
+      if (!appWalletSnapshotIsUserPortfolioRow(row)) continue;
       const usd = appWalletBalanceUsdValue(row);
       if (usd === null) continue;
       const bucket = appWalletBalanceBucket(row);
@@ -1052,6 +1118,81 @@ async function appFetchWalletAddressSnapshotPortfolioTotalsUsd() {
   } catch {
     return null;
   }
+}
+
+async function appFetchWalletAddressSnapshotPortfolioBalanceRows() {
+  try {
+    const data = await appFetchJson("/api/wallet_addresses/balances/latest?with_prices=1&limit=5000");
+    const rows = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.items)
+        ? data.items
+        : Array.isArray(data?.rows)
+          ? data.rows
+          : Array.isArray(data?.balances)
+            ? data.balances
+            : Array.isArray(data?.data)
+              ? data.data
+              : [];
+
+    return (rows || []).map((row) => {
+      const asset = String(row?.asset || row?.symbol || "").toUpperCase().trim();
+      if (!asset || !appWalletSnapshotIsUserPortfolioRow(row)) return null;
+
+      const qty = appFiniteNumberOrNull(row?.balance ?? row?.total ?? row?.amount ?? row?.qty ?? row?.balance_qty) ?? 0;
+      const px = appFiniteNumberOrNull(row?.usd_price ?? row?.price_usd ?? row?.px_usd ?? row?.priceUsd);
+      const totalUsd = appWalletBalanceUsdValue(row);
+      const walletId = String(row?.wallet_id || row?.walletId || "").trim();
+      const network = String(row?.network || row?.chain || "").trim().toLowerCase();
+      const address = String(row?.address || row?.wallet_address || row?.walletAddress || "").trim();
+      const bucket = appWalletBalanceBucket(row);
+
+      return {
+        ...row,
+        venue: walletId || (bucket === "solana" ? "self_custody_solana" : bucket === "hydration" ? "self_custody_hydration" : "self_custody"),
+        source_type: "Self custody",
+        network,
+        chain: network,
+        address,
+        wallet_address: address,
+        asset,
+        symbol: asset,
+        total: qty,
+        available: qty,
+        hold: appFiniteNumberOrNull(row?.hold) ?? 0,
+        px_usd: px,
+        total_usd: totalUsd,
+        available_usd: totalUsd,
+        hold_usd: 0,
+        usd_source_symbol: px !== null ? `${asset}-USD` : (totalUsd !== null ? "snapshot" : "—"),
+        balance_status: row?.balance_status || row?.status || "snapshot",
+        fetched_at: row?.fetched_at || row?.captured_at || row?.created_at || null,
+      };
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function appPortfolioBalanceDedupKey(row) {
+  const asset = String(row?.asset || row?.symbol || "").toUpperCase().trim();
+  if (!asset) return "";
+  const address = String(row?.address || row?.wallet_address || row?.walletAddress || "").trim().toLowerCase();
+  if (!address) return "";
+  const networkRaw = String(row?.network || row?.chain || row?.venue || "").trim().toLowerCase();
+  let network = networkRaw;
+  if (network.includes("solana") || networkRaw === "solana_jupiter") network = "solana";
+  else if (network.includes("hydration") || network.includes("polkadot")) network = "hydration";
+  return `${network}:${address}:${asset}`;
+}
+
+function appFilterLiveDexRowsAlreadyCoveredByWalletSnapshots(dexRows, walletRows) {
+  const walletKeys = new Set((walletRows || []).map((row) => appPortfolioBalanceDedupKey(row)).filter(Boolean));
+  if (!walletKeys.size) return dexRows || [];
+  return (dexRows || []).filter((row) => {
+    const key = appPortfolioBalanceDedupKey(row);
+    return !key || !walletKeys.has(key);
+  });
 }
 
 
@@ -1313,8 +1454,23 @@ async function appLoadHydrationWalletAddressFromRegistry() {
 }
 
 async function appFetchHydrationDexPortfolioTotalUsd() {
+  const rows = await appFetchHydrationDexPortfolioBalanceRows();
+  if (!rows.length) return null;
+  let totalUsd = 0;
+  let hasUsd = false;
+  for (const it of rows) {
+    const tu = appFiniteNumberOrNull(it?.total_usd);
+    if (tu !== null) {
+      totalUsd += tu;
+      hasUsd = true;
+    }
+  }
+  return hasUsd ? totalUsd : null;
+}
+
+async function appFetchHydrationDexPortfolioBalanceRows() {
   const address = await appLoadHydrationWalletAddressFromRegistry();
-  if (!address) return null;
+  if (!address) return [];
   try {
     const data = await appFetchJson(`/api/polkadot_dex/balances?address=${encodeURIComponent(address)}`);
     const normalized = appNormalizeHydrationBalanceItems(data);
@@ -1325,19 +1481,41 @@ async function appFetchHydrationDexPortfolioTotalUsd() {
     } catch {
       items = normalized;
     }
-    let totalUsd = 0;
-    let hasUsd = false;
-    for (const it of items) {
-      const tu = appFiniteNumberOrNull(it?.total_usd);
-      if (tu !== null) {
-        totalUsd += tu;
-        hasUsd = true;
-      }
-    }
-    return hasUsd ? totalUsd : null;
+
+    return (items || []).map((it) => ({
+      venue: "polkadot_hydration",
+      source_type: "DEX wallet",
+      network: "hydration",
+      address,
+      wallet_address: address,
+      asset: String(it?.asset || it?.symbol || it?.asset_id || "").toUpperCase(),
+      symbol: it?.symbol || null,
+      asset_id: it?.asset_id || null,
+      total: appFiniteNumberOrNull(it?.total) || 0,
+      available: appFiniteNumberOrNull(it?.available ?? it?.total) || 0,
+      hold: appFiniteNumberOrNull(it?.hold) || 0,
+      px_usd: appFiniteNumberOrNull(it?.px_usd),
+      total_usd: appFiniteNumberOrNull(it?.total_usd),
+      available_usd: appFiniteNumberOrNull(it?.available_usd),
+      hold_usd: appFiniteNumberOrNull(it?.hold_usd),
+      usd_source_symbol: it?.usd_source_symbol || "—",
+      balance_status: "fresh",
+    })).filter((it) => it.asset);
   } catch {
-    return null;
+    return [];
   }
+}
+
+async function appFetchDexPortfolioBalanceRows() {
+  const [connectedSolanaRows, registeredSolanaRows, hydrationRows] = await Promise.all([
+    appFetchSolanaDexPortfolioBalanceRows(),
+    appFetchSolanaRegisteredWalletPortfolioBalanceRows(),
+    appFetchHydrationDexPortfolioBalanceRows(),
+  ]);
+
+  // Prefer connected-wallet Solana rows when present; otherwise use registered Solana wallet rows.
+  const solanaRows = connectedSolanaRows.length ? connectedSolanaRows : registeredSolanaRows;
+  return [...solanaRows, ...hydrationRows];
 }
 
 async function appFetchDexPortfolioTotalsUsd() {
@@ -1347,16 +1525,14 @@ async function appFetchDexPortfolioTotalsUsd() {
     appFetchWalletAddressSnapshotPortfolioTotalsUsd(),
   ]);
 
-  // Prefer live/explicit DEX lookups when available, but fall back to cached
-  // wallet-address snapshots so the AppHeader portfolio total does not depend on
-  // opening the Balances tab first.
+  // Prefer wallet-address snapshots first: they are the portfolio/self-custody
+  // source of record and may include multiple registered wallets. Live DEX lookups
+  // are fallback-only so a connected Solana/Hydration wallet does not replace or
+  // double-count the saved self-custody snapshot set.
   const snapshotSolanaUsd = appFiniteNumberOrNull(snapshotTotals?.solanaUsd);
   let registeredSolanaUsd = null;
-  let solanaUsd = appFiniteNumberOrNull(connectedSolanaUsd) ?? snapshotSolanaUsd;
+  let solanaUsd = snapshotSolanaUsd ?? appFiniteNumberOrNull(connectedSolanaUsd);
 
-  // Last resort only: if there is no connected Solana wallet and no cached
-  // snapshot yet, use registered Solana wallet-address rows. This keeps the
-  // header from hammering Solana RPC on every normal portfolio refresh.
   if (solanaUsd === null) {
     registeredSolanaUsd = await appFetchSolanaRegisteredWalletPortfolioTotalUsd();
     solanaUsd = appFiniteNumberOrNull(registeredSolanaUsd);
@@ -1364,7 +1540,7 @@ async function appFetchDexPortfolioTotalsUsd() {
 
   const hydrationLiveUsd = appFiniteNumberOrNull(hydrationUsd);
   const hydrationFallbackUsd = appFiniteNumberOrNull(snapshotTotals?.hydrationUsd);
-  const hydrationResolvedUsd = hydrationLiveUsd ?? hydrationFallbackUsd;
+  const hydrationResolvedUsd = hydrationFallbackUsd ?? hydrationLiveUsd;
 
   const otherWalletUsd = appFiniteNumberOrNull(snapshotTotals?.otherUsd);
 
@@ -3616,14 +3792,24 @@ export default function App() {
 
       if (balancesReqIdRef.current !== reqId) return;
 
-      setBalances(merged);
-
-      let dexTotalsForCurrentAllView = null;
+      let walletSnapshotRowsForCurrentAllView = [];
+      let dexBalanceRowsForCurrentAllView = [];
       if (isAllVenuesView) {
-        dexTotalsForCurrentAllView = await appFetchDexPortfolioTotalsUsd();
-        const dexTotal = Number.isFinite(Number(dexTotalsForCurrentAllView?.totalUsd)) ? Number(dexTotalsForCurrentAllView.totalUsd) : 0;
-        unifiedPortCurrentView += dexTotal;
+        walletSnapshotRowsForCurrentAllView = await appFetchWalletAddressSnapshotPortfolioBalanceRows();
+        const liveDexRows = await appFetchDexPortfolioBalanceRows();
+        dexBalanceRowsForCurrentAllView = appFilterLiveDexRowsAlreadyCoveredByWalletSnapshots(liveDexRows, walletSnapshotRowsForCurrentAllView);
+
+        for (const row of [...walletSnapshotRowsForCurrentAllView, ...dexBalanceRowsForCurrentAllView]) {
+          const tu = Number(row?.total_usd);
+          if (Number.isFinite(tu)) unifiedPortCurrentView += tu;
+        }
       }
+
+      const displayMerged = isAllVenuesView
+        ? [...merged, ...walletSnapshotRowsForCurrentAllView, ...dexBalanceRowsForCurrentAllView]
+        : merged;
+
+      setBalances(displayMerged);
 
       setPortfolioTotalUsd(Number.isFinite(unifiedPortCurrentView) ? unifiedPortCurrentView : null);
 

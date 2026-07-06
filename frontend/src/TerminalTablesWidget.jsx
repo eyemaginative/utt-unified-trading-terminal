@@ -1438,6 +1438,108 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       return Number.isFinite(n) ? n : null;
     }
 
+    function pickBalanceNumber(row, keys) {
+      for (const key of keys || []) {
+        const n = balanceNumberOrNull(row?.[key]);
+        if (n !== null) return n;
+      }
+      return null;
+    }
+
+    function getBalanceCostBasisUsd(row) {
+      return pickBalanceNumber(row, [
+        "cost_basis_usd",
+        "costBasisUsd",
+        "total_basis_usd",
+        "totalBasisUsd",
+        "basis_usd",
+        "basisUsd",
+        "current_basis_usd",
+        "currentBasisUsd",
+        "remaining_basis_usd",
+        "remainingBasisUsd",
+        "total_cost_basis_usd",
+        "totalCostBasisUsd",
+      ]);
+    }
+
+    function getBalanceCostAvgUsd(row) {
+      const explicit = pickBalanceNumber(row, [
+        "cost_avg_usd",
+        "costAvgUsd",
+        "average_cost_usd",
+        "averageCostUsd",
+        "avg_cost_usd",
+        "avgCostUsd",
+        "unit_cost_basis_usd",
+        "unitCostBasisUsd",
+      ]);
+      if (explicit !== null) return explicit;
+
+      const basis = getBalanceCostBasisUsd(row);
+      const qty = balanceNumberOrNull(row?.total ?? row?.qty_remaining ?? row?.quantity ?? row?.balance);
+      if (basis !== null && qty !== null && Math.abs(qty) > 1e-12) return basis / qty;
+      return null;
+    }
+
+    function getBalanceBasisStatus(row) {
+      const explicit = String(
+        row?.basis_status ??
+          row?.basisStatus ??
+          row?.cost_basis_status ??
+          row?.costBasisStatus ??
+          ""
+      ).trim();
+      if (explicit) return explicit;
+
+      const qty = balanceNumberOrNull(row?.total ?? row?.qty_remaining ?? row?.quantity ?? row?.balance);
+      if (qty !== null && Math.abs(qty) <= 1e-12) return "basis_not_applicable";
+
+      if (
+        row?.basis_is_missing === true ||
+        row?.basisIsMissing === true ||
+        row?.cost_basis_missing === true ||
+        row?.costBasisMissing === true
+      ) {
+        return "basis_missing";
+      }
+
+      if (
+        row?.basis_is_partial === true ||
+        row?.basisIsPartial === true ||
+        row?.cost_basis_partial === true ||
+        row?.costBasisPartial === true
+      ) {
+        return "basis_partial";
+      }
+
+      return getBalanceCostBasisUsd(row) !== null ? "basis_ok" : "basis_missing";
+    }
+
+    function getGroupedBalanceBasisStatus(group) {
+      const total = balanceNumberOrNull(group?.total);
+      if (total !== null && Math.abs(total) <= 1e-12) return "basis_not_applicable";
+      if (!group?.hasCostBasisUsd) return "basis_missing";
+      if ((group?.basisPartialChildren || 0) > 0 || (group?.basisMissingChildren || 0) > 0) return "basis_partial";
+      return "basis_ok";
+    }
+
+    function displayBalanceBasisStatus(status) {
+      const s = String(status || "").trim().toLowerCase();
+      if (s === "basis_ok" || s === "ok") return "OK";
+      if (s === "basis_partial" || s === "partial") return "Partial";
+      if (s === "basis_missing" || s === "missing") return "Missing";
+      if (s === "basis_not_applicable" || s === "not_applicable" || s === "n/a") return "N/A";
+      return status ? String(status) : "—";
+    }
+
+    function formatBalanceMoneyMaybe(v) {
+      const n = balanceNumberOrNull(v);
+      if (n === null) return "—";
+      return fmtUsd?.(n) ?? n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+
+
     function balanceGroupKeyForRow(row) {
       const symbol = String(row?.symbol || row?.asset || "").trim().toUpperCase();
       const mint = String(row?.mint || row?.address || row?.contract_address || row?.contractAddress || "").trim();
@@ -1477,6 +1579,10 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
             priceUsd: null,
             venues: new Set(),
             sources: new Set(),
+            costBasisUsd: 0,
+            hasCostBasisUsd: false,
+            basisMissingChildren: 0,
+            basisPartialChildren: 0,
             children: [],
           };
           groups.set(key, g);
@@ -1499,6 +1605,16 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         const px = balanceNumberOrNull(row?.px_usd);
         if (g.priceUsd === null && px !== null) g.priceUsd = px;
 
+        const costBasisUsd = getBalanceCostBasisUsd(row);
+        if (costBasisUsd !== null) {
+          g.costBasisUsd += costBasisUsd;
+          g.hasCostBasisUsd = true;
+        }
+
+        const basisStatus = getBalanceBasisStatus(row).toLowerCase();
+        if (basisStatus === "basis_missing" || basisStatus === "missing") g.basisMissingChildren += 1;
+        if (basisStatus === "basis_partial" || basisStatus === "partial") g.basisPartialChildren += 1;
+
         g.children.push({
           ...row,
           __balanceGroupChild: true,
@@ -1520,6 +1636,9 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           hold: g.hold,
           px_usd: weightedPx,
           total_usd: totalUsd,
+          cost_basis_usd: g.hasCostBasisUsd ? g.costBasisUsd : null,
+          cost_avg_usd: g.hasCostBasisUsd && g.total > 0 ? g.costBasisUsd / g.total : null,
+          basis_status: getGroupedBalanceBasisStatus(g),
           usd_source_symbol: g.sources.size > 0 ? Array.from(g.sources).slice(0, 3).join(", ") : g.first?.usd_source_symbol || "—",
           __balanceGroupParent: true,
           __balanceGroupKey: g.key,
@@ -5953,6 +6072,13 @@ function renderFillToasts() {
                 <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("total_usd")}>
                   Total USD {balSortKey === "total_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
                 </th>
+                <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("cost_basis_usd")}>
+                  Cost Basis {balSortKey === "cost_basis_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
+                </th>
+                <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("cost_avg_usd")}>
+                  Cost Avg {balSortKey === "cost_avg_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
+                </th>
+                <th style={sx.th}>Basis</th>
                 <th style={sx.th}>USD Src</th>
               </tr>
             </thead>
@@ -6009,6 +6135,24 @@ function renderFillToasts() {
 
                     <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.px_usd === null ? "—" : fmtPxUsd?.(b.px_usd)}</td>
                     <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.total_usd === null ? "—" : fmtUsd?.(b.total_usd)}</td>
+                    <td
+                      style={sx.td}
+                      title={hideTableDataGlobal ? "" : "Current holding cost basis in USD, if emitted by the backend basis/FIFO data path."}
+                    >
+                      {hideTableDataGlobal ? "••••" : formatBalanceMoneyMaybe(getBalanceCostBasisUsd(b))}
+                    </td>
+                    <td
+                      style={sx.td}
+                      title={hideTableDataGlobal ? "" : "Average cost per currently held unit: cost basis / current quantity."}
+                    >
+                      {hideTableDataGlobal ? "••••" : formatBalanceMoneyMaybe(getBalanceCostAvgUsd(b))}
+                    </td>
+                    <td
+                      style={sx.td}
+                      title={hideTableDataGlobal ? "" : String(getBalanceBasisStatus(b) || "—")}
+                    >
+                      {hideTableDataGlobal ? "••••" : displayBalanceBasisStatus(getBalanceBasisStatus(b))}
+                    </td>
                     <td
                       style={{
                         ...sx.td,

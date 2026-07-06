@@ -781,6 +781,103 @@ function normalizePricesUsdResponse(res) {
 }
 
 
+
+function balanceBasisNumberOrNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickBalanceBasisNumber(row, keys) {
+  for (const key of keys || []) {
+    const n = balanceBasisNumberOrNull(row?.[key]);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
+function getBalanceCostBasisUsd(row) {
+  return pickBalanceBasisNumber(row, [
+    "cost_basis_usd",
+    "costBasisUsd",
+    "total_basis_usd",
+    "totalBasisUsd",
+    "basis_usd",
+    "basisUsd",
+    "current_basis_usd",
+    "currentBasisUsd",
+    "remaining_basis_usd",
+    "remainingBasisUsd",
+    "total_cost_basis_usd",
+    "totalCostBasisUsd",
+  ]);
+}
+
+function getBalanceCostAvgUsd(row) {
+  const explicit = pickBalanceBasisNumber(row, [
+    "cost_avg_usd",
+    "costAvgUsd",
+    "average_cost_usd",
+    "averageCostUsd",
+    "avg_cost_usd",
+    "avgCostUsd",
+    "unit_cost_basis_usd",
+    "unitCostBasisUsd",
+  ]);
+  if (explicit !== null) return explicit;
+
+  const basis = getBalanceCostBasisUsd(row);
+  const qty = balanceBasisNumberOrNull(row?.total ?? row?.qty_remaining ?? row?.quantity ?? row?.balance);
+  if (basis !== null && qty !== null && Math.abs(qty) > 1e-12) return basis / qty;
+  return null;
+}
+
+function getBalanceBasisStatus(row) {
+  const explicit = String(
+    row?.basis_status ??
+      row?.basisStatus ??
+      row?.cost_basis_status ??
+      row?.costBasisStatus ??
+      ""
+  ).trim();
+  if (explicit) return explicit;
+
+  const qty = balanceBasisNumberOrNull(row?.total ?? row?.qty_remaining ?? row?.quantity ?? row?.balance);
+  if (qty !== null && Math.abs(qty) <= 1e-12) return "basis_not_applicable";
+
+  if (
+    row?.basis_is_missing === true ||
+    row?.basisIsMissing === true ||
+    row?.cost_basis_missing === true ||
+    row?.costBasisMissing === true
+  ) {
+    return "basis_missing";
+  }
+
+  if (
+    row?.basis_is_partial === true ||
+    row?.basisIsPartial === true ||
+    row?.cost_basis_partial === true ||
+    row?.costBasisPartial === true
+  ) {
+    return "basis_partial";
+  }
+
+  return getBalanceCostBasisUsd(row) !== null ? "basis_ok" : "basis_missing";
+}
+
+function withBalanceBasisFields(row) {
+  const basis = getBalanceCostBasisUsd(row);
+  const avg = getBalanceCostAvgUsd(row);
+  return {
+    ...row,
+    cost_basis_usd: basis,
+    cost_avg_usd: avg,
+    basis_status: getBalanceBasisStatus(row),
+  };
+}
+
+
 // ─────────────────────────────────────────────────────────────
 // App-level DEX portfolio totals
 // These are intentionally best-effort and isolated from the CEX balances pipeline.
@@ -3677,7 +3774,7 @@ export default function App() {
               const available = Number(b.available ?? 0) || 0;
               const hold = Number(b.hold ?? 0) || 0;
 
-              return {
+              return withBalanceBasisFields({
                 ...b,
                 venue: v,
                 asset,
@@ -3689,7 +3786,7 @@ export default function App() {
                 available_usd: b.available_usd ?? null,
                 hold_usd: b.hold_usd ?? null,
                 usd_source_symbol: b.usd_source_symbol ?? null,
-              };
+              });
             });
             return items;
           })
@@ -3705,7 +3802,7 @@ export default function App() {
           const available = Number(b.available ?? 0) || 0;
           const hold = Number(b.hold ?? 0) || 0;
 
-          return {
+          return withBalanceBasisFields({
             ...b,
             venue,
             asset,
@@ -3717,7 +3814,7 @@ export default function App() {
             available_usd: b.available_usd ?? null,
             hold_usd: b.hold_usd ?? null,
             usd_source_symbol: b.usd_source_symbol ?? null,
-          };
+          });
         });
       }
 
@@ -3787,7 +3884,7 @@ export default function App() {
 
         if (totalUsd !== null && Number.isFinite(totalUsd)) unifiedPortCurrentView += totalUsd;
 
-        return { ...b, px_usd: px, total_usd: totalUsd, available_usd: availUsd, hold_usd: holdUsd, usd_source_symbol: usdSrc };
+        return withBalanceBasisFields({ ...b, px_usd: px, total_usd: totalUsd, available_usd: availUsd, hold_usd: holdUsd, usd_source_symbol: usdSrc });
       });
 
       if (balancesReqIdRef.current !== reqId) return;
@@ -5050,7 +5147,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     ...(disabled ? styles.buttonDisabled : {}),
   });
 
-  const balancesColSpan = venue === ALL_VENUES_VALUE ? 8 : 7;
+  const balancesColSpan = venue === ALL_VENUES_VALUE ? 11 : 10;
 
   const statusIsCanceledLocal = isHiddenByHideCancelled(statusFilter);
 

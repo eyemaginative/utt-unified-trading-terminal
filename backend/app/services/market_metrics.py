@@ -1,6 +1,7 @@
 # backend/app/services/market_metrics.py
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -136,7 +137,12 @@ def _parse_assets(assets: Optional[Any]) -> List[str]:
     return out or list(DEFAULT_ASSETS)
 
 
-_OWNED_ASSET_SENTINELS = {"OWNED", "DB", "DB_OWNED", "KNOWN", "HELD"}
+# "owned" means current/likely current holdings.
+# "db/known/tracked" means the broader local market universe the app knows about.
+# PORT-METRICS.1 needs these split so owned/unowned rows are not both sourced from
+# the same owned-only set.
+_OWNED_ASSET_SENTINELS = {"OWNED", "DB_OWNED", "HELD"}
+_KNOWN_ASSET_SENTINELS = {"DB", "KNOWN", "TRACKED", "DB_KNOWN", "ALL_DB"}
 _METRIC_ASSET_EXCLUDE = {"", "USD", "FIAT"}
 
 
@@ -144,6 +150,12 @@ def _is_owned_asset_request(assets: Optional[Any]) -> bool:
     if not isinstance(assets, str):
         return False
     return assets.strip().upper() in _OWNED_ASSET_SENTINELS
+
+
+def _is_known_asset_request(assets: Optional[Any]) -> bool:
+    if not isinstance(assets, str):
+        return False
+    return assets.strip().upper() in _KNOWN_ASSET_SENTINELS
 
 
 def _clean_asset_symbol(value: Any) -> str:
@@ -254,13 +266,28 @@ def _db_owned_query_limit(default: int = 1000) -> int:
     return max(50, min(5000, n))
 
 
-def _db_owned_asset_cap(default: int = 80) -> int:
+def _db_owned_asset_cap(default: int = 1000) -> int:
     raw = _env_first("UTT_MARKET_METRICS_OWNED_ASSET_CAP", "MARKET_METRICS_OWNED_ASSET_CAP")
     try:
         n = int(float(raw)) if str(raw or "").strip() else int(default)
     except Exception:
         n = int(default)
-    return max(5, min(250, n))
+    return max(5, min(1000, n))
+
+
+def _db_known_asset_cap(default: int = 1000) -> int:
+    """Maximum local known/tracked symbols surfaced to market metric windows.
+
+    Defaults above the old 250-row route ceiling so each window can show the
+    full local venue/token-registry universe available to one response instead
+    of truncating to a small discovery subset.
+    """
+    raw = _env_first("UTT_MARKET_METRICS_KNOWN_ASSET_CAP", "MARKET_METRICS_KNOWN_ASSET_CAP")
+    try:
+        n = int(float(raw)) if str(raw or "").strip() else int(default)
+    except Exception:
+        n = int(default)
+    return max(10, min(1000, n))
 
 
 def _db_scalar_values_recent(
@@ -291,7 +318,7 @@ def _db_scalar_values_recent(
         return []
 
 
-def _db_owned_metric_assets(limit: int = 250) -> Tuple[List[str], str]:
+def _db_owned_metric_assets(limit: int = 1000) -> Tuple[List[str], str]:
     """Fast local DB asset discovery for MarketCap/Volume windows.
 
     Keep this intentionally conservative:
@@ -309,7 +336,7 @@ def _db_owned_metric_assets(limit: int = 250) -> Tuple[List[str], str]:
     if eps is None:
         eps = 1e-12
 
-    asset_cap = min(max(1, int(limit)), _db_owned_asset_cap(80))
+    asset_cap = min(max(1, int(limit)), _db_owned_asset_cap(1000))
     query_limit = _db_owned_query_limit(1000)
 
     try:
@@ -411,6 +438,260 @@ def _db_owned_metric_assets(limit: int = 250) -> Tuple[List[str], str]:
             pass
 
 
+
+def _metric_context_blank() -> Dict[str, Any]:
+    return {
+        "owned": False,
+        "owned_venues": set(),
+        "tracked_venues": set(),
+        "chains": set(),
+        "sources": set(),
+    }
+
+
+def _metric_context_add(
+    ctx: Dict[str, Dict[str, Any]],
+    value: Any,
+    *,
+    venue: Optional[Any] = None,
+    chain: Optional[Any] = None,
+    source: Optional[str] = None,
+    owned: bool = False,
+) -> None:
+    venue_s = str(venue or "").strip().lower()
+    chain_s = str(chain or "").strip().lower()
+    source_s = str(source or "").strip().lower()
+
+    for sym in _asset_symbols_from_value(value):
+        if not sym or sym in _METRIC_ASSET_EXCLUDE:
+            continue
+
+        row = ctx.setdefault(sym, _metric_context_blank())
+        if owned:
+            row["owned"] = True
+
+        if venue_s:
+            if owned:
+                row["owned_venues"].add(venue_s)
+            row["tracked_venues"].add(venue_s)
+
+        # Chain is informational.  Only promote DEX-like chains into the filter
+        # universe when there is no explicit venue id available.
+        if chain_s:
+            row["chains"].add(chain_s)
+            if chain_s in {"hydration", "polkadot_hydration", "solana", "jupiter", "raydium"} and not venue_s:
+                row["tracked_venues"].add(chain_s)
+
+        if source_s:
+            row["sources"].add(source_s)
+
+
+def _db_metric_rows(
+    db: Any,
+    *,
+    table_name: str,
+    column_names: Sequence[str],
+    where_sql: str = "",
+    params: Optional[Dict[str, Any]] = None,
+    order_column: str = "",
+    limit: int = 1000,
+) -> List[Dict[str, Any]]:
+    cols = _db_table_columns(db, table_name)
+    selected = [c for c in column_names if c in cols]
+    if not selected:
+        return []
+
+    try:
+        from sqlalchemy import text
+
+        col_sql = ", ".join(f'"{c}"' for c in selected)
+        sql = f'SELECT {col_sql} FROM "{table_name}" WHERE 1=1'
+        if where_sql:
+            sql += f" AND ({where_sql})"
+        if order_column and order_column in cols:
+            sql += f' ORDER BY "{order_column}" DESC'
+        sql += " LIMIT :limit"
+        rows = db.execute(text(sql), {**(params or {}), "limit": int(limit)}).mappings().all()
+        return [dict(r) for r in rows or []]
+    except Exception:
+        return []
+
+
+def _db_market_metric_asset_context(limit: int = 1000) -> Dict[str, Dict[str, Any]]:
+    """Return local asset context for owned/tracked source filtering.
+
+    This is read-only and deliberately bounded.  It does not mutate balances,
+    token registry, ledger, or basis lots.
+    """
+    eps = _num(_env_first("UTT_MARKET_METRICS_OWNED_EPS", "MARKET_METRICS_OWNED_EPS"))
+    if eps is None:
+        eps = 1e-12
+
+    query_limit = _db_owned_query_limit(1000)
+    try:
+        from ..db import SessionLocal
+    except Exception:
+        return {}
+
+    ctx: Dict[str, Dict[str, Any]] = {}
+    db = SessionLocal()
+    try:
+        for r in _db_metric_rows(
+            db,
+            table_name="balance_snapshots",
+            column_names=("asset", "venue", "captured_at", "total", "available", "hold"),
+            where_sql='ABS(COALESCE("total", 0)) > :eps OR ABS(COALESCE("available", 0)) > :eps OR ABS(COALESCE("hold", 0)) > :eps',
+            params={"eps": float(eps)},
+            order_column="captured_at",
+            limit=query_limit,
+        ):
+            _metric_context_add(ctx, r.get("asset"), venue=r.get("venue"), source="balance_snapshots", owned=True)
+
+        for r in _db_metric_rows(
+            db,
+            table_name="basis_lots",
+            column_names=("asset", "venue", "qty_remaining", "acquired_at"),
+            where_sql='ABS(COALESCE("qty_remaining", 0)) > :eps',
+            params={"eps": float(eps)},
+            order_column="acquired_at",
+            limit=query_limit,
+        ):
+            _metric_context_add(ctx, r.get("asset"), venue=r.get("venue"), source="basis_lots", owned=True)
+
+        for r in _db_metric_rows(
+            db,
+            table_name="asset_deposits",
+            column_names=("asset", "venue", "qty", "status", "deposit_time"),
+            where_sql='ABS(COALESCE("qty", 0)) > :eps AND COALESCE(UPPER("status"), \'\') <> \'IGNORED\'',
+            params={"eps": float(eps)},
+            order_column="deposit_time",
+            limit=query_limit,
+        ):
+            _metric_context_add(ctx, r.get("asset"), venue=r.get("venue"), source="asset_deposits", owned=True)
+
+        for r in _db_metric_rows(
+            db,
+            table_name="wallet_addresses",
+            column_names=("asset", "network", "wallet_id", "created_at"),
+            order_column="created_at",
+            limit=query_limit,
+        ):
+            wallet_id = str(r.get("wallet_id") or "").strip().lower()
+            venue = wallet_id or "self_custody"
+            _metric_context_add(ctx, r.get("asset"), venue=venue, chain=r.get("network"), source="wallet_addresses", owned=True)
+
+        for r in _db_metric_rows(
+            db,
+            table_name="wallet_address_snapshots",
+            column_names=("asset", "network", "balance_qty", "fetched_at"),
+            where_sql='ABS(COALESCE("balance_qty", 0)) > :eps',
+            params={"eps": float(eps)},
+            order_column="fetched_at",
+            limit=query_limit,
+        ):
+            _metric_context_add(ctx, r.get("asset"), venue="self_custody", chain=r.get("network"), source="wallet_address_snapshots", owned=True)
+
+        for r in _db_metric_rows(
+            db,
+            table_name="token_registry",
+            column_names=("symbol", "chain", "venue", "updated_at"),
+            order_column="updated_at",
+            limit=query_limit,
+        ):
+            _metric_context_add(ctx, r.get("symbol"), venue=r.get("venue"), chain=r.get("chain"), source="token_registry", owned=False)
+
+        for r in _db_metric_rows(
+            db,
+            table_name="venue_symbols",
+            column_names=("base_asset", "quote_asset", "symbol_canon", "venue", "captured_at"),
+            order_column="captured_at",
+            limit=query_limit,
+        ):
+            venue = r.get("venue")
+            _metric_context_add(ctx, r.get("base_asset") or r.get("symbol_canon"), venue=venue, source="venue_symbols", owned=False)
+            _metric_context_add(ctx, r.get("quote_asset"), venue=venue, source="venue_symbols", owned=False)
+
+    except Exception:
+        return ctx
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    return ctx
+
+
+def _db_known_metric_assets(limit: int = 1000) -> Tuple[List[str], str]:
+    """Local DB universe for owned + unowned market metric rows."""
+    asset_cap = min(max(1, int(limit)), _db_known_asset_cap(1000))
+    ctx = _db_market_metric_asset_context(limit=limit)
+    owned_assets, owned_source = _db_owned_metric_assets(limit=limit)
+
+    assets = _merge_assets(owned_assets, ctx.keys())
+    if assets:
+        return assets[:asset_cap], "db_known"
+
+    if owned_assets:
+        return owned_assets[:asset_cap], owned_source
+
+    return [], "db_known_empty"
+
+
+def _metric_context_public(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "owned": bool(ctx.get("owned")),
+        "owned_venues": sorted(str(x) for x in (ctx.get("owned_venues") or set()) if str(x or "").strip()),
+        "tracked_venues": sorted(str(x) for x in (ctx.get("tracked_venues") or set()) if str(x or "").strip()),
+        "chains": sorted(str(x) for x in (ctx.get("chains") or set()) if str(x or "").strip()),
+        "sources": sorted(str(x) for x in (ctx.get("sources") or set()) if str(x or "").strip()),
+    }
+
+
+def _annotate_market_metric_rows(
+    items: List[Dict[str, Any]],
+    *,
+    asset_context: Dict[str, Dict[str, Any]],
+    owned_assets: Sequence[str],
+) -> List[Dict[str, Any]]:
+    owned_set = set(_merge_assets(owned_assets))
+    out: List[Dict[str, Any]] = []
+
+    for row in items or []:
+        if not isinstance(row, dict):
+            continue
+        next_row = dict(row)
+        sym_list = _merge_assets([next_row.get("asset") or next_row.get("symbol") or next_row.get("pair")])
+        sym = sym_list[0] if sym_list else str(next_row.get("asset") or "").strip().upper()
+        ctx = asset_context.get(sym, _metric_context_blank())
+        public_ctx = _metric_context_public(ctx)
+
+        is_owned = bool(public_ctx.get("owned")) or (sym in owned_set)
+        next_row["is_owned"] = is_owned
+        next_row["owned_venues"] = public_ctx["owned_venues"]
+        next_row["tracked_venues"] = public_ctx["tracked_venues"]
+        next_row["chains"] = public_ctx["chains"]
+        next_row["asset_context_sources"] = public_ctx["sources"]
+
+        venue_keys: List[str] = []
+        for group in (public_ctx["owned_venues"], public_ctx["tracked_venues"]):
+            for v in group:
+                vv = str(v or "").strip().lower()
+                if vv and vv not in venue_keys:
+                    venue_keys.append(vv)
+
+        # Preserve real venue/dex rows if a future backend adds them; do not
+        # promote CoinGecko IDs into venue filters.
+        for v in (next_row.get("dex"), next_row.get("venue")):
+            vv = str(v or "").strip().lower()
+            if vv and vv not in {"global", "unknown", "none", "n/a", "na"} and vv not in venue_keys:
+                venue_keys.append(vv)
+
+        next_row["venue_filter_keys"] = venue_keys
+        out.append(next_row)
+
+    return out
+
 def _env_first(*keys: str) -> str:
     for k in keys:
         v = os.getenv(k)
@@ -439,8 +720,234 @@ def _cg_backoff_s() -> int:
     return _clamp_int(_env_first("UTT_MARKET_METRICS_CG_BACKOFF_S"), 30, 1800, 300)
 
 
+def _cg_live_id_cap() -> int:
+    """Max CoinGecko IDs to fetch live during one market-metrics refresh.
+
+    The local row universe may be much larger than CoinGecko's practical
+    per-request market endpoint size.  Keep live fetches bounded so the window
+    can still display all owned/tracked assets as rows while filling live market
+    data for a safe subset and using cache/placeholders for the rest.
+    """
+    return _clamp_int(_env_first("UTT_MARKET_METRICS_LIVE_CG_ID_CAP"), 1, 250, 250)
+
+
+def _cg_market_page_cap() -> int:
+    """Number of CoinGecko market-cap pages to cache during manual refresh.
+
+    This is a small, bounded page sweep used to populate market data for broad
+    local universes without doing one /search request per token symbol.
+    """
+    return _clamp_int(_env_first("UTT_MARKET_METRICS_CG_MARKET_PAGE_CAP"), 0, 10, 4)
+
+
+def _cg_market_page_per_page() -> int:
+    return _clamp_int(_env_first("UTT_MARKET_METRICS_CG_MARKET_PAGE_SIZE"), 50, 250, 250)
+
+
+def _market_row_symbol(row: Dict[str, Any]) -> str:
+    return str(row.get("symbol") or "").strip().upper()
+
+
+def _market_row_rank_key(row: Dict[str, Any]) -> Tuple[int, int, str]:
+    rank_raw = row.get("market_cap_rank")
+    try:
+        rank = int(rank_raw) if rank_raw is not None else 999999
+    except Exception:
+        rank = 999999
+    market_cap = _num(row.get("market_cap")) or 0.0
+    coin_id = str(row.get("id") or "").strip().lower()
+    # Lower rank is better; for unranked rows, higher market cap wins.
+    return (rank, int(-market_cap), coin_id)
+
+
+def _cg_rows_by_symbol(rows: Sequence[Dict[str, Any]], assets: Sequence[Any]) -> Dict[str, Dict[str, Any]]:
+    wanted = {str(a or "").strip().upper() for a in _merge_assets(assets)}
+    if not wanted:
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        sym = _market_row_symbol(row)
+        if not sym or sym not in wanted:
+            continue
+        prev = out.get(sym)
+        if prev is None or _market_row_rank_key(row) < _market_row_rank_key(prev):
+            next_row = dict(row)
+            next_row["_utt_symbol_match"] = True
+            next_row["_utt_symbol_match_symbol"] = sym
+            out[sym] = next_row
+    return out
+
+
+def _cg_raw_cache_symbol_rows(
+    assets: Sequence[Any],
+    *,
+    max_age_s: int,
+    allow_stale: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Return cached CoinGecko market rows matched by ticker symbol.
+
+    This lets broad Market Cap / Volume windows show market data for assets that
+    do not yet have explicit Token Registry external_price_id mappings.  Rows are
+    matched by CoinGecko ticker symbol and ranked by market_cap_rank, so exact
+    Token Registry mappings remain preferred when available.
+    """
+    _cg_raw_cache_load_once()
+
+    wanted = {str(a or "").strip().upper() for a in _merge_assets(assets)}
+    if not wanted:
+        return {}
+
+    now = time.time()
+    candidates: List[Dict[str, Any]] = []
+    for rec in list(_CG_RAW_BY_ID.values()):
+        if not isinstance(rec, dict):
+            continue
+        row = rec.get("row")
+        cached_at = _num(rec.get("cached_at"))
+        if not isinstance(row, dict) or cached_at is None:
+            continue
+
+        sym = _market_row_symbol(row)
+        if not sym or sym not in wanted:
+            continue
+
+        age_s = max(0.0, now - float(cached_at))
+        if not allow_stale and age_s > max(10, int(max_age_s)):
+            continue
+
+        next_row = dict(row)
+        if age_s > max(10, int(max_age_s)):
+            next_row["_utt_cache_stale"] = True
+            next_row["_utt_cache_age_s"] = age_s
+        next_row["_utt_symbol_match"] = True
+        next_row["_utt_symbol_match_symbol"] = sym
+        next_row["_utt_symbol_match_source"] = "coingecko_market_cache"
+        candidates.append(next_row)
+
+    return _cg_rows_by_symbol(candidates, list(wanted))
+
+
 def _summary_error_ttl_s() -> int:
     return _clamp_int(_env_first("UTT_MARKET_METRICS_ERROR_TTL_S"), 10, 300, 30)
+
+
+def _summary_snapshot_cache_enabled() -> bool:
+    """Whether broad market-metrics windows may load the last full summary from disk.
+
+    This makes Market Cap / Volume windows open immediately from the last good
+    asset/metric snapshot. Manual Refresh still rebuilds local rows and refreshes
+    live market data.
+    """
+    return _env_bool("UTT_MARKET_METRICS_SUMMARY_SNAPSHOT_CACHE", True)
+
+
+def _summary_snapshot_max_age_s() -> int:
+    return _clamp_int(_env_first("UTT_MARKET_METRICS_SUMMARY_SNAPSHOT_MAX_AGE_S"), 60, 604800, 86400)
+
+
+def _summary_snapshot_cache_file() -> Path:
+    raw = _env_first("UTT_MARKET_METRICS_SUMMARY_CACHE_FILE")
+    if raw:
+        return Path(raw).expanduser()
+    return Path(__file__).resolve().parents[2] / "data" / "market_metrics_summary_cache.json"
+
+
+def _summary_snapshot_key(
+    *,
+    assets: Optional[Any],
+    include_assets: Optional[Any],
+    limit: int,
+) -> str:
+    """Stable cache key for the broad window summary.
+
+    For assets=db/known, ignore include_assets so a selected symbol does not
+    fragment the broad Market Cap / Volume cache. The selected asset should be a
+    frontend highlight/filter concern, not a reason to rebuild 700+ local rows.
+    """
+    mode = str(assets or "default").strip().lower() or "default"
+    include_clean: List[str] = []
+    if mode not in {s.lower() for s in _KNOWN_ASSET_SENTINELS}:
+        include_clean = _parse_assets(include_assets) if str(include_assets or "").strip() else []
+    raw = json.dumps(
+        {
+            "mode": mode,
+            "include_assets": include_clean,
+            "limit": int(limit),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _summary_snapshot_load(snapshot_key: str) -> Optional[Dict[str, Any]]:
+    if not snapshot_key or not _summary_snapshot_cache_enabled():
+        return None
+
+    path = _summary_snapshot_cache_file()
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        snapshots = data.get("snapshots") if isinstance(data, dict) else None
+        rec = snapshots.get(snapshot_key) if isinstance(snapshots, dict) else None
+        if not isinstance(rec, dict):
+            return None
+        payload = rec.get("payload")
+        cached_at = _num(rec.get("cached_at"))
+        if not isinstance(payload, dict) or cached_at is None:
+            return None
+        age_s = max(0.0, time.time() - float(cached_at))
+        if age_s > _summary_snapshot_max_age_s():
+            return None
+        out = dict(payload)
+        out["cache"] = "summary_disk_hit"
+        out["summary_snapshot"] = True
+        out["summary_snapshot_cached_at"] = rec.get("cached_at_iso") or ""
+        out["summary_snapshot_age_s"] = age_s
+        out["refresh_mode"] = "summary_snapshot"
+        out["market_data_cache_snapshot_only"] = True
+        return out
+    except Exception:
+        return None
+
+
+def _summary_snapshot_save(snapshot_key: str, payload: Dict[str, Any]) -> None:
+    if not snapshot_key or not _summary_snapshot_cache_enabled() or not isinstance(payload, dict):
+        return
+
+    try:
+        path = _summary_snapshot_cache_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        snapshots = data.get("snapshots")
+        if not isinstance(snapshots, dict):
+            snapshots = {}
+
+        clean_payload = dict(payload)
+        clean_payload.pop("cache", None)
+        clean_payload.pop("summary_snapshot", None)
+        clean_payload.pop("summary_snapshot_cached_at", None)
+        clean_payload.pop("summary_snapshot_age_s", None)
+
+        now = time.time()
+        snapshots[snapshot_key] = {
+            "cached_at": now,
+            "cached_at_iso": _utc_now_iso(),
+            "payload": clean_payload,
+        }
+        data["updated_at"] = _utc_now_iso()
+        data["snapshots"] = snapshots
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    except Exception:
+        return
 
 
 def _cg_raw_cache_file() -> Path:
@@ -922,7 +1429,7 @@ def _http_json(url: str, timeout_s: float = 10.0) -> Any:
     return json.loads(raw.decode("utf-8"))
 
 
-def _fetch_coingecko_markets(ids: Sequence[str], limit: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _fetch_coingecko_markets(ids: Sequence[str], limit: int, page: int = 1) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     global _CG_BACKOFF_UNTIL
 
     now = time.time()
@@ -938,7 +1445,7 @@ def _fetch_coingecko_markets(ids: Sequence[str], limit: int) -> Tuple[List[Dict[
         "vs_currency": "usd",
         "order": "market_cap_desc",
         "per_page": str(_clamp_int(limit, 1, 250, 250)),
-        "page": "1",
+        "page": str(_clamp_int(page, 1, 100, 1)),
         "sparkline": "false",
         "price_change_percentage": "24h",
         "locale": "en",
@@ -968,11 +1475,54 @@ def _fetch_coingecko_markets(ids: Sequence[str], limit: int) -> Tuple[List[Dict[
     return [x for x in data if isinstance(x, dict)], errors
 
 
+
+def _fetch_coingecko_market_pages(page_count: int, per_page: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Fetch top CoinGecko market pages for broad symbol-cache seeding.
+
+    This is used only on manual live refresh for db/known market metric windows.
+    It avoids hundreds of per-symbol /search requests and fills the raw market
+    cache with ranked rows that can be matched back to local symbols.
+    """
+    pages = _clamp_int(page_count, 0, 10, 4)
+    size = _clamp_int(per_page, 50, 250, 250)
+    if pages <= 0:
+        return [], []
+
+    all_rows: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    for page in range(1, pages + 1):
+        rows, page_errors = _fetch_coingecko_markets([], size, page=page)
+        if page_errors:
+            errors.extend(page_errors)
+            # Stop paging on rate-limit/backoff/transport errors.
+            break
+
+        clean_rows = [r for r in rows or [] if isinstance(r, dict)]
+        if not clean_rows:
+            break
+
+        for row in clean_rows:
+            cg_id = str(row.get("id") or "").strip()
+            if cg_id and cg_id in seen_ids:
+                continue
+            if cg_id:
+                seen_ids.add(cg_id)
+            all_rows.append(row)
+
+        if len(clean_rows) < size:
+            break
+
+    return all_rows, errors
+
 def _row_from_cg(asset: str, meta: Dict[str, str], raw: Dict[str, Any], updated_at: str) -> Dict[str, Any]:
     warnings: List[str] = []
     if raw.get("_utt_cache_stale"):
         age_s = _num(raw.get("_utt_cache_age_s")) or 0
         warnings.append(f"Using stale CoinGecko cache ({int(age_s // 60)}m old).")
+    if raw.get("_utt_symbol_match"):
+        warnings.append("CoinGecko data matched by ticker symbol; verify if this symbol is ambiguous.")
 
     price = _num(raw.get("current_price"))
     market_cap = _num(raw.get("market_cap"))
@@ -1082,15 +1632,40 @@ def get_market_metrics_summary(
     *,
     assets: Optional[Any] = None,
     include_assets: Optional[Any] = None,
-    limit: int = 250,
+    limit: int = 1000,
     ttl_s: int = 300,
     force_refresh: bool = False,
 ) -> Dict[str, Any]:
-    clean_limit = _clamp_int(limit, 1, 250, 250)
+    clean_limit = _clamp_int(limit, 1, 1000, 1000)
     clean_ttl = _clamp_int(ttl_s, 10, 3600, 300)
 
-    if _is_owned_asset_request(assets):
-        clean_assets, asset_source = _db_owned_metric_assets(limit=clean_limit)
+    is_owned_request = _is_owned_asset_request(assets)
+    is_known_request = _is_known_asset_request(assets)
+    summary_snapshot_key = _summary_snapshot_key(
+        assets=assets,
+        include_assets=include_assets,
+        limit=clean_limit,
+    )
+
+    # PORT-METRICS.1 v9:
+    # Let broad Market Cap / Volume window opens return immediately from the
+    # last full summary snapshot. Manual Refresh uses force_refresh=true and
+    # rebuilds the local universe / live market cache.
+    if is_known_request and not force_refresh:
+        snapshot_payload = _summary_snapshot_load(summary_snapshot_key)
+        if snapshot_payload is not None:
+            return snapshot_payload
+
+    owned_assets_raw, owned_asset_source = _db_owned_metric_assets(limit=clean_limit)
+
+    if is_owned_request:
+        clean_assets = list(owned_assets_raw)
+        asset_source = owned_asset_source
+        if not clean_assets:
+            clean_assets = list(DEFAULT_ASSETS)
+            asset_source = f"{asset_source}_fallback_default"
+    elif is_known_request:
+        clean_assets, asset_source = _db_known_metric_assets(limit=clean_limit)
         if not clean_assets:
             clean_assets = list(DEFAULT_ASSETS)
             asset_source = f"{asset_source}_fallback_default"
@@ -1104,10 +1679,14 @@ def get_market_metrics_summary(
         clean_assets = list(DEFAULT_ASSETS)
         asset_source = f"{asset_source}_fallback_default"
 
-    # Window-owned requests can discover many legacy/dust/tracked symbols. Keep
-    # the default window payload fast/useful by hiding unmapped rows unless an
-    # unmapped asset was explicitly requested through include_assets.
-    if _is_owned_asset_request(assets) and not _env_bool("UTT_MARKET_METRICS_SHOW_UNMAPPED_OWNED", False):
+    # PORT-METRICS.1 v5:
+    # Do not hide unmapped owned assets by default.  The Market Cap / Volume
+    # windows are discovery/visibility tools; an owned token without a
+    # CoinGecko/registry mapping should still display as an owned placeholder so
+    # venue holdings are not silently under-counted.  The old mapped-only mode is
+    # preserved behind an explicit opt-in env flag for users who want a shorter
+    # market-data-only list.
+    if is_owned_request and _env_bool("UTT_MARKET_METRICS_HIDE_UNMAPPED_OWNED", False):
         keep_explicit = set(include_clean)
         mapped_assets: List[str] = []
         for asset in clean_assets:
@@ -1121,7 +1700,19 @@ def get_market_metrics_summary(
             if not str(asset_source or "").endswith("_mapped"):
                 asset_source = f"{asset_source}_mapped"
 
-    cache_key = "summary:" + asset_source + ":" + ",".join(clean_assets) + f":{clean_limit}"
+    asset_context = _db_market_metric_asset_context(limit=clean_limit)
+    context_known_assets = _merge_assets(asset_context.keys())
+    owned_assets_payload = _merge_assets(owned_assets_raw)
+
+    cache_key = (
+        "summary:"
+        + asset_source
+        + ":"
+        + ",".join(clean_assets)
+        + ":owned:"
+        + ",".join(owned_assets_payload)
+        + f":{clean_limit}"
+    )
     if not force_refresh:
         cached = _cache_get(cache_key)
         if cached is not None:
@@ -1131,9 +1722,15 @@ def get_market_metrics_summary(
     ids: List[str] = []
     id_to_symbol: Dict[str, str] = {}
 
-    explicit_discovery_assets = set(include_clean)
-    if not _is_owned_asset_request(assets):
+    # Avoid broad CoinGecko /search fan-out for assets=db/known window loads.
+    # Known/unowned rows should return quickly from Token Registry, local
+    # hardcoded mappings, env mappings, and placeholders.  Symbol search is kept
+    # only for explicit one-off asset requests so the Market Cap / Volume windows
+    # do not time out or rate-limit when many unowned candidates are present.
+    explicit_discovery_assets = set()
+    if not is_owned_request and not is_known_request:
         explicit_discovery_assets.update(clean_assets)
+        explicit_discovery_assets.update(include_clean)
 
     for asset in clean_assets:
         meta = _coingecko_meta_for_symbol(asset, allow_discovery=str(asset or "").strip().upper() in explicit_discovery_assets)
@@ -1142,23 +1739,70 @@ def get_market_metrics_summary(
             ids.append(cg_id)
             id_to_symbol[cg_id] = asset
 
-    fresh_cached = _cg_raw_cache_rows(ids, max_age_s=clean_ttl, allow_stale=False)
+    # PORT-METRICS.1 v7 cache-first behavior:
+    # Market Cap / Volume windows use assets=db/known and may include hundreds
+    # of local rows.  Do not block window-open/auto-refresh on live CoinGecko
+    # fetches for that broad universe.  Return local rows plus any cached/stale
+    # market data immediately.  A manual frontend Refresh sets force_refresh=1
+    # and performs the bounded live fill/update path.
+    cache_snapshot_only = bool(is_known_request and not force_refresh and _env_bool("UTT_MARKET_METRICS_DB_CACHE_FIRST", True))
+    raw_cache_allow_stale = bool(cache_snapshot_only)
+
+    fresh_cached = _cg_raw_cache_rows(ids, max_age_s=clean_ttl, allow_stale=raw_cache_allow_stale)
     missing_ids = [cg_id for cg_id in ids if cg_id not in fresh_cached]
 
+    if cache_snapshot_only:
+        live_missing_ids = []
+        skipped_live_ids = list(missing_ids)
+    else:
+        live_missing_ids = missing_ids[: _cg_live_id_cap()]
+        skipped_live_ids = missing_ids[len(live_missing_ids) :]
+
     markets: List[Dict[str, Any]] = []
+    market_page_rows: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
-    if missing_ids:
-        markets, errors = _fetch_coingecko_markets(missing_ids, clean_limit)
+    if live_missing_ids:
+        markets, live_errors = _fetch_coingecko_markets(live_missing_ids, min(clean_limit, len(live_missing_ids), 250))
+        errors.extend(live_errors)
         if markets:
             _cg_raw_cache_update(markets)
 
+    # PORT-METRICS.1 v8:
+    # A broad local universe can contain hundreds of symbols that do not yet
+    # have explicit Token Registry/CoinGecko ID mappings. On manual Refresh,
+    # seed the raw CoinGecko market cache from bounded market-cap pages, then
+    # match local assets by ticker symbol. Cache-first window loads reuse those
+    # rows without live HTTP calls.
+    if (
+        is_known_request
+        and force_refresh
+        and _env_bool("UTT_MARKET_METRICS_ENABLE_MARKET_PAGE_REFRESH", True)
+    ):
+        market_page_rows, page_errors = _fetch_coingecko_market_pages(
+            _cg_market_page_cap(),
+            _cg_market_page_per_page(),
+        )
+        errors.extend(page_errors)
+        if market_page_rows:
+            _cg_raw_cache_update(market_page_rows)
+
     by_id: Dict[str, Dict[str, Any]] = {str(row.get("id") or ""): row for row in fresh_cached.values() if row.get("id")}
     by_id.update({str(row.get("id") or ""): row for row in markets if row.get("id")})
+    by_id.update({str(row.get("id") or ""): row for row in market_page_rows if row.get("id")})
 
     if errors:
         stale_cached = _cg_raw_cache_rows(ids, max_age_s=clean_ttl, allow_stale=True)
         for cg_id, row in stale_cached.items():
             by_id.setdefault(cg_id, row)
+
+    symbol_cached = _cg_raw_cache_symbol_rows(
+        clean_assets,
+        max_age_s=clean_ttl,
+        allow_stale=bool(raw_cache_allow_stale or cache_snapshot_only),
+    )
+    symbol_live = _cg_rows_by_symbol(market_page_rows, clean_assets)
+    symbol_rows: Dict[str, Dict[str, Any]] = dict(symbol_cached)
+    symbol_rows.update(symbol_live)
 
     items: List[Dict[str, Any]] = []
     for asset in clean_assets:
@@ -1166,11 +1810,26 @@ def get_market_metrics_summary(
             items.append(_uttt_placeholder(updated_at))
             continue
 
-        meta = _coingecko_meta_for_symbol(asset, allow_discovery=str(asset or "").strip().upper() in explicit_discovery_assets)
+        asset_sym = str(asset or "").strip().upper()
+        meta = _coingecko_meta_for_symbol(asset, allow_discovery=asset_sym in explicit_discovery_assets)
         cg_id = meta.get("id") if meta else ""
         raw = by_id.get(cg_id)
         if meta and raw:
             items.append(_row_from_cg(asset, meta, raw, updated_at))
+            continue
+
+        # Fallback: broad CoinGecko market-page cache matched by ticker symbol.
+        # This fills market data for assets that do not yet have explicit
+        # external_price_id mappings in Token Registry.
+        symbol_raw = symbol_rows.get(asset_sym)
+        if symbol_raw:
+            symbol_meta = {
+                "id": str(symbol_raw.get("id") or cg_id or asset_sym.lower()).strip(),
+                "name": str(symbol_raw.get("name") or (meta or {}).get("name") or asset_sym).strip() or asset_sym,
+                "chain": str((meta or {}).get("chain") or "global").strip() or "global",
+                "source": "coingecko_market_symbol_match",
+            }
+            items.append(_row_from_cg(asset, symbol_meta, symbol_raw, updated_at))
             continue
 
         if meta and not raw:
@@ -1178,17 +1837,11 @@ def get_market_metrics_summary(
         else:
             items.append(_missing_placeholder(asset, updated_at, "No market_metrics source mapping exists for this asset."))
 
-    payload = {
-        "ok": not bool(errors),
-        "updated_at": updated_at,
-        "ttl_s": clean_ttl,
-        "asset_source": asset_source,
-        "assets": clean_assets,
-        "include_assets": include_clean,
-        "items": items,
-        "errors": errors,
-        "cache": "miss",
-    }
+    items = _annotate_market_metric_rows(
+        items,
+        asset_context=asset_context,
+        owned_assets=owned_assets_payload,
+    )
 
     has_real_market_rows = any(
         _num(row.get("price_usd")) is not None
@@ -1197,5 +1850,38 @@ def get_market_metrics_summary(
         for row in items
         if isinstance(row, dict) and row.get("source_kind") != "missing"
     )
+
+    payload = {
+        "ok": bool(has_real_market_rows) or not bool(errors),
+        "updated_at": updated_at,
+        "ttl_s": clean_ttl,
+        "asset_source": asset_source,
+        "owned_asset_source": owned_asset_source,
+        "assets": clean_assets,
+        "asset_count": len(clean_assets),
+        "known_assets": _merge_assets(clean_assets, context_known_assets),
+        "known_asset_count": len(_merge_assets(clean_assets, context_known_assets)),
+        "owned_assets": owned_assets_payload,
+        "owned_asset_count": len(owned_assets_payload),
+        "market_data_id_count": len(ids),
+        "market_data_cached_id_count": len(fresh_cached),
+        "market_data_live_fetch_id_count": len(live_missing_ids),
+        "market_data_skipped_live_id_count": len(skipped_live_ids),
+        "market_data_symbol_match_count": len(symbol_rows),
+        "market_data_symbol_cache_match_count": len(symbol_cached),
+        "market_data_symbol_live_match_count": len(symbol_live),
+        "market_data_market_page_live_fetch_count": len(market_page_rows),
+        "market_data_cache_snapshot_only": cache_snapshot_only,
+        "refresh_mode": "cache_snapshot" if cache_snapshot_only else ("live_refresh" if force_refresh else "normal"),
+        "include_assets": include_clean,
+        "asset_context": {k: _metric_context_public(v) for k, v in sorted(asset_context.items())},
+        "items": items,
+        "errors": errors,
+        "cache": "miss",
+    }
+
     _cache_set(cache_key, payload, clean_ttl if has_real_market_rows else _summary_error_ttl_s())
+    if is_known_request:
+        _summary_snapshot_save(summary_snapshot_key, payload)
     return payload
+

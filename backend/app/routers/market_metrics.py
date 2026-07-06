@@ -46,7 +46,7 @@ def market_metrics_summary(
         None,
         description="Comma-separated asset symbols to append to the requested/discovered asset set.",
     ),
-    limit: int = Query(250, ge=1, le=250),
+    limit: int = Query(250, ge=1, le=1000),
     ttl_s: int = Query(300, ge=10, le=3600),
     force_refresh: bool = Query(False),
 ):

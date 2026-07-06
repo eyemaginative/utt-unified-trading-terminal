@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime
 from typing import Optional, Tuple, Any, Dict, List
@@ -7,7 +8,7 @@ from typing import Optional, Tuple, Any, Dict, List
 from sqlalchemy.orm import Session
 from sqlalchemy import select, false, func, or_, Table, MetaData
 
-from ..models import Order, VenueOrderRow, OrderView, RuntimeSetting
+from ..models import Order, VenueOrderRow, OrderView, RuntimeSetting, TokenRegistry
 
 # NEW (3.5): realized sourcing from lot_journal
 from ..models_lot_journal import LotJournal
@@ -76,7 +77,171 @@ def _swap_orders_table(db: Session):
         return None
 
 
-def _to_unified_swap(mp: dict) -> Dict[str, Any]:
+
+
+_SOL_WRAPPED_MINT = "So11111111111111111111111111111111111111112"
+
+
+def _swap_token_registry_symbol_map(db: Optional[Session]) -> Dict[str, str]:
+    """Return best-effort Solana mint/ticker -> symbol mapping for swap display.
+
+    Read-only helper used only by All Orders normalization.  It does not mutate
+    token_registry, swap_orders, ledger, or basis tables.
+    """
+    out: Dict[str, str] = {
+        "SOL": "SOL",
+        "WSOL": "SOL",
+        _SOL_WRAPPED_MINT: "SOL",
+        _SOL_WRAPPED_MINT.lower(): "SOL",
+    }
+    if db is None:
+        return out
+
+    try:
+        rows = (
+            db.query(TokenRegistry)
+            .filter(func.lower(TokenRegistry.chain) == "solana")
+            .all()
+        )
+    except Exception:
+        return out
+
+    for row in rows or []:
+        try:
+            sym = str(getattr(row, "symbol", None) or "").strip().upper()
+            addr = str(getattr(row, "address", None) or "").strip()
+        except Exception:
+            continue
+        if not sym:
+            continue
+        out.setdefault(sym, sym)
+        if addr:
+            out[addr] = sym
+            out[addr.lower()] = sym
+    return out
+
+
+def _swap_parse_raw(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _swap_deltas_from_raw(mp: Dict[str, Any]) -> Dict[str, float]:
+    raw_obj = _swap_parse_raw(mp.get("raw"))
+    deltas = raw_obj.get("deltas") if isinstance(raw_obj, dict) else None
+    if not isinstance(deltas, dict):
+        return {}
+
+    out: Dict[str, float] = {}
+    for key, value in deltas.items():
+        k = str(key or "").strip()
+        if not k:
+            continue
+        try:
+            v = float(value)
+        except Exception:
+            continue
+        if v == 0.0:
+            continue
+        out[k] = v
+    return out
+
+
+def _swap_symbol_for_delta_key(key: Any, mint_symbol_map: Optional[Dict[str, str]]) -> str:
+    raw = str(key or "").strip()
+    if not raw:
+        return ""
+
+    upper = raw.upper()
+    if upper in {"SOL", "WSOL"} or raw == _SOL_WRAPPED_MINT:
+        return "SOL"
+
+    m = mint_symbol_map or {}
+    mapped = m.get(raw) or m.get(raw.lower()) or m.get(upper)
+    if mapped:
+        return str(mapped).strip().upper()
+
+    # Some delta payloads already use a ticker rather than a mint.
+    if len(raw) <= 16 and re.match(r"^[A-Za-z0-9._-]+$", raw):
+        return upper
+
+    # Fallback: preserve the mint so the row is still inspectable instead of blank.
+    return raw
+
+
+def _swap_principal_from_deltas(
+    mp: Dict[str, Any],
+    *,
+    mint_symbol_map: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Derive the user-facing swap pair from wallet-level net deltas.
+
+    Aggregator routes can contain intermediate pool tokens.  The swap_orders row
+    may therefore have raw_symbol/base_mint from an intermediate hop.  When the
+    raw payload has net wallet deltas, prefer the largest positive and largest
+    negative principal deltas for All Orders display.
+    """
+    deltas = _swap_deltas_from_raw(mp)
+    if not deltas:
+        return None
+
+    positives = [(k, v) for k, v in deltas.items() if v > 0]
+    negatives = [(k, v) for k, v in deltas.items() if v < 0]
+    if not positives or not negatives:
+        return None
+
+    out_key, out_delta = max(positives, key=lambda kv: abs(kv[1]))
+    in_key, in_delta = max(negatives, key=lambda kv: abs(kv[1]))
+    input_qty = abs(float(in_delta))
+    output_qty = abs(float(out_delta))
+    if input_qty <= 0 or output_qty <= 0:
+        return None
+
+    side = str(mp.get("side") or "").strip().lower()
+    if side == "sell":
+        base_key, base_qty = in_key, input_qty
+        quote_key, quote_qty = out_key, output_qty
+    else:
+        # Default aggregator swap presentation is BUY output using input.
+        base_key, base_qty = out_key, output_qty
+        quote_key, quote_qty = in_key, input_qty
+        if side not in {"buy", "sell"}:
+            side = "buy"
+
+    base_sym = _swap_symbol_for_delta_key(base_key, mint_symbol_map)
+    quote_sym = _swap_symbol_for_delta_key(quote_key, mint_symbol_map)
+    if not base_sym or not quote_sym or base_sym == quote_sym:
+        return None
+
+    price = None
+    try:
+        if base_qty > 0:
+            price = quote_qty / base_qty
+    except Exception:
+        price = None
+
+    return {
+        "source": "raw_deltas_principal",
+        "symbol": f"{base_sym}-{quote_sym}",
+        "base_key": base_key,
+        "quote_key": quote_key,
+        "base_qty": base_qty,
+        "quote_qty": quote_qty,
+        "price": price,
+        "input_key": in_key,
+        "input_qty": input_qty,
+        "output_key": out_key,
+        "output_qty": output_qty,
+    }
+
+def _to_unified_swap(mp: dict, mint_symbol_map: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Normalize a swap_orders row mapping into the All Orders unified shape.
 
     Keep this minimal + compatible with downstream enrichment steps.
@@ -114,24 +279,36 @@ def _to_unified_swap(mp: dict) -> Dict[str, Any]:
         else quote_qty_f
     )
 
+    principal = _swap_principal_from_deltas(mp, mint_symbol_map=mint_symbol_map)
+    display_symbol = str(
+        (principal or {}).get('symbol')
+        or mp.get('resolved_symbol')
+        or mp.get('raw_symbol')
+        or ''
+    )
+    symbol_canon = str(mp.get('resolved_symbol') or (principal or {}).get('symbol') or '')
+    base_qty_eff = (principal or {}).get('base_qty', base_qty)
+    quote_qty_eff = (principal or {}).get('quote_qty', quote_qty)
+    price_eff = (principal or {}).get('price', price)
+
     return {
         'id': str(mp.get('signature') or ''),
         'source': 'SWAP',
         'venue': str(mp.get('venue') or ''),
         'view_key': _view_key_swap(str(mp.get('venue') or ''), str(mp.get('signature') or mp.get('tx_signature') or mp.get('tx_sig') or '')),
-        'symbol': str(mp.get('resolved_symbol') or mp.get('raw_symbol') or ''),
-        'symbol_canon': str(mp.get('resolved_symbol') or ''),
+        'symbol': display_symbol,
+        'symbol_canon': symbol_canon,
         'symbol_venue': str(mp.get('raw_symbol') or ''),
         'side': side,
         'type': 'swap',
         'status': status,
         'status_bucket': status_bucket,
-        'qty': _f(base_qty),
-        'filled_qty': _f(base_qty),
+        'qty': _f(base_qty_eff),
+        'filled_qty': _f(base_qty_eff),
         'limit_price': None,
-        'avg_fill_price': _f(price),
+        'avg_fill_price': _f(price_eff),
         'fee': fee_f,
-        'total_after_fee': total_after_fee,
+        'total_after_fee': (_f(quote_qty_eff) if principal else total_after_fee),
         'client_order_id': None,
         'venue_order_id': str(mp.get('signature') or ''),
         'can_cancel': False,
@@ -147,7 +324,13 @@ def _to_unified_swap(mp: dict) -> Dict[str, Any]:
         'swap_wallet': mp.get('wallet_address'),
         'swap_base_mint': mp.get('base_mint'),
         'swap_quote_mint': mp.get('quote_mint'),
-        'swap_quote_qty': _f(quote_qty),
+        'swap_quote_qty': _f(quote_qty_eff),
+        'swap_route_symbol': str(mp.get('raw_symbol') or ''),
+        'swap_principal_source': (principal or {}).get('source'),
+        'swap_principal_base': (principal or {}).get('base_key'),
+        'swap_principal_quote': (principal or {}).get('quote_key'),
+        'swap_principal_input': (principal or {}).get('input_key'),
+        'swap_principal_output': (principal or {}).get('output_key'),
     }
 
 
@@ -1340,9 +1523,9 @@ def list_all_orders(
                     elif sb == 'open':
                         sstmt = sstmt.where(or_(t_swaps.c.status.is_(None), ~func.lower(t_swaps.c.status).in_(list(_TERMINAL))))
 
-                if symbol:
-                    # Some venues will only populate raw_symbol; prefer resolved_symbol when present
-                    sstmt = sstmt.where((t_swaps.c.resolved_symbol == symbol) | (t_swaps.c.raw_symbol == symbol))
+                # Do not SQL-filter swaps by symbol here.  Some Solana aggregator
+                # rows have raw_symbol from an intermediate route hop; normalize first
+                # from wallet-level principal deltas, then apply the symbol filter below.
                 if dt_from:
                     sstmt = sstmt.where(t_swaps.c.ts >= dt_from)
                 if dt_to:
@@ -1350,8 +1533,18 @@ def list_all_orders(
                 if status:
                     sstmt = sstmt.where(t_swaps.c.status == status)
 
+                mint_symbol_map = _swap_token_registry_symbol_map(db)
                 for mp in db.execute(sstmt).mappings().all():
-                    swap_items.append(_to_unified_swap(dict(mp)))
+                    sw = _to_unified_swap(dict(mp), mint_symbol_map=mint_symbol_map)
+                    if symbol:
+                        sym_filter = str(symbol or '').strip()
+                        if sym_filter and sym_filter not in {
+                            str(sw.get('symbol') or ''),
+                            str(sw.get('symbol_canon') or ''),
+                            str(sw.get('symbol_venue') or ''),
+                        }:
+                            continue
+                    swap_items.append(sw)
         except Exception:
             swap_items = []
 

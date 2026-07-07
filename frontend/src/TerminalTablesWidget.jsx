@@ -1519,8 +1519,10 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     function getGroupedBalanceBasisStatus(group) {
       const total = balanceNumberOrNull(group?.total);
       if (total !== null && Math.abs(total) <= 1e-12) return "basis_not_applicable";
-      if (!group?.hasCostBasisUsd) return "basis_missing";
+      if ((group?.basisUnmatchedChildren || 0) > 0 || (group?.basisUnmatchedQty || 0) > 1e-12) return "basis_unmatched";
       if ((group?.basisPartialChildren || 0) > 0 || (group?.basisMissingChildren || 0) > 0) return "basis_partial";
+      if ((group?.basisNoLotChildren || 0) > 0) return group?.hasCostBasisUsd ? "basis_partial" : "no_basis_lots";
+      if (!group?.hasCostBasisUsd) return "basis_missing";
       return "basis_ok";
     }
 
@@ -1529,8 +1531,129 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       if (s === "basis_ok" || s === "ok") return "OK";
       if (s === "basis_partial" || s === "partial") return "Partial";
       if (s === "basis_missing" || s === "missing") return "Missing";
+      if (s === "basis_unmatched" || s === "unmatched") return "Unmatched";
+      if (s === "no_basis_lots" || s === "basis_no_lots" || s === "no_lots") return "No Lots";
       if (s === "basis_not_applicable" || s === "not_applicable" || s === "n/a") return "N/A";
       return status ? String(status) : "—";
+    }
+
+    function normalizeBalanceBasisStatusForDisplay(row) {
+      const raw = getBalanceBasisStatus(row);
+      const s = String(raw || "").trim().toLowerCase();
+      const lotCount = balanceNumberOrNull(row?.basis_lot_count ?? row?.basisLotCount);
+      const costBasis = getBalanceCostBasisUsd(row);
+      const unmatchedQty = balanceNumberOrNull(row?.basis_unmatched_qty ?? row?.basisUnmatchedQty);
+
+      if (s === "basis_missing" && lotCount === 0 && costBasis === null) return "no_basis_lots";
+      if ((s === "basis_partial" || s === "partial") && unmatchedQty !== null && unmatchedQty > 1e-12) return "basis_unmatched";
+      return raw;
+    }
+
+    function balanceBasisStatusDescription(status) {
+      const s = String(status || "").trim().toLowerCase();
+      if (s === "basis_ok" || s === "ok") return "Current balance is fully matched to remaining basis lots.";
+      if (s === "basis_partial" || s === "partial") return "Some quantity has known basis and some is missing or only partially matched.";
+      if (s === "basis_missing" || s === "missing") return "Basis lots exist but basis value is missing or unavailable.";
+      if (s === "basis_unmatched" || s === "unmatched") return "Current balance exceeds remaining basis lot quantity for this venue/wallet/asset.";
+      if (s === "no_basis_lots" || s === "basis_no_lots" || s === "no_lots") return "No remaining basis lots were found for this venue/wallet/asset.";
+      if (s === "basis_not_applicable" || s === "not_applicable" || s === "n/a") return "Basis is not applicable for a zero or non-held balance.";
+      return "Read-only basis status from backend basis lot enrichment.";
+    }
+
+    function formatBalanceQtyMaybe(v) {
+      const n = balanceNumberOrNull(v);
+      if (n === null) return "—";
+      return fmtBal?.(n) ?? n.toLocaleString(undefined, { maximumFractionDigits: 8 });
+    }
+
+    function getBalanceBasisTooltip(row) {
+      const status = normalizeBalanceBasisStatusForDisplay(row);
+      const label = displayBalanceBasisStatus(status);
+      const lines = [
+        `Basis Status: ${label}`,
+        balanceBasisStatusDescription(status),
+      ];
+
+      const venueLabel = row?.__balanceGroupParent ? "Grouped / All Venues" : String(row?.venue || "—");
+      const walletLabel = row?.basis_wallet_id ?? row?.basisWalletId ?? row?.wallet_id ?? row?.walletId ?? "default";
+      lines.push(`Venue: ${venueLabel}`);
+      if (!row?.__balanceGroupParent) lines.push(`Wallet ID: ${walletLabel}`);
+
+      lines.push(`Balance Qty: ${formatBalanceQtyMaybe(row?.total ?? row?.balance ?? row?.quantity)}`);
+      lines.push(`Cost Basis USD: ${formatBalanceMoneyMaybe(getBalanceCostBasisUsd(row))}`);
+      lines.push(`Cost Avg USD: ${formatBalanceMoneyMaybe(getBalanceCostAvgUsd(row))}`);
+      lines.push(`Remaining Basis Qty: ${formatBalanceQtyMaybe(row?.basis_qty_remaining ?? row?.basisQtyRemaining)}`);
+      lines.push(`Known Basis Qty: ${formatBalanceQtyMaybe(row?.basis_known_qty_remaining ?? row?.basisKnownQtyRemaining)}`);
+      lines.push(`Missing Basis Qty: ${formatBalanceQtyMaybe(row?.basis_missing_qty_remaining ?? row?.basisMissingQtyRemaining)}`);
+      lines.push(`Unmatched Qty: ${formatBalanceQtyMaybe(row?.basis_unmatched_qty ?? row?.basisUnmatchedQty)}`);
+
+      const lotCount = balanceNumberOrNull(row?.basis_lot_count ?? row?.basisLotCount);
+      const missingLots = balanceNumberOrNull(row?.basis_missing_lots ?? row?.basisMissingLots);
+      lines.push(`Lot Count: ${lotCount === null ? "—" : lotCount.toLocaleString()}`);
+      lines.push(`Missing Lots: ${missingLots === null ? "—" : missingLots.toLocaleString()}`);
+
+      if (row?.__balanceGroupParent) {
+        const sourceCount = Array.isArray(row?.__balanceGroupChildren) ? row.__balanceGroupChildren.length : null;
+        lines.push(`Grouped Sources: ${sourceCount === null ? "—" : sourceCount.toLocaleString()}`);
+        lines.push("Expand this row to inspect venue-level basis status.");
+      }
+
+      lines.push("Source: read-only basis_lots remaining-inventory summary.");
+      return lines.join("\n");
+    }
+
+    function basisBadgeStyle(status) {
+      const s = String(status || "").trim().toLowerCase();
+      let background = "rgba(140,150,170,0.16)";
+      let color = pal.text;
+      let borderColor = "rgba(255,255,255,0.12)";
+
+      if (s === "basis_ok" || s === "ok") {
+        background = "rgba(70,190,120,0.16)";
+        color = pal.good;
+        borderColor = "rgba(70,190,120,0.28)";
+      } else if (s === "basis_partial" || s === "partial") {
+        background = "rgba(255,190,80,0.16)";
+        color = pal.warn;
+        borderColor = "rgba(255,190,80,0.30)";
+      } else if (s === "basis_unmatched" || s === "unmatched") {
+        background = "rgba(255,120,80,0.17)";
+        color = pal.warn;
+        borderColor = "rgba(255,120,80,0.32)";
+      } else if (s === "basis_missing" || s === "missing" || s === "no_basis_lots" || s === "basis_no_lots" || s === "no_lots") {
+        background = "rgba(255,80,80,0.14)";
+        color = pal.danger;
+        borderColor = "rgba(255,80,80,0.28)";
+      } else if (s === "basis_not_applicable" || s === "not_applicable" || s === "n/a") {
+        background = "rgba(140,150,170,0.11)";
+        color = pal.muted;
+      }
+
+      return {
+        ...(sx.badge || {}),
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: 52,
+        padding: "2px 8px",
+        borderRadius: 999,
+        border: `1px solid ${borderColor}`,
+        background,
+        color,
+        fontSize: 11,
+        fontWeight: 800,
+        lineHeight: 1.3,
+        whiteSpace: "nowrap",
+      };
+    }
+
+    function renderBalanceBasisBadge(row) {
+      const status = normalizeBalanceBasisStatusForDisplay(row);
+      return (
+        <span style={basisBadgeStyle(status)} title={getBalanceBasisTooltip(row)}>
+          {displayBalanceBasisStatus(status)}
+        </span>
+      );
     }
 
     function formatBalanceMoneyMaybe(v) {
@@ -1581,8 +1704,20 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
             sources: new Set(),
             costBasisUsd: 0,
             hasCostBasisUsd: false,
+            basisQtyRemaining: 0,
+            hasBasisQtyRemaining: false,
+            basisKnownQtyRemaining: 0,
+            hasBasisKnownQtyRemaining: false,
+            basisMissingQtyRemaining: 0,
+            hasBasisMissingQtyRemaining: false,
+            basisMissingLots: 0,
+            basisLotCount: 0,
+            basisUnmatchedQty: 0,
+            hasBasisUnmatchedQty: false,
             basisMissingChildren: 0,
             basisPartialChildren: 0,
+            basisUnmatchedChildren: 0,
+            basisNoLotChildren: 0,
             children: [],
           };
           groups.set(key, g);
@@ -1611,9 +1746,41 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           g.hasCostBasisUsd = true;
         }
 
-        const basisStatus = getBalanceBasisStatus(row).toLowerCase();
+        const basisQtyRemaining = balanceNumberOrNull(row?.basis_qty_remaining ?? row?.basisQtyRemaining);
+        if (basisQtyRemaining !== null) {
+          g.basisQtyRemaining += basisQtyRemaining;
+          g.hasBasisQtyRemaining = true;
+        }
+
+        const basisKnownQtyRemaining = balanceNumberOrNull(row?.basis_known_qty_remaining ?? row?.basisKnownQtyRemaining);
+        if (basisKnownQtyRemaining !== null) {
+          g.basisKnownQtyRemaining += basisKnownQtyRemaining;
+          g.hasBasisKnownQtyRemaining = true;
+        }
+
+        const basisMissingQtyRemaining = balanceNumberOrNull(row?.basis_missing_qty_remaining ?? row?.basisMissingQtyRemaining);
+        if (basisMissingQtyRemaining !== null) {
+          g.basisMissingQtyRemaining += basisMissingQtyRemaining;
+          g.hasBasisMissingQtyRemaining = true;
+        }
+
+        const basisMissingLots = balanceNumberOrNull(row?.basis_missing_lots ?? row?.basisMissingLots);
+        if (basisMissingLots !== null) g.basisMissingLots += basisMissingLots;
+
+        const basisLotCount = balanceNumberOrNull(row?.basis_lot_count ?? row?.basisLotCount);
+        if (basisLotCount !== null) g.basisLotCount += basisLotCount;
+
+        const basisUnmatchedQty = balanceNumberOrNull(row?.basis_unmatched_qty ?? row?.basisUnmatchedQty);
+        if (basisUnmatchedQty !== null) {
+          g.basisUnmatchedQty += basisUnmatchedQty;
+          g.hasBasisUnmatchedQty = true;
+        }
+
+        const basisStatus = String(normalizeBalanceBasisStatusForDisplay(row) || "").toLowerCase();
         if (basisStatus === "basis_missing" || basisStatus === "missing") g.basisMissingChildren += 1;
         if (basisStatus === "basis_partial" || basisStatus === "partial") g.basisPartialChildren += 1;
+        if (basisStatus === "basis_unmatched" || basisStatus === "unmatched") g.basisUnmatchedChildren += 1;
+        if (basisStatus === "no_basis_lots" || basisStatus === "basis_no_lots" || basisStatus === "no_lots") g.basisNoLotChildren += 1;
 
         g.children.push({
           ...row,
@@ -1639,6 +1806,12 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           cost_basis_usd: g.hasCostBasisUsd ? g.costBasisUsd : null,
           cost_avg_usd: g.hasCostBasisUsd && g.total > 0 ? g.costBasisUsd / g.total : null,
           basis_status: getGroupedBalanceBasisStatus(g),
+          basis_qty_remaining: g.hasBasisQtyRemaining ? g.basisQtyRemaining : null,
+          basis_known_qty_remaining: g.hasBasisKnownQtyRemaining ? g.basisKnownQtyRemaining : null,
+          basis_missing_qty_remaining: g.hasBasisMissingQtyRemaining ? g.basisMissingQtyRemaining : null,
+          basis_missing_lots: g.basisMissingLots,
+          basis_lot_count: g.basisLotCount,
+          basis_unmatched_qty: g.hasBasisUnmatchedQty ? g.basisUnmatchedQty : null,
           usd_source_symbol: g.sources.size > 0 ? Array.from(g.sources).slice(0, 3).join(", ") : g.first?.usd_source_symbol || "—",
           __balanceGroupParent: true,
           __balanceGroupKey: g.key,
@@ -6149,9 +6322,9 @@ function renderFillToasts() {
                     </td>
                     <td
                       style={sx.td}
-                      title={hideTableDataGlobal ? "" : String(getBalanceBasisStatus(b) || "—")}
+                      title={hideTableDataGlobal ? "" : getBalanceBasisTooltip(b)}
                     >
-                      {hideTableDataGlobal ? "••••" : displayBalanceBasisStatus(getBalanceBasisStatus(b))}
+                      {hideTableDataGlobal ? "••••" : renderBalanceBasisBadge(b)}
                     </td>
                     <td
                       style={{

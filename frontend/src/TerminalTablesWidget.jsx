@@ -1,5 +1,5 @@
 // frontend/src/TerminalTablesWidget.jsx
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { fmtQty, fmtPrice, fmtMoney, fmtFee, fmtBal, fmtNum } from "./lib/format";
 
@@ -955,6 +955,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
 
   const [solanaPrices, setSolanaPrices] = useState({ ok: false, items: {}, ts: 0 });
   const [expandedBalanceGroups, setExpandedBalanceGroups] = useState(() => ({}));
+  const [basisLotDetailsByKey, setBasisLotDetailsByKey] = useState(() => ({}));
   // Canonical wrapped SOL mint (for Jupiter pricing lookups)
   const SOL_MINT = "So11111111111111111111111111111111111111112";
   // Solana venues do NOT use the CEX balances refresh pipeline
@@ -1647,6 +1648,91 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       };
     }
 
+    function balanceBasisLotRequestParams(row) {
+      if (!row || row.__balanceGroupParent) return null;
+
+      const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+      const rawVenue = row?.basis_venue ?? row?.basisVenue ?? row?.venue;
+      const venueKey = String(rawVenue || "").trim().toLowerCase();
+      const rawWallet = row?.basis_wallet_id ?? row?.basisWalletId ?? row?.wallet_id ?? row?.walletId ?? "default";
+      const walletKey = String(rawWallet || "default").trim() || "default";
+
+      if (!venueKey || !asset) return null;
+      if (venueKey.includes(" venue")) return null;
+
+      return {
+        venue: venueKey,
+        wallet_id: walletKey,
+        asset,
+      };
+    }
+
+    function balanceBasisLotRequestKey(row) {
+      const p = balanceBasisLotRequestParams(row);
+      if (!p) return "";
+      return `${p.venue}|${p.wallet_id}|${p.asset}`;
+    }
+
+    async function toggleBalanceBasisLotDetails(row) {
+      const params = balanceBasisLotRequestParams(row);
+      const key = balanceBasisLotRequestKey(row);
+      if (!params || !key) return;
+
+      const current = basisLotDetailsByKey?.[key];
+      if (current?.open) {
+        setBasisLotDetailsByKey((prev) => ({
+          ...(prev || {}),
+          [key]: {
+            ...(prev?.[key] || {}),
+            open: false,
+          },
+        }));
+        return;
+      }
+
+      setBasisLotDetailsByKey((prev) => ({
+        ...(prev || {}),
+        [key]: {
+          ...(prev?.[key] || {}),
+          open: true,
+          loading: !(prev?.[key]?.data),
+          error: "",
+        },
+      }));
+
+      if (current?.data) return;
+
+      try {
+        const qs = new URLSearchParams({
+          venue: params.venue,
+          wallet_id: params.wallet_id,
+          asset: params.asset,
+          limit: "250",
+        });
+        const data = await fetchJSONMaybe(`/api/basis/lots?${qs.toString()}`);
+        setBasisLotDetailsByKey((prev) => ({
+          ...(prev || {}),
+          [key]: {
+            ...(prev?.[key] || {}),
+            open: true,
+            loading: false,
+            error: "",
+            data,
+          },
+        }));
+      } catch (e) {
+        setBasisLotDetailsByKey((prev) => ({
+          ...(prev || {}),
+          [key]: {
+            ...(prev?.[key] || {}),
+            open: true,
+            loading: false,
+            error: String(e?.message || e || "Failed to load basis lots"),
+          },
+        }));
+      }
+    }
+
     function renderBalanceBasisBadge(row) {
       const status = normalizeBalanceBasisStatusForDisplay(row);
       return (
@@ -1656,10 +1742,175 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       );
     }
 
+    function renderBalanceBasisLotControl(row) {
+      const key = balanceBasisLotRequestKey(row);
+      const lotCount = balanceNumberOrNull(row?.basis_lot_count ?? row?.basisLotCount) || 0;
+      const state = key ? basisLotDetailsByKey?.[key] : null;
+      const disabled = !key || lotCount <= 0 || !!row?.__balanceGroupParent || hideTableDataGlobal;
+      const label = state?.loading ? "Lots…" : state?.open ? "Hide Lots" : "Lots";
+
+      return (
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          {renderBalanceBasisBadge(row)}
+          <button
+            data-no-drag="1"
+            type="button"
+            disabled={disabled}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              toggleBalanceBasisLotDetails(row);
+            }}
+            title={
+              disabled
+                ? row?.__balanceGroupParent
+                  ? "Expand grouped rows first, then inspect a venue-level row."
+                  : lotCount <= 0
+                    ? "No remaining basis lots for this row."
+                    : "Basis lot details unavailable for this row."
+                : "Show read-only remaining basis lot details for this balance row."
+            }
+            style={{
+              ...(sx.button || {}),
+              padding: "2px 7px",
+              fontSize: 11,
+              lineHeight: 1.3,
+              opacity: disabled ? 0.45 : 0.92,
+              cursor: disabled ? "not-allowed" : "pointer",
+            }}
+          >
+            {label}
+          </button>
+        </span>
+      );
+    }
+
     function formatBalanceMoneyMaybe(v) {
       const n = balanceNumberOrNull(v);
       if (n === null) return "—";
       return fmtUsd?.(n) ?? n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+
+    function formatBasisLotDate(v) {
+      if (!v) return "—";
+      try {
+        const d = new Date(v);
+        if (!Number.isNaN(d.getTime())) return d.toLocaleString();
+      } catch {}
+      return String(v);
+    }
+
+    function renderBasisLotId(value) {
+      const s = String(value || "");
+      if (!s) return "—";
+      return s.length > 18 ? `${s.slice(0, 8)}…${s.slice(-6)}` : s;
+    }
+
+    function renderBalanceBasisLotDetailsRow(row, colSpan) {
+      const key = balanceBasisLotRequestKey(row);
+      if (!key) return null;
+      const state = basisLotDetailsByKey?.[key];
+      if (!state?.open) return null;
+
+      const data = state?.data || {};
+      const items = Array.isArray(data?.items) ? data.items : [];
+      const summaryTitle = [
+        `Venue: ${data?.venue || row?.venue || "—"}`,
+        `Wallet: ${data?.wallet_id || row?.basis_wallet_id || row?.wallet_id || "default"}`,
+        `Asset: ${data?.asset || row?.asset || "—"}`,
+      ].join(" • ");
+
+      return (
+        <tr key={`${key}:basis-lots`} style={{ background: "rgba(90,160,255,0.045)" }}>
+          <td style={{ ...sx.td, padding: 0 }} colSpan={colSpan}>
+            <div
+              data-no-drag="1"
+              style={{
+                margin: "6px 8px 10px",
+                padding: "10px 12px",
+                border: `1px solid ${pal.border}`,
+                borderRadius: 10,
+                background: "rgba(0,0,0,0.16)",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 900 }}>Remaining basis lots</div>
+                  <div style={{ ...sx.muted, fontSize: 12 }}>{summaryTitle}</div>
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <span style={{ ...sx.badge, background: "rgba(90,160,255,0.14)" }}>
+                    {state?.loading ? "Loading…" : `${Number(data?.count ?? items.length ?? 0).toLocaleString()} lots`}
+                  </span>
+                  <span style={{ ...sx.badge, background: "rgba(70,190,120,0.12)", color: pal.good }}>
+                    Basis {formatBalanceMoneyMaybe(data?.total_remaining_basis_usd)}
+                  </span>
+                  <span style={{ ...sx.badge, background: "rgba(255,190,80,0.10)", color: pal.warn }}>
+                    Missing Qty {formatBalanceQtyMaybe(data?.missing_qty_remaining)}
+                  </span>
+                </div>
+              </div>
+
+              {state?.error && (
+                <div style={{ marginTop: 8, color: pal.danger, fontSize: 12 }}>
+                  {state.error}
+                </div>
+              )}
+
+              {state?.loading && !state?.data ? (
+                <div style={{ marginTop: 8, ...sx.muted }}>Loading read-only basis lot details…</div>
+              ) : items.length === 0 ? (
+                <div style={{ marginTop: 8, ...sx.muted }}>No remaining basis lots returned for this exact venue / wallet / asset key.</div>
+              ) : (
+                <div style={{ marginTop: 10, overflowX: "auto" }}>
+                  <table style={{ ...sx.table, fontSize: 12 }}>
+                    <thead>
+                      <tr>
+                        <th style={sx.th}>Acquired</th>
+                        <th style={sx.th}>Qty Rem</th>
+                        <th style={sx.th}>Qty Total</th>
+                        <th style={sx.th}>Rem Basis</th>
+                        <th style={sx.th}>Cost Avg</th>
+                        <th style={sx.th}>Source</th>
+                        <th style={sx.th}>Origin</th>
+                        <th style={sx.th}>Missing</th>
+                        <th style={sx.th}>Lot</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {items.map((lot, idx) => (
+                        <tr key={lot?.id || idx}>
+                          <td style={sx.td}>{formatBasisLotDate(lot?.acquired_at)}</td>
+                          <td style={sx.td}>{mask?.(formatBalanceQtyMaybe(lot?.qty_remaining))}</td>
+                          <td style={sx.td}>{mask?.(formatBalanceQtyMaybe(lot?.qty_total))}</td>
+                          <td style={sx.td}>{formatBalanceMoneyMaybe(lot?.remaining_basis_usd)}</td>
+                          <td style={sx.td}>{formatBalanceMoneyMaybe(lot?.cost_avg_usd)}</td>
+                          <td style={sx.td}>{String(lot?.basis_source || "—")}</td>
+                          <td style={sx.td} title={String(lot?.origin_ref || "")}>
+                            {String(lot?.origin_type || "—")}
+                          </td>
+                          <td style={sx.td}>
+                            {lot?.basis_is_missing ? (
+                              <span style={{ ...sx.badge, background: "rgba(255,80,80,0.14)", color: pal.danger }}>Yes</span>
+                            ) : (
+                              <span style={{ ...sx.badge, background: "rgba(70,190,120,0.12)", color: pal.good }}>No</span>
+                            )}
+                          </td>
+                          <td style={sx.td} title={String(lot?.id || "")}>{renderBasisLotId(lot?.id)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div style={{ marginTop: 8, ...sx.muted, fontSize: 12 }}>
+                Read-only view from basis_lots. This does not mutate FIFO lots or rebuild inventory.
+              </div>
+            </div>
+          </td>
+        </tr>
+      );
     }
 
 
@@ -6260,11 +6511,12 @@ function renderFillToasts() {
                 const isGroupedParent = !!b.__balanceGroupParent;
                 const isGroupedChild = !!b.__balanceGroupChild;
                 const groupKey = b.__balanceGroupKey;
+                const basisDetailColSpan = balancesColSpan || (venue === ALL_VENUES_VALUE ? 10 : 9);
                 return (
-                  <tr
-                    key={`${b.venue || ""}:${b.asset || ""}:${groupKey || ""}:${i}`}
-                    style={isGroupedChild ? { background: "rgba(255,255,255,0.025)" } : undefined}
-                  >
+                  <Fragment key={`${b.venue || ""}:${b.asset || ""}:${groupKey || ""}:${i}`}>
+                    <tr
+                      style={isGroupedChild ? { background: "rgba(255,255,255,0.025)" } : undefined}
+                    >
                     {venue === ALL_VENUES_VALUE && (
                       <td style={sx.td}>
                         {hideVenueNames
@@ -6324,7 +6576,7 @@ function renderFillToasts() {
                       style={sx.td}
                       title={hideTableDataGlobal ? "" : getBalanceBasisTooltip(b)}
                     >
-                      {hideTableDataGlobal ? "••••" : renderBalanceBasisBadge(b)}
+                      {hideTableDataGlobal ? "••••" : renderBalanceBasisLotControl(b)}
                     </td>
                     <td
                       style={{
@@ -6348,7 +6600,9 @@ function renderFillToasts() {
                         {hideTableDataGlobal ? "••••" : b.usd_source_symbol || "—"}
                       </span>
                     </td>
-                  </tr>
+                    </tr>
+                    {hideTableDataGlobal ? null : renderBalanceBasisLotDetailsRow(b, basisDetailColSpan)}
+                  </Fragment>
                 );
               })}
 

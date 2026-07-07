@@ -47,6 +47,14 @@ except Exception as e:
     bridge_router = None
 
 
+# BASIS-BAL.4: read-only basis-lot drilldown router (/api/basis/*)
+try:
+    from .routers.basis import router as basis_router
+except Exception as e:
+    print("basis router import failed:", repr(e))
+    basis_router = None
+
+
 # NEW: rules router (/api/rules/order)
 from .routers.rules import router as rules_router
 
@@ -167,6 +175,8 @@ def create_app() -> FastAPI:
         app.include_router(market_metrics_router)
     if bridge_router is not None:
         app.include_router(bridge_router)
+    if basis_router is not None:
+        app.include_router(basis_router)
     app.include_router(arm_router)
     app.include_router(venue_orders_router)
     app.include_router(all_orders_router)

@@ -113,6 +113,44 @@ class BalancesLatestResponse(BaseModel):
     portfolio_total_usd: Optional[float] = None
 
 
+# BASIS-BAL.4: read-only lot drilldown behind balance cost basis rows
+class BasisLotDetailRow(BaseModel):
+    id: str
+    venue: str
+    wallet_id: str
+    asset: str
+    acquired_at: Optional[datetime] = None
+    qty_total: float
+    qty_remaining: float
+    total_basis_usd: Optional[float] = None
+    remaining_basis_usd: Optional[float] = None
+    cost_avg_usd: Optional[float] = None
+    basis_is_missing: bool = False
+    basis_source: Optional[str] = None
+    origin_type: Optional[str] = None
+    origin_ref: Optional[str] = None
+    note: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class BasisLotsResponse(BaseModel):
+    ok: bool = True
+    version: str = "basis_lot_details_v1"
+    venue: str
+    wallet_id: str
+    asset: str
+    limit: int
+    count: int
+    total_qty_remaining: float
+    known_qty_remaining: float
+    missing_qty_remaining: float
+    total_remaining_basis_usd: Optional[float] = None
+    cost_avg_usd: Optional[float] = None
+    any_basis_missing: bool = False
+    items: List[BasisLotDetailRow]
+
+
 class BalanceRefreshRequest(BaseModel):
     venue: Venue
 

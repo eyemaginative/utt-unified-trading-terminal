@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -261,3 +261,167 @@ def basis_fields_for_balance(
         "basis_lot_count": int(summary.lot_count or 0),
         "basis_unmatched_qty": unmatched,
     }
+
+
+def basis_lot_details_for_key(
+    db: Session,
+    *,
+    venue: Any,
+    wallet_id: Any = "default",
+    asset: Any,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """Return read-only remaining lot details for one exact venue/wallet/asset key.
+
+    This function is intentionally diagnostic only:
+      - reads basis_lots only
+      - only returns qty_remaining > 0 rows
+      - does not mutate FIFO lots
+      - does not rebuild or consume inventory
+      - does not pool across venues/accounts/wallets
+    """
+    key = normalize_basis_key(venue, wallet_id, asset)
+    if not key[0] or not key[1] or not key[2]:
+        return {
+            "ok": False,
+            "version": "basis_lot_details_v1",
+            "venue": key[0],
+            "wallet_id": key[1],
+            "asset": key[2],
+            "limit": int(limit or 0),
+            "count": 0,
+            "total_qty_remaining": 0.0,
+            "known_qty_remaining": 0.0,
+            "missing_qty_remaining": 0.0,
+            "total_remaining_basis_usd": None,
+            "cost_avg_usd": None,
+            "any_basis_missing": False,
+            "items": [],
+            "error": "venue_wallet_asset_required",
+        }
+
+    try:
+        lim = int(limit or 200)
+    except Exception:
+        lim = 200
+    lim = max(1, min(lim, 1000))
+
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                LOWER(venue) AS venue,
+                wallet_id,
+                UPPER(asset) AS asset,
+                acquired_at,
+                qty_total,
+                qty_remaining,
+                total_basis_usd,
+                CASE
+                    WHEN qty_remaining > 0
+                     AND COALESCE(basis_is_missing, 0) = 0
+                     AND total_basis_usd IS NOT NULL
+                     AND qty_total > 0
+                    THEN total_basis_usd * (qty_remaining / qty_total)
+                    ELSE NULL
+                END AS remaining_basis_usd,
+                CASE
+                    WHEN COALESCE(basis_is_missing, 0) = 0
+                     AND total_basis_usd IS NOT NULL
+                     AND qty_total > 0
+                    THEN total_basis_usd / qty_total
+                    ELSE NULL
+                END AS cost_avg_usd,
+                COALESCE(basis_is_missing, 0) AS basis_is_missing,
+                basis_source,
+                origin_type,
+                origin_ref,
+                note,
+                created_at,
+                updated_at
+            FROM basis_lots
+            WHERE LOWER(venue) = :venue
+              AND wallet_id = :wallet_id
+              AND UPPER(asset) = :asset
+              AND qty_remaining > 0
+            ORDER BY acquired_at ASC, created_at ASC, id ASC
+            LIMIT :limit
+            """
+        ),
+        {
+            "venue": key[0],
+            "wallet_id": key[1],
+            "asset": key[2],
+            "limit": lim,
+        },
+    ).mappings().all()
+
+    items: List[Dict[str, Any]] = []
+    total_qty_remaining = 0.0
+    known_qty_remaining = 0.0
+    missing_qty_remaining = 0.0
+    total_remaining_basis = 0.0
+    basis_sum_defined = False
+    any_basis_missing = False
+
+    for row in rows:
+        qty_remaining = _safe_float(row.get("qty_remaining")) or 0.0
+        qty_total = _safe_float(row.get("qty_total")) or 0.0
+        remaining_basis = _safe_float(row.get("remaining_basis_usd"))
+        cost_avg = _safe_float(row.get("cost_avg_usd"))
+        missing = bool(row.get("basis_is_missing")) or remaining_basis is None
+
+        total_qty_remaining += float(qty_remaining)
+        if missing:
+            missing_qty_remaining += float(qty_remaining)
+            any_basis_missing = True
+        else:
+            known_qty_remaining += float(qty_remaining)
+            total_remaining_basis += float(remaining_basis or 0.0)
+            basis_sum_defined = True
+
+        items.append(
+            {
+                "id": str(row.get("id") or ""),
+                "venue": key[0],
+                "wallet_id": key[1],
+                "asset": key[2],
+                "acquired_at": row.get("acquired_at"),
+                "qty_total": float(qty_total),
+                "qty_remaining": float(qty_remaining),
+                "total_basis_usd": _safe_float(row.get("total_basis_usd")),
+                "remaining_basis_usd": remaining_basis,
+                "cost_avg_usd": cost_avg,
+                "basis_is_missing": bool(missing),
+                "basis_source": row.get("basis_source"),
+                "origin_type": row.get("origin_type"),
+                "origin_ref": row.get("origin_ref"),
+                "note": row.get("note"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+            }
+        )
+
+    total_basis_out = float(total_remaining_basis) if basis_sum_defined else None
+    avg_out = None
+    if total_basis_out is not None and known_qty_remaining > 0:
+        avg_out = float(total_basis_out) / float(known_qty_remaining)
+
+    return {
+        "ok": True,
+        "version": "basis_lot_details_v1",
+        "venue": key[0],
+        "wallet_id": key[1],
+        "asset": key[2],
+        "limit": int(lim),
+        "count": int(len(items)),
+        "total_qty_remaining": float(total_qty_remaining),
+        "known_qty_remaining": float(known_qty_remaining),
+        "missing_qty_remaining": float(missing_qty_remaining),
+        "total_remaining_basis_usd": total_basis_out,
+        "cost_avg_usd": avg_out,
+        "any_basis_missing": bool(any_basis_missing),
+        "items": items,
+    }
+

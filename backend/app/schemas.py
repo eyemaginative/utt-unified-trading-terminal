@@ -92,6 +92,18 @@ class BalanceRow(BaseModel):
     hold_usd: Optional[float] = None
     usd_source_symbol: Optional[str] = None
 
+    # BASIS-BAL.2: read-only basis enrichment from basis_lots
+    wallet_id: Optional[str] = None
+    cost_basis_usd: Optional[float] = None
+    cost_avg_usd: Optional[float] = None
+    basis_status: Optional[str] = None
+    basis_qty_remaining: Optional[float] = None
+    basis_known_qty_remaining: Optional[float] = None
+    basis_missing_qty_remaining: Optional[float] = None
+    basis_missing_lots: Optional[int] = None
+    basis_lot_count: Optional[int] = None
+    basis_unmatched_qty: Optional[float] = None
+
 
 class BalancesLatestResponse(BaseModel):
     items: List[BalanceRow]

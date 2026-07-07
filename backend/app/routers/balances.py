@@ -14,6 +14,7 @@ from ..models import BalanceSnapshot
 from ..utils import now_utc, parse_sort
 from ..services.balances import refresh_balances  # NOTE: we do NOT call latest_balances anymore
 from ..services.market import prices_usd_from_assets
+from ..services.basis_enrichment import build_basis_summary_map, basis_fields_for_balance
 
 router = APIRouter(prefix="/api/balances", tags=["balances"])
 
@@ -298,15 +299,30 @@ def get_latest(
 
     items = filtered
 
+    # Read-only cost-basis enrichment.  BalanceSnapshot rows do not carry an
+    # account/wallet dimension yet, so CEX/app-adapter balances map to wallet_id="default".
+    # This only reads basis_lots and does not mutate FIFO state.
+    basis_keys = [
+        (b.venue, "default", b.asset)
+        for b in items
+        if str(getattr(b, "asset", "") or "").strip()
+    ]
+    basis_map = build_basis_summary_map(db, basis_keys)
+
+    # Release the short basis read before any optional slow pricing fan-out.
+    _release_db_early(db)
+
     # Fast path: no pricing
     if not with_prices:
         out = []
         for b in items:
+            total = float(b.total or 0.0)
             out.append(
                 {
                     "venue": b.venue,
+                    "wallet_id": "default",
                     "asset": b.asset,
-                    "total": float(b.total or 0.0),
+                    "total": total,
                     "available": float(b.available or 0.0),
                     "hold": float(b.hold or 0.0),
                     "captured_at": b.captured_at,
@@ -315,6 +331,13 @@ def get_latest(
                     "available_usd": None,
                     "hold_usd": None,
                     "usd_source_symbol": None,
+                    **basis_fields_for_balance(
+                        basis_map,
+                        venue=b.venue,
+                        wallet_id="default",
+                        asset=b.asset,
+                        balance_qty=total,
+                    ),
                 }
             )
         return {"items": out, "as_of": as_of, "portfolio_total_usd": 0.0}
@@ -459,6 +482,7 @@ def get_latest(
         out.append(
             {
                 "venue": b.venue,
+                "wallet_id": "default",
                 "asset": b.asset,
                 "total": total,
                 "available": available,
@@ -469,6 +493,13 @@ def get_latest(
                 "available_usd": available_usd,
                 "hold_usd": hold_usd,
                 "usd_source_symbol": usd_source_symbol,
+                **basis_fields_for_balance(
+                    basis_map,
+                    venue=b.venue,
+                    wallet_id="default",
+                    asset=b.asset,
+                    balance_qty=total,
+                ),
             }
         )
 

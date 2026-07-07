@@ -122,3 +122,16 @@ class WalletAddressBalanceOut(BaseModel):
     # Back-compat (optional)
     created_at: Optional[datetime] = None
     captured_at: Optional[datetime] = None
+
+    # BASIS-BAL.2: read-only basis enrichment from basis_lots
+    cost_basis_usd: Optional[float] = None
+    cost_avg_usd: Optional[float] = None
+    basis_status: Optional[str] = None
+    basis_qty_remaining: Optional[float] = None
+    basis_known_qty_remaining: Optional[float] = None
+    basis_missing_qty_remaining: Optional[float] = None
+    basis_missing_lots: Optional[int] = None
+    basis_lot_count: Optional[int] = None
+    basis_unmatched_qty: Optional[float] = None
+    basis_venue: Optional[str] = None
+    basis_wallet_id: Optional[str] = None

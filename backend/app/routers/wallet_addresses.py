@@ -24,6 +24,7 @@ from ..schemas_wallet_addresses import (
 
 # Reuse existing USD pricing helper so on-chain balances display like venue balances
 from ..services.market import prices_usd_from_assets
+from ..services.basis_enrichment import build_basis_summary_map, basis_fields_for_balance
 from ..config import settings
 
 # Pricing venue used for USD valuation (market data venue, not where funds are held)
@@ -834,6 +835,16 @@ def wallet_balances_latest(
         if addr_key not in latest:
             latest[addr_key] = (snap, addr)
 
+    # Read-only cost-basis enrichment.  Wallet-address ledger ingestion stores
+    # self-custody rows as venue=(addr.wallet_id or "self_custody"),
+    # wallet_id="wallet_address".  This only reads basis_lots and does not
+    # mutate FIFO state.
+    basis_keys = []
+    for _snap, addr in latest.values():
+        basis_venue = (str(addr.wallet_id or "").strip().lower() or "self_custody")
+        basis_keys.append((basis_venue, "wallet_address", addr.asset))
+    basis_map = build_basis_summary_map(db, basis_keys)
+
     # Build pricing map (optional)
     prices_usd = {}
     if with_prices:
@@ -851,6 +862,19 @@ def wallet_balances_latest(
 
         # IMPORTANT: make UUID-ish ids strings defensively + include fetched_at
         fetched_at = snap.fetched_at
+
+        basis_venue = (str(addr.wallet_id or "").strip().lower() or "self_custody")
+        basis_fields = basis_fields_for_balance(
+            basis_map,
+            venue=basis_venue,
+            wallet_id="wallet_address",
+            asset=addr.asset,
+            balance_qty=qty,
+        )
+        # Preserve WalletAddressBalanceOut.wallet_id as the visible wallet/venue grouping.
+        basis_fields.pop("wallet_id", None)
+        basis_fields["basis_wallet_id"] = "wallet_address"
+        basis_fields["basis_venue"] = basis_venue
 
         out.append(
             WalletAddressBalanceOut(
@@ -873,6 +897,8 @@ def wallet_balances_latest(
                 # Back-compat (optional in schema)
                 created_at=fetched_at,
                 captured_at=fetched_at,
+
+                **basis_fields,
             )
         )
 

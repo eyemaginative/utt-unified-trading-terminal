@@ -206,7 +206,7 @@ def _make_registry() -> Dict[str, VenueSpec]:
             display_name="OKX",
             enabled=_okx_enabled,
             adapter_factory=okx_factory,
-            supports_trading=False,   # OKX.5: enable only after read-only validation + gated trading patch
+            supports_trading=True,    # OKX.5: UI can submit/cancel; live routing remains backend-gated.
             supports_balances=True,
             supports_orderbook=True,
             supports_markets=True,

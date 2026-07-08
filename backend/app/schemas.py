@@ -18,6 +18,12 @@ class OrderCreate(BaseModel):
     qty: float = Field(..., gt=0)
     limit_price: Optional[float] = Field(default=None, gt=0)
 
+    # Optional order-ticket controls used by gated live adapters.
+    # Existing adapters that ignore these fields remain unaffected.
+    tif: Optional[str] = Field(default=None, description="Time in force, e.g. gtc/ioc/fok")
+    post_only: bool = Field(default=False)
+    client_order_id: Optional[str] = Field(default=None, max_length=64)
+
 
 class OrderOut(BaseModel):
     id: str

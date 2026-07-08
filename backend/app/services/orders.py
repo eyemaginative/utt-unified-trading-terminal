@@ -339,31 +339,35 @@ def _place_order_safely(adapter, *, symbol_venue: str, side: str, type_: str, qt
         raise
 
 
-def _cancel_order_safely(adapter, venue_order_id: str, dry_run: bool) -> bool:
+def _cancel_order_safely(adapter, venue_order_id: str, dry_run: bool, symbol_venue: Optional[str] = None) -> bool:
     """
     Cross-adapter safety shim for cancel.
 
-    Primary attempt matches your current adapters: cancel_order(<id>, dry_run=bool)
-    Fallbacks cover:
-      - adapters that don't accept dry_run kwarg
-      - adapters that require keyword venue_order_id=
+    Newer adapters such as OKX require symbol_venue/instId in addition to the venue order id.
+    Older adapters keep working through TypeError fallbacks.
     """
-    # 1) Preferred: positional id + dry_run kwarg
-    try:
-        return bool(adapter.cancel_order(venue_order_id, dry_run=dry_run))
-    except TypeError as e:
-        msg = str(e) or ""
-        if "unexpected keyword argument" in msg:
-            # 2) Positional id only
-            return bool(adapter.cancel_order(venue_order_id))
-        # 3) Try keyword venue_order_id=
+    attempts = []
+    if symbol_venue:
+        attempts.extend([
+            lambda: adapter.cancel_order(venue_order_id, dry_run=dry_run, symbol_venue=symbol_venue),
+            lambda: adapter.cancel_order(venue_order_id=venue_order_id, dry_run=dry_run, symbol_venue=symbol_venue),
+        ])
+    attempts.extend([
+        lambda: adapter.cancel_order(venue_order_id, dry_run=dry_run),
+        lambda: adapter.cancel_order(venue_order_id),
+        lambda: adapter.cancel_order(venue_order_id=venue_order_id, dry_run=dry_run),
+        lambda: adapter.cancel_order(venue_order_id=venue_order_id),
+    ])
+    last_type_error: Optional[TypeError] = None
+    for attempt in attempts:
         try:
-            return bool(adapter.cancel_order(venue_order_id=venue_order_id, dry_run=dry_run))
-        except TypeError as e2:
-            msg2 = str(e2) or ""
-            if "unexpected keyword argument" in msg2:
-                return bool(adapter.cancel_order(venue_order_id=venue_order_id))
-            raise
+            return bool(attempt())
+        except TypeError as e:
+            last_type_error = e
+            continue
+    if last_type_error is not None:
+        raise last_type_error
+    return False
 
 
 def create_order(db: Session, req: OrderCreate) -> Order:
@@ -564,8 +568,22 @@ def cancel_order(db: Session, order_id: str) -> Order:
 
     adapter = get_adapter((order.venue or "").strip().lower())
 
+    symbol_for_cancel = getattr(order, "symbol_venue", None) or getattr(order, "symbol_canon", None)
     try:
-        ok = _cancel_order_safely(adapter, str(order.venue_order_id), dry_run=is_dry)
+        row_for_cancel = db.execute(
+            select(VenueOrderRow)
+            .where(func.lower(VenueOrderRow.venue) == (order.venue or "").strip().lower())
+            .where(VenueOrderRow.venue_order_id == str(order.venue_order_id))
+            .order_by(desc(VenueOrderRow.captured_at))
+            .limit(1)
+        ).scalars().first()
+        if row_for_cancel is not None:
+            symbol_for_cancel = getattr(row_for_cancel, "symbol_venue", None) or getattr(row_for_cancel, "symbol_canon", None) or symbol_for_cancel
+    except Exception:
+        pass
+
+    try:
+        ok = _cancel_order_safely(adapter, str(order.venue_order_id), dry_run=is_dry, symbol_venue=symbol_for_cancel)
     except Exception as e:
         # ✅ Surgical change: treat "already not open" as success
         if _is_already_closed_cancel_error(str(e)):
@@ -668,13 +686,24 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
     error: Optional[str] = None
     simulated = False
 
+    row = db.execute(
+        select(VenueOrderRow)
+        .where(VenueOrderRow.venue == venue)
+        .where(VenueOrderRow.venue_order_id == venue_order_id)
+        .order_by(desc(VenueOrderRow.captured_at))
+        .limit(1)
+    ).scalars().first()
+    symbol_for_cancel = None
+    if row is not None:
+        symbol_for_cancel = getattr(row, "symbol_venue", None) or getattr(row, "symbol_canon", None)
+
     if is_dry:
         simulated = True
         ok = True
     else:
         try:
             adapter = get_adapter(venue)
-            ok = bool(_cancel_order_safely(adapter, venue_order_id, dry_run=is_dry))
+            ok = bool(_cancel_order_safely(adapter, venue_order_id, dry_run=is_dry, symbol_venue=symbol_for_cancel))
         except Exception as e:
             # ✅ Surgical change: treat "already not open" as success
             if _is_already_closed_cancel_error(str(e)):
@@ -683,14 +712,6 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
             else:
                 ok = False
                 error = str(e)
-
-    row = db.execute(
-        select(VenueOrderRow)
-        .where(VenueOrderRow.venue == venue)
-        .where(VenueOrderRow.venue_order_id == venue_order_id)
-        .order_by(desc(VenueOrderRow.captured_at))
-        .limit(1)
-    ).scalars().first()
 
     did_update_snapshot = False
     snapshot_rows_updated = 0

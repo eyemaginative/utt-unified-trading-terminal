@@ -181,6 +181,17 @@ class OKXAdapter(ExchangeAdapter):
             data = r.json() if r.content else {}
         return self._check_okx_response(data, op=f"private GET {path}")
 
+    def _private_post(self, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        request_path = self._request_path(path, None)
+        url = self._api_url(request_path)
+        body = json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False)
+        headers = self._headers(method="POST", request_path=request_path, body=body)
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(url, headers=headers, content=body.encode("utf-8"))
+            r.raise_for_status()
+            data = r.json() if r.content else {}
+        return self._check_okx_response(data, op=f"private POST {path}")
+
     # ─────────────────────────────────────────────────────────────
     # Instruments / symbols
     # ─────────────────────────────────────────────────────────────
@@ -752,6 +763,54 @@ class OKXAdapter(ExchangeAdapter):
                 by_id[oid] = o
         return list(by_id.values())
 
+    @staticmethod
+    def _okx_env_enabled(name: str) -> bool:
+        return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _okx_live_venues_include_okx() -> bool:
+        try:
+            live = settings.live_venues_set()
+            return "okx" in {str(x or "").strip().lower() for x in live}
+        except Exception:
+            raw = getattr(settings, "live_venues", None) or os.getenv("LIVE_VENUES") or ""
+            return "okx" in {x.strip().lower() for x in str(raw).split(",") if x.strip()}
+
+    def _okx_trading_enabled(self) -> bool:
+        return self._okx_env_enabled("OKX_ENABLE_TRADING") and self._okx_live_venues_include_okx()
+
+    def _okx_trading_gate_reason(self) -> str:
+        missing = []
+        if not self._okx_env_enabled("OKX_ENABLE_TRADING"):
+            missing.append("OKX_ENABLE_TRADING=1")
+        if not self._okx_live_venues_include_okx():
+            missing.append("LIVE_VENUES includes okx")
+        return "OKX live trading is disabled. Required: " + ", ".join(missing or ["live gates"])
+
+    @staticmethod
+    def _okx_client_order_id(value: Any) -> Optional[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        cleaned = "".join(ch for ch in raw if ch.isalnum())
+        if not cleaned:
+            cleaned = "UTT" + hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()[:29]
+        if len(cleaned) > 32:
+            cleaned = cleaned[:32]
+        return cleaned or None
+
+    @staticmethod
+    def _okx_order_type(type_: Any, tif: Optional[str], post_only: bool) -> str:
+        typ = str(type_ or "").strip().lower()
+        tif_norm = str(tif or "").strip().lower()
+        if typ == "market":
+            return "market"
+        if post_only:
+            return "post_only"
+        if tif_norm in {"ioc", "fok"}:
+            return tif_norm
+        return "limit"
+
     def place_order(
         self,
         symbol_venue: str,
@@ -765,32 +824,72 @@ class OKXAdapter(ExchangeAdapter):
         post_only: bool = False,
     ) -> PlacedOrder:
         inst_id = self.resolve_symbol(symbol_venue)
-        payload = {
+        ord_type = self._okx_order_type(type_, tif, post_only)
+        payload: Dict[str, Any] = {
             "instId": inst_id,
             "tdMode": "cash",
             "side": str(side or "").lower(),
-            "ordType": "market" if str(type_ or "").lower() == "market" else ("post_only" if post_only else "limit"),
+            "ordType": ord_type,
             "sz": str(qty),
-            "clOrdId": str(client_order_id or "")[:32] or None,
         }
-        if payload["ordType"] == "limit":
+        client_oid = self._okx_client_order_id(client_order_id)
+        if client_oid:
+            payload["clOrdId"] = client_oid
+        if ord_type != "market":
             payload["px"] = str(limit_price or "")
-        _ = tif  # OKX.5 will wire venue-specific TIF behavior after read-only validation.
 
         if dry_run:
             return {"status": "acked", "venue_order_id": "dryrun", "raw": {"dry_run": True, "payload": payload}}
 
-        if str(os.getenv("OKX_ENABLE_TRADING") or "").strip().lower() not in {"1", "true", "yes", "on"}:
-            return {"status": "rejected", "reject_reason": "OKX live trading is disabled. Set OKX_ENABLE_TRADING=1 only after OKX.5 validation.", "raw": {"payload": payload}}
+        if not self._okx_trading_enabled():
+            return {"status": "rejected", "reject_reason": self._okx_trading_gate_reason(), "raw": {"payload": payload}}
 
-        return {"status": "rejected", "reject_reason": "OKX live trading submit is intentionally not wired until OKX.5.", "raw": {"payload": payload}}
+        data = self._private_post("/api/v5/trade/order", payload=payload)
+        rows = data.get("data") or []
+        row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+        s_code = str(row.get("sCode", "0") or "0")
+        if s_code != "0":
+            msg = str(row.get("sMsg") or row.get("msg") or "OKX order rejected")
+            return {"status": "rejected", "reject_reason": f"OKX order rejected sCode={s_code} sMsg={msg}", "raw": data}
+        oid = str(row.get("ordId") or "").strip()
+        return {"status": "open", "venue_order_id": oid or None, "raw": data}
 
-    def cancel_order(self, venue_order_id: str, dry_run: bool) -> bool:
+    def _lookup_inst_for_order_id(self, venue_order_id: str) -> Optional[str]:
+        oid = str(venue_order_id or "").strip()
+        if not oid:
+            return None
+        for fetcher in (lambda: self._orders_pending_rows(), lambda: self._orders_history_rows(limit=100)):
+            try:
+                for row in fetcher() or []:
+                    if str(row.get("ordId") or "").strip() == oid:
+                        inst = str(row.get("instId") or "").strip().upper()
+                        if inst:
+                            return inst
+            except Exception:
+                continue
+        return None
+
+    def cancel_order(self, venue_order_id: str, dry_run: bool, symbol_venue: Optional[str] = None) -> bool:
         if dry_run:
             return True
-        if str(os.getenv("OKX_ENABLE_TRADING") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        if not self._okx_trading_enabled():
             return False
-        return False
+        oid = str(venue_order_id or "").strip()
+        if not oid:
+            raise RuntimeError("OKX cancel requires venue_order_id")
+        inst_id = self.resolve_symbol(symbol_venue) if symbol_venue else None
+        if not inst_id:
+            inst_id = self._lookup_inst_for_order_id(oid)
+        if not inst_id:
+            raise RuntimeError("OKX cancel requires symbol_venue/instId")
+        data = self._private_post("/api/v5/trade/cancel-order", payload={"instId": inst_id, "ordId": oid})
+        rows = data.get("data") or []
+        row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+        s_code = str(row.get("sCode", "0") or "0")
+        if s_code != "0":
+            msg = str(row.get("sMsg") or row.get("msg") or "OKX cancel rejected")
+            raise RuntimeError(f"OKX cancel rejected sCode={s_code} sMsg={msg}")
+        return True
 
     # ─────────────────────────────────────────────────────────────
     # Diagnostics support for /api/okx/diagnostics

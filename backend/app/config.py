@@ -146,6 +146,19 @@ class Settings(BaseSettings):
     cryptocom_enabled: bool = Field(default=False, alias="CRYPTOCOM_ENABLED")
 
     # ─────────────────────────────────────────────────────────────
+    # OKX integration — optional & guarded
+    #
+    # Credentials can come from env vars or Profile → API Keys with venue='okx'.
+    # For US-facing OKX accounts, keep OKX_BASE_URL at the default https://us.okx.com.
+    # If you later explicitly confirm a different OKX region, override OKX_BASE_URL.
+    # ─────────────────────────────────────────────────────────────
+    okx_enabled: bool = Field(default=False, alias="OKX_ENABLED")
+    okx_api_key: str = Field(default="", alias="OKX_API_KEY")
+    okx_api_secret: str = Field(default="", alias="OKX_API_SECRET")
+    okx_api_passphrase: str = Field(default="", alias="OKX_API_PASSPHRASE")
+    okx_base_url: str = Field(default="https://us.okx.com", alias="OKX_BASE_URL")
+
+    # ─────────────────────────────────────────────────────────────
     # Robinhood (Crypto) integration — optional & guarded
     # ─────────────────────────────────────────────────────────────
     robinhood_enabled: bool = Field(default=False, alias="ROBINHOOD_ENABLED")
@@ -500,6 +513,64 @@ class Settings(BaseSettings):
         if has_env:
             return True
         return False
+
+
+    def okx_private_creds(self):
+        """Optional callable for adapters: returns (api_key, api_secret, passphrase).
+
+        Preferred storage: Profile → API Keys with venue='okx'.
+        Env fallback: OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE.
+        """
+        bundle = self._vault_latest_bundle("okx")
+        if bundle:
+            api_key = (bundle.get("api_key") or "").strip()
+            api_secret = (bundle.get("api_secret") or "").strip()
+            passphrase = (bundle.get("passphrase") or "").strip()
+            if api_key and api_secret and passphrase:
+                return (api_key, api_secret, passphrase)
+
+        api_key = (getattr(self, "okx_api_key", "") or os.getenv("OKX_API_KEY") or "").strip()
+        api_secret = (getattr(self, "okx_api_secret", "") or os.getenv("OKX_API_SECRET") or "").strip()
+        passphrase = (getattr(self, "okx_api_passphrase", "") or os.getenv("OKX_API_PASSPHRASE") or "").strip()
+        if api_key and api_secret and passphrase:
+            return (api_key, api_secret, passphrase)
+        return None
+
+    def okx_effective_enabled(self) -> bool:
+        """True when OKX has a complete credential bundle and a valid base URL.
+
+        The explicit OKX_ENABLED flag is supported, but Profile → API Keys credentials
+        are enough to enable read-only balance/symbol/orderbook paths.
+        """
+        vc = None
+        try:
+            vc = self.okx_private_creds()
+        except Exception:
+            vc = None
+        has_creds = (
+            isinstance(vc, (list, tuple))
+            and len(vc) >= 3
+            and bool((vc[0] or "").strip())
+            and bool((vc[1] or "").strip())
+            and bool((vc[2] or "").strip())
+        )
+        if not has_creds:
+            return False
+
+        base_url = self.okx_effective_base_url()
+        if not (base_url.startswith("https://") or base_url.startswith("http://")):
+            return False
+
+        # OKX_ENABLED can be used as an explicit operator signal, but read-only
+        # onboarding should also work from saved Profile credentials alone.
+        return True
+
+    def okx_effective_base_url(self) -> str:
+        base = (getattr(self, "okx_base_url", "") or os.getenv("OKX_BASE_URL") or "https://us.okx.com").strip()
+        base = base.rstrip("/")
+        if base.endswith("/api/v5"):
+            base = base[: -len("/api/v5")]
+        return base or "https://us.okx.com"
 
 
     def coinbase_trade_private_creds(self):

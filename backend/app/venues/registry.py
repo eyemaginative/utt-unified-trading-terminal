@@ -79,6 +79,22 @@ def _cryptocom_enabled() -> bool:
     return bool(k2 and s2)
 
 
+def _okx_enabled() -> bool:
+    """OKX is enabled when a complete env or Profile API-key bundle exists."""
+    try:
+        fn = getattr(settings, "okx_effective_enabled", None)
+        if callable(fn):
+            return bool(fn())
+    except Exception:
+        return False
+
+    import os
+    k = (os.getenv("OKX_API_KEY") or "").strip()
+    s = (os.getenv("OKX_API_SECRET") or "").strip()
+    p = (os.getenv("OKX_API_PASSPHRASE") or "").strip()
+    return bool(k and s and p)
+
+
 def _make_registry() -> Dict[str, VenueSpec]:
     """
     Build the registry lazily to avoid import-time circular dependencies
@@ -108,6 +124,10 @@ def _make_registry() -> Dict[str, VenueSpec]:
     def cryptocom_factory():
         from ..adapters.cryptocom_exchange import CryptoComExchangeAdapter
         return CryptoComExchangeAdapter()
+
+    def okx_factory():
+        from ..adapters.okx import OKXAdapter
+        return OKXAdapter()
 
     def solana_dex_factory():
         # On-chain Solana DEX / aggregator execution + reads
@@ -178,6 +198,18 @@ def _make_registry() -> Dict[str, VenueSpec]:
             supports_balances=True,
             supports_orderbook=True,  # public/get-book
             supports_markets=True,    # instruments discovery via public/get-instruments
+        ),
+
+        # NEW: OKX Exchange (REST, read-only foundation first)
+        "okx": VenueSpec(
+            key="okx",
+            display_name="OKX",
+            enabled=_okx_enabled,
+            adapter_factory=okx_factory,
+            supports_trading=False,   # OKX.5: enable only after read-only validation + gated trading patch
+            supports_balances=True,
+            supports_orderbook=True,
+            supports_markets=True,
         ),
 
         # NEW: Solana on-chain DEX (reads first; trading wired later)

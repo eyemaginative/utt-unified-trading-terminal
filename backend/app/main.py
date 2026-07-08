@@ -55,6 +55,14 @@ except Exception as e:
     basis_router = None
 
 
+# OKX read-only diagnostics router (/api/okx/*)
+try:
+    from .routers.okx import router as okx_router
+except Exception as e:
+    print("okx router import failed:", repr(e))
+    okx_router = None
+
+
 # NEW: rules router (/api/rules/order)
 from .routers.rules import router as rules_router
 
@@ -177,6 +185,8 @@ def create_app() -> FastAPI:
         app.include_router(bridge_router)
     if basis_router is not None:
         app.include_router(basis_router)
+    if okx_router is not None:
+        app.include_router(okx_router)
     app.include_router(arm_router)
     app.include_router(venue_orders_router)
     app.include_router(all_orders_router)

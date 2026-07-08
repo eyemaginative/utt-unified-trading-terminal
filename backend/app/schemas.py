@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
 from datetime import datetime
 
-Venue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom"]
+Venue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx"]
 Side = Literal["buy", "sell"]
 OrderType = Literal["market", "limit"]
 

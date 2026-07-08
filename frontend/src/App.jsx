@@ -314,14 +314,14 @@ const ALL_VENUES_VALUE = "ALL";
 
 // NOTE: This list is used for *core trading/balances polling* fallback.
 // Do not restrict it to “discovery-capable” venues.
-const DEFAULT_SUPPORTED_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade"];
+const DEFAULT_SUPPORTED_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "okx"];
 
 // Frontend-only DEX venues whose backend route exists before the generic venues registry advertises them.
 // Keep these opt-in through the normal Manage-venues UI override.
 const FRONTEND_LOCAL_DEX_VENUES = ["polkadot_hydration"];
 
 // Arb venues (preferred cross-venue scan list)
-const ARB_VENUES = ["coinbase", "kraken", "gemini", "robinhood", "dex_trade"];
+const ARB_VENUES = ["coinbase", "kraken", "gemini", "robinhood", "dex_trade", "okx"];
 
 const LS_VISIBLE_WIDGETS = "utt_visible_widgets_v1";
 const LS_RIGHT_RAIL_SPLIT = "utt_right_rail_split_v1";
@@ -3466,6 +3466,7 @@ export default function App() {
     if (value === "kraken") return "Kraken";
     if (value === "robinhood") return "Robinhood";
     if (value === "dex_trade") return "Dex-Trade";
+    if (value === "okx") return "OKX";
     if (value === "polkadot_hydration") return "Polkadot-Hydration";
     if (value === "polkadot_dex") return "Polkadot DEX";
     if (value === "hydration") return "Hydration";

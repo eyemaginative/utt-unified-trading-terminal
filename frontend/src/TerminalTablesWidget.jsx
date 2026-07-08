@@ -958,8 +958,12 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   const [basisLotDetailsByKey, setBasisLotDetailsByKey] = useState(() => ({}));
   // Canonical wrapped SOL mint (for Jupiter pricing lookups)
   const SOL_MINT = "So11111111111111111111111111111111111111112";
-  // Solana venues do NOT use the CEX balances refresh pipeline
+  // Solana venues do NOT use the CEX balances refresh pipeline.
+  // When viewing All Venues, include Solana-Jupiter via the same on-chain path
+  // because /api/balances/latest is CEX/adapter snapshot only.
   const isSolanaVenue = String(venue || "").toLowerCase().startsWith("solana");
+  const isAllVenuesSelected = String(venue || "") === String(ALL_VENUES_VALUE || "");
+  const shouldIncludeSolanaOnchainBalances = isSolanaVenue || isAllVenuesSelected;
   const [showSolanaOnchainDetails, setShowSolanaOnchainDetails] = useState(false);
 
   // ─────────────────────────────────────────────────────────────
@@ -1750,7 +1754,16 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       const label = state?.loading ? "Lots…" : state?.open ? "Hide Lots" : "Lots";
 
       return (
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+        <span
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+            flexWrap: "nowrap",
+            whiteSpace: "nowrap",
+            verticalAlign: "middle",
+          }}
+        >
           {renderBalanceBasisBadge(row)}
           <button
             data-no-drag="1"
@@ -1772,11 +1785,14 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
             }
             style={{
               ...(sx.button || {}),
-              padding: "2px 7px",
-              fontSize: 11,
-              lineHeight: 1.3,
+              padding: "1px 6px",
+              fontSize: 10,
+              lineHeight: 1.2,
+              minHeight: 18,
               opacity: disabled ? 0.45 : 0.92,
               cursor: disabled ? "not-allowed" : "pointer",
+              whiteSpace: "nowrap",
+              flex: "0 0 auto",
             }}
           >
             {label}
@@ -2075,36 +2091,162 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       return out;
     }
 
+    function solanaOnchainBalanceRows(venueLabel) {
+      return (solanaOnchain?.items || []).map((it) => {
+        const mint = String(it?.mint || "").trim();
+        const mintShort = mint ? `${mint.slice(0, 6)}…` : "";
+        // Prefer explicit symbol or Token Registry (mint->symbol).
+        // Avoid falling back to `it.asset` here because for mint-only rows `asset` is already mint-short,
+        // which would make the UI show the mint twice.
+        const symbol = String(it?.symbol || (mint ? (solanaTokenRegistryMap?.[mint] || solanaTokenRegistryMap?.[String(mint).toLowerCase()]) : "") || "").trim();
+        const assetLabel = symbol || mintShort || mint || "";
+        const amt = Number(it?.amount ?? 0);
+        const px = getSolanaUsdPriceForMint(mint);
+        return {
+          venue: venueLabel || "solana_jupiter",
+          asset: assetLabel,
+          symbol: symbol || null,
+          mint: mint || null,
+          // Only show mint on a second line when we have a real symbol.
+          mint_short: symbol ? (mintShort || null) : null,
+          total: amt,
+          available: amt,
+          hold: 0,
+          px_usd: typeof px === "number" ? px : null,
+          total_usd: typeof px === "number" ? amt * px : null,
+          usd_source_symbol: "USDC",
+        };
+      });
+    }
+
+    function isSolanaJupiterBalanceRow(row) {
+      const v = String(row?.venue || "").trim().toLowerCase();
+      return v === "solana_jupiter" || v === "solana-dex" || v === "solana_dex" || v.startsWith("solana");
+    }
+
+    function isSolanaSelfCustodyBalanceRow(row) {
+      const venueKey = String(row?.venue || "").trim().toLowerCase();
+      const basisVenueKey = String(row?.basis_venue || row?.basisVenue || "").trim().toLowerCase();
+      const networkKey = String(row?.network || row?.chain || "").trim().toLowerCase();
+      return (
+        venueKey === "self_custody_solana" ||
+        venueKey === "self-custody-solana" ||
+        venueKey === "solana_self_custody" ||
+        venueKey === "solana-self-custody" ||
+        (venueKey.includes("self") && venueKey.includes("solana")) ||
+        basisVenueKey === "self_custody_solana" ||
+        basisVenueKey === "self-custody-solana" ||
+        (basisVenueKey.includes("self") && basisVenueKey.includes("solana")) ||
+        ((venueKey === "self_custody" || venueKey === "self-custody" || venueKey === "wallet") && networkKey.includes("solana"))
+      );
+    }
+
+    function solanaBalanceDedupeKeys(row) {
+      const out = [];
+      const seen = new Set();
+      const add = (key) => {
+        const k = String(key || "").trim();
+        if (!k || seen.has(k)) return;
+        seen.add(k);
+        out.push(k);
+      };
+
+      const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+      const symbol = String(row?.symbol || "").trim().toUpperCase();
+      if (asset && asset !== "—") add(`asset:${asset}`);
+      if (symbol && symbol !== "—") add(`asset:${symbol}`);
+
+      // Do not use generic row.address here.  Wallet/self-custody rows use
+      // address as the wallet address, not the token mint, which prevented
+      // self_custody_solana SOL/UTTT rows from matching live solana_jupiter rows.
+      const mint = String(
+        row?.mint ||
+        row?.token_mint ||
+        row?.tokenMint ||
+        row?.mint_address ||
+        row?.mintAddress ||
+        row?.token_address ||
+        row?.tokenAddress ||
+        ""
+      ).trim().toLowerCase();
+      if (mint) {
+        if (mint === "sol" || mint === "so11111111111111111111111111111111111111112") {
+          add("asset:SOL");
+        } else {
+          add(`mint:${mint}`);
+        }
+      }
+
+      return out;
+    }
+
+    function solanaBalanceDedupeKey(row) {
+      const keys = solanaBalanceDedupeKeys(row);
+      return keys[0] || "";
+    }
+
+    function solanaBalanceUsdValue(row) {
+      const totalUsd = Number(row?.total_usd ?? row?.usd_value ?? row?.usdValue);
+      if (Number.isFinite(totalUsd)) return totalUsd;
+      const px = Number(row?.px_usd ?? row?.usd_price ?? row?.usdPrice);
+      const qty = Number(row?.total ?? row?.balance ?? row?.amount ?? 0);
+      if (Number.isFinite(px) && Number.isFinite(qty)) return px * qty;
+      return 0;
+    }
+
+    function solanaLiveDedupeKeySet(liveRows) {
+      const keys = new Set();
+      for (const row of liveRows || []) {
+        for (const key of solanaBalanceDedupeKeys(row)) {
+          if (key) keys.add(key);
+        }
+      }
+      return keys;
+    }
+
+    function solanaRowMatchesDedupeKeySet(row, keys) {
+      if (!keys || !keys.size) return false;
+      return solanaBalanceDedupeKeys(row).some((key) => keys.has(key));
+    }
+
+    function replacedSolanaSelfCustodyRowsForAllVenues(existingRows, liveRows) {
+      const liveKeys = solanaLiveDedupeKeySet(liveRows);
+      if (!liveKeys.size) return [];
+      return (existingRows || []).filter((row) => {
+        if (!isSolanaSelfCustodyBalanceRow(row)) return false;
+        return solanaRowMatchesDedupeKeySet(row, liveKeys);
+      });
+    }
+
+    function rowsWithLiveSolanaReplacingSelfCustody(existingRows, liveRows) {
+      const liveKeys = solanaLiveDedupeKeySet(liveRows);
+      if (!liveKeys.size) return existingRows || [];
+      return (existingRows || []).filter((row) => {
+        if (!isSolanaSelfCustodyBalanceRow(row)) return true;
+        return !solanaRowMatchesDedupeKeySet(row, liveKeys);
+      });
+    }
+
+    function missingSolanaBalanceRowsForAllVenues(existingRows, liveRows) {
+      const existing = new Set();
+      for (const row of existingRows || []) {
+        if (!isSolanaJupiterBalanceRow(row)) continue;
+        for (const key of solanaBalanceDedupeKeys(row)) {
+          if (key) existing.add(key);
+        }
+      }
+      return (liveRows || []).filter((row) => {
+        const keys = solanaBalanceDedupeKeys(row);
+        return !keys.length || !keys.some((key) => existing.has(key));
+      });
+    }
+
     const balancesFiltered = useMemo(() => {
       let rows = balancesSorted || [];
       if (isSolanaVenue) {
         // When the selected venue is Solana, balances come from live on-chain RPC
         // (solanaOnchain.items normalized earlier). Shape it to match the balances table.
-        rows = (solanaOnchain?.items || []).map((it) => {
-          const mint = String(it?.mint || "").trim();
-          const mintShort = mint ? `${mint.slice(0, 6)}…` : "";
-          // Prefer explicit symbol or Token Registry (mint->symbol).
-          // Avoid falling back to `it.asset` here because for mint-only rows `asset` is already mint-short,
-          // which would make the UI show the mint twice.
-          const symbol = String(it?.symbol || (mint ? (solanaTokenRegistryMap?.[mint] || solanaTokenRegistryMap?.[String(mint).toLowerCase()]) : "") || "").trim();
-          const assetLabel = symbol || mintShort || mint || "";
-          const amt = Number(it?.amount ?? 0);
-          const px = getSolanaUsdPriceForMint(mint);
-          return {
-            venue: venue || "solana",
-            asset: assetLabel,
-            symbol: symbol || null,
-            mint: mint || null,
-            // Only show mint on a second line when we have a real symbol.
-            mint_short: symbol ? (mintShort || null) : null,
-            total: amt,
-            available: amt,
-            hold: 0,
-            px_usd: typeof px === "number" ? px : null,
-            total_usd: typeof px === "number" ? amt * px : null,
-            usd_source_symbol: "USDC",
-          };
-        });
+        rows = solanaOnchainBalanceRows(venue || "solana_jupiter");
       } else if (isPolkadotHydrationVenue) {
         rows = (hydrationOnchain?.items || []).map((it) => ({
           venue: venue || "polkadot_hydration",
@@ -2119,6 +2261,19 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           usd_source_symbol: it?.usd_source_symbol || "—",
         }));
       }
+
+      if (isAllVenuesSelected && (solanaOnchain?.items || []).length) {
+        const liveSolanaRows = solanaOnchainBalanceRows("solana_jupiter");
+        const baseRows = rowsWithLiveSolanaReplacingSelfCustody(rows || [], liveSolanaRows);
+        const missingSolanaRows = missingSolanaBalanceRowsForAllVenues(baseRows || [], liveSolanaRows);
+        if (baseRows !== rows || missingSolanaRows.length) {
+          rows = [
+            ...(baseRows || []),
+            ...missingSolanaRows,
+          ];
+        }
+      }
+
       const q = String(balancesSymbolQuery || "")
         .trim()
         .toUpperCase();
@@ -2130,7 +2285,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         const a = String(b?.asset || "").trim().toUpperCase();
         return a.includes(q);
       });
-    }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, isPolkadotHydrationVenue, solanaOnchain, hydrationOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
+    }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, isPolkadotHydrationVenue, isAllVenuesSelected, solanaOnchain, hydrationOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
 
     const balancesDisplayRows = useMemo(() => {
       if (venue !== ALL_VENUES_VALUE) return balancesFiltered || [];
@@ -2138,17 +2293,22 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     }, [balancesFiltered, expandedBalanceGroups, venue, ALL_VENUES_VALUE]);
 
   const solanaPortfolioTotalUsd = useMemo(() => {
-    if (!isSolanaVenue) return null;
-    const items = solanaOnchain?.items || [];
-    let sum = 0;
-    for (const t of items) {
-      const mint = String(t?.mint || "").trim();
-      const amt = Number(t?.amount ?? 0) || 0;
-      const p = getSolanaUsdPriceForMint(mint);
-      if (typeof p === "number") sum += amt * p;
+    if (!shouldIncludeSolanaOnchainBalances) return null;
+    const liveRows = solanaOnchainBalanceRows("solana_jupiter");
+    let rowsForTotal = liveRows;
+    let replacedSelfCustodyUsd = 0;
+    if (isAllVenuesSelected) {
+      const replacedRows = replacedSolanaSelfCustodyRowsForAllVenues(balancesSorted || [], liveRows);
+      replacedSelfCustodyUsd = replacedRows.reduce((sum, row) => sum + solanaBalanceUsdValue(row), 0);
+      const baseRows = rowsWithLiveSolanaReplacingSelfCustody(balancesSorted || [], liveRows);
+      rowsForTotal = missingSolanaBalanceRowsForAllVenues(baseRows || [], liveRows);
     }
-    return sum;
-  }, [isSolanaVenue, solanaOnchain, solanaPrices]);
+    let sum = 0;
+    for (const row of rowsForTotal || []) {
+      sum += solanaBalanceUsdValue(row);
+    }
+    return sum - replacedSelfCustodyUsd;
+  }, [shouldIncludeSolanaOnchainBalances, isAllVenuesSelected, balancesSorted, solanaOnchain, solanaPrices, solanaTokenRegistryMap]);
 
   const hydrationPortfolioTotalUsd = useMemo(() => {
     if (!isPolkadotHydrationVenue) return null;
@@ -2260,6 +2420,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     // ─────────────────────────────────────────────────────────────
     const balancesRefreshRef = useRef({ inFlight: false, seq: 0 });
     const solanaRefreshRef = useRef({ inFlight: false, lastAt: 0 });
+    const allVenuesSolanaAutoLoadRef = useRef(false);
     const hydrationRefreshRef = useRef({ inFlight: false, lastAt: 0 });
     const balancesBannerTimerRef = useRef(null);
 
@@ -2622,7 +2783,7 @@ async function loadSolanaTokenRegistryMap() {
 
 
 async function refreshSolanaOnchainBalances() {
-      if (!isSolanaVenue) return;
+      if (!shouldIncludeSolanaOnchainBalances) return;
 
       // Prevent overlap / click-spam bursts (helps avoid public RPC 429 cascades).
       if (solanaRefreshRef?.current?.inFlight) return;
@@ -2744,6 +2905,21 @@ async function refreshSolanaOnchainBalances() {
       try { solanaRefreshRef.current.inFlight = false; } catch { /* ignore */ }
 
     useEffect(() => {
+      if (!isAllVenuesSelected) {
+        allVenuesSolanaAutoLoadRef.current = false;
+        return;
+      }
+      if (allVenuesSolanaAutoLoadRef.current) return;
+      if (solanaOnchain?.loading || solanaRefreshRef?.current?.inFlight) return;
+      if ((solanaOnchain?.items || []).length > 0) return;
+
+      allVenuesSolanaAutoLoadRef.current = true;
+      refreshSolanaOnchainBalances();
+      // Intentionally one-shot per All Venues selection to avoid RPC hammering.
+      // Manual Refresh still refreshes Solana-Jupiter alongside the CEX/adapter rows.
+    }, [isAllVenuesSelected]);
+
+    useEffect(() => {
       return () => {
         if (balancesBannerTimerRef.current) {
           clearTimeout(balancesBannerTimerRef.current);
@@ -2794,9 +2970,13 @@ async function refreshSolanaOnchainBalances() {
       setBalancesRefreshingLocal(true);
 
       try {
-        // Always pass the current venue explicitly. App owns ALL-venues fan-out + skip guards.
-        // doRefreshBalances may or may not return a promise; normalize.
+        // Always pass the current venue explicitly. App owns CEX/all-venue fan-out + skip guards.
+        // Solana-Jupiter balances live outside /api/balances/latest, so refresh them
+        // alongside All Venues instead of requiring a prior Solana-Jupiter selection.
         await Promise.resolve(doRefreshBalances({ venue }));
+        if (isAllVenuesSelected) {
+          await refreshSolanaOnchainBalances();
+        }
         // If App.jsx keeps last-known balances on error, no banner needed here.
       } catch (e) {
         const msg =
@@ -6359,7 +6539,7 @@ function renderFillToasts() {
 
   function renderBalances() {
     const row = { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" };
-    const balancesBusy = !!loadingBalances || !!balancesRefreshingLocal || (isSolanaVenue && !!solanaOnchain.loading) || (isPolkadotHydrationVenue && !!hydrationOnchain.loading);
+    const balancesBusy = !!loadingBalances || !!balancesRefreshingLocal || (shouldIncludeSolanaOnchainBalances && !!solanaOnchain.loading) || (isPolkadotHydrationVenue && !!hydrationOnchain.loading);
 
     return (
       <>
@@ -6418,11 +6598,15 @@ function renderFillToasts() {
                 hideTableDataGlobal
                   ? "••••"
                   : venue === ALL_VENUES_VALUE
-                    ? portfolioTotalUsdAllVenues === null || portfolioTotalUsdAllVenues === undefined
-                      ? portfolioTotalUsd === null
-                        ? "—"
-                        : fmtUsd?.(portfolioTotalUsd)
-                      : fmtUsd?.(portfolioTotalUsdAllVenues)
+                    ? (() => {
+                        const base =
+                          portfolioTotalUsdAllVenues === null || portfolioTotalUsdAllVenues === undefined
+                            ? portfolioTotalUsd
+                            : portfolioTotalUsdAllVenues;
+                        const dex = solanaPortfolioTotalUsd;
+                        if (base === null || base === undefined) return dex === null || dex === undefined ? "—" : fmtUsd?.(dex);
+                        return fmtUsd?.(Number(base || 0) + Number(dex || 0));
+                      })()
                     : isSolanaVenue
                       ? solanaPortfolioTotalUsd === null
                         ? "—"

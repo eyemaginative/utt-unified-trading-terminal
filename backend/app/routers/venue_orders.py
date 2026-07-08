@@ -47,7 +47,7 @@ def post_refresh(
 
     if is_all:
         # Keep this list up to date as you add venues.
-        venues = ["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom"]
+        venues = ["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx"]
 
         results_list: List[Dict[str, Any]] = []
         results_by_venue: Dict[str, Dict[str, Any]] = {}

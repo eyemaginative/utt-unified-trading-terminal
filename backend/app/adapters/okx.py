@@ -432,8 +432,35 @@ class OKXAdapter(ExchangeAdapter):
             filled = self._safe_float(row.get("accFillSz"))
             avg = self._safe_float(row.get("avgPx"))
             px = self._safe_float(row.get("px"))
-            fee = self._safe_float(row.get("fee"))
+            fee_raw = self._safe_float(row.get("fee"))
             fee_asset = str(row.get("feeCcy") or "").strip().upper() or None
+
+            # OKX reports fees as signed values (usually negative for a fee charged).
+            # UTT venue rows store fees as positive cost amounts, matching the
+            # existing Gemini/Dex-Trade rows and allowing Net/Tax columns to use
+            # total_after_fee consistently.
+            fee = abs(float(fee_raw)) if fee_raw is not None else None
+
+            quote_asset = ""
+            try:
+                if "-" in inst_id:
+                    quote_asset = (inst_id.split("-", 1)[1] or "").strip().upper()
+            except Exception:
+                quote_asset = ""
+
+            total_after_fee = None
+            try:
+                exec_qty = filled if (filled is not None and float(filled) > 0.0) else None
+                exec_px = avg if (avg is not None and float(avg) > 0.0) else None
+                if exec_qty is not None and exec_px is not None:
+                    gross_quote = float(exec_qty) * float(exec_px)
+                    if fee is not None and fee_asset and (fee_asset == quote_asset or fee_asset in {"USD", "USDT", "USDC"}):
+                        total_after_fee = gross_quote - float(fee)
+                    else:
+                        total_after_fee = gross_quote
+            except Exception:
+                total_after_fee = None
+
             ctime = self._dt_from_ms(row.get("cTime"))
             utime = self._dt_from_ms(row.get("uTime"))
             return {
@@ -452,6 +479,7 @@ class OKXAdapter(ExchangeAdapter):
                 "avg_fill_price": avg,
                 "fee": fee,
                 "fee_asset": fee_asset,
+                "total_after_fee": total_after_fee,
                 "created_at": ctime,
                 "updated_at": utime,
             }

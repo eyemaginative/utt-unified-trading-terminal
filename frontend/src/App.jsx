@@ -717,17 +717,31 @@ function calcGrossTotal(o) {
 }
 
 function calcFee(o) {
-  const fee = Number(o?.fee);
-  return Number.isFinite(fee) ? fee : null;
+  const raw = o?.fee;
+  if (raw === null || raw === undefined || raw === "") return null;
+
+  const fee = Number(raw);
+  if (!Number.isFinite(fee)) return null;
+
+  // OKX reports fee charges as signed negative values in raw order payloads.
+  // Treat them as positive fee-cost values for UTT display/economics fallback.
+  const venue = String(o?.venue || o?.source || "").trim().toLowerCase();
+  if (venue === "okx") return Math.abs(fee);
+
+  return fee;
 }
 
 function calcNetTotal(o) {
-  const taf = Number(o?.total_after_fee);
-  if (Number.isFinite(taf)) return taf;
+  const rawTaf = o?.total_after_fee;
+  if (rawTaf !== null && rawTaf !== undefined && rawTaf !== "") {
+    const taf = Number(rawTaf);
+    if (Number.isFinite(taf)) return taf;
+  }
 
   const gross = calcGrossTotal(o);
   const fee = calcFee(o);
   if (Number.isFinite(gross) && Number.isFinite(fee)) return gross - fee;
+  if (Number.isFinite(gross)) return gross;
 
   return null;
 }

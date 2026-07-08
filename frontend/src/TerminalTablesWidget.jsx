@@ -73,7 +73,7 @@ const LS_SOLANA_DETECTED_TOKENS_KEY = "utt_solana_detected_tokens_v1";
 
 // Discovery-enabled venues (UI allow-list)
 // We only show venues that are BOTH supported by the app AND in this allow-list.
-const DEFAULT_DISCOVERY_ALLOW_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "cryptocom"];
+const DEFAULT_DISCOVERY_ALLOW_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "cryptocom", "okx"];
 const COLS = {
   created: "created",
   closed: "closed",

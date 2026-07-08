@@ -323,6 +323,10 @@ const FRONTEND_LOCAL_DEX_VENUES = ["polkadot_hydration"];
 // Arb venues (preferred cross-venue scan list)
 const ARB_VENUES = ["coinbase", "kraken", "gemini", "robinhood", "dex_trade", "okx"];
 
+// Venues that should mount OrderTicketWidget for read-only pretrade/rules inspection,
+// but must remain submit-blocked inside the ticket until trading is explicitly enabled.
+const READ_ONLY_ORDER_TICKET_VENUES = new Set(["okx"]);
+
 const LS_VISIBLE_WIDGETS = "utt_visible_widgets_v1";
 const LS_RIGHT_RAIL_SPLIT = "utt_right_rail_split_v1";
 const LS_RIGHT_RAIL_WIDTH = "utt_right_rail_width_v1";
@@ -2315,6 +2319,14 @@ export default function App() {
   const tradingVenuesList = useMemo(() => normalizeVenueList(tradingVenues), [tradingVenues]);
   const orderbookVenuesList = useMemo(() => normalizeVenueList(orderbookVenues), [orderbookVenues]);
   const balancesVenuesList = useMemo(() => normalizeVenueList(balancesVenues), [balancesVenues]);
+  const readOnlyOrderTicketVenuesList = useMemo(
+    () => normalizeVenueList(venuesEnabled).filter((v) => READ_ONLY_ORDER_TICKET_VENUES.has(v)),
+    [venuesEnabled]
+  );
+  const orderTicketVenuesList = useMemo(
+    () => normalizeVenueList([...tradingVenuesList, ...readOnlyOrderTicketVenuesList]),
+    [tradingVenuesList, readOnlyOrderTicketVenuesList]
+  );
 
   useEffect(() => {
     let alive = true;
@@ -4885,7 +4897,10 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
   const isAllMode = venue === ALL_VENUES_VALUE;
 
   const canShowOrderBook = isAllMode ? orderbookVenuesList.length > 0 : venueSupports(selectedVenueNorm, "orderbook");
-  const canShowOrderTicket = isAllMode ? tradingVenuesList.length > 0 : venueSupports(selectedVenueNorm, "trading");
+  const selectedVenueReadOnlyTicket = READ_ONLY_ORDER_TICKET_VENUES.has(selectedVenueNorm) && venueSupports(selectedVenueNorm, "orderbook");
+  const canShowOrderTicket = isAllMode
+    ? tradingVenuesList.length > 0
+    : (venueSupports(selectedVenueNorm, "trading") || selectedVenueReadOnlyTicket);
 
   const fallbackObVenue = orderbookVenuesList[0] || supportedVenues[0] || "gemini";
   const fallbackTradeVenue = tradingVenuesList[0] || supportedVenues[0] || "gemini";
@@ -5578,7 +5593,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                           setQty={setOtQty}
                           limitPrice={otLimitPrice}
                           setLimitPrice={setOtLimitPrice}
-                          venues={tradingVenuesList.length > 0 ? tradingVenuesList : supportedVenues}
+                          venues={orderTicketVenuesList.length > 0 ? orderTicketVenuesList : (tradingVenuesList.length > 0 ? tradingVenuesList : supportedVenues)}
                         />
                       </div>
                     </div>

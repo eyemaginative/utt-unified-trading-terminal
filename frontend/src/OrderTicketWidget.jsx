@@ -1779,6 +1779,10 @@ export default function OrderTicketWidget({
     const v = String(effectiveVenue || "").toLowerCase().trim();
     return v === "polkadot_hydration" || v === "hydration" || v === "polkadot_dex" || v.startsWith("polkadot_");
   }, [effectiveVenue]);
+  const isOkxReadOnlyVenue = useMemo(
+    () => String(effectiveVenue || "").toLowerCase().trim() === "okx",
+    [effectiveVenue]
+  );
   const isDexSwapVenue = isSolanaDexVenue || isPolkadotDexVenue;
   const isSolanaLimitMode = isSolanaJupiterVenue && solanaOrderMode === "limit";
   const [preferredSolanaWallet, setPreferredSolanaWallet] = useState(() => getPreferredSolanaWalletKey());
@@ -3899,6 +3903,31 @@ export default function OrderTicketWidget({
 
     if (rulesLoading) return { status: "neutral", title: "Pre-trade checks: loading…", lines: [], block: false };
 
+    if (isOkxReadOnlyVenue) {
+      const ruleLines = [];
+      if (!hideTableData && rules) {
+        const biStr = fmtStepValue(rules?.base_increment ?? null, rules?.qty_decimals);
+        const piStr = fmtStepValue(rules?.price_increment ?? null, rules?.price_decimals);
+        const mq = rules?.min_qty ?? null;
+        const parts = [];
+        if (biStr) parts.push(`qty step: ${biStr}`);
+        if (piStr) parts.push(`price step: ${piStr}`);
+        if (mq !== null && mq !== undefined) parts.push(`min qty: ${mq}`);
+        if (parts.length) ruleLines.push(`OKX rules loaded (${parts.join(" • ")}).`);
+      }
+      return {
+        status: "warn",
+        title: "OKX read-only mode",
+        lines: [
+          "OKX Order Ticket is mounted for orderbook/rules inspection only.",
+          "Submit remains disabled until the later OKX trading-gate patch.",
+          ...ruleLines,
+        ],
+        block: true,
+        message: "OKX trading is disabled in this build. Rules/orderbook are read-only.",
+      };
+    }
+
     if (isSolanaLimitMode) {
       if (qtyNum === null) {
         lines.push("Qty missing/invalid.");
@@ -4137,6 +4166,7 @@ export default function OrderTicketWidget({
     hideTableData,
     isSolanaLimitMode,
     isPolkadotDexVenue,
+    isOkxReadOnlyVenue,
     totalQuoteNum,
     quoteAsset,
     jupiterFrontendInputUsdValue,
@@ -6309,6 +6339,7 @@ async function submitLimitOrder() {
           Type: <b>{isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
           {isSolanaLimitMode ? <> • Expiry: <b>{hideTableData ? "••••" : solanaExpiryLabel}</b></> : null}
           {" "}• Est. Total ({totalLabel}): <b>{notional === null ? "—" : fmtNum ? fmtNum(notional) : String(notional)}</b>
+          {isOkxReadOnlyVenue ? <> • <b>Read-only</b></> : null}
         </div>
 
         <div style={{ marginTop: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -6322,16 +6353,20 @@ async function submitLimitOrder() {
             disabled={submitting || !canSubmit}
             onClick={openConfirm}
             title={
-              !canSubmitBase
-                ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isDexSwapVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
-                : preTrade?.block
-                  ? "Blocked by pre-trade checks"
-                  : "Review and confirm order"
+              isOkxReadOnlyVenue
+                ? "OKX submit is disabled until the later OKX trading-gate patch. Rules/orderbook are read-only."
+                : !canSubmitBase
+                  ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isDexSwapVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
+                  : preTrade?.block
+                    ? "Blocked by pre-trade checks"
+                    : "Review and confirm order"
             }
           >
             {submitting
               ? "Submitting…"
-              : isSolanaLimitMode
+              : isOkxReadOnlyVenue
+                ? "OKX Read-only"
+                : isSolanaLimitMode
                 ? side === "buy" ? "Place Buy Limit" : "Place Sell Limit"
                 : isDexSwapVenue
                   ? isPolkadotDexVenue

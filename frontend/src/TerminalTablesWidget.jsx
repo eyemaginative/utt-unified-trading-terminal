@@ -956,6 +956,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   const [solanaPrices, setSolanaPrices] = useState({ ok: false, items: {}, ts: 0 });
   const [expandedBalanceGroups, setExpandedBalanceGroups] = useState(() => ({}));
   const [basisLotDetailsByKey, setBasisLotDetailsByKey] = useState(() => ({}));
+  const [balanceMarketChange24hPctByAsset, setBalanceMarketChange24hPctByAsset] = useState(() => ({}));
   // Canonical wrapped SOL mint (for Jupiter pricing lookups)
   const SOL_MINT = "So11111111111111111111111111111111111111112";
   // Solana venues do NOT use the CEX balances refresh pipeline.
@@ -1487,6 +1488,123 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       return null;
     }
 
+    function getBalanceTotalUsd(row) {
+      return pickBalanceNumber(row, [
+        "total_usd",
+        "totalUsd",
+        "usd_value",
+        "usdValue",
+        "value_usd",
+        "valueUsd",
+      ]);
+    }
+
+    function getBalanceTotalGainUsd(row) {
+      const explicit = pickBalanceNumber(row, [
+        "total_gain_usd",
+        "totalGainUsd",
+        "unrealized_gain_usd",
+        "unrealizedGainUsd",
+        "gain_usd",
+        "gainUsd",
+      ]);
+      if (explicit !== null) return explicit;
+
+      const totalUsd = getBalanceTotalUsd(row);
+      const costBasis = getBalanceCostBasisUsd(row);
+      if (totalUsd === null || costBasis === null || Math.abs(costBasis) <= 1e-12) return null;
+      return totalUsd - costBasis;
+    }
+
+    function getBalanceTotalGainPct(row) {
+      const explicit = pickBalanceNumber(row, [
+        "total_gain_pct",
+        "totalGainPct",
+        "unrealized_gain_pct",
+        "unrealizedGainPct",
+        "gain_pct",
+        "gainPct",
+      ]);
+      if (explicit !== null) return explicit;
+
+      const gainUsd = getBalanceTotalGainUsd(row);
+      const costBasis = getBalanceCostBasisUsd(row);
+      if (gainUsd === null || costBasis === null || Math.abs(costBasis) <= 1e-12) return null;
+      return (gainUsd / costBasis) * 100;
+    }
+
+    function getBalanceDayGainPct(row) {
+      const explicit = pickBalanceNumber(row, [
+        "day_gain_pct",
+        "dayGainPct",
+        "gain_1d_pct",
+        "gain1dPct",
+        "change_24h_pct",
+        "change24hPct",
+        "price_change_percentage_24h",
+        "priceChangePercentage24h",
+      ]);
+      if (explicit !== null) return explicit;
+
+      const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+      const mapped = balanceMarketChange24hPctByAsset?.[asset];
+      const n = balanceNumberOrNull(mapped);
+      return n;
+    }
+
+    function getBalanceDayGainUsd(row) {
+      const explicit = pickBalanceNumber(row, [
+        "day_gain_usd",
+        "dayGainUsd",
+        "gain_1d_usd",
+        "gain1dUsd",
+      ]);
+      if (explicit !== null) return explicit;
+
+      const totalUsd = getBalanceTotalUsd(row);
+      const pct = getBalanceDayGainPct(row);
+      if (totalUsd === null || pct === null) return null;
+
+      // Price-change based estimate.  This is not a cash-flow/time-weighted portfolio return.
+      return totalUsd * (pct / 100);
+    }
+
+    function formatBalancePctMaybe(v) {
+      const n = balanceNumberOrNull(v);
+      if (n === null) return "—";
+      const abs = Math.abs(n);
+      const digits = abs >= 100 ? 1 : 2;
+      const sign = n > 0 ? "+" : "";
+      return `${sign}${n.toFixed(digits)}%`;
+    }
+
+    function balanceGainPctCellStyle(v) {
+      const n = balanceNumberOrNull(v);
+      if (n === null) return sx.td;
+      if (n > 0) return { ...sx.td, color: pal.good, fontWeight: 800 };
+      if (n < 0) return { ...sx.td, color: pal.danger, fontWeight: 800 };
+      return sx.td;
+    }
+
+    function getBalanceGainTooltip(row, kind) {
+      const isDay = kind === "day";
+      const pct = isDay ? getBalanceDayGainPct(row) : getBalanceTotalGainPct(row);
+      const usd = isDay ? getBalanceDayGainUsd(row) : getBalanceTotalGainUsd(row);
+      const lines = [];
+      if (isDay) {
+        lines.push(`1D Gain %: ${formatBalancePctMaybe(pct)}`);
+        lines.push(`1D Gain USD: ${formatBalanceMoneyMaybe(usd)}`);
+        lines.push("Source: asset 24h market change from Market Metrics, applied to current balance value.");
+      } else {
+        lines.push(`Total Gain %: ${formatBalancePctMaybe(pct)}`);
+        lines.push(`Total Gain USD: ${formatBalanceMoneyMaybe(usd)}`);
+        lines.push("Formula: (Total USD - Cost Basis USD) / Cost Basis USD.");
+      }
+      lines.push(`Total USD: ${formatBalanceMoneyMaybe(getBalanceTotalUsd(row))}`);
+      lines.push(`Cost Basis USD: ${formatBalanceMoneyMaybe(getBalanceCostBasisUsd(row))}`);
+      return lines.join("\n");
+    }
+
     function getBalanceBasisStatus(row) {
       const explicit = String(
         row?.basis_status ??
@@ -1985,6 +2103,11 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
             basisPartialChildren: 0,
             basisUnmatchedChildren: 0,
             basisNoLotChildren: 0,
+            dayGainUsd: 0,
+            hasDayGainUsd: false,
+            dayGainPct: null,
+            totalGainUsd: 0,
+            hasTotalGainUsd: false,
             children: [],
           };
           groups.set(key, g);
@@ -2011,6 +2134,23 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         if (costBasisUsd !== null) {
           g.costBasisUsd += costBasisUsd;
           g.hasCostBasisUsd = true;
+        }
+
+        const totalGainUsd = getBalanceTotalGainUsd(row);
+        if (totalGainUsd !== null) {
+          g.totalGainUsd += totalGainUsd;
+          g.hasTotalGainUsd = true;
+        }
+
+        const dayGainUsd = getBalanceDayGainUsd(row);
+        if (dayGainUsd !== null) {
+          g.dayGainUsd += dayGainUsd;
+          g.hasDayGainUsd = true;
+        }
+
+        const dayGainPct = getBalanceDayGainPct(row);
+        if (g.dayGainPct === null && dayGainPct !== null) {
+          g.dayGainPct = dayGainPct;
         }
 
         const basisQtyRemaining = balanceNumberOrNull(row?.basis_qty_remaining ?? row?.basisQtyRemaining);
@@ -2070,6 +2210,10 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           hold: g.hold,
           px_usd: weightedPx,
           total_usd: totalUsd,
+          day_gain_usd: g.hasDayGainUsd ? g.dayGainUsd : null,
+          day_gain_pct: g.dayGainPct,
+          total_gain_usd: g.hasTotalGainUsd ? g.totalGainUsd : null,
+          total_gain_pct: g.hasCostBasisUsd && g.hasTotalGainUsd && Math.abs(g.costBasisUsd) > 1e-12 ? (g.totalGainUsd / g.costBasisUsd) * 100 : null,
           cost_basis_usd: g.hasCostBasisUsd ? g.costBasisUsd : null,
           cost_avg_usd: g.hasCostBasisUsd && g.total > 0 ? g.costBasisUsd / g.total : null,
           basis_status: getGroupedBalanceBasisStatus(g),
@@ -2290,7 +2434,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     const balancesDisplayRows = useMemo(() => {
       if (venue !== ALL_VENUES_VALUE) return balancesFiltered || [];
       return buildAllVenuesBalanceDisplayRows(balancesFiltered || [], expandedBalanceGroups);
-    }, [balancesFiltered, expandedBalanceGroups, venue, ALL_VENUES_VALUE]);
+    }, [balancesFiltered, expandedBalanceGroups, venue, ALL_VENUES_VALUE, balanceMarketChange24hPctByAsset]);
 
   const solanaPortfolioTotalUsd = useMemo(() => {
     if (!shouldIncludeSolanaOnchainBalances) return null;
@@ -2528,6 +2672,43 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     }
     return js;
   }
+
+  function parseBalanceMarketChange24hPctMap(data) {
+    const out = {};
+    const items = Array.isArray(data?.items) ? data.items : [];
+    for (const row of items) {
+      const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+      const pct = balanceNumberOrNull(
+        row?.change_24h_pct ??
+          row?.change24hPct ??
+          row?.price_change_percentage_24h ??
+          row?.priceChangePercentage24h
+      );
+      if (asset && pct !== null) out[asset] = pct;
+    }
+    return out;
+  }
+
+  useEffect(() => {
+    if (tab !== "balances") return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        // Cache-first broad market summary.  This should use the market metrics
+        // summary/disk cache on normal window opens and avoid live fan-out.
+        const data = await fetchJSONMaybe("/api/market_metrics/summary?assets=db&ttl_s=300&limit=1000");
+        const next = parseBalanceMarketChange24hPctMap(data);
+        if (!cancelled) setBalanceMarketChange24hPctByAsset(next);
+      } catch {
+        if (!cancelled) setBalanceMarketChange24hPctByAsset((prev) => prev || {});
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [tab]);
 
 async function loadSolanaTokenRegistryMap() {
     // Best-effort: token registry is local DB-backed, so no paid dependency.
@@ -6680,6 +6861,8 @@ function renderFillToasts() {
                 <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("total_usd")}>
                   Total USD {balSortKey === "total_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
                 </th>
+                <th style={sx.th}>1D Gain %</th>
+                <th style={sx.th}>Total Gain %</th>
                 <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("cost_basis_usd")}>
                   Cost Basis {balSortKey === "cost_basis_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
                 </th>
@@ -6695,7 +6878,7 @@ function renderFillToasts() {
                 const isGroupedParent = !!b.__balanceGroupParent;
                 const isGroupedChild = !!b.__balanceGroupChild;
                 const groupKey = b.__balanceGroupKey;
-                const basisDetailColSpan = balancesColSpan || (venue === ALL_VENUES_VALUE ? 10 : 9);
+                const basisDetailColSpan = balancesColSpan || (venue === ALL_VENUES_VALUE ? 13 : 12);
                 return (
                   <Fragment key={`${b.venue || ""}:${b.asset || ""}:${groupKey || ""}:${i}`}>
                     <tr
@@ -6745,6 +6928,18 @@ function renderFillToasts() {
                     <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.px_usd === null ? "—" : fmtPxUsd?.(b.px_usd)}</td>
                     <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.total_usd === null ? "—" : fmtUsd?.(b.total_usd)}</td>
                     <td
+                      style={balanceGainPctCellStyle(getBalanceDayGainPct(b))}
+                      title={hideTableDataGlobal ? "" : getBalanceGainTooltip(b, "day")}
+                    >
+                      {hideTableDataGlobal ? "••••" : formatBalancePctMaybe(getBalanceDayGainPct(b))}
+                    </td>
+                    <td
+                      style={balanceGainPctCellStyle(getBalanceTotalGainPct(b))}
+                      title={hideTableDataGlobal ? "" : getBalanceGainTooltip(b, "total")}
+                    >
+                      {hideTableDataGlobal ? "••••" : formatBalancePctMaybe(getBalanceTotalGainPct(b))}
+                    </td>
+                    <td
                       style={sx.td}
                       title={hideTableDataGlobal ? "" : "Current holding cost basis in USD, if emitted by the backend basis/FIFO data path."}
                     >
@@ -6792,7 +6987,7 @@ function renderFillToasts() {
 
               {(balancesDisplayRows || []).length === 0 && (
                 <tr>
-                  <td style={sx.td} colSpan={balancesColSpan || 7}>
+                  <td style={sx.td} colSpan={balancesColSpan || (venue === ALL_VENUES_VALUE ? 13 : 12)}>
                     <span style={sx.muted}>
                       {balancesBusy
                         ? "Loading…"

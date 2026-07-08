@@ -5147,7 +5147,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     ...(disabled ? styles.buttonDisabled : {}),
   });
 
-  const balancesColSpan = venue === ALL_VENUES_VALUE ? 11 : 10;
+  const balancesColSpan = venue === ALL_VENUES_VALUE ? 13 : 12;
 
   const statusIsCanceledLocal = isHiddenByHideCancelled(statusFilter);
 

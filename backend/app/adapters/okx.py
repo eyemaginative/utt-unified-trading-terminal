@@ -486,28 +486,262 @@ class OKXAdapter(ExchangeAdapter):
         except Exception:
             return None
 
+    def _orders_pending_rows(self, inst_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"instType": "SPOT"}
+        if inst_id:
+            params["instId"] = inst_id
+        data = self._private_get("/api/v5/trade/orders-pending", params=params)
+        rows = data.get("data") or []
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+    def _orders_history_rows(self, inst_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        lim = max(1, min(100, int(limit or 100)))
+        params: Dict[str, Any] = {"instType": "SPOT", "limit": str(lim)}
+        if inst_id:
+            params["instId"] = inst_id
+        data = self._private_get("/api/v5/trade/orders-history", params=params)
+        rows = data.get("data") or []
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+    def _fills_history_rows(self, inst_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        lim = max(1, min(100, int(limit or 100)))
+        params: Dict[str, Any] = {"instType": "SPOT", "limit": str(lim)}
+        if inst_id:
+            params["instId"] = inst_id
+        data = self._private_get("/api/v5/trade/fills-history", params=params)
+        rows = data.get("data") or []
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+    def _quote_asset_for_inst(self, inst_id: Any) -> str:
+        s = str(inst_id or "").strip().upper()
+        if "-" not in s:
+            return ""
+        try:
+            return (s.split("-", 1)[1] or "").strip().upper()
+        except Exception:
+            return ""
+
+    def _fill_from_row(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Normalize one OKX fills-history row into a read-only diagnostic shape.
+
+        This does not write Fill rows, ledger rows, lot journals, or basis lots.
+        It is intentionally diagnostic/basis-preview-ready only.
+        """
+        try:
+            inst_id = str(row.get("instId") or "").strip().upper()
+            trade_id = str(row.get("tradeId") or row.get("fillId") or "").strip()
+            order_id = str(row.get("ordId") or "").strip()
+            if not inst_id or not trade_id:
+                return None
+
+            side = str(row.get("side") or "").strip().lower() or None
+            qty = self._safe_float(row.get("fillSz") or row.get("sz"))
+            price = self._safe_float(row.get("fillPx") or row.get("px"))
+            fee_raw = self._safe_float(row.get("fee"))
+            fee_asset = str(row.get("feeCcy") or "").strip().upper() or None
+            fee = abs(float(fee_raw)) if fee_raw is not None else None
+            ts = self._dt_from_ms(row.get("ts") or row.get("fillTime") or row.get("uTime") or row.get("cTime"))
+
+            quote_asset = self._quote_asset_for_inst(inst_id)
+            gross_quote = None
+            total_after_fee = None
+            try:
+                if qty is not None and price is not None:
+                    gross_quote = float(qty) * float(price)
+                    total_after_fee = gross_quote
+                    if fee is not None and fee_asset and (fee_asset == quote_asset or fee_asset in {"USD", "USDT", "USDC"}):
+                        if side == "buy":
+                            # For buys, this is acquisition cost in quote terms.
+                            total_after_fee = gross_quote + float(fee)
+                        elif side == "sell":
+                            # For sells, this is net proceeds in quote terms.
+                            total_after_fee = gross_quote - float(fee)
+            except Exception:
+                gross_quote = None
+                total_after_fee = None
+
+            return {
+                "venue": self.venue,
+                "venue_trade_id": trade_id,
+                "venue_order_id": order_id or None,
+                "symbol_canon": inst_id,
+                "symbol_venue": inst_id,
+                "side": side or "",
+                "qty": float(qty or 0.0),
+                "price": price,
+                "gross_quote": gross_quote,
+                "fee": fee,
+                "fee_asset": fee_asset,
+                "total_after_fee": total_after_fee,
+                "ts": ts,
+                "exec_type": str(row.get("execType") or "").strip() or None,
+            }
+        except Exception:
+            return None
+
+    def fetch_fills_history(self, symbol: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        inst_id = self.resolve_symbol(symbol) if symbol else None
+        rows = self._fills_history_rows(inst_id=inst_id, limit=limit)
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            norm = self._fill_from_row(row)
+            if norm:
+                out.append(norm)
+        return out
+
+    def _summarize_fills_by_order(self, fills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        by_order: Dict[str, Dict[str, Any]] = {}
+        for f in fills or []:
+            oid = str(f.get("venue_order_id") or "").strip()
+            if not oid:
+                oid = f"TRADE:{str(f.get('venue_trade_id') or '').strip()}"
+            row = by_order.setdefault(
+                oid,
+                {
+                    "venue_order_id": (None if oid.startswith("TRADE:") else oid),
+                    "fill_count": 0,
+                    "symbol_canon": f.get("symbol_canon"),
+                    "side": f.get("side"),
+                    "filled_qty": 0.0,
+                    "gross_quote": 0.0,
+                    "fee": 0.0,
+                    "fee_asset": f.get("fee_asset"),
+                    "total_after_fee": 0.0,
+                    "first_ts": f.get("ts"),
+                    "last_ts": f.get("ts"),
+                },
+            )
+
+            row["fill_count"] = int(row.get("fill_count") or 0) + 1
+            try:
+                row["filled_qty"] = float(row.get("filled_qty") or 0.0) + float(f.get("qty") or 0.0)
+            except Exception:
+                pass
+            try:
+                if f.get("gross_quote") is not None:
+                    row["gross_quote"] = float(row.get("gross_quote") or 0.0) + float(f.get("gross_quote") or 0.0)
+            except Exception:
+                pass
+            try:
+                if f.get("fee") is not None:
+                    row["fee"] = float(row.get("fee") or 0.0) + float(f.get("fee") or 0.0)
+            except Exception:
+                pass
+            try:
+                if f.get("total_after_fee") is not None:
+                    row["total_after_fee"] = float(row.get("total_after_fee") or 0.0) + float(f.get("total_after_fee") or 0.0)
+            except Exception:
+                pass
+
+            ts = f.get("ts")
+            if ts is not None:
+                try:
+                    if row.get("first_ts") is None or ts < row.get("first_ts"):
+                        row["first_ts"] = ts
+                    if row.get("last_ts") is None or ts > row.get("last_ts"):
+                        row["last_ts"] = ts
+                except Exception:
+                    pass
+
+        out = list(by_order.values())
+        out.sort(key=lambda x: str(x.get("last_ts") or ""), reverse=True)
+        return out
+
+    def order_diagnostics(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        include_samples: bool = True,
+    ) -> Dict[str, Any]:
+        """Read-only order/fill diagnostics for OKX.  Never returns secrets."""
+        lim = max(1, min(100, int(limit or 100)))
+        inst_id = self.resolve_symbol(symbol) if symbol else None
+
+        out: Dict[str, Any] = {
+            "ok": True,
+            "venue": self.venue,
+            "base_url": self._base_url(),
+            "symbol": (str(symbol).strip().upper() if symbol else None),
+            "inst_id": inst_id,
+            "limit": lim,
+            "counts": {
+                "orders_pending": 0,
+                "orders_history": 0,
+                "fills_history": 0,
+                "normalized_fills": 0,
+            },
+            "endpoint_errors": {},
+        }
+
+        pending_rows: List[Dict[str, Any]] = []
+        history_rows: List[Dict[str, Any]] = []
+        fill_rows: List[Dict[str, Any]] = []
+
+        try:
+            pending_rows = self._orders_pending_rows(inst_id=inst_id)
+            out["counts"]["orders_pending"] = len(pending_rows)
+        except Exception as e:
+            out["ok"] = False
+            out["endpoint_errors"]["orders_pending"] = str(e)
+
+        try:
+            history_rows = self._orders_history_rows(inst_id=inst_id, limit=lim)
+            out["counts"]["orders_history"] = len(history_rows)
+        except Exception as e:
+            out["ok"] = False
+            out["endpoint_errors"]["orders_history"] = str(e)
+
+        try:
+            fill_rows = self._fills_history_rows(inst_id=inst_id, limit=lim)
+            out["counts"]["fills_history"] = len(fill_rows)
+        except Exception as e:
+            out["ok"] = False
+            out["endpoint_errors"]["fills_history"] = str(e)
+
+        normalized_orders: List[Dict[str, Any]] = []
+        for row in pending_rows + history_rows:
+            norm_order = self._order_from_row(row)
+            if norm_order:
+                normalized_orders.append(norm_order)
+
+        normalized_fills: List[Dict[str, Any]] = []
+        for row in fill_rows:
+            norm_fill = self._fill_from_row(row)
+            if norm_fill:
+                normalized_fills.append(norm_fill)
+
+        out["counts"]["normalized_orders"] = len(normalized_orders)
+        out["counts"]["normalized_fills"] = len(normalized_fills)
+        out["fills_by_order"] = self._summarize_fills_by_order(normalized_fills)
+
+        if include_samples:
+            out["samples"] = {
+                "orders_pending": normalized_orders[:10],
+                "fills_history": normalized_fills[:10],
+                "fills_by_order": out["fills_by_order"][:10],
+            }
+
+        return out
+
     def fetch_orders(self, dry_run: bool) -> List[VenueOrder]:
         if dry_run:
             return []
         out: List[VenueOrder] = []
         try:
-            data = self._private_get("/api/v5/trade/orders-pending", params={"instType": "SPOT"})
-            for row in data.get("data") or []:
-                if isinstance(row, dict):
-                    vo = self._order_from_row(row)
-                    if vo:
-                        out.append(vo)
+            for row in self._orders_pending_rows():
+                vo = self._order_from_row(row)
+                if vo:
+                    out.append(vo)
         except Exception:
             pass
 
-        # Recent terminal history, best-effort.  OKX.4 can expand paging/range controls.
+        # Recent terminal history, best-effort.  OKX.4B diagnostics surfaces endpoint errors separately.
         try:
-            hist = self._private_get("/api/v5/trade/orders-history", params={"instType": "SPOT", "limit": "100"})
-            for row in hist.get("data") or []:
-                if isinstance(row, dict):
-                    vo = self._order_from_row(row)
-                    if vo:
-                        out.append(vo)
+            for row in self._orders_history_rows(limit=100):
+                vo = self._order_from_row(row)
+                if vo:
+                    out.append(vo)
         except Exception:
             pass
 

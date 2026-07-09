@@ -26,6 +26,67 @@ _TERMINAL = {"filled", "canceled", "cancelled", "rejected", "done", "closed", "e
 
 
 # ─────────────────────────────────────────────────────────────
+# Post-trade read-only refresh helper
+# ─────────────────────────────────────────────────────────────
+def _post_trade_refresh_enabled_for(venue: str) -> bool:
+    """Return True when a venue should be refreshed immediately after live submit/cancel.
+
+    Defaults to OKX only.  This is intentionally read-only: it refreshes venue order
+    snapshots and balances, but does not mutate FIFO, lot journal, basis, deposits,
+    withdrawals, or bridge state.
+    """
+    if _env_bool("UTT_POST_TRADE_REFRESH_DISABLED", False):
+        return False
+    v = (venue or "").strip().lower()
+    raw = (os.getenv("UTT_POST_TRADE_REFRESH_VENUES") or "okx").strip()
+    allow = {x.strip().lower() for x in raw.split(",") if x.strip()}
+    return bool(v and ("*" in allow or v in allow))
+
+
+def _post_trade_refresh(db: Session, *, venue: str, reason: str, force: bool = True) -> dict:
+    """Best-effort read-only refresh after a confirmed live venue side effect.
+
+    Used for OKX live submit/cancel so UTT's local/venue order snapshots and balance
+    holds converge immediately instead of waiting for the next manual Sync+Load.
+    """
+    v = (venue or "").strip().lower()
+    out = {
+        "enabled": _post_trade_refresh_enabled_for(v),
+        "venue": v,
+        "reason": str(reason or "post_trade"),
+        "force": bool(force),
+        "venue_orders": None,
+        "balances": None,
+        "errors": [],
+    }
+    if not out["enabled"] or not v:
+        return out
+
+    try:
+        from .venue_orders import refresh_venue_orders
+        n = refresh_venue_orders(db, v, force=bool(force))
+        out["venue_orders"] = {"ok": True, "count": int(n or 0)}
+    except Exception as e:
+        out["venue_orders"] = {"ok": False, "error": str(e)}
+        out["errors"].append(f"venue_orders: {e}")
+
+    if not _env_bool("UTT_POST_TRADE_BALANCE_REFRESH_DISABLED", False):
+        try:
+            from .balances import refresh_balances
+            rows, msg = refresh_balances(db, v)
+            out["balances"] = {
+                "ok": True,
+                "count": len(rows or []),
+                "message": msg,
+            }
+        except Exception as e:
+            out["balances"] = {"ok": False, "error": str(e)}
+            out["errors"].append(f"balances: {e}")
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
 # Cancel semantics helper
 # ─────────────────────────────────────────────────────────────
 def _is_already_closed_cancel_error(msg: str) -> bool:
@@ -479,6 +540,16 @@ def create_order(db: Session, req: OrderCreate) -> Order:
 
     db.add(order)
     db.commit()
+
+    # OKX.5C: after a confirmed live venue submit, refresh read-only order snapshots
+    # and balances/holds before returning the local Order row.
+    if order.venue_order_id and (str(order.status or "").strip().lower() not in {"rejected", "failed"}):
+        try:
+            _post_trade_refresh(db, venue=venue, reason="submit", force=True)
+        except Exception:
+            # Submit already succeeded or failed truthfully above; refresh is best-effort only.
+            pass
+
     db.refresh(order)
     return order
 
@@ -646,6 +717,13 @@ def cancel_order(db: Session, order_id: str) -> Order:
 
     db.add(order)
     db.commit()
+
+    if ok and not is_dry:
+        try:
+            _post_trade_refresh(db, venue=(order.venue or ""), reason="cancel", force=True)
+        except Exception:
+            pass
+
     db.refresh(order)
     return order
 
@@ -716,6 +794,7 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
     did_update_snapshot = False
     snapshot_rows_updated = 0
     orders_rows_updated = 0
+    post_refresh = None
     if simulated or ok:
         now = now_utc()
 
@@ -758,8 +837,18 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
             db.add(o)
 
         db.commit()
+
+        if ok and not simulated:
+            try:
+                post_refresh = _post_trade_refresh(db, venue=venue, reason="cancel_by_ref", force=True)
+            except Exception as e:
+                post_refresh = {"enabled": True, "venue": venue, "reason": "cancel_by_ref", "errors": [str(e)]}
+
         if row:
-            db.refresh(row)
+            try:
+                db.refresh(row)
+            except Exception:
+                pass
 
     if row:
         return {
@@ -774,6 +863,7 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
             "snapshot_updated": bool(did_update_snapshot),
             "snapshot_rows_updated": int(snapshot_rows_updated),
             "orders_rows_updated": int(orders_rows_updated),
+            "post_cancel_refresh": post_refresh,
             "error": error,
         }
 
@@ -785,6 +875,7 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
         "venue_order_id": venue_order_id,
         "status": ("canceled" if (simulated or ok) else "unknown"),
         "snapshot_updated": False,
+        "post_cancel_refresh": post_refresh,
         "note": "no VenueOrderRow found to update",
         "error": error,
     }

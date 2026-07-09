@@ -4223,13 +4223,16 @@ export default function App() {
       setError(null);
       if (cancel_ref.toLowerCase().startsWith("solana_jupiter:")) {
         const orderId = cancel_ref.split(":").slice(1).join(":").trim();
-        await doManualJupiterCancel(orderId, { markCanceled: true });
-      } else {
-        await cancelOrderByRef(cancel_ref);
+        const resp = await doManualJupiterCancel(orderId, { markCanceled: true });
+        return resp || { ok: true, venue: "solana_jupiter", venue_order_id: orderId };
       }
+
+      const resp = await cancelOrderByRef(cancel_ref);
+      return resp;
     } catch (e) {
       const msg = e?.response?.data?.detail || e?.message || "Unknown error canceling unified order";
       setError(String(msg));
+      return { ok: false, cancel_ref, error: String(msg) };
     }
   }
 

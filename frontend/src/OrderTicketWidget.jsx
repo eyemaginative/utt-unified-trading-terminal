@@ -4361,6 +4361,42 @@ export default function OrderTicketWidget({
     }
   }
 
+  async function refreshVenueOrdersAfterSubmit({ venueKey } = {}) {
+    const v = String(venueKey || "").toLowerCase().trim();
+    if (!v || !apiBase) return null;
+
+    const tok = getAuthToken();
+    const headers = { "Content-Type": "application/json" };
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+
+    const base = String(apiBase || "").replace(/\/+$/, "");
+    const url = `${base}/api/venue_orders/refresh?force=true`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ venue: v }),
+    });
+
+    let body = null;
+    try {
+      body = await resp.json();
+    } catch {
+      body = null;
+    }
+
+    if (!resp.ok) {
+      const detail = body?.detail || body?.error || `venue_orders refresh HTTP ${resp.status}`;
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+
+    // One delayed follow-up helps exchanges whose order list lags the submit ack.
+    setTimeout(() => {
+      fetch(url, { method: "POST", headers, body: JSON.stringify({ venue: v }) }).catch(() => {});
+    }, 1800);
+
+    return body || { ok: true, venue: v };
+  }
+
   
   async function submitSolanaSwapOrder() {
     const tok = getAuthToken();
@@ -5038,10 +5074,37 @@ async function submitLimitOrder() {
       }
 
       const j = await r.json();
-      setSubmitOk(j);
+      const pendingPayload = {
+        ...(j || {}),
+        post_submit_refresh: { status: "pending", venue: v, venue_orders: null },
+      };
+      setSubmitOk(pendingPayload);
 
-      // Show modal instead of inline printing below the widget
-      openSubmitResultModal("ok", j, "Order Submitted");
+      // Show modal instead of inline printing below the widget.
+      openSubmitResultModal("ok", pendingPayload, "Order Submitted — Refreshing Venue State");
+
+      // OKX.5C: force-refresh venue order snapshots immediately after submit so
+      // All Orders can see the real venue_order_id/open/filled state without a manual Sync+Load.
+      try {
+        const venueRefresh = await refreshVenueOrdersAfterSubmit({ venueKey: v });
+        const refreshedPayload = {
+          ...(j || {}),
+          post_submit_refresh: { status: "ok", venue: v, venue_orders: venueRefresh },
+        };
+        setSubmitOk(refreshedPayload);
+        openSubmitResultModal("ok", refreshedPayload, "Order Submitted — Venue State Refreshed");
+      } catch (refreshErr) {
+        const refreshedPayload = {
+          ...(j || {}),
+          post_submit_refresh: {
+            status: "error",
+            venue: v,
+            error: refreshErr?.message || String(refreshErr || "venue refresh failed"),
+          },
+        };
+        setSubmitOk(refreshedPayload);
+        openSubmitResultModal("ok", refreshedPayload, "Order Submitted — Refresh Needs Retry");
+      }
 
       // UPDATED: capture venue + base/quote at submit time and refresh deterministically.
       refreshBalancesAfterSubmit({ venueKey: v, focusBase: baseAsset, focusQuote: quoteAsset });

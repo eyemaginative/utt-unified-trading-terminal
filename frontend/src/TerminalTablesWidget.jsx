@@ -73,7 +73,7 @@ const LS_SOLANA_DETECTED_TOKENS_KEY = "utt_solana_detected_tokens_v1";
 
 // Discovery-enabled venues (UI allow-list)
 // We only show venues that are BOTH supported by the app AND in this allow-list.
-const DEFAULT_DISCOVERY_ALLOW_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "cryptocom", "okx"];
+const DEFAULT_DISCOVERY_ALLOW_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "cryptocom"];
 const COLS = {
   created: "created",
   closed: "closed",
@@ -956,15 +956,10 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   const [solanaPrices, setSolanaPrices] = useState({ ok: false, items: {}, ts: 0 });
   const [expandedBalanceGroups, setExpandedBalanceGroups] = useState(() => ({}));
   const [basisLotDetailsByKey, setBasisLotDetailsByKey] = useState(() => ({}));
-  const [balanceMarketChange24hPctByAsset, setBalanceMarketChange24hPctByAsset] = useState(() => ({}));
   // Canonical wrapped SOL mint (for Jupiter pricing lookups)
   const SOL_MINT = "So11111111111111111111111111111111111111112";
-  // Solana venues do NOT use the CEX balances refresh pipeline.
-  // When viewing All Venues, include Solana-Jupiter via the same on-chain path
-  // because /api/balances/latest is CEX/adapter snapshot only.
+  // Solana venues do NOT use the CEX balances refresh pipeline
   const isSolanaVenue = String(venue || "").toLowerCase().startsWith("solana");
-  const isAllVenuesSelected = String(venue || "") === String(ALL_VENUES_VALUE || "");
-  const shouldIncludeSolanaOnchainBalances = isSolanaVenue || isAllVenuesSelected;
   const [showSolanaOnchainDetails, setShowSolanaOnchainDetails] = useState(false);
 
   // ─────────────────────────────────────────────────────────────
@@ -1488,123 +1483,6 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       return null;
     }
 
-    function getBalanceTotalUsd(row) {
-      return pickBalanceNumber(row, [
-        "total_usd",
-        "totalUsd",
-        "usd_value",
-        "usdValue",
-        "value_usd",
-        "valueUsd",
-      ]);
-    }
-
-    function getBalanceTotalGainUsd(row) {
-      const explicit = pickBalanceNumber(row, [
-        "total_gain_usd",
-        "totalGainUsd",
-        "unrealized_gain_usd",
-        "unrealizedGainUsd",
-        "gain_usd",
-        "gainUsd",
-      ]);
-      if (explicit !== null) return explicit;
-
-      const totalUsd = getBalanceTotalUsd(row);
-      const costBasis = getBalanceCostBasisUsd(row);
-      if (totalUsd === null || costBasis === null || Math.abs(costBasis) <= 1e-12) return null;
-      return totalUsd - costBasis;
-    }
-
-    function getBalanceTotalGainPct(row) {
-      const explicit = pickBalanceNumber(row, [
-        "total_gain_pct",
-        "totalGainPct",
-        "unrealized_gain_pct",
-        "unrealizedGainPct",
-        "gain_pct",
-        "gainPct",
-      ]);
-      if (explicit !== null) return explicit;
-
-      const gainUsd = getBalanceTotalGainUsd(row);
-      const costBasis = getBalanceCostBasisUsd(row);
-      if (gainUsd === null || costBasis === null || Math.abs(costBasis) <= 1e-12) return null;
-      return (gainUsd / costBasis) * 100;
-    }
-
-    function getBalanceDayGainPct(row) {
-      const explicit = pickBalanceNumber(row, [
-        "day_gain_pct",
-        "dayGainPct",
-        "gain_1d_pct",
-        "gain1dPct",
-        "change_24h_pct",
-        "change24hPct",
-        "price_change_percentage_24h",
-        "priceChangePercentage24h",
-      ]);
-      if (explicit !== null) return explicit;
-
-      const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
-      const mapped = balanceMarketChange24hPctByAsset?.[asset];
-      const n = balanceNumberOrNull(mapped);
-      return n;
-    }
-
-    function getBalanceDayGainUsd(row) {
-      const explicit = pickBalanceNumber(row, [
-        "day_gain_usd",
-        "dayGainUsd",
-        "gain_1d_usd",
-        "gain1dUsd",
-      ]);
-      if (explicit !== null) return explicit;
-
-      const totalUsd = getBalanceTotalUsd(row);
-      const pct = getBalanceDayGainPct(row);
-      if (totalUsd === null || pct === null) return null;
-
-      // Price-change based estimate.  This is not a cash-flow/time-weighted portfolio return.
-      return totalUsd * (pct / 100);
-    }
-
-    function formatBalancePctMaybe(v) {
-      const n = balanceNumberOrNull(v);
-      if (n === null) return "—";
-      const abs = Math.abs(n);
-      const digits = abs >= 100 ? 1 : 2;
-      const sign = n > 0 ? "+" : "";
-      return `${sign}${n.toFixed(digits)}%`;
-    }
-
-    function balanceGainPctCellStyle(v) {
-      const n = balanceNumberOrNull(v);
-      if (n === null) return sx.td;
-      if (n > 0) return { ...sx.td, color: pal.good, fontWeight: 800 };
-      if (n < 0) return { ...sx.td, color: pal.danger, fontWeight: 800 };
-      return sx.td;
-    }
-
-    function getBalanceGainTooltip(row, kind) {
-      const isDay = kind === "day";
-      const pct = isDay ? getBalanceDayGainPct(row) : getBalanceTotalGainPct(row);
-      const usd = isDay ? getBalanceDayGainUsd(row) : getBalanceTotalGainUsd(row);
-      const lines = [];
-      if (isDay) {
-        lines.push(`1D Gain %: ${formatBalancePctMaybe(pct)}`);
-        lines.push(`1D Gain USD: ${formatBalanceMoneyMaybe(usd)}`);
-        lines.push("Source: asset 24h market change from Market Metrics, applied to current balance value.");
-      } else {
-        lines.push(`Total Gain %: ${formatBalancePctMaybe(pct)}`);
-        lines.push(`Total Gain USD: ${formatBalanceMoneyMaybe(usd)}`);
-        lines.push("Formula: (Total USD - Cost Basis USD) / Cost Basis USD.");
-      }
-      lines.push(`Total USD: ${formatBalanceMoneyMaybe(getBalanceTotalUsd(row))}`);
-      lines.push(`Cost Basis USD: ${formatBalanceMoneyMaybe(getBalanceCostBasisUsd(row))}`);
-      return lines.join("\n");
-    }
-
     function getBalanceBasisStatus(row) {
       const explicit = String(
         row?.basis_status ??
@@ -1872,16 +1750,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       const label = state?.loading ? "Lots…" : state?.open ? "Hide Lots" : "Lots";
 
       return (
-        <span
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 4,
-            flexWrap: "nowrap",
-            whiteSpace: "nowrap",
-            verticalAlign: "middle",
-          }}
-        >
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
           {renderBalanceBasisBadge(row)}
           <button
             data-no-drag="1"
@@ -1903,14 +1772,11 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
             }
             style={{
               ...(sx.button || {}),
-              padding: "1px 6px",
-              fontSize: 10,
-              lineHeight: 1.2,
-              minHeight: 18,
+              padding: "2px 7px",
+              fontSize: 11,
+              lineHeight: 1.3,
               opacity: disabled ? 0.45 : 0.92,
               cursor: disabled ? "not-allowed" : "pointer",
-              whiteSpace: "nowrap",
-              flex: "0 0 auto",
             }}
           >
             {label}
@@ -2103,11 +1969,6 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
             basisPartialChildren: 0,
             basisUnmatchedChildren: 0,
             basisNoLotChildren: 0,
-            dayGainUsd: 0,
-            hasDayGainUsd: false,
-            dayGainPct: null,
-            totalGainUsd: 0,
-            hasTotalGainUsd: false,
             children: [],
           };
           groups.set(key, g);
@@ -2134,23 +1995,6 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         if (costBasisUsd !== null) {
           g.costBasisUsd += costBasisUsd;
           g.hasCostBasisUsd = true;
-        }
-
-        const totalGainUsd = getBalanceTotalGainUsd(row);
-        if (totalGainUsd !== null) {
-          g.totalGainUsd += totalGainUsd;
-          g.hasTotalGainUsd = true;
-        }
-
-        const dayGainUsd = getBalanceDayGainUsd(row);
-        if (dayGainUsd !== null) {
-          g.dayGainUsd += dayGainUsd;
-          g.hasDayGainUsd = true;
-        }
-
-        const dayGainPct = getBalanceDayGainPct(row);
-        if (g.dayGainPct === null && dayGainPct !== null) {
-          g.dayGainPct = dayGainPct;
         }
 
         const basisQtyRemaining = balanceNumberOrNull(row?.basis_qty_remaining ?? row?.basisQtyRemaining);
@@ -2210,10 +2054,6 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           hold: g.hold,
           px_usd: weightedPx,
           total_usd: totalUsd,
-          day_gain_usd: g.hasDayGainUsd ? g.dayGainUsd : null,
-          day_gain_pct: g.dayGainPct,
-          total_gain_usd: g.hasTotalGainUsd ? g.totalGainUsd : null,
-          total_gain_pct: g.hasCostBasisUsd && g.hasTotalGainUsd && Math.abs(g.costBasisUsd) > 1e-12 ? (g.totalGainUsd / g.costBasisUsd) * 100 : null,
           cost_basis_usd: g.hasCostBasisUsd ? g.costBasisUsd : null,
           cost_avg_usd: g.hasCostBasisUsd && g.total > 0 ? g.costBasisUsd / g.total : null,
           basis_status: getGroupedBalanceBasisStatus(g),
@@ -2235,162 +2075,36 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       return out;
     }
 
-    function solanaOnchainBalanceRows(venueLabel) {
-      return (solanaOnchain?.items || []).map((it) => {
-        const mint = String(it?.mint || "").trim();
-        const mintShort = mint ? `${mint.slice(0, 6)}…` : "";
-        // Prefer explicit symbol or Token Registry (mint->symbol).
-        // Avoid falling back to `it.asset` here because for mint-only rows `asset` is already mint-short,
-        // which would make the UI show the mint twice.
-        const symbol = String(it?.symbol || (mint ? (solanaTokenRegistryMap?.[mint] || solanaTokenRegistryMap?.[String(mint).toLowerCase()]) : "") || "").trim();
-        const assetLabel = symbol || mintShort || mint || "";
-        const amt = Number(it?.amount ?? 0);
-        const px = getSolanaUsdPriceForMint(mint);
-        return {
-          venue: venueLabel || "solana_jupiter",
-          asset: assetLabel,
-          symbol: symbol || null,
-          mint: mint || null,
-          // Only show mint on a second line when we have a real symbol.
-          mint_short: symbol ? (mintShort || null) : null,
-          total: amt,
-          available: amt,
-          hold: 0,
-          px_usd: typeof px === "number" ? px : null,
-          total_usd: typeof px === "number" ? amt * px : null,
-          usd_source_symbol: "USDC",
-        };
-      });
-    }
-
-    function isSolanaJupiterBalanceRow(row) {
-      const v = String(row?.venue || "").trim().toLowerCase();
-      return v === "solana_jupiter" || v === "solana-dex" || v === "solana_dex" || v.startsWith("solana");
-    }
-
-    function isSolanaSelfCustodyBalanceRow(row) {
-      const venueKey = String(row?.venue || "").trim().toLowerCase();
-      const basisVenueKey = String(row?.basis_venue || row?.basisVenue || "").trim().toLowerCase();
-      const networkKey = String(row?.network || row?.chain || "").trim().toLowerCase();
-      return (
-        venueKey === "self_custody_solana" ||
-        venueKey === "self-custody-solana" ||
-        venueKey === "solana_self_custody" ||
-        venueKey === "solana-self-custody" ||
-        (venueKey.includes("self") && venueKey.includes("solana")) ||
-        basisVenueKey === "self_custody_solana" ||
-        basisVenueKey === "self-custody-solana" ||
-        (basisVenueKey.includes("self") && basisVenueKey.includes("solana")) ||
-        ((venueKey === "self_custody" || venueKey === "self-custody" || venueKey === "wallet") && networkKey.includes("solana"))
-      );
-    }
-
-    function solanaBalanceDedupeKeys(row) {
-      const out = [];
-      const seen = new Set();
-      const add = (key) => {
-        const k = String(key || "").trim();
-        if (!k || seen.has(k)) return;
-        seen.add(k);
-        out.push(k);
-      };
-
-      const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
-      const symbol = String(row?.symbol || "").trim().toUpperCase();
-      if (asset && asset !== "—") add(`asset:${asset}`);
-      if (symbol && symbol !== "—") add(`asset:${symbol}`);
-
-      // Do not use generic row.address here.  Wallet/self-custody rows use
-      // address as the wallet address, not the token mint, which prevented
-      // self_custody_solana SOL/UTTT rows from matching live solana_jupiter rows.
-      const mint = String(
-        row?.mint ||
-        row?.token_mint ||
-        row?.tokenMint ||
-        row?.mint_address ||
-        row?.mintAddress ||
-        row?.token_address ||
-        row?.tokenAddress ||
-        ""
-      ).trim().toLowerCase();
-      if (mint) {
-        if (mint === "sol" || mint === "so11111111111111111111111111111111111111112") {
-          add("asset:SOL");
-        } else {
-          add(`mint:${mint}`);
-        }
-      }
-
-      return out;
-    }
-
-    function solanaBalanceDedupeKey(row) {
-      const keys = solanaBalanceDedupeKeys(row);
-      return keys[0] || "";
-    }
-
-    function solanaBalanceUsdValue(row) {
-      const totalUsd = Number(row?.total_usd ?? row?.usd_value ?? row?.usdValue);
-      if (Number.isFinite(totalUsd)) return totalUsd;
-      const px = Number(row?.px_usd ?? row?.usd_price ?? row?.usdPrice);
-      const qty = Number(row?.total ?? row?.balance ?? row?.amount ?? 0);
-      if (Number.isFinite(px) && Number.isFinite(qty)) return px * qty;
-      return 0;
-    }
-
-    function solanaLiveDedupeKeySet(liveRows) {
-      const keys = new Set();
-      for (const row of liveRows || []) {
-        for (const key of solanaBalanceDedupeKeys(row)) {
-          if (key) keys.add(key);
-        }
-      }
-      return keys;
-    }
-
-    function solanaRowMatchesDedupeKeySet(row, keys) {
-      if (!keys || !keys.size) return false;
-      return solanaBalanceDedupeKeys(row).some((key) => keys.has(key));
-    }
-
-    function replacedSolanaSelfCustodyRowsForAllVenues(existingRows, liveRows) {
-      const liveKeys = solanaLiveDedupeKeySet(liveRows);
-      if (!liveKeys.size) return [];
-      return (existingRows || []).filter((row) => {
-        if (!isSolanaSelfCustodyBalanceRow(row)) return false;
-        return solanaRowMatchesDedupeKeySet(row, liveKeys);
-      });
-    }
-
-    function rowsWithLiveSolanaReplacingSelfCustody(existingRows, liveRows) {
-      const liveKeys = solanaLiveDedupeKeySet(liveRows);
-      if (!liveKeys.size) return existingRows || [];
-      return (existingRows || []).filter((row) => {
-        if (!isSolanaSelfCustodyBalanceRow(row)) return true;
-        return !solanaRowMatchesDedupeKeySet(row, liveKeys);
-      });
-    }
-
-    function missingSolanaBalanceRowsForAllVenues(existingRows, liveRows) {
-      const existing = new Set();
-      for (const row of existingRows || []) {
-        if (!isSolanaJupiterBalanceRow(row)) continue;
-        for (const key of solanaBalanceDedupeKeys(row)) {
-          if (key) existing.add(key);
-        }
-      }
-      return (liveRows || []).filter((row) => {
-        const keys = solanaBalanceDedupeKeys(row);
-        return !keys.length || !keys.some((key) => existing.has(key));
-      });
-    }
-
     const balancesFiltered = useMemo(() => {
       let rows = balancesSorted || [];
       if (isSolanaVenue) {
         // When the selected venue is Solana, balances come from live on-chain RPC
         // (solanaOnchain.items normalized earlier). Shape it to match the balances table.
-        rows = solanaOnchainBalanceRows(venue || "solana_jupiter");
+        rows = (solanaOnchain?.items || []).map((it) => {
+          const mint = String(it?.mint || "").trim();
+          const mintShort = mint ? `${mint.slice(0, 6)}…` : "";
+          // Prefer explicit symbol or Token Registry (mint->symbol).
+          // Avoid falling back to `it.asset` here because for mint-only rows `asset` is already mint-short,
+          // which would make the UI show the mint twice.
+          const symbol = String(it?.symbol || (mint ? (solanaTokenRegistryMap?.[mint] || solanaTokenRegistryMap?.[String(mint).toLowerCase()]) : "") || "").trim();
+          const assetLabel = symbol || mintShort || mint || "";
+          const amt = Number(it?.amount ?? 0);
+          const px = getSolanaUsdPriceForMint(mint);
+          return {
+            venue: venue || "solana",
+            asset: assetLabel,
+            symbol: symbol || null,
+            mint: mint || null,
+            // Only show mint on a second line when we have a real symbol.
+            mint_short: symbol ? (mintShort || null) : null,
+            total: amt,
+            available: amt,
+            hold: 0,
+            px_usd: typeof px === "number" ? px : null,
+            total_usd: typeof px === "number" ? amt * px : null,
+            usd_source_symbol: "USDC",
+          };
+        });
       } else if (isPolkadotHydrationVenue) {
         rows = (hydrationOnchain?.items || []).map((it) => ({
           venue: venue || "polkadot_hydration",
@@ -2405,19 +2119,6 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
           usd_source_symbol: it?.usd_source_symbol || "—",
         }));
       }
-
-      if (isAllVenuesSelected && (solanaOnchain?.items || []).length) {
-        const liveSolanaRows = solanaOnchainBalanceRows("solana_jupiter");
-        const baseRows = rowsWithLiveSolanaReplacingSelfCustody(rows || [], liveSolanaRows);
-        const missingSolanaRows = missingSolanaBalanceRowsForAllVenues(baseRows || [], liveSolanaRows);
-        if (baseRows !== rows || missingSolanaRows.length) {
-          rows = [
-            ...(baseRows || []),
-            ...missingSolanaRows,
-          ];
-        }
-      }
-
       const q = String(balancesSymbolQuery || "")
         .trim()
         .toUpperCase();
@@ -2429,30 +2130,25 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
         const a = String(b?.asset || "").trim().toUpperCase();
         return a.includes(q);
       });
-    }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, isPolkadotHydrationVenue, isAllVenuesSelected, solanaOnchain, hydrationOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
+    }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, isPolkadotHydrationVenue, solanaOnchain, hydrationOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
 
     const balancesDisplayRows = useMemo(() => {
       if (venue !== ALL_VENUES_VALUE) return balancesFiltered || [];
       return buildAllVenuesBalanceDisplayRows(balancesFiltered || [], expandedBalanceGroups);
-    }, [balancesFiltered, expandedBalanceGroups, venue, ALL_VENUES_VALUE, balanceMarketChange24hPctByAsset]);
+    }, [balancesFiltered, expandedBalanceGroups, venue, ALL_VENUES_VALUE]);
 
   const solanaPortfolioTotalUsd = useMemo(() => {
-    if (!shouldIncludeSolanaOnchainBalances) return null;
-    const liveRows = solanaOnchainBalanceRows("solana_jupiter");
-    let rowsForTotal = liveRows;
-    let replacedSelfCustodyUsd = 0;
-    if (isAllVenuesSelected) {
-      const replacedRows = replacedSolanaSelfCustodyRowsForAllVenues(balancesSorted || [], liveRows);
-      replacedSelfCustodyUsd = replacedRows.reduce((sum, row) => sum + solanaBalanceUsdValue(row), 0);
-      const baseRows = rowsWithLiveSolanaReplacingSelfCustody(balancesSorted || [], liveRows);
-      rowsForTotal = missingSolanaBalanceRowsForAllVenues(baseRows || [], liveRows);
-    }
+    if (!isSolanaVenue) return null;
+    const items = solanaOnchain?.items || [];
     let sum = 0;
-    for (const row of rowsForTotal || []) {
-      sum += solanaBalanceUsdValue(row);
+    for (const t of items) {
+      const mint = String(t?.mint || "").trim();
+      const amt = Number(t?.amount ?? 0) || 0;
+      const p = getSolanaUsdPriceForMint(mint);
+      if (typeof p === "number") sum += amt * p;
     }
-    return sum - replacedSelfCustodyUsd;
-  }, [shouldIncludeSolanaOnchainBalances, isAllVenuesSelected, balancesSorted, solanaOnchain, solanaPrices, solanaTokenRegistryMap]);
+    return sum;
+  }, [isSolanaVenue, solanaOnchain, solanaPrices]);
 
   const hydrationPortfolioTotalUsd = useMemo(() => {
     if (!isPolkadotHydrationVenue) return null;
@@ -2564,7 +2260,6 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     // ─────────────────────────────────────────────────────────────
     const balancesRefreshRef = useRef({ inFlight: false, seq: 0 });
     const solanaRefreshRef = useRef({ inFlight: false, lastAt: 0 });
-    const allVenuesSolanaAutoLoadRef = useRef(false);
     const hydrationRefreshRef = useRef({ inFlight: false, lastAt: 0 });
     const balancesBannerTimerRef = useRef(null);
 
@@ -2672,43 +2367,6 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     }
     return js;
   }
-
-  function parseBalanceMarketChange24hPctMap(data) {
-    const out = {};
-    const items = Array.isArray(data?.items) ? data.items : [];
-    for (const row of items) {
-      const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
-      const pct = balanceNumberOrNull(
-        row?.change_24h_pct ??
-          row?.change24hPct ??
-          row?.price_change_percentage_24h ??
-          row?.priceChangePercentage24h
-      );
-      if (asset && pct !== null) out[asset] = pct;
-    }
-    return out;
-  }
-
-  useEffect(() => {
-    if (tab !== "balances") return;
-
-    let cancelled = false;
-    (async () => {
-      try {
-        // Cache-first broad market summary.  This should use the market metrics
-        // summary/disk cache on normal window opens and avoid live fan-out.
-        const data = await fetchJSONMaybe("/api/market_metrics/summary?assets=db&ttl_s=300&limit=1000");
-        const next = parseBalanceMarketChange24hPctMap(data);
-        if (!cancelled) setBalanceMarketChange24hPctByAsset(next);
-      } catch {
-        if (!cancelled) setBalanceMarketChange24hPctByAsset((prev) => prev || {});
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [tab]);
 
 async function loadSolanaTokenRegistryMap() {
     // Best-effort: token registry is local DB-backed, so no paid dependency.
@@ -2964,7 +2622,7 @@ async function loadSolanaTokenRegistryMap() {
 
 
 async function refreshSolanaOnchainBalances() {
-      if (!shouldIncludeSolanaOnchainBalances) return;
+      if (!isSolanaVenue) return;
 
       // Prevent overlap / click-spam bursts (helps avoid public RPC 429 cascades).
       if (solanaRefreshRef?.current?.inFlight) return;
@@ -3086,21 +2744,6 @@ async function refreshSolanaOnchainBalances() {
       try { solanaRefreshRef.current.inFlight = false; } catch { /* ignore */ }
 
     useEffect(() => {
-      if (!isAllVenuesSelected) {
-        allVenuesSolanaAutoLoadRef.current = false;
-        return;
-      }
-      if (allVenuesSolanaAutoLoadRef.current) return;
-      if (solanaOnchain?.loading || solanaRefreshRef?.current?.inFlight) return;
-      if ((solanaOnchain?.items || []).length > 0) return;
-
-      allVenuesSolanaAutoLoadRef.current = true;
-      refreshSolanaOnchainBalances();
-      // Intentionally one-shot per All Venues selection to avoid RPC hammering.
-      // Manual Refresh still refreshes Solana-Jupiter alongside the CEX/adapter rows.
-    }, [isAllVenuesSelected]);
-
-    useEffect(() => {
       return () => {
         if (balancesBannerTimerRef.current) {
           clearTimeout(balancesBannerTimerRef.current);
@@ -3151,13 +2794,9 @@ async function refreshSolanaOnchainBalances() {
       setBalancesRefreshingLocal(true);
 
       try {
-        // Always pass the current venue explicitly. App owns CEX/all-venue fan-out + skip guards.
-        // Solana-Jupiter balances live outside /api/balances/latest, so refresh them
-        // alongside All Venues instead of requiring a prior Solana-Jupiter selection.
+        // Always pass the current venue explicitly. App owns ALL-venues fan-out + skip guards.
+        // doRefreshBalances may or may not return a promise; normalize.
         await Promise.resolve(doRefreshBalances({ venue }));
-        if (isAllVenuesSelected) {
-          await refreshSolanaOnchainBalances();
-        }
         // If App.jsx keeps last-known balances on error, no banner needed here.
       } catch (e) {
         const msg =
@@ -4644,6 +4283,13 @@ async function refreshSolanaOnchainBalances() {
 
     postCancelTimerRef.current = setTimeout(() => {
       runRefreshBalances(venueMaybe);
+      try {
+        if (typeof doSyncAndLoadAllOrders === "function") {
+          doSyncAndLoadAllOrders({ venue: String(venueMaybe || "").trim(), force: true });
+        }
+      } catch {
+        // ignore delayed order refresh failures
+      }
     }, 1200);
   }
 
@@ -4674,7 +4320,7 @@ async function refreshSolanaOnchainBalances() {
         }
 
         // Refresh orders + balances (recompute holds)
-        await doSyncAndLoadAllOrders?.();
+        await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
         await postCancelRefresh(ven);
         return;
       }
@@ -4686,7 +4332,7 @@ async function refreshSolanaOnchainBalances() {
       if (isLocalish) {
         if (typeof doCancelOrder === "function" && o.id != null) {
           await doCancelOrder(o.id);
-          await doSyncAndLoadAllOrders?.();
+          await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
           await postCancelRefresh(ven);
         }
         return;
@@ -4704,7 +4350,7 @@ async function refreshSolanaOnchainBalances() {
           }
           return;
         }
-        await doSyncAndLoadAllOrders?.();
+        await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
         await postCancelRefresh(ven);
       }
     } finally {
@@ -4744,7 +4390,7 @@ async function refreshSolanaOnchainBalances() {
 
         // Keep Local + Unified views consistent after a cancel.
         await doLoadOrders?.();
-        await doSyncAndLoadAllOrders?.();
+        await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
         await postCancelRefresh(ven);
         return;
       }
@@ -4752,7 +4398,7 @@ async function refreshSolanaOnchainBalances() {
       if (typeof doCancelOrder === "function" && o.id != null) {
         await doCancelOrder(o.id);
         await doLoadOrders?.();
-        await doSyncAndLoadAllOrders?.();
+        await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
         await postCancelRefresh(ven);
         return;
       }
@@ -6720,7 +6366,7 @@ function renderFillToasts() {
 
   function renderBalances() {
     const row = { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" };
-    const balancesBusy = !!loadingBalances || !!balancesRefreshingLocal || (shouldIncludeSolanaOnchainBalances && !!solanaOnchain.loading) || (isPolkadotHydrationVenue && !!hydrationOnchain.loading);
+    const balancesBusy = !!loadingBalances || !!balancesRefreshingLocal || (isSolanaVenue && !!solanaOnchain.loading) || (isPolkadotHydrationVenue && !!hydrationOnchain.loading);
 
     return (
       <>
@@ -6779,15 +6425,11 @@ function renderFillToasts() {
                 hideTableDataGlobal
                   ? "••••"
                   : venue === ALL_VENUES_VALUE
-                    ? (() => {
-                        const base =
-                          portfolioTotalUsdAllVenues === null || portfolioTotalUsdAllVenues === undefined
-                            ? portfolioTotalUsd
-                            : portfolioTotalUsdAllVenues;
-                        const dex = solanaPortfolioTotalUsd;
-                        if (base === null || base === undefined) return dex === null || dex === undefined ? "—" : fmtUsd?.(dex);
-                        return fmtUsd?.(Number(base || 0) + Number(dex || 0));
-                      })()
+                    ? portfolioTotalUsdAllVenues === null || portfolioTotalUsdAllVenues === undefined
+                      ? portfolioTotalUsd === null
+                        ? "—"
+                        : fmtUsd?.(portfolioTotalUsd)
+                      : fmtUsd?.(portfolioTotalUsdAllVenues)
                     : isSolanaVenue
                       ? solanaPortfolioTotalUsd === null
                         ? "—"
@@ -6861,8 +6503,6 @@ function renderFillToasts() {
                 <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("total_usd")}>
                   Total USD {balSortKey === "total_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
                 </th>
-                <th style={sx.th}>1D Gain %</th>
-                <th style={sx.th}>Total Gain %</th>
                 <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("cost_basis_usd")}>
                   Cost Basis {balSortKey === "cost_basis_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
                 </th>
@@ -6878,7 +6518,7 @@ function renderFillToasts() {
                 const isGroupedParent = !!b.__balanceGroupParent;
                 const isGroupedChild = !!b.__balanceGroupChild;
                 const groupKey = b.__balanceGroupKey;
-                const basisDetailColSpan = balancesColSpan || (venue === ALL_VENUES_VALUE ? 13 : 12);
+                const basisDetailColSpan = balancesColSpan || (venue === ALL_VENUES_VALUE ? 10 : 9);
                 return (
                   <Fragment key={`${b.venue || ""}:${b.asset || ""}:${groupKey || ""}:${i}`}>
                     <tr
@@ -6928,18 +6568,6 @@ function renderFillToasts() {
                     <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.px_usd === null ? "—" : fmtPxUsd?.(b.px_usd)}</td>
                     <td style={sx.td}>{hideTableDataGlobal ? "••••" : b.total_usd === null ? "—" : fmtUsd?.(b.total_usd)}</td>
                     <td
-                      style={balanceGainPctCellStyle(getBalanceDayGainPct(b))}
-                      title={hideTableDataGlobal ? "" : getBalanceGainTooltip(b, "day")}
-                    >
-                      {hideTableDataGlobal ? "••••" : formatBalancePctMaybe(getBalanceDayGainPct(b))}
-                    </td>
-                    <td
-                      style={balanceGainPctCellStyle(getBalanceTotalGainPct(b))}
-                      title={hideTableDataGlobal ? "" : getBalanceGainTooltip(b, "total")}
-                    >
-                      {hideTableDataGlobal ? "••••" : formatBalancePctMaybe(getBalanceTotalGainPct(b))}
-                    </td>
-                    <td
                       style={sx.td}
                       title={hideTableDataGlobal ? "" : "Current holding cost basis in USD, if emitted by the backend basis/FIFO data path."}
                     >
@@ -6987,7 +6615,7 @@ function renderFillToasts() {
 
               {(balancesDisplayRows || []).length === 0 && (
                 <tr>
-                  <td style={sx.td} colSpan={balancesColSpan || (venue === ALL_VENUES_VALUE ? 13 : 12)}>
+                  <td style={sx.td} colSpan={balancesColSpan || 7}>
                     <span style={sx.muted}>
                       {balancesBusy
                         ? "Loading…"

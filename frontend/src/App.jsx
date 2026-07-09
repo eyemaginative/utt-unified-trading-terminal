@@ -4925,6 +4925,11 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
 
   const effectiveObVenue = isAllMode ? fallbackObVenue : selectedVenueNorm;
   const effectiveTradeVenue = isAllMode ? fallbackTradeVenue : selectedVenueNorm;
+  const effectiveTradeVenueGate = useMemo(() => {
+    const v = normalizeVenue(effectiveTradeVenue);
+    if (!v) return null;
+    return venuesById?.[v]?.trade_gate || null;
+  }, [effectiveTradeVenue, venuesById]);
 
   const effectiveChartVenue = canShowOrderBook ? effectiveObVenue : fallbackChartVenue;
 
@@ -5611,6 +5616,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                           limitPrice={otLimitPrice}
                           setLimitPrice={setOtLimitPrice}
                           venues={orderTicketVenuesList.length > 0 ? orderTicketVenuesList : (tradingVenuesList.length > 0 ? tradingVenuesList : supportedVenues)}
+                          venueTradeGate={effectiveTradeVenueGate}
                         />
                       </div>
                     </div>

@@ -1719,6 +1719,7 @@ export default function OrderTicketWidget({
   setQty: setQtyProp,
   limitPrice: limitPriceProp,
   setLimitPrice: setLimitPriceProp,
+  venueTradeGate = null,
 }) {
   // Optional toast emitter (some app shells inject this; keep safe/no-op if absent)
   const onToast = (typeof window !== "undefined" && (window.__uttOnToast || window.uttOnToast))
@@ -1766,6 +1767,62 @@ export default function OrderTicketWidget({
   const [submitResultTitle, setSubmitResultTitle] = useState(""); // heading for modal
 
   const venueLabel = hideVenueNames ? "••••" : String(effectiveVenue || "");
+  const tradeGate = venueTradeGate && typeof venueTradeGate === "object" ? venueTradeGate : null;
+  const showTradeGateStatus = !!tradeGate;
+
+  const tradeGateDisplay = useMemo(() => {
+    if (!tradeGate) return null;
+    const yn = (v) => (v === null || v === undefined ? "—" : v ? "YES" : "NO");
+    const onOff = (v) => (v === null || v === undefined ? "—" : v ? "ON" : "OFF");
+    const venueId = String(tradeGate?.venue || effectiveVenue || "").trim().toLowerCase();
+    const ok = !!tradeGate?.effective_live_submit_enabled;
+    const missing = Array.isArray(tradeGate?.missing_requirements)
+      ? tradeGate.missing_requirements.filter(Boolean).map(String)
+      : [];
+
+    const lines = [
+      `supports trading: ${yn(tradeGate?.supports_trading)}`,
+      `venue enabled/configured: ${yn(tradeGate?.venue_enabled)}`,
+      `DRY_RUN: ${onOff(tradeGate?.dry_run)}`,
+      `ARMED: ${yn(tradeGate?.armed)}`,
+      `LIVE_VENUES includes ${venueId || "venue"}: ${yn(tradeGate?.live_venues_includes_venue)}`,
+    ];
+
+    if (venueId === "okx" || (tradeGate?.okx_enable_trading !== null && tradeGate?.okx_enable_trading !== undefined)) {
+      lines.push(`OKX_ENABLE_TRADING: ${yn(tradeGate?.okx_enable_trading)}`);
+    }
+
+    lines.push(`effective live submit: ${yn(tradeGate?.effective_live_submit_enabled)}`);
+
+    const title = ok ? "Live submit gate: ENABLED" : "Live submit gate: BLOCKED";
+    const inlineParts = [
+      `supports trading ${yn(tradeGate?.supports_trading)}`,
+      `venue enabled ${yn(tradeGate?.venue_enabled)}`,
+      `DRY_RUN ${onOff(tradeGate?.dry_run)}`,
+      `ARMED ${yn(tradeGate?.armed)}`,
+      `LIVE_VENUES ${yn(tradeGate?.live_venues_includes_venue)}`,
+    ];
+
+    if (venueId === "okx" || (tradeGate?.okx_enable_trading !== null && tradeGate?.okx_enable_trading !== undefined)) {
+      inlineParts.push(`OKX_ENABLE_TRADING ${yn(tradeGate?.okx_enable_trading)}`);
+    }
+
+    inlineParts.push(`effective live submit ${yn(tradeGate?.effective_live_submit_enabled)}`);
+
+    const hoverLines = [title, ...lines.map((ln) => `• ${ln}`)];
+    if (missing.length > 0) {
+      hoverLines.push(`Missing: ${missing.join(", ")}`);
+    }
+
+    return {
+      ok,
+      title,
+      lines,
+      missing,
+      inlineText: `${title} · ${inlineParts.join(" · ")}`,
+      hoverTitle: hoverLines.join("\n"),
+    };
+  }, [tradeGate, effectiveVenue]);
 
   const isSolanaDexVenue = useMemo(() => {
     const v = String(effectiveVenue || "").toLowerCase().trim();
@@ -5672,6 +5729,30 @@ async function submitLimitOrder() {
           )}
 
         </div>
+
+        {showTradeGateStatus && tradeGateDisplay && (
+          <div
+            style={{
+              marginTop: 6,
+              padding: "6px 8px",
+              borderRadius: 10,
+              fontSize: 11,
+              lineHeight: 1.2,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              border: tradeGateDisplay.ok ? "1px solid rgba(46, 204, 113, 0.30)" : "1px solid rgba(245, 158, 11, 0.35)",
+              background: tradeGateDisplay.ok ? "rgba(46, 204, 113, 0.07)" : "rgba(120, 72, 16, 0.14)",
+              color: tradeGateDisplay.ok ? "#c9f7d7" : "#ffe2a6",
+              cursor: "help",
+            }}
+            title={tradeGateDisplay.hoverTitle}
+          >
+            <div style={{ fontWeight: 900, overflow: "hidden", textOverflow: "ellipsis" }}>
+              {tradeGateDisplay.inlineText}
+            </div>
+          </div>
+        )}
 
         {rulesBanner && (
           <div

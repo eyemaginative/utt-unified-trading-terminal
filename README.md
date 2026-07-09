@@ -4,13 +4,17 @@ UTT (Unified Trading Terminal) is a local-first, multi-venue crypto trading term
 
 At a high level, UTT provides one place to:
 
-- connect and manage venue credentials
-- inspect balances and portfolio state
+- connect and manage venue credentials through local profile-managed API-key storage
+- inspect balances, available amounts, holds, priced totals, cost basis, average cost, and gain/loss columns
 - view orderbooks, pseudo-orderbooks, synthetic price-context orderbooks, and manual route orderbooks
-- submit and track CEX orders, Solana swaps / limit-style flows, and confirmed Hydration manual-route swaps
+- submit and track CEX orders, cancel supported venue orders, and monitor venue-native order snapshots
+- trade through supported live-gated CEX adapters such as Coinbase, Crypto.com, Dex-Trade, Gemini, Kraken, Robinhood, and OKX where configured
+- submit and track Solana swaps / limit-style flows and confirmed Hydration manual-route swaps
 - monitor scanners, discovery tools, wallet activity, market-cap data, volume data, and self-custody balances
+- filter Market Cap and Volume windows by All / Owned / Unowned and by venue/source such as Coinbase, Crypto.com, Dex-Trade, Gemini, Hydration, Kraken, OKX, Robinhood, self-custody, Solana, and Solana-Jupiter
 - work with local ledger, deposits, withdrawals, missing-basis lots, transfer links, FIFO lot-impact previews, and tax-related state
-- plan cross-chain UTTT movements with bridge-transfer records, canonical supply context, and read-only basis previews
+- preview per-fill basis impact for supported venue fills without mutating FIFO lots
+- plan cross-chain UTTT movements with bridge-transfer records, canonical supply context, per-chain supply context, and read-only basis previews
 - manage Token Registry rows, Hydration Route Registry rows, wallet addresses, venue API keys, and local operator preferences
 - integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
 
@@ -29,6 +33,97 @@ This repository contains the application code, not live credentials, private key
 
 ---
 
+## Capability index
+
+UTT is best understood as a local operator workstation rather than a single exchange wrapper. The current codebase covers these broad function groups:
+
+### Trading and execution
+
+- CEX order-ticket submission for integrated venues with backend safety gates.
+- Venue-native cancel paths where the venue adapter supports cancellation.
+- Unified CEX order lifecycle tracking through local `orders` rows and read-only `venue_orders` snapshots.
+- Venue order refresh with per-venue and all-venue refresh paths.
+- Status normalization across venue-specific order states.
+- Order rule inspection, including quantity steps, price ticks, minimum quantity, supported order types, supported time-in-force values, and post-only support where the venue exposes it.
+- Server-side pre-trade normalization to venue increments before live order placement.
+- Dry-run / armed / live-venue gate enforcement so live trading cannot occur only because the UI is visible.
+- OKX gated live submit and cancel support using the OKX trade endpoint and cancel endpoint, while leaving withdrawals unsupported.
+- Solana DEX swap and limit-style flow integration where the selected wallet and route support the requested pair.
+- Hydration manual XYK and confirmed manual Router swap-transaction preparation for known route-registry rows.
+
+### Market data and routing context
+
+- CEX orderbooks where venue adapters expose them.
+- DEX pseudo-orderbooks for route-based execution contexts.
+- Hydration manual/live UTTT-HDX pseudo-orderbook generation from live pool reserves.
+- Hydration synthetic orderbook rows for price context only, kept non-tradable unless a safe route exists.
+- CoinGecko-backed market-cap and volume windows through a backend cache layer.
+- Token Registry-first external price mapping for deterministic asset-to-market-data resolution.
+- Source and venue filtering in Market Cap and Volume windows for owned and unowned asset discovery.
+- Backend summary snapshots and browser snapshot caches to keep market windows usable during external API backoff.
+
+### Portfolio, balances, and accounting context
+
+- Per-venue balances with total, available, and hold values.
+- USD pricing enrichment for balances when requested.
+- AppHeader portfolio totals across CEX, Solana DEX, Hydration DEX, and cached self-custody balances where configured.
+- Cost basis and average cost columns on balance rows.
+- Basis status indicators such as OK, partial, missing, unmatched, no lots, and not applicable.
+- Basis lot drilldown from balance rows.
+- 1D gain percentage and total gain percentage display where enough market/basis data exists.
+- All Venues grouping and de-duplication logic for self-custody and live Solana balance rows.
+- Missing-basis tracking without inventing USD basis.
+- FIFO preview/apply paths kept separate from passive balance and market-data windows.
+
+### Unified orders, realized state, and operator workflow
+
+- All Orders view that merges local orders, venue order snapshots, and supported DEX swap records.
+- Open and terminal bucket separation.
+- Cancelability detection for open venue rows.
+- Fee, gross, net, tax-estimate, and net-after-tax display fields where backend data exists.
+- Viewed/confirmed tracking for operator review workflows.
+- Sound and toast-on-fill UI behavior.
+- OKX normalized order economics, including signed-fee normalization and `total_after_fee` calculation for fills.
+- OKX fills-history diagnostics and per-fill basis-preview rows without creating fill records or mutating basis lots.
+
+### Ledger, wallet, basis, and transfer workflows
+
+- Asset deposits and withdrawals as local ledger objects.
+- Basis lots as local inventory objects.
+- Missing-basis lot creation for detected deposits.
+- Transfer-link preview and metadata-only linking for likely internal movements.
+- Explicit-only FIFO lot-impact rebuilds.
+- Dry-run-first handling for ledger materialization and basis impact.
+- Hydration wallet-history ingestion into cached wallet-address transaction rows.
+- Deposit and withdrawal materialization from trusted cached wallet transactions.
+- Internal transfer and bridge planning surfaces that avoid treating transfers as taxable disposals by default.
+
+### UTTT-specific workflows and use cases
+
+UTTT is treated as a first-class project asset inside UTT. The application does not merely display a token balance; it provides operator tooling around UTTT routing, pricing, supply context, and cross-chain movement planning.
+
+Current UTTT-related functions and use cases include:
+
+- Token Registry metadata for UTTT on supported chains and venues.
+- Solana mint / token-account resolution for UTTT-related Solana flows.
+- UTTT-SOL / Solana DEX visibility where local token metadata and liquidity routes are configured.
+- Hydration UTTT-HDX route metadata through the Hydration Route Registry.
+- Manual/live UTTT-HDX orderbook generation from live Hydration pool reserves.
+- UTTT/USD derivation from UTTT-HDX route pricing multiplied by HDX/USD.
+- Spread / Bridge dashboard comparison of Solana-side UTTT price context and Hydration-derived UTTT price context.
+- Total Canonical Supply display for UTTT across supported chain contexts.
+- Per-chain UTTT supply rows, including Solana, Asset Hub / Polkadot-side context, and Hydration route metadata without double-counting canonical supply.
+- Bridge transfer-record planning for UTTT movements such as Solana-to-Hydration or Hydration-to-Solana movements.
+- Source and destination evidence linkage for planned UTTT movements.
+- Reconciliation of local UTTT bridge-transfer records.
+- Read-only basis / tax-treatment preview for UTTT bridge-transfer records.
+- Read-only apply-basis-transfer preview to model future basis movement without mutating lots.
+- Operator use cases such as UTTT treasury visibility, liquidity monitoring, cross-chain supply review, bridge test planning, price-spread review, and route-readiness diagnostics.
+
+UTTT bridge execution and basis-transfer mutation remain intentionally separated from planning. The README describes the current planning, routing, accounting, and diagnostics surfaces; it does not imply that UTT automatically executes bridges or mutates basis across chains.
+
+---
+
 ## Major capabilities
 
 ### Centralized exchange workflow
@@ -40,10 +135,35 @@ Current functionality in the codebase includes:
 - venue registry and adapter routing
 - balances, available/held amounts, account views, and priced portfolio totals
 - order submission plumbing, cancellation paths, and venue-order refresh
+- live-gated order submission where the adapter and safety gates allow it
+- live-gated cancellation through All Orders for supported venues
 - order status aggregation and local order reconciliation
 - unified all-orders style data views, including swap-order reflection where supported
+- order rules / pre-trade checks for supported venues
+- cost-basis, gain, net, fee, and tax-aware display fields where backend data is available
 - Robinhood balance hold handling using a fast open-order overlay so balance refresh is not blocked by full order-history scans
+- OKX read-only diagnostics, balances, orderbooks, rules, venue orders, fills diagnostics, basis previews, live-gated submit, and live-gated cancel
 - auth, profile, local session, database backup, 2FA, and API-key management flows
+
+#### OKX integration
+
+The OKX adapter is now integrated as a live-gated CEX venue. OKX support includes:
+
+- public instrument discovery
+- public orderbook retrieval
+- order-rule inspection for quantity steps, price ticks, minimum quantity, order type support, time-in-force support, and post-only support
+- private balances through profile-managed credentials
+- venue-order refresh for open, canceled, and filled OKX rows
+- All Orders integration for OKX open and terminal buckets
+- signed OKX fee normalization into positive UTT fee-cost values
+- `total_after_fee` calculation for filled OKX rows when fill economics are available
+- OKX fills-history diagnostics grouped by OKX order ID
+- per-fill basis preview for OKX fills without creating fill rows or mutating basis lots
+- live-gated order submission through the unified Order Ticket
+- live-gated cancellation from All Orders
+- Market Cap and Volume source filtering so OKX-held assets appear under the OKX source filter
+
+OKX live routing remains explicitly guarded. A visible OKX Order Ticket is not enough to place an order. Live OKX submit/cancel requires the backend to be armed, dry-run to be disabled, `LIVE_VENUES` to include `okx`, and `OKX_ENABLE_TRADING=1`. OKX withdrawal support is intentionally not implemented.
 
 ### Solana DEX workflow
 
@@ -103,8 +223,12 @@ Current architecture in this repository includes support for:
 - selected-asset market cap and volume summaries in the AppHeader tool tabs
 - backend-cached CoinGecko market data with TTL, stale-cache behavior, and rate-limit backoff
 - DB-owned / tracked asset discovery for market-metrics windows
+- All / Owned / Unowned filtering for market-metric rows
+- source filtering by venue or source context such as Coinbase, Crypto.com, Dex-Trade, Gemini, Hydration, Kraken, OKX, Robinhood, self-custody, Solana, Solana-Jupiter, and Derived rows
 - Token Registry-managed external price IDs as the preferred market-data resolver
 - automatic CoinGecko symbol discovery for explicitly selected assets when no registry mapping exists
+- browser and backend summary snapshot behavior so windows can continue showing the last usable payload during refresh timeout or rate-limit events
+- re-annotation of cached summary rows with current local asset context so newly added venues such as OKX can appear without requiring a full live market-data refresh
 - graceful unavailable / placeholder rows for unsupported or unresolved assets
 
 The frontend does not call CoinGecko directly. Market-cap and volume windows read normalized data from the backend market-metrics service, while the backend owns source selection, caching, rate-limit handling, and symbol-to-source resolution.
@@ -282,6 +406,17 @@ The exact state of each venue may evolve over time, but the repository currently
 - Dex-Trade
 - Gemini
 - Kraken
+- OKX
+  - public instruments and orderbook
+  - private balances
+  - order rules
+  - venue order refresh
+  - order economics normalization
+  - fills diagnostics
+  - read-only fill basis preview
+  - live-gated submit
+  - live-gated cancel from All Orders
+  - Market Cap / Volume source filtering
 - Robinhood
 - Solana DEX flows
   - Jupiter
@@ -380,6 +515,25 @@ hold       = quantity reserved by open orders or venue restrictions where known
 
 Robinhood balances use a fast open-order hold overlay for balance refresh so the Balances window and Order Ticket do not need to wait for a full paginated order-history refresh. Full order history still remains available through the Orders workflow.
 
+Balance and portfolio rows may also include:
+
+```text
+px_usd
+available_usd
+hold_usd
+total_usd
+cost_basis_usd
+cost_avg_usd
+basis_status
+basis_lot_count
+basis_qty_remaining
+basis_missing_qty_remaining
+1D gain percentage
+total gain percentage
+```
+
+Cost-basis and gain fields are read-only display/enrichment fields unless an explicit ledger or FIFO apply workflow is invoked elsewhere. Balance windows should not mutate FIFO lots merely by opening, refreshing, sorting, or filtering.
+
 ### 3) Orders, All Orders, and order refresh
 
 Use the order tables to inspect venue order state, local order records, and DEX swap records reflected into the unified order view.
@@ -415,6 +569,22 @@ select venue
 → submit order
 → inspect result and All Orders
 ```
+
+For OKX specifically, the normal validated flow is:
+
+```text
+select OKX
+→ select DOGE-USD or another supported OKX spot symbol
+→ inspect rules and orderbook
+→ enter limit order details
+→ backend validates quantity step, price tick, minimum quantity, TIF, and post-only fields
+→ backend checks live-routing gates
+→ OKX returns a venue_order_id if accepted
+→ refresh OKX venue orders to confirm open / filled / canceled state
+→ cancel from All Orders when needed
+```
+
+OKX live submit and cancel are intentionally gated. If the gate is not open, the UI can still mount the ticket, but the backend will reject live routing with a clear message.
 
 Typical DEX flow:
 
@@ -645,6 +815,45 @@ open Market Cap or Volume tool window
 → inspect unavailable or rate-limited rows without frontend directly calling CoinGecko
 ```
 
+Market Cap and Volume windows support operator filtering by:
+
+```text
+All assets
+Owned assets
+Unowned assets
+All venues / sources
+Individual venue/source filters
+```
+
+Representative source filters include:
+
+```text
+Coinbase
+Crypto.com
+Derived
+Dex-Trade
+Gemini
+Hydration
+Kraken
+OKX
+Robinhood
+Self-custody
+Solana
+Solana-Jupiter
+```
+
+Owned/unowned state is derived from local balance, basis, deposit, wallet, token-registry, and venue-symbol context. Rows expose source context through fields such as:
+
+```text
+is_owned
+owned_venues
+tracked_venues
+asset_context_sources
+venue_filter_keys
+```
+
+A market-data row can still display as `global` for the market-data venue while also being filterable under OKX or another local source because the price/volume source and the local ownership source are intentionally separate concepts.
+
 ### 14) Scanner and discovery tooling
 
 Scanner and discovery windows are operator tools for surfacing assets, venue data, or other candidate rows depending on which backend routes are enabled.
@@ -860,6 +1069,32 @@ Open:
 - save it through the UI
 
 The current codebase uses profile and API-key management flows with local encrypted secret-bundle handling rather than relying on committed backend files.
+
+### 10) Live trading safety gates
+
+UTT separates UI capability from live backend routing. A venue may appear in the Order Ticket and still be blocked from live routing until backend gates are intentionally opened.
+
+Typical live routing controls include:
+
+```text
+DRY_RUN
+ARMED
+LIVE_VENUES
+venue-specific gate variables such as OKX_ENABLE_TRADING
+```
+
+For OKX live submit/cancel testing, the backend process must be started from an environment equivalent to:
+
+```powershell
+$env:DRY_RUN="false"
+$env:ARMED="true"
+$env:LIVE_VENUES="coinbase,cryptocom,dex_trade,gemini,kraken,robinhood,okx"
+$env:OKX_ENABLE_TRADING="1"
+```
+
+Then restart the backend from that same terminal. If any required gate is missing, the backend should reject live OKX routing with a clear message such as `Venue 'okx' is not enabled for LIVE routing`.
+
+Do not grant withdrawal permission to OKX API keys for UTT live order testing. The OKX workflow only requires the permissions needed for balances, market data, and trade placement/canceling.
 
 ---
 
@@ -1377,6 +1612,51 @@ Check:
 
 The FIFO rebuild path is explicit-only. Do not use `allow_partial=true`, `force_rebuild=true`, or broad all-asset application unless you are intentionally performing a controlled ledger repair.
 
+### OKX Order Ticket, live submit, or cancel does not work
+
+Check:
+
+- OKX credentials are saved through **Profile → API Keys** for venue `okx`
+- the OKX account/API region matches the account you actually use
+- the API key has trade permission for submit/cancel testing
+- withdrawal permission is not required and should not be granted for UTT order testing
+- `/api/venues?include_disabled=true` reports OKX as enabled and trading-capable
+- the browser has been hard-refreshed after frontend capability changes
+- backend live gates are set only when intentionally testing live trading
+
+Expected capability row:
+
+```text
+venue: okx
+supports.trading: true
+supports.balances: true
+supports.orderbook: true
+supports.markets: true
+```
+
+For a live-gate rejection, inspect the backend message. A response like this means the UI path is working, but the live gate is closed:
+
+```text
+Venue 'okx' is not enabled for LIVE routing.
+```
+
+For OKX order state diagnostics:
+
+```text
+GET /api/okx/diagnostics?private=true&ccy=DOGE
+GET /api/okx/order_diagnostics?symbol=DOGE-USD&limit=100&include_samples=true
+GET /api/venue_orders/latest?venue=okx&page_size=100
+GET /api/all_orders?scope=VENUES&venue=okx&page_size=100
+```
+
+For OKX fill basis preview:
+
+```text
+GET /api/okx/fill_basis_preview?symbol=DOGE-USD&wallet_id=default&limit=100&include_items=true
+```
+
+A preview status of `insufficient_inventory` is expected if the DOGE was transferred into OKX from another venue or wallet and the transfer-in basis has not yet been linked or entered.
+
 ### Market Cap or Volume windows show unavailable data
 
 Check:
@@ -1397,6 +1677,25 @@ DB-owned/tracked asset
 → small hardcoded fallback map for bootstrap assets
 ```
 
+If a newly integrated venue such as OKX does not appear in a Market Cap or Volume source dropdown, check the local context payload rather than scanning a huge JSON file for common words:
+
+```powershell
+$j = Invoke-RestMethod "http://127.0.0.1:8000/api/market_metrics/summary?assets=db&limit=1000"
+$j.venue_filter_options
+$j.asset_context.DOGE | ConvertTo-Json -Depth 8
+$j.items | Where-Object { $_.asset -eq "DOGE" } | Select-Object asset,is_owned,owned_venues,tracked_venues,venue_filter_keys | ConvertTo-Json -Depth 8
+```
+
+Expected for an OKX-held DOGE balance:
+
+```text
+owned_venues includes okx
+tracked_venues includes okx
+venue_filter_keys includes okx
+```
+
+The Market Cap and Volume windows each maintain browser-side snapshots. If one window updates before the other, click Refresh in that window or clear only that window's browser cache key.
+
 ### UI layout looks wrong
 
 The terminal UI uses pane and window logic with multiple specialized widgets. Layout issues are usually related to dependencies, recent layout changes, or stale frontend state after major UI updates.
@@ -1404,6 +1703,21 @@ The terminal UI uses pane and window logic with multiple specialized widgets. La
 For Hydration specifically, the Order Book price-cache indicator is intentionally inline with the existing depth / auto / route status row. It should not add a standalone notification row or change widget height when switching between CEX venues and `polkadot_hydration`.
 
 The Order Book and Order Ticket no longer depend on visible Lock controls for normal operation. If old local UI state behaves oddly after upgrading, clear local widget state or reload the app so the current unlocked widget behavior is applied.
+
+---
+
+## Current boundaries and non-goals
+
+The repository includes many execution and accounting surfaces, but several boundaries are intentional:
+
+- UTT does not store live secrets in source control.
+- UTT does not require withdrawal permission for OKX order testing.
+- UTT does not auto-apply FIFO merely because a venue fill exists.
+- UTT does not invent missing USD basis for transferred-in assets.
+- UTTT bridge execution is not enabled by the planning dashboard.
+- UTTT basis-transfer mutation is not enabled by the read-only preview endpoint.
+- Generic Hydration SDK polling is not the normal price path and remains disabled unless explicitly enabled for diagnostics.
+- Market Cap / Volume windows are discovery and monitoring tools, not order execution tools.
 
 ---
 
@@ -1463,6 +1777,10 @@ See the top-level [LICENSE](LICENSE) file for the full license text.
 UTT is an actively evolving trading terminal codebase with ongoing work across:
 
 - UI and layout refinement
+- OKX balances, orderbooks, rules, fills diagnostics, fill basis preview, live-gated submit, live-gated cancel, and Market Cap / Volume source filtering
+- CEX order-economics normalization, fee/net display, and All Orders cancelability
+- balance cost basis, average cost, basis badges, lot drilldowns, 1D gain, and total gain display
+- Market Cap / Volume owned/unowned and venue/source filters backed by cached market-metrics context
 - Solana wallet and router integration
 - Polkadot / Hydration UTTT-HDX routing
 - Hydration price-cache status, external USD pricing, and UTTT/USD derivation

@@ -94,6 +94,13 @@ except Exception as e:
     print("polkadot_dex router import failed:", repr(e))
     polkadot_dex_router = None
 
+# NEW: Counterparty / Bitcoin metaprotocol router (/api/counterparty/*)
+try:
+    from .routers.counterparty import router as counterparty_router
+except Exception as e:
+    print("counterparty router import failed:", repr(e))
+    counterparty_router = None
+
 
 
 # NEW: Hydration wallet-history ingestion skeleton (/api/hydration_wallet_history/*)
@@ -164,6 +171,10 @@ def create_app() -> FastAPI:
     # Polkadot DEX / Hydration (reads first)
     if polkadot_dex_router is not None:
         app.include_router(polkadot_dex_router)
+
+    # Counterparty / Bitcoin metaprotocol (reads first)
+    if counterparty_router is not None:
+        app.include_router(counterparty_router)
 
     # Airdrop registration / status
     if airdrop_router is not None:

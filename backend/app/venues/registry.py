@@ -95,6 +95,17 @@ def _okx_enabled() -> bool:
     return bool(k and s and p)
 
 
+def _counterparty_enabled() -> bool:
+    """Counterparty is a read-only Bitcoin metaprotocol venue in this tranche."""
+    try:
+        fn = getattr(settings, "counterparty_effective_enabled", None)
+        if callable(fn):
+            return bool(fn())
+    except Exception:
+        return False
+    return False
+
+
 def _make_registry() -> Dict[str, VenueSpec]:
     """
     Build the registry lazily to avoid import-time circular dependencies
@@ -133,6 +144,11 @@ def _make_registry() -> Dict[str, VenueSpec]:
         # On-chain Solana DEX / aggregator execution + reads
         from ..adapters.solana_onchain import SolanaDexAdapter
         return SolanaDexAdapter()
+
+    def counterparty_factory():
+        # Counterparty / Bitcoin metaprotocol read adapter
+        from ..adapters.counterparty import CounterpartyAdapter
+        return CounterpartyAdapter()
 
     reg: Dict[str, VenueSpec] = {
         "gemini": VenueSpec(
@@ -210,6 +226,18 @@ def _make_registry() -> Dict[str, VenueSpec]:
             supports_balances=True,
             supports_orderbook=True,
             supports_markets=True,
+        ),
+
+        # NEW: Counterparty / Bitcoin metaprotocol (read-only foundation)
+        "counterparty": VenueSpec(
+            key="counterparty",
+            display_name="Counterparty / Bitcoin",
+            enabled=_counterparty_enabled,
+            adapter_factory=counterparty_factory,
+            supports_trading=False,   # no direct signing/broadcasting in this tranche
+            supports_balances=False,  # wallet-address balances use /api/wallet_addresses, not venue balances
+            supports_orderbook=False, # protocol DEX/order reads will get a dedicated path
+            supports_markets=False,   # DEX metrics will get a dedicated source adapter later
         ),
 
         # NEW: Solana on-chain DEX (reads first; trading wired later)

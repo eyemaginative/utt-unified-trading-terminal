@@ -187,6 +187,18 @@ class Settings(BaseSettings):
     dex_trade_base_url: Optional[str] = Field(default=None, alias="DEX_TRADE_BASE_URL")
     dex_trade_socket_base_url: Optional[str] = Field(default=None, alias="DEX_TRADE_SOCKET_BASE_URL")
 
+    # ─────────────────────────────────────────────────────────────
+    # Counterparty / Bitcoin metaprotocol integration — read-only foundation
+    #
+    # Counterparty assets are controlled by Bitcoin addresses.  Wallet signing
+    # should stay browser/wallet-mediated (for example, UniSat) until an
+    # explicit unsigned-transaction compose path is built.
+    # ─────────────────────────────────────────────────────────────
+    counterparty_enabled: bool = Field(default=True, alias="COUNTERPARTY_ENABLED")
+    counterparty_api_base_url: Optional[str] = Field(default="https://api.counterparty.io:4000", alias="COUNTERPARTY_API_BASE_URL")
+    counterparty_network: str = Field(default="mainnet", alias="COUNTERPARTY_NETWORK")
+    counterparty_wallet_provider: Optional[str] = Field(default="unisat", alias="COUNTERPARTY_WALLET_PROVIDER")
+
     def model_post_init(self, __context) -> None:
         # Vault-first hydration for Crypto.com: some routers/guards check the Settings fields
         # directly (cryptocom_exchange_api_key/secret). If env secrets are removed, mirror vault
@@ -649,6 +661,9 @@ class Settings(BaseSettings):
         "dex_trade_secret",
         "dex_trade_base_url",
         "dex_trade_socket_base_url",
+        # Counterparty fields
+        "counterparty_api_base_url",
+        "counterparty_wallet_provider",
         mode="before",
     )
     @classmethod
@@ -757,6 +772,41 @@ class Settings(BaseSettings):
         Convenience: returns configured base url or the Dex-Trade default.
         """
         return (self.dex_trade_base_url or "https://api.dex-trade.com").strip()
+
+    def counterparty_effective_enabled(self) -> bool:
+        """True when the read-only Counterparty adapter should be visible/usable.
+
+        This is intentionally not tied to exchange credentials: Counterparty is
+        Bitcoin-address based and the first tranche is read-only.  A missing or
+        invalid URL disables the venue so a bad env value does not break UI
+        discovery.
+        """
+        if not bool(getattr(self, "counterparty_enabled", True)):
+            return False
+        base_url = self.counterparty_effective_base_url()
+        return bool(base_url.startswith("https://") or base_url.startswith("http://"))
+
+    def counterparty_effective_base_url(self) -> str:
+        base = (
+            getattr(self, "counterparty_api_base_url", None)
+            or os.getenv("COUNTERPARTY_API_BASE_URL")
+            or "https://api.counterparty.io:4000"
+        )
+        return str(base or "").strip().rstrip("/")
+
+    def counterparty_effective_network(self) -> str:
+        net = (getattr(self, "counterparty_network", "mainnet") or os.getenv("COUNTERPARTY_NETWORK") or "mainnet")
+        net = str(net or "mainnet").strip().lower()
+        return net or "mainnet"
+
+    def counterparty_effective_wallet_provider(self) -> str:
+        provider = (
+            getattr(self, "counterparty_wallet_provider", None)
+            or os.getenv("COUNTERPARTY_WALLET_PROVIDER")
+            or "unisat"
+        )
+        provider = str(provider or "unisat").strip().lower()
+        return provider or "unisat"
 
     def dex_trade_effective_socket_base_url(self) -> str:
         """

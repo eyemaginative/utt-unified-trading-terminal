@@ -163,6 +163,31 @@ def _is_solana_network(network: str) -> bool:
     return n in {"solana", "mainnet", "mainnet-beta", "solana-mainnet", "solana_mainnet"}
 
 
+def _is_counterparty_network(network: str) -> bool:
+    n = str(network or "").strip().lower().replace("-", "_")
+    return n in {
+        "counterparty",
+        "bitcoin_counterparty",
+        "btc_counterparty",
+        "xcp",
+    }
+
+
+def _fetch_counterparty_asset_balance_atomic(address: str, asset: str) -> Tuple[int, int, Dict]:
+    """Return Counterparty asset balance for a Bitcoin/UniSat address.
+
+    This is intentionally read-only.  Signing/broadcasting remains wallet-mediated
+    and should be added through an explicit compose flow later.
+    """
+    from ..adapters.counterparty import CounterpartyAdapter
+
+    adapter = CounterpartyAdapter()
+    bal = adapter.get_address_asset_balance(address=address, asset=asset)
+    atomic = int(bal.get("quantity_atomic") or 0)
+    decimals = int(bal.get("decimals") if bal.get("decimals") is not None else 8)
+    return atomic, decimals, bal
+
+
 def _resolve_solana_spl_token(db: Optional[Session], asset: str) -> Tuple[Optional[str], Optional[int], Optional[Dict]]:
     """Resolve a Solana SPL token symbol to (mint, decimals, registry_meta).
 
@@ -628,6 +653,12 @@ async def _get_balance_atomic(asset: str, network: str, address: str, db: Option
     """
     a = _norm_asset(asset)
     decimals = _DECIMALS.get(a, 8)
+
+    # Counterparty assets live on Bitcoin addresses (UniSat-compatible address tracking).
+    # Add wallet row examples: asset=UTTT network=counterparty address=<bitcoin address>.
+    if _is_counterparty_network(network):
+        atomic, cp_decimals, raw = _fetch_counterparty_asset_balance_atomic(address, a)
+        return atomic, cp_decimals, raw, "counterparty_api"
 
     # Solana native SOL
     if a == "SOL":

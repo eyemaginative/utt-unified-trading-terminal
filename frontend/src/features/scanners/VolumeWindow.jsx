@@ -301,6 +301,25 @@ function ownedKeysFromPayload(...payloads) {
   return out;
 }
 
+
+function sourceKeysFromPayload(...payloads) {
+  const out = [];
+  const add = (value) => addNormalizedSourceKey(out, value);
+
+  payloads.forEach((payload) => {
+    if (!payload) return;
+    add(payload.venue_filter_options);
+    const ctx = payload.asset_context && typeof payload.asset_context === "object" ? payload.asset_context : {};
+    Object.values(ctx).forEach((row) => {
+      if (!row || typeof row !== "object") return;
+      add(row.owned_venues);
+      add(row.tracked_venues);
+    });
+  });
+
+  return out;
+}
+
 function rowIsOwned(row, ownedAssetKeys) {
   const explicit = row?.is_owned ?? row?.owned ?? row?.has_balance;
   if (typeof explicit === "boolean") return explicit;
@@ -362,6 +381,7 @@ export default function VolumeWindow({
   const [rows, setRows] = useState([]);
   const [payloadCounts, setPayloadCounts] = useState({ asset: 0, known: 0, owned: 0, ids: 0, symbolMatched: 0, pageRows: 0 });
   const [ownedAssetKeys, setOwnedAssetKeys] = useState([]);
+  const [payloadSourceKeys, setPayloadSourceKeys] = useState([]);
   const [sourceFilter, setSourceFilter] = useState("all");
   const sortKey = "volume_24h_usd";
   const [sortDir, setSortDir] = useState("desc");
@@ -521,6 +541,7 @@ export default function VolumeWindow({
       const nextDbRows = Array.isArray(dbJson?.items) ? dbJson.items : [];
       const nextRows = mergeMetricRows(nextDbRows, nextOwnedRows);
       const nextOwnedKeys = ownedKeysFromPayload(dbJson, ownedJson);
+      const nextSourceKeys = sourceKeysFromPayload(dbJson, ownedJson);
       const nextErrors = [
         ...(Array.isArray(ownedJson?.errors) ? ownedJson.errors : []),
         ...(Array.isArray(dbJson?.errors) ? dbJson.errors : []),
@@ -556,6 +577,7 @@ export default function VolumeWindow({
       const nextLastUpdated = dbJson?.updated_at || ownedJson?.updated_at || new Date().toISOString();
 
       setOwnedAssetKeys(nextOwnedKeys);
+      setPayloadSourceKeys(nextSourceKeys);
       setPayloadCounts(nextPayloadCounts);
       setRows(nextRows);
       setErrors(nextErrors);
@@ -563,6 +585,7 @@ export default function VolumeWindow({
       writeBrowserMetricSnapshot({
         rows: nextRows,
         ownedAssetKeys: nextOwnedKeys,
+        payloadSourceKeys: nextSourceKeys,
         payloadCounts: nextPayloadCounts,
         lastUpdated: nextLastUpdated,
       });
@@ -578,6 +601,7 @@ export default function VolumeWindow({
       if (!rows.length && cachedSnapshot?.rows?.length) {
         setRows(cachedSnapshot.rows);
         setOwnedAssetKeys(Array.isArray(cachedSnapshot.ownedAssetKeys) ? cachedSnapshot.ownedAssetKeys : []);
+        setPayloadSourceKeys(Array.isArray(cachedSnapshot.payloadSourceKeys) ? cachedSnapshot.payloadSourceKeys : []);
         setPayloadCounts(cachedSnapshot.payloadCounts || {});
         setLastUpdated(cachedSnapshot.lastUpdated || null);
         setErrors([{ message: `${msg}; showing last browser-cached market metrics snapshot.` }]);
@@ -602,6 +626,7 @@ export default function VolumeWindow({
     if (!cachedSnapshot?.rows?.length) return;
     setRows(cachedSnapshot.rows);
     setOwnedAssetKeys(Array.isArray(cachedSnapshot.ownedAssetKeys) ? cachedSnapshot.ownedAssetKeys : []);
+    setPayloadSourceKeys(Array.isArray(cachedSnapshot.payloadSourceKeys) ? cachedSnapshot.payloadSourceKeys : []);
     setPayloadCounts(cachedSnapshot.payloadCounts || {});
     setLastUpdated(cachedSnapshot.lastUpdated || null);
   }, []);
@@ -621,11 +646,15 @@ export default function VolumeWindow({
 
   const sourceOptions = useMemo(() => {
     const keys = new Set();
+    (Array.isArray(payloadSourceKeys) ? payloadSourceKeys : []).forEach((key) => {
+      const k = normalizeSourceKey(key);
+      if (k) keys.add(k);
+    });
     (Array.isArray(rows) ? rows : []).forEach((r) => {
       rowSourceKeys(r).forEach((key) => keys.add(key));
     });
     return Array.from(keys).filter(Boolean).sort((a, b) => rowSourceLabel(a).localeCompare(rowSourceLabel(b)));
-  }, [rows]);
+  }, [rows, payloadSourceKeys]);
 
   const rowCounts = useMemo(() => {
     const sourceRows = (Array.isArray(rows) ? rows : []).filter((r) => rowMatchesSource(r, sourceFilter));

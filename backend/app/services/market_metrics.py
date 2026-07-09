@@ -648,6 +648,85 @@ def _metric_context_public(ctx: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _venue_filter_options_from_context(asset_context: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Return stable venue/source filter keys from current local asset context.
+
+    This is read-only. It gives Market Cap / Volume windows a compact source
+    option list even when the broad summary itself is loaded from disk cache.
+    """
+    keys: List[str] = []
+    seen = set()
+
+    def add(value: Any) -> None:
+        s = str(value or "").strip().lower()
+        if not s or s in {"global", "unknown", "none", "n/a", "na", "all"}:
+            return
+        if s == "self-custody" or s == "selfcustody":
+            s = "self_custody"
+        elif s in {"crypto_com", "crypto.com", "crypto-com"}:
+            s = "cryptocom"
+        elif s == "dex-trade":
+            s = "dex_trade"
+        elif s in {"polkadot_hydration", "hydration_dex"}:
+            s = "hydration"
+        elif s in {"solana_jupiter", "jupiter", "raydium", "solana_dex"}:
+            s = "solana"
+        if s and s not in seen:
+            seen.add(s)
+            keys.append(s)
+
+    for ctx in (asset_context or {}).values():
+        if not isinstance(ctx, dict):
+            continue
+        for group_name in ("owned_venues", "tracked_venues"):
+            for v in (ctx.get(group_name) or set()):
+                add(v)
+
+    return sorted(keys)
+
+
+def _summary_snapshot_refresh_current_context(
+    payload: Dict[str, Any],
+    *,
+    limit: int,
+) -> Dict[str, Any]:
+    """Re-annotate a cached summary with current local owned/source context.
+
+    The summary disk cache intentionally avoids live CoinGecko work on window
+    open. However, local venues/balances can change after the snapshot is saved.
+    Re-reading only local DB context keeps the window fast while letting new
+    venues such as OKX appear in source filters immediately after balances are
+    refreshed.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    try:
+        asset_context = _db_market_metric_asset_context(limit=limit)
+        owned_assets_raw, owned_asset_source = _db_owned_metric_assets(limit=limit)
+        owned_assets_payload = _merge_assets(owned_assets_raw)
+
+        items = payload.get("items")
+        if isinstance(items, list):
+            payload["items"] = _annotate_market_metric_rows(
+                [dict(r) for r in items if isinstance(r, dict)],
+                asset_context=asset_context,
+                owned_assets=owned_assets_payload,
+            )
+
+        payload["owned_assets"] = owned_assets_payload
+        payload["owned_asset_count"] = len(owned_assets_payload)
+        payload["owned_asset_source"] = owned_asset_source
+        payload["asset_context"] = {k: _metric_context_public(v) for k, v in sorted(asset_context.items())}
+        payload["venue_filter_options"] = _venue_filter_options_from_context(asset_context)
+        payload["summary_snapshot_context_refreshed"] = True
+    except Exception:
+        # Snapshot context refresh is best-effort; never block window open.
+        payload["summary_snapshot_context_refreshed"] = False
+
+    return payload
+
+
 def _annotate_market_metric_rows(
     items: List[Dict[str, Any]],
     *,
@@ -882,7 +961,7 @@ def _summary_snapshot_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _summary_snapshot_load(snapshot_key: str) -> Optional[Dict[str, Any]]:
+def _summary_snapshot_load(snapshot_key: str, *, limit: int = 1000) -> Optional[Dict[str, Any]]:
     if not snapshot_key or not _summary_snapshot_cache_enabled():
         return None
 
@@ -909,6 +988,7 @@ def _summary_snapshot_load(snapshot_key: str) -> Optional[Dict[str, Any]]:
         out["summary_snapshot_age_s"] = age_s
         out["refresh_mode"] = "summary_snapshot"
         out["market_data_cache_snapshot_only"] = True
+        out = _summary_snapshot_refresh_current_context(out, limit=limit)
         return out
     except Exception:
         return None
@@ -1652,7 +1732,7 @@ def get_market_metrics_summary(
     # last full summary snapshot. Manual Refresh uses force_refresh=true and
     # rebuilds the local universe / live market cache.
     if is_known_request and not force_refresh:
-        snapshot_payload = _summary_snapshot_load(summary_snapshot_key)
+        snapshot_payload = _summary_snapshot_load(summary_snapshot_key, limit=clean_limit)
         if snapshot_payload is not None:
             return snapshot_payload
 
@@ -1875,6 +1955,7 @@ def get_market_metrics_summary(
         "refresh_mode": "cache_snapshot" if cache_snapshot_only else ("live_refresh" if force_refresh else "normal"),
         "include_assets": include_clean,
         "asset_context": {k: _metric_context_public(v) for k, v in sorted(asset_context.items())},
+        "venue_filter_options": _venue_filter_options_from_context(asset_context),
         "items": items,
         "errors": errors,
         "cache": "miss",

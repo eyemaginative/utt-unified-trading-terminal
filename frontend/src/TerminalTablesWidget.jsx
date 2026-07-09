@@ -1605,6 +1605,67 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       return lines.join("\n");
     }
 
+    function isBalanceGainSortKey(key) {
+      const k = String(key || "").trim().toLowerCase();
+      return k === "day_gain_pct" || k === "gain_1d_pct" || k === "total_gain_pct";
+    }
+
+    function getBalanceGainSortValue(row, key) {
+      const k = String(key || "").trim().toLowerCase();
+      if (k === "day_gain_pct" || k === "gain_1d_pct") return getBalanceDayGainPct(row);
+      if (k === "total_gain_pct") return getBalanceTotalGainPct(row);
+      return null;
+    }
+
+    function compareBalanceGainRows(a, b, key, dir) {
+      const av = balanceNumberOrNull(getBalanceGainSortValue(a, key));
+      const bv = balanceNumberOrNull(getBalanceGainSortValue(b, key));
+      const aMissing = av === null;
+      const bMissing = bv === null;
+
+      // Keep rows without a computable gain value at the bottom in both directions.
+      if (aMissing && bMissing) {
+        return String(a?.asset || a?.symbol || "").localeCompare(String(b?.asset || b?.symbol || ""));
+      }
+      if (aMissing) return 1;
+      if (bMissing) return -1;
+
+      const mult = String(dir || "desc").toLowerCase() === "asc" ? 1 : -1;
+      const diff = (av - bv) * mult;
+      if (Math.abs(diff) > 1e-12) return diff;
+      return String(a?.asset || a?.symbol || "").localeCompare(String(b?.asset || b?.symbol || ""));
+    }
+
+    function sortBalanceRowsByGain(rows, key, dir) {
+      if (!isBalanceGainSortKey(key)) return rows || [];
+      return [...(rows || [])].sort((a, b) => compareBalanceGainRows(a, b, key, dir));
+    }
+
+    function sortBalanceDisplayRowsByGainPreservingGroups(rows, key, dir) {
+      if (!isBalanceGainSortKey(key)) return rows || [];
+
+      const blocks = [];
+      let current = null;
+      for (const row of rows || []) {
+        if (row?.__balanceGroupParent) {
+          current = { parent: row, rows: [row] };
+          blocks.push(current);
+          continue;
+        }
+
+        if (row?.__balanceGroupChild && current && row.__balanceGroupKey === current.parent?.__balanceGroupKey) {
+          current.rows.push(row);
+          continue;
+        }
+
+        current = null;
+        blocks.push({ parent: row, rows: [row] });
+      }
+
+      blocks.sort((a, b) => compareBalanceGainRows(a.parent, b.parent, key, dir));
+      return blocks.flatMap((block) => block.rows);
+    }
+
     function getBalanceBasisStatus(row) {
       const explicit = String(
         row?.basis_status ??
@@ -2432,9 +2493,12 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
     }, [balancesSorted, balancesSymbolQuery, isSolanaVenue, isPolkadotHydrationVenue, isAllVenuesSelected, solanaOnchain, hydrationOnchain, venue, solanaPrices, solanaTokenRegistryMap]);
 
     const balancesDisplayRows = useMemo(() => {
-      if (venue !== ALL_VENUES_VALUE) return balancesFiltered || [];
-      return buildAllVenuesBalanceDisplayRows(balancesFiltered || [], expandedBalanceGroups);
-    }, [balancesFiltered, expandedBalanceGroups, venue, ALL_VENUES_VALUE, balanceMarketChange24hPctByAsset]);
+      if (venue !== ALL_VENUES_VALUE) {
+        return sortBalanceRowsByGain(balancesFiltered || [], balSortKey, balSortDir);
+      }
+      const groupedRows = buildAllVenuesBalanceDisplayRows(balancesFiltered || [], expandedBalanceGroups);
+      return sortBalanceDisplayRowsByGainPreservingGroups(groupedRows, balSortKey, balSortDir);
+    }, [balancesFiltered, expandedBalanceGroups, venue, ALL_VENUES_VALUE, balanceMarketChange24hPctByAsset, balSortKey, balSortDir]);
 
   const solanaPortfolioTotalUsd = useMemo(() => {
     if (!shouldIncludeSolanaOnchainBalances) return null;
@@ -6868,8 +6932,12 @@ function renderFillToasts() {
                 <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("total_usd")}>
                   Total USD {balSortKey === "total_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
                 </th>
-                <th style={sx.th}>1D Gain %</th>
-                <th style={sx.th}>Total Gain %</th>
+                <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("day_gain_pct")}>
+                  1D Gain % {balSortKey === "day_gain_pct" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
+                </th>
+                <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("total_gain_pct")}>
+                  Total Gain % {balSortKey === "total_gain_pct" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
+                </th>
                 <th style={{ ...sx.th, ...sx.linkyHeader }} onClick={() => toggleBalanceSort?.("cost_basis_usd")}>
                   Cost Basis {balSortKey === "cost_basis_usd" ? (balSortDir === "asc" ? "▲" : "▼") : ""}
                 </th>

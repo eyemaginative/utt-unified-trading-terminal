@@ -29,6 +29,15 @@ def counterparty_unisat_provider() -> Dict[str, Any]:
     return _adapter().wallet_provider_info("unisat")
 
 
+@router.get("/assets/metadata")
+def counterparty_assets_metadata(
+    assets: str = Query(default="", description="Comma-separated Counterparty asset names"),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> Dict[str, Any]:
+    asset_list = [a.strip() for a in str(assets or "").split(",") if a.strip()]
+    return _adapter().get_assets_metadata(asset_list, limit=limit)
+
+
 @router.get("/assets/{asset}")
 def counterparty_asset(asset: str) -> Dict[str, Any]:
     return _raise_if_failed(_adapter().get_asset(asset), label="counterparty_asset_lookup_failed")

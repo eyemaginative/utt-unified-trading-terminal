@@ -110,6 +110,116 @@ class CounterpartyAdapter:
             except Exception:
                 return None
 
+    @staticmethod
+    def _first_dict_from_payload(payload: Any) -> Dict[str, Any]:
+        if isinstance(payload, dict):
+            for key in ("result", "data", "asset", "info", "item", "metadata"):
+                val = payload.get(key)
+                if isinstance(val, dict):
+                    nested = CounterpartyAdapter._first_dict_from_payload(val)
+                    if nested:
+                        return nested
+            return payload
+        return {}
+
+    @staticmethod
+    def _as_bool(v: Any) -> Optional[bool]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "locked"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "unlocked"}:
+            return False
+        return None
+
+    @staticmethod
+    def _first_present(row: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+        for key in keys:
+            if key in row and row.get(key) not in (None, ""):
+                return row.get(key)
+        return None
+
+    @classmethod
+    def _normalize_asset_metadata(cls, asset: str, raw_payload: Any, *, source_path: Optional[str] = None) -> Dict[str, Any]:
+        row = cls._first_dict_from_payload(raw_payload)
+        asset_norm = str(asset or cls._first_present(row, ("asset", "asset_name", "assetName", "symbol")) or "").strip().upper()
+        longname = str(cls._first_present(row, ("asset_longname", "assetLongname", "asset_long_name", "longname", "long_name")) or "").strip()
+        issuer = str(cls._first_present(row, ("issuer", "owner", "source", "issuer_address", "issuerAddress", "owner_address", "ownerAddress", "current_holder", "holder")) or "").strip()
+        description = str(cls._first_present(row, ("description", "desc", "memo", "text", "message")) or "").strip()
+        divisible = cls._as_bool(cls._first_present(row, ("divisible", "is_divisible", "isDivisible")))
+        locked = cls._as_bool(cls._first_present(row, ("locked", "lock", "is_locked", "isLocked", "locked_status")))
+        callable_ = cls._as_bool(cls._first_present(row, ("callable", "is_callable", "isCallable")))
+        reset = cls._as_bool(cls._first_present(row, ("reset", "resettable", "is_resettable", "isResettable")))
+
+        supply_source = None
+        supply = None
+        supply_atomic = None
+        supply_decimals = 8 if divisible is True else 0
+        normalized_supply_keys = (
+            "supply_normalized",
+            "total_supply_normalized",
+            "quantity_normalized",
+            "normalized_supply",
+            "supplyNormalized",
+            "totalSupplyNormalized",
+        )
+        raw_supply_keys = ("supply", "total_supply", "quantity", "issued", "issued_supply", "totalSupply")
+
+        for key in normalized_supply_keys:
+            supply = cls._as_float(row.get(key))
+            if supply is not None:
+                supply_source = key
+                if divisible is True:
+                    supply_atomic = int(round(float(supply) * 100000000))
+                elif divisible is False:
+                    supply_atomic = int(round(float(supply)))
+                break
+        if supply is None:
+            for key in raw_supply_keys:
+                raw_supply = cls._as_float(row.get(key))
+                if raw_supply is not None:
+                    supply_source = key
+                    if divisible is True:
+                        # Counterparty Core v2 asset metadata exposes `supply` for
+                        # divisible assets in atomic/base units. Convert it to
+                        # display units so XCP-like assets do not show 1e8-scaled
+                        # supply in UTT.
+                        supply_atomic = int(round(float(raw_supply)))
+                        supply = float(raw_supply) / 100000000.0
+                    else:
+                        supply = float(raw_supply)
+                        supply_atomic = int(round(float(raw_supply)))
+                    break
+
+        call_date = cls._first_present(row, ("call_date", "callDate"))
+        call_price = cls._as_float(cls._first_present(row, ("call_price", "callPrice")))
+        block_index = cls._first_present(row, ("block_index", "blockIndex", "block"))
+        tx_hash = str(cls._first_present(row, ("tx_hash", "txHash", "txid", "transaction_hash")) or "").strip()
+
+        return {
+            "asset": asset_norm,
+            "asset_longname": longname or None,
+            "issuer": issuer or None,
+            "description": description or None,
+            "divisible": divisible,
+            "locked": locked,
+            "callable": callable_,
+            "reset": reset,
+            "supply": supply,
+            "supply_atomic": supply_atomic,
+            "supply_decimals": supply_decimals,
+            "supply_source": supply_source,
+            "call_date": call_date,
+            "call_price": call_price,
+            "block_index": block_index,
+            "tx_hash": tx_hash or None,
+            "source_path": source_path,
+            "raw_item": row,
+        }
+
     # ------------------------------------------------------------------
     # Read endpoints
     # ------------------------------------------------------------------
@@ -156,13 +266,54 @@ class CounterpartyAdapter:
         }
 
     def get_asset(self, asset: str) -> Dict[str, Any]:
-        a = quote(str(asset or "").strip().upper(), safe="")
-        return self._first_ok([
+        a_norm = str(asset or "").strip().upper()
+        a = quote(a_norm, safe="")
+        result = self._first_ok([
             (f"/v2/assets/{a}", None),
             (f"/v2/assets/{a}/info", None),
             (f"/api/assets/{a}", None),
             (f"/assets/{a}", None),
         ])
+        if result.get("ok"):
+            result["asset"] = a_norm
+            result["metadata"] = self._normalize_asset_metadata(a_norm, result.get("raw"), source_path=result.get("path"))
+        return result
+
+    def get_assets_metadata(self, assets: List[str], limit: int = 100) -> Dict[str, Any]:
+        seen = set()
+        normalized: List[str] = []
+        for asset in assets or []:
+            a = str(asset or "").strip().upper()
+            if not a or a in seen:
+                continue
+            seen.add(a)
+            normalized.append(a)
+            if len(normalized) >= max(1, min(int(limit or 100), 200)):
+                break
+
+        items: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        for asset in normalized:
+            result = self.get_asset(asset)
+            if result.get("ok"):
+                items.append({
+                    "ok": True,
+                    "asset": asset,
+                    "metadata": result.get("metadata") or {},
+                    "source_path": result.get("path"),
+                    "raw": result.get("raw"),
+                })
+            else:
+                errors.append({"asset": asset, "errors": result.get("errors") or []})
+
+        return {
+            "ok": True,
+            "count": len(items),
+            "requested_count": len(normalized),
+            "items": items,
+            "errors": errors,
+            "read_only": True,
+        }
 
     def get_address_balances(self, address: str) -> Dict[str, Any]:
         addr = quote(str(address or "").strip(), safe="")

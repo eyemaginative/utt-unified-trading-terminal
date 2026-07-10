@@ -206,6 +206,61 @@ function normalizeCounterpartyBalancesPayload(payload) {
     .filter(Boolean);
 }
 
+function normalizeCounterpartyMetadataItems(payload) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const rawItems = Array.isArray(payload)
+    ? payload
+    : Array.isArray(root.items)
+      ? root.items
+      : Array.isArray(root.data)
+        ? root.data
+        : Array.isArray(root.results)
+          ? root.results
+          : [];
+
+  const out = {};
+  for (const it of rawItems || []) {
+    const obj = it && typeof it === "object" ? it : {};
+    const meta = obj.metadata && typeof obj.metadata === "object" ? obj.metadata : obj;
+    const asset = String(obj.asset || meta.asset || meta.asset_name || meta.symbol || "").trim().toUpperCase();
+    if (!asset) continue;
+    out[asset] = {
+      ...meta,
+      asset,
+      asset_longname: meta.asset_longname || meta.assetLongname || meta.longname || meta.asset_long_name || null,
+      issuer: meta.issuer || meta.owner || meta.source || meta.issuer_address || meta.owner_address || null,
+      description: meta.description || meta.desc || meta.memo || null,
+      divisible: meta.divisible,
+      locked: meta.locked,
+      callable: meta.callable,
+      reset: meta.reset,
+      supply: meta.supply,
+      supply_source: meta.supply_source || null,
+      source_path: obj.source_path || meta.source_path || null,
+    };
+  }
+  return out;
+}
+
+function boolLabel(v) {
+  if (v === true) return "Yes";
+  if (v === false) return "No";
+  return "—";
+}
+
+function firstText(...vals) {
+  for (const v of vals || []) {
+    const s = String(v ?? "").trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+function counterpartyMetadataFor(row, metadataMap) {
+  const asset = String(row?.asset || "").trim().toUpperCase();
+  return asset ? (metadataMap?.[asset] || null) : null;
+}
+
 function fmtQuantityMaybe(v) {
   const n = finiteNumberOrNull(v);
   if (n === null) return "—";
@@ -225,6 +280,9 @@ function rowSearchText(row) {
     row.asset,
     row.assetLongname,
     row.asset_longname,
+    row.assetMetadata?.asset_longname,
+    row.assetMetadata?.issuer,
+    row.assetMetadata?.description,
     row.utxo,
     row.utxo_address,
   ].map((x) => String(x || "").toLowerCase()).join(" ");
@@ -336,6 +394,9 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   const [counterpartyLoading, setCounterpartyLoading] = useState(false);
   const [counterpartyErr, setCounterpartyErr] = useState("");
   const [counterpartyUpdatedAt, setCounterpartyUpdatedAt] = useState(null);
+  const [counterpartyMetadataMap, setCounterpartyMetadataMap] = useState({});
+  const [counterpartyMetadataLoading, setCounterpartyMetadataLoading] = useState(false);
+  const [counterpartyMetadataErr, setCounterpartyMetadataErr] = useState("");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [query, setQuery] = useState("");
@@ -396,6 +457,28 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
     return addr;
   }
 
+  async function loadCounterpartyAssetMetadata(rowsMaybe = counterpartyItems) {
+    const assets = Array.from(new Set((rowsMaybe || []).map((row) => String(row?.asset || "").trim().toUpperCase()).filter(Boolean))).slice(0, 100);
+    if (!assets.length) {
+      setCounterpartyMetadataMap({});
+      return {};
+    }
+
+    setCounterpartyMetadataLoading(true);
+    setCounterpartyMetadataErr("");
+    try {
+      const payload = await fetchJsonMaybe(apiBase, `/api/counterparty/assets/metadata?assets=${encodeURIComponent(assets.join(","))}&limit=100`);
+      const normalized = normalizeCounterpartyMetadataItems(payload);
+      setCounterpartyMetadataMap(normalized);
+      return normalized;
+    } catch (e) {
+      setCounterpartyMetadataErr(String(e?.message || e || "Failed to load Counterparty asset metadata."));
+      return {};
+    } finally {
+      setCounterpartyMetadataLoading(false);
+    }
+  }
+
   async function loadCounterpartyBalances(addrMaybe = address) {
     const addr = String(addrMaybe || "").trim();
     if (!addr) {
@@ -410,6 +493,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
       const normalized = normalizeCounterpartyBalancesPayload(payload);
       setCounterpartyItems(normalized);
       setCounterpartyUpdatedAt(new Date().toISOString());
+      loadCounterpartyAssetMetadata(normalized).catch(() => {});
       return normalized;
     } catch (e) {
       setCounterpartyErr(String(e?.message || e || "Failed to load Counterparty assets."));
@@ -467,7 +551,15 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
     const tf = String(typeFilter || "all").trim().toLowerCase();
     const sf = String(sourceFilter || "all").trim().toLowerCase();
     const ordinalRows = (items || []).map((it) => ({ ...it, sourceKind: "ordinal" }));
-    const counterpartyRows = (counterpartyItems || []).map((it) => ({ ...it, sourceKind: "counterparty" }));
+    const counterpartyRows = (counterpartyItems || []).map((it) => {
+      const meta = counterpartyMetadataFor(it, counterpartyMetadataMap);
+      return {
+        ...it,
+        sourceKind: "counterparty",
+        assetMetadata: meta,
+        assetLongname: it.assetLongname || meta?.asset_longname || "",
+      };
+    });
 
     return [...ordinalRows, ...counterpartyRows].filter((row) => {
       const rowKind = String(row?.sourceKind || "").toLowerCase();
@@ -479,17 +571,17 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
       if (!q) return true;
       return rowSearchText(row).includes(q);
     });
-  }, [items, counterpartyItems, query, typeFilter, sourceFilter]);
+  }, [items, counterpartyItems, counterpartyMetadataMap, query, typeFilter, sourceFilter]);
 
   const summary = useMemo(() => {
-    const out = { total: items.length + counterpartyItems.length, image: 0, video: 0, audio: 0, text: 0, json: 0, external: 0, other: 0, counterparty: counterpartyItems.length };
+    const out = { total: items.length + counterpartyItems.length, image: 0, video: 0, audio: 0, text: 0, json: 0, external: 0, other: 0, counterparty: counterpartyItems.length, metadata: Object.keys(counterpartyMetadataMap || {}).length };
     for (const it of items || []) {
       const b = contentTypeBucket(it?.contentType);
       if (out[b] === undefined) out.other += 1;
       else out[b] += 1;
     }
     return out;
-  }, [items, counterpartyItems]);
+  }, [items, counterpartyItems, counterpartyMetadataMap]);
 
   const pageCanPrev = cursor > 0;
   const pageCanNext = total > 0 ? cursor + pageSize < total : items.length >= pageSize;
@@ -555,6 +647,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   const selectedKind = String(selected?.sourceKind || "ordinal").toLowerCase();
   const selectedContentUrl = String(selected?.content || selected?.preview || "").trim();
   const selectedBucket = contentTypeBucket(selected?.contentType);
+  const selectedMetadata = selectedKind === "counterparty" ? counterpartyMetadataFor(selected, counterpartyMetadataMap) : null;
 
   return (
     <div style={panelStyle}>
@@ -577,7 +670,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
       <div style={{ display: "grid", gridTemplateColumns: "repeat(6, minmax(120px, 1fr))", gap: 8 }}>
         <div style={cardStyle}><div style={mutedStyle}>Loaded</div><div style={{ fontWeight: 950, fontSize: 18 }}>{hideTableData ? "••••" : summary.total.toLocaleString()}</div></div>
         <div style={cardStyle}><div style={mutedStyle}>Ordinals</div><div style={{ fontWeight: 950, fontSize: 18 }}>{hideTableData ? "••••" : items.length.toLocaleString()}</div></div>
-        <div style={cardStyle}><div style={mutedStyle}>Counterparty</div><div style={{ fontWeight: 950, fontSize: 18 }}>{hideTableData ? "••••" : summary.counterparty.toLocaleString()}</div></div>
+        <div style={cardStyle} title="Counterparty balances / metadata loaded"><div style={mutedStyle}>Counterparty</div><div style={{ fontWeight: 950, fontSize: 18 }}>{hideTableData ? "••••" : `${summary.counterparty.toLocaleString()} / ${summary.metadata.toLocaleString()}`}</div></div>
         <div style={cardStyle}><div style={mutedStyle}>Images</div><div style={{ fontWeight: 950, fontSize: 18 }}>{hideTableData ? "••••" : summary.image.toLocaleString()}</div></div>
         <div style={cardStyle}><div style={mutedStyle}>Text / JSON</div><div style={{ fontWeight: 950, fontSize: 18 }}>{hideTableData ? "••••" : (summary.text + summary.json).toLocaleString()}</div></div>
         <div style={cardStyle} title="UniSat getBalance result">
@@ -630,6 +723,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
 
       {err ? <div style={{ color: "#ff6b6b", fontSize: 12, whiteSpace: "pre-wrap" }}>{err}</div> : null}
       {counterpartyErr ? <div style={{ color: "#ffb86b", fontSize: 12, whiteSpace: "pre-wrap" }}>Counterparty assets: {counterpartyErr}</div> : null}
+      {counterpartyMetadataErr ? <div style={{ color: "#ffb86b", fontSize: 12, whiteSpace: "pre-wrap" }}>Counterparty metadata: {counterpartyMetadataErr}</div> : null}
 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 320px", gap: 10, minHeight: 0, flex: "1 1 auto" }}>
         <div style={{ ...cardStyle, padding: 0, overflow: "hidden", minHeight: 0 }}>
@@ -672,7 +766,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
                       <td style={tdStyle}><span style={typeBadgeStyle(bucket)}>{isCounterparty ? "Counterparty asset" : (it.contentType || bucket)}</span></td>
                       <td style={tdStyle}>
                         <div style={{ fontWeight: 900 }}>{isCounterparty ? it.asset : (it.inscriptionNumber !== null && it.inscriptionNumber !== undefined ? `Inscription #${it.inscriptionNumber}` : "Inscription")}</div>
-                        <div style={{ ...mutedStyle, fontSize: 11 }}>{isCounterparty ? (it.assetLongname || "Protocol balance") : (bucket === "external" ? "External-open only" : "Safe preview eligible")}</div>
+                        <div style={{ ...mutedStyle, fontSize: 11 }}>{isCounterparty ? (firstText(it.assetLongname, it.assetMetadata?.issuer ? `Issuer ${maskMiddle(it.assetMetadata.issuer, 6, 4)}` : "", "Protocol balance")) : (bucket === "external" ? "External-open only" : "Safe preview eligible")}</div>
                       </td>
                       <td style={tdStyle}>{isCounterparty ? "Counterparty" : "Ordinals"}</td>
                       <td style={tdStyle}>{isCounterparty ? "Counterparty API" : "UniSat"}</td>
@@ -705,8 +799,12 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
                 ) : selectedKind === "counterparty" ? (
                   <div style={{ padding: 18, textAlign: "center" }}>
                     <div style={{ fontSize: 26, fontWeight: 950 }}>{selected.asset || "Counterparty"}</div>
-                    <div style={{ marginTop: 8, ...mutedStyle }}>Counterparty asset balance</div>
+                    <div style={{ marginTop: 8, ...mutedStyle }}>{selectedMetadata?.asset_longname || "Counterparty asset balance"}</div>
                     <div style={{ marginTop: 8, fontWeight: 900 }}>{fmtQuantityMaybe(selected.quantity)}</div>
+                    <div style={{ marginTop: 8, display: "flex", gap: 6, justifyContent: "center", flexWrap: "wrap" }}>
+                      <span style={typeBadgeStyle("counterparty")}>Divisible: {boolLabel(selectedMetadata?.divisible)}</span>
+                      <span style={typeBadgeStyle(selectedMetadata?.locked ? "external" : "other")}>Locked: {boolLabel(selectedMetadata?.locked)}</span>
+                    </div>
                   </div>
                 ) : selectedContentUrl && selectedBucket === "image" ? (
                   <img alt="selected inscription" src={selectedContentUrl} referrerPolicy="no-referrer" style={{ maxWidth: "100%", maxHeight: 260, objectFit: "contain" }} />
@@ -726,12 +824,18 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
                   <>
                     <div><b>Standard:</b> Counterparty</div>
                     <div title={selected.asset}><b>Asset:</b> {hideTableData ? "••••" : selected.asset || "—"}</div>
-                    <div title={selected.assetLongname || selected.asset_longname}><b>Longname:</b> {hideTableData ? "••••" : (selected.assetLongname || selected.asset_longname || "—")}</div>
+                    <div title={selected.assetLongname || selected.asset_longname || selectedMetadata?.asset_longname}><b>Longname:</b> {hideTableData ? "••••" : (selected.assetLongname || selected.asset_longname || selectedMetadata?.asset_longname || "—")}</div>
                     <div><b>Quantity:</b> {hideTableData ? "••••" : fmtQuantityMaybe(selected.quantity)}</div>
+                    <div title={selectedMetadata?.supply}><b>Supply:</b> {hideTableData ? "••••" : fmtQuantityMaybe(selectedMetadata?.supply)}</div>
+                    <div title={selectedMetadata?.issuer}><b>Issuer / Owner:</b> {hideTableData ? "••••" : maskMiddle(selectedMetadata?.issuer, 10, 10)}</div>
+                    <div><b>Divisible:</b> {hideTableData ? "••••" : boolLabel(selectedMetadata?.divisible)}</div>
+                    <div><b>Locked:</b> {hideTableData ? "••••" : boolLabel(selectedMetadata?.locked)}</div>
+                    <div title={selectedMetadata?.description}><b>Description:</b> {hideTableData ? "••••" : (selectedMetadata?.description || "—")}</div>
                     <div title={selected.address}><b>Address:</b> {hideTableData ? "••••" : maskMiddle(selected.address, 10, 10)}</div>
                     <div title={selected.utxo || selected.location}><b>UTXO:</b> {hideTableData ? "••••" : maskMiddle(selected.utxo || selected.location, 10, 10)}</div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 4 }}>
                       <button type="button" style={{ ...buttonStyle, padding: "5px 8px" }} onClick={() => copyTextSafe(selected.asset)}>Copy Asset</button>
+                      {selectedMetadata?.issuer ? <button type="button" style={{ ...buttonStyle, padding: "5px 8px" }} onClick={() => copyTextSafe(selectedMetadata.issuer)}>Copy Issuer</button> : null}
                     </div>
                   </>
                 ) : (
@@ -761,6 +865,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
           ) : null}
           {updatedAt ? <div style={{ marginTop: 8, ...mutedStyle, fontSize: 11 }}>Ordinals updated: {fmtTimeMaybe(updatedAt)}</div> : null}
           {counterpartyUpdatedAt ? <div style={{ marginTop: 4, ...mutedStyle, fontSize: 11 }}>Counterparty updated: {fmtTimeMaybe(counterpartyUpdatedAt)}</div> : null}
+          {counterpartyMetadataLoading ? <div style={{ marginTop: 4, ...mutedStyle, fontSize: 11 }}>Counterparty metadata loading…</div> : null}
         </div>
       </div>
     </div>

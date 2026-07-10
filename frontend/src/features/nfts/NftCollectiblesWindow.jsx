@@ -1,7 +1,10 @@
 // frontend/src/features/nfts/NftCollectiblesWindow.jsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const LS_UNISAT_ADDR_KEY = "utt_nft_unisat_address_v1";
+const LS_COUNTERPARTY_METADATA_CACHE_KEY = "utt_nft_counterparty_metadata_cache_v1";
+const COUNTERPARTY_METADATA_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const COUNTERPARTY_METADATA_CACHE_MAX_ASSETS = 500;
 
 function asArray(v) {
   return Array.isArray(v) ? v : [];
@@ -91,6 +94,191 @@ async function fetchJsonMaybe(apiBase, path) {
   const data = await r.json().catch(() => ({}));
   if (!r.ok || data?.ok === false) throw new Error(data?.detail || data?.error || `HTTP ${r.status}`);
   return data;
+}
+
+function looksLikeExternalMetadataPointer(v) {
+  const s = String(v || "").trim();
+  if (!s) return false;
+  if (/^(https?:\/\/|ipfs:\/\/|ar:\/\/|arweave:\/\/|\/\/)/i.test(s)) return true;
+  return /^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(\/|$)/.test(s) && (s.includes("/") || /\.(json|png|jpe?g|gif|webp|html?)(\?|$)/i.test(s));
+}
+
+function metadataHasRetryableMediaFailure(metadataMaybe) {
+  const metadata = metadataMaybe && typeof metadataMaybe === "object" ? metadataMaybe : {};
+  const media = metadata.media && typeof metadata.media === "object" ? metadata.media : null;
+  if (media?.ok) return false;
+  const external = metadata.external_metadata && typeof metadata.external_metadata === "object" ? metadata.external_metadata : {};
+  const err = String(metadata.media_error || external.error || "").trim().toLowerCase();
+  const hasExternalPointer = !!metadata.external_metadata_url || !!external.url || looksLikeExternalMetadataPointer(metadata.description);
+  if (!hasExternalPointer) {
+    const desc = String(metadata.description || "").trim().toLowerCase();
+    const asset = String(metadata.asset || "").trim().toUpperCase();
+    // Older Counterparty collectibles often have no on-chain media pointer,
+    // but registry probes can still enrich them later. Do not let a stale
+    // localStorage no-media row suppress TokenScan/registry retries.
+    if (asset.endsWith("CARD") || asset.endsWith("CD") || ` ${desc} `.includes(" card") || desc.includes("sog") || desc.includes("spells of genesis")) {
+      return true;
+    }
+    return false;
+  }
+  if (["no_media_url_in_metadata", "no_media_url_in_override", "no_media_url_in_orbital_metadata"].includes(err)) return false;
+  // Any failed external metadata result should be retried instead of being
+  // preserved in localStorage as a permanent no-image record.
+  if (err) return true;
+  // Older cached entries may have a bare-domain description but no
+  // external_metadata_url because earlier code did not normalize bare URLs.
+  return true;
+}
+
+function uniqueStrings(...vals) {
+  const out = [];
+  const push = (v) => {
+    if (Array.isArray(v)) {
+      v.forEach(push);
+      return;
+    }
+    const s = String(v || "").trim();
+    if (s && !out.includes(s)) out.push(s);
+  };
+  vals.forEach(push);
+  return out;
+}
+
+function arweaveMediaPathFallbacks(urlMaybe) {
+  const raw = String(urlMaybe || "").trim();
+  if (!raw) return [];
+  try {
+    const u = new URL(raw);
+    const host = String(u.hostname || "").toLowerCase();
+    const parts = String(u.pathname || "").split("/").filter(Boolean);
+    const out = [];
+    const add = (candidate) => {
+      const s = String(candidate || "").trim();
+      if (s && !out.includes(s)) out.push(s);
+    };
+    if (parts.length >= 2) {
+      const rootPath = `/${parts[0]}${u.search || ""}`;
+      if (host.endsWith(".arweave.net") || ["arweave.net", "permagate.io", "ar-io.net"].includes(host)) {
+        // Key Counterparty/ORBital case:
+        //   .../<data-id>/<name>_image.png
+        // often resolves in-browser as:
+        //   .../<data-id>
+        add(`${u.protocol}//${u.host}${rootPath}`);
+        add(`https://arweave.net/${parts[0]}${u.search || ""}`);
+        add(`https://permagate.io/${parts[0]}${u.search || ""}`);
+        add(`https://ar-io.net/${parts[0]}${u.search || ""}`);
+      }
+      if (["ipfs.io", "cloudflare-ipfs.com", "gateway.pinata.cloud"].includes(host) && parts[0].toLowerCase() === "ipfs" && parts[1]) {
+        add(`https://ipfs.io/ipfs/${parts[1]}${u.search || ""}`);
+        add(`https://cloudflare-ipfs.com/ipfs/${parts[1]}${u.search || ""}`);
+        add(`https://gateway.pinata.cloud/ipfs/${parts[1]}${u.search || ""}`);
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function mediaUrlCandidates(primary, ...candidateGroups) {
+  const base = uniqueStrings(primary, ...candidateGroups);
+  const expanded = [];
+  base.forEach((u) => {
+    if (!expanded.includes(u)) expanded.push(u);
+    arweaveMediaPathFallbacks(u).forEach((candidate) => {
+      if (!expanded.includes(candidate)) expanded.push(candidate);
+    });
+  });
+  return expanded;
+}
+
+function ResilientMediaImage({ src, candidates, alt, style, fallbackStyle, loading = "lazy" }) {
+  const urls = useMemo(() => mediaUrlCandidates(src, candidates), [src, candidates]);
+  const [idx, setIdx] = useState(0);
+  useEffect(() => {
+    setIdx(0);
+  }, [urls.join("|")]);
+
+  const current = urls[idx] || "";
+  if (!current) {
+    return <div style={fallbackStyle || style}>Image unavailable</div>;
+  }
+  if (idx >= urls.length) {
+    return <div style={fallbackStyle || style}>Image unavailable</div>;
+  }
+
+  return (
+    <img
+      alt={alt || "media preview"}
+      src={current}
+      loading={loading}
+      referrerPolicy="no-referrer"
+      onError={() => setIdx((prev) => prev + 1)}
+      style={style}
+    />
+  );
+}
+
+function readCounterpartyMetadataCache(assetsMaybe = []) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return {};
+    const wanted = new Set((assetsMaybe || []).map((a) => String(a || "").trim().toUpperCase()).filter(Boolean));
+    const raw = window.localStorage.getItem(LS_COUNTERPARTY_METADATA_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    const items = parsed?.items && typeof parsed.items === "object" ? parsed.items : parsed;
+    const now = Date.now();
+    const out = {};
+    for (const [assetRaw, entryRaw] of Object.entries(items || {})) {
+      const asset = String(assetRaw || "").trim().toUpperCase();
+      if (!asset || (wanted.size && !wanted.has(asset))) continue;
+      const entry = entryRaw && typeof entryRaw === "object" ? entryRaw : {};
+      const ts = Number(entry.ts || entry.updatedAt || entry.cachedAt || 0);
+      const metadata = entry.metadata && typeof entry.metadata === "object" ? entry.metadata : entry;
+      if (!metadata || typeof metadata !== "object") continue;
+      if (metadataHasRetryableMediaFailure(metadata)) continue;
+      if (ts && now - ts > COUNTERPARTY_METADATA_CACHE_TTL_MS) continue;
+      out[asset] = { ...metadata, asset: metadata.asset || asset };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeCounterpartyMetadataCache(metadataMapMaybe = {}) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    const incoming = metadataMapMaybe && typeof metadataMapMaybe === "object" ? metadataMapMaybe : {};
+    if (!Object.keys(incoming).length) return;
+    let items = {};
+    try {
+      const raw = window.localStorage.getItem(LS_COUNTERPARTY_METADATA_CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        items = parsed?.items && typeof parsed.items === "object" ? parsed.items : (parsed && typeof parsed === "object" ? parsed : {});
+      }
+    } catch {
+      items = {};
+    }
+    const now = Date.now();
+    for (const [assetRaw, metadataRaw] of Object.entries(incoming)) {
+      const asset = String(assetRaw || metadataRaw?.asset || "").trim().toUpperCase();
+      if (!asset || !metadataRaw || typeof metadataRaw !== "object") continue;
+      if (metadataHasRetryableMediaFailure(metadataRaw)) continue;
+      items[asset] = {
+        ts: now,
+        metadata: { ...metadataRaw, asset },
+      };
+    }
+    const sorted = Object.entries(items)
+      .filter(([asset, entry]) => asset && entry && typeof entry === "object")
+      .sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0))
+      .slice(0, COUNTERPARTY_METADATA_CACHE_MAX_ASSETS);
+    window.localStorage.setItem(LS_COUNTERPARTY_METADATA_CACHE_KEY, JSON.stringify({ version: 1, updatedAt: now, items: Object.fromEntries(sorted) }));
+  } catch {
+    // localStorage quota/private mode should never block NFT display
+  }
 }
 
 function normalizeInscriptionsPayload(payload) {
@@ -224,12 +412,20 @@ function normalizeCounterpartyMetadataItems(payload) {
     const meta = obj.metadata && typeof obj.metadata === "object" ? obj.metadata : obj;
     const asset = String(obj.asset || meta.asset || meta.asset_name || meta.symbol || "").trim().toUpperCase();
     if (!asset) continue;
+    const media = meta.media && typeof meta.media === "object" ? meta.media : null;
+    const externalMetadata = meta.external_metadata && typeof meta.external_metadata === "object" ? meta.external_metadata : null;
     out[asset] = {
       ...meta,
       asset,
       asset_longname: meta.asset_longname || meta.assetLongname || meta.longname || meta.asset_long_name || null,
       issuer: meta.issuer || meta.owner || meta.source || meta.issuer_address || meta.owner_address || null,
       description: meta.description || meta.desc || meta.memo || null,
+      media_name: meta.media_name || media?.name || null,
+      media_description: meta.media_description || media?.description || null,
+      media,
+      external_metadata: externalMetadata,
+      external_metadata_url: meta.external_metadata_url || media?.metadata_url || externalMetadata?.url || null,
+      media_error: meta.media_error || null,
       divisible: meta.divisible,
       locked: meta.locked,
       callable: meta.callable,
@@ -261,6 +457,89 @@ function counterpartyMetadataFor(row, metadataMap) {
   return asset ? (metadataMap?.[asset] || null) : null;
 }
 
+function counterpartyMediaFor(row, metadataMap) {
+  const meta = counterpartyMetadataFor(row, metadataMap) || row?.assetMetadata || null;
+  const media = meta?.media && typeof meta.media === "object" ? meta.media : null;
+  if (!media?.content_url && !media?.preview_url && !media?.image_url && !media?.animation_url) return null;
+  const contentUrl = firstText(media.content_url, media.animation_url, media.image_url, media.preview_url);
+  const previewUrl = firstText(media.preview_url, media.image_url, media.content_url, media.animation_url);
+  const imageCandidates = mediaUrlCandidates(media.image_url, media.image_url_candidates);
+  const animationCandidates = mediaUrlCandidates(media.animation_url, media.animation_url_candidates);
+  const audioCandidates = mediaUrlCandidates(media.audio_url, media.audio_url_candidates);
+  const contentCandidates = mediaUrlCandidates(contentUrl, media.content_url_candidates, animationCandidates, imageCandidates, audioCandidates);
+  const previewCandidates = mediaUrlCandidates(previewUrl, media.preview_url_candidates, imageCandidates, contentCandidates);
+  return {
+    ...media,
+    content_url: contentUrl,
+    preview_url: previewUrl,
+    image_url_candidates: imageCandidates,
+    animation_url_candidates: animationCandidates,
+    audio_url_candidates: audioCandidates,
+    content_url_candidates: contentCandidates,
+    preview_url_candidates: previewCandidates,
+    content_type: media.content_type || "",
+  };
+}
+
+function uniqueCounterpartyAssets(rowsMaybe) {
+  const seen = new Set();
+  const out = [];
+  for (const row of rowsMaybe || []) {
+    const asset = String(row?.asset || "").trim().toUpperCase();
+    if (!asset || seen.has(asset)) continue;
+    seen.add(asset);
+    out.push(asset);
+  }
+  return out;
+}
+
+function chunkArray(items, size) {
+  const n = Math.max(1, Number(size) || 1);
+  const out = [];
+  for (let i = 0; i < (items || []).length; i += n) out.push(items.slice(i, i + n));
+  return out;
+}
+
+function prioritizeCounterpartyAssets(rowsMaybe, assetsMaybe, queryMaybe, selectedMaybe) {
+  const rows = rowsMaybe || [];
+  const assetIndex = new Map();
+  rows.forEach((row, idx) => {
+    const asset = String(row?.asset || "").trim().toUpperCase();
+    if (asset && !assetIndex.has(asset)) assetIndex.set(asset, idx);
+  });
+  const q = String(queryMaybe || "").trim().toLowerCase();
+  const selectedAsset = String(selectedMaybe?.asset || "").trim().toUpperCase();
+
+  function score(asset) {
+    const idx = assetIndex.has(asset) ? assetIndex.get(asset) : 9999;
+    const row = rows[idx] || null;
+    let s = -idx;
+    if (selectedAsset && asset === selectedAsset) s += 100000;
+    if (q && rowSearchText(row).includes(q)) s += 50000;
+    if (q && String(asset || "").toLowerCase().includes(q)) s += 25000;
+    return s;
+  }
+
+  return [...(assetsMaybe || [])].sort((a, b) => score(b) - score(a));
+}
+
+function withCounterpartyMedia(row, metadataMap) {
+  const meta = counterpartyMetadataFor(row, metadataMap);
+  const media = counterpartyMediaFor(row, metadataMap);
+  if (!media) return { ...row, assetMetadata: meta };
+  const ct = media.content_type || row?.contentType || "counterparty/asset";
+  return {
+    ...row,
+    assetMetadata: meta,
+    media,
+    contentType: ct,
+    preview: media.preview_url || row?.preview || "",
+    content: media.content_url || row?.content || "",
+    mediaName: media.name || meta?.media_name || "",
+    mediaDescription: media.description || meta?.media_description || "",
+  };
+}
+
 function fmtQuantityMaybe(v) {
   const n = finiteNumberOrNull(v);
   if (n === null) return "—";
@@ -283,6 +562,10 @@ function rowSearchText(row) {
     row.assetMetadata?.asset_longname,
     row.assetMetadata?.issuer,
     row.assetMetadata?.description,
+    row.assetMetadata?.media_name,
+    row.assetMetadata?.media_description,
+    row.media?.name,
+    row.media?.description,
     row.utxo,
     row.utxo_address,
   ].map((x) => String(x || "").toLowerCase()).join(" ");
@@ -337,7 +620,16 @@ function renderPreview(item, styles) {
   };
 
   if (previewUrl && bucket === "image") {
-    return <img alt="inscription preview" src={previewUrl} loading="lazy" referrerPolicy="no-referrer" style={{ ...boxStyle, objectFit: "cover" }} />;
+    return (
+      <ResilientMediaImage
+        alt="inscription preview"
+        src={previewUrl}
+        candidates={item?.media?.preview_url_candidates || item?.media?.image_url_candidates || item?.media?.content_url_candidates}
+        loading="lazy"
+        style={{ ...boxStyle, objectFit: "cover" }}
+        fallbackStyle={{ ...boxStyle, padding: 4, textAlign: "center" }}
+      />
+    );
   }
   if (previewUrl && bucket === "video") {
     return <video src={previewUrl} muted preload="metadata" style={{ ...boxStyle, objectFit: "cover" }} />;
@@ -404,6 +696,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   const [sourceFilter, setSourceFilter] = useState("all");
   const [selected, setSelected] = useState(null);
   const [updatedAt, setUpdatedAt] = useState(null);
+  const counterpartyMetadataLoadSeqRef = useRef(0);
 
   useEffect(() => {
     setProviderPresent(!!getUnisatProvider());
@@ -458,24 +751,80 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   }
 
   async function loadCounterpartyAssetMetadata(rowsMaybe = counterpartyItems) {
-    const assets = Array.from(new Set((rowsMaybe || []).map((row) => String(row?.asset || "").trim().toUpperCase()).filter(Boolean))).slice(0, 100);
+    const rows = rowsMaybe || [];
+    const assets = prioritizeCounterpartyAssets(rows, uniqueCounterpartyAssets(rows).slice(0, 100), query, selected);
+    const loadSeq = counterpartyMetadataLoadSeqRef.current + 1;
+    counterpartyMetadataLoadSeqRef.current = loadSeq;
+
     if (!assets.length) {
       setCounterpartyMetadataMap({});
       return {};
     }
 
+    const cached = readCounterpartyMetadataCache(assets);
+    const cachedAssets = new Set(Object.keys(cached || {}));
+    const assetsToFetch = assets.filter((asset) => !cachedAssets.has(String(asset || "").trim().toUpperCase()));
+    const merged = { ...(cached || {}) };
+    const errors = [];
+
+    async function fetchAssets(assetSubset) {
+      const subset = (assetSubset || []).map((a) => String(a || "").trim().toUpperCase()).filter(Boolean);
+      if (!subset.length) return {};
+      const payload = await fetchJsonMaybe(apiBase, `/api/counterparty/assets/metadata?assets=${encodeURIComponent(subset.join(","))}&limit=${Math.max(1, subset.length)}`);
+      return normalizeCounterpartyMetadataItems(payload);
+    }
+
+    function mergeChunk(normalized) {
+      if (counterpartyMetadataLoadSeqRef.current !== loadSeq) return;
+      Object.assign(merged, normalized || {});
+      writeCounterpartyMetadataCache(normalized || {});
+      setCounterpartyMetadataMap((prev) => ({ ...(prev || {}), ...(normalized || {}) }));
+    }
+
     setCounterpartyMetadataLoading(true);
     setCounterpartyMetadataErr("");
+    setCounterpartyMetadataMap(cached || {});
     try {
-      const payload = await fetchJsonMaybe(apiBase, `/api/counterparty/assets/metadata?assets=${encodeURIComponent(assets.join(","))}&limit=100`);
-      const normalized = normalizeCounterpartyMetadataItems(payload);
-      setCounterpartyMetadataMap(normalized);
-      return normalized;
-    } catch (e) {
-      setCounterpartyMetadataErr(String(e?.message || e || "Failed to load Counterparty asset metadata."));
-      return {};
+      // Hydrate from local cache immediately, then fetch only missing/stale
+      // assets.  This makes media previews appear immediately after the first
+      // successful metadata run while preserving incremental network refreshes.
+      if (!assetsToFetch.length) {
+        return merged;
+      }
+
+      // Load priority rows one asset at a time first. This prevents one slow or
+      // broken Counterparty metadata lookup from holding the whole NFT window at
+      // 43 / 0, and lets searched/selected rows like FREESPIN render as soon as
+      // their own metadata returns.
+      const priorityAssets = assetsToFetch.slice(0, 8);
+      const remainderAssets = assetsToFetch.slice(8);
+
+      for (const asset of priorityAssets) {
+        try {
+          const normalized = await fetchAssets([asset]);
+          mergeChunk(normalized);
+        } catch (e) {
+          errors.push(`${asset}: ${String(e?.message || e || "metadata failed")}`);
+        }
+      }
+
+      for (const chunk of chunkArray(remainderAssets, 8)) {
+        try {
+          const normalized = await fetchAssets(chunk);
+          mergeChunk(normalized);
+        } catch (e) {
+          errors.push(`${chunk.join(",")}: ${String(e?.message || e || "metadata failed")}`);
+        }
+      }
+
+      if (errors.length && counterpartyMetadataLoadSeqRef.current === loadSeq) {
+        setCounterpartyMetadataErr(`Some Counterparty metadata failed: ${errors.slice(0, 3).join(" | ")}${errors.length > 3 ? " ..." : ""}`);
+      }
+      return merged;
     } finally {
-      setCounterpartyMetadataLoading(false);
+      if (counterpartyMetadataLoadSeqRef.current === loadSeq) {
+        setCounterpartyMetadataLoading(false);
+      }
     }
   }
 
@@ -553,12 +902,12 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
     const ordinalRows = (items || []).map((it) => ({ ...it, sourceKind: "ordinal" }));
     const counterpartyRows = (counterpartyItems || []).map((it) => {
       const meta = counterpartyMetadataFor(it, counterpartyMetadataMap);
-      return {
+      return withCounterpartyMedia({
         ...it,
         sourceKind: "counterparty",
         assetMetadata: meta,
         assetLongname: it.assetLongname || meta?.asset_longname || "",
-      };
+      }, counterpartyMetadataMap);
     });
 
     return [...ordinalRows, ...counterpartyRows].filter((row) => {
@@ -567,7 +916,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
       if (sf === "counterparty" && rowKind !== "counterparty") return false;
 
       const bucket = contentTypeBucket(row?.contentType);
-      if (tf !== "all" && bucket !== tf) return false;
+      if (tf !== "all" && !(tf === "counterparty" && rowKind === "counterparty") && bucket !== tf) return false;
       if (!q) return true;
       return rowSearchText(row).includes(q);
     });
@@ -577,6 +926,13 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
     const out = { total: items.length + counterpartyItems.length, image: 0, video: 0, audio: 0, text: 0, json: 0, external: 0, other: 0, counterparty: counterpartyItems.length, metadata: Object.keys(counterpartyMetadataMap || {}).length };
     for (const it of items || []) {
       const b = contentTypeBucket(it?.contentType);
+      if (out[b] === undefined) out.other += 1;
+      else out[b] += 1;
+    }
+    for (const it of counterpartyItems || []) {
+      const media = counterpartyMediaFor(it, counterpartyMetadataMap);
+      if (!media) continue;
+      const b = contentTypeBucket(media.content_type);
       if (out[b] === undefined) out.other += 1;
       else out[b] += 1;
     }
@@ -645,9 +1001,14 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   const mutedStyle = { color: "var(--utt-muted, rgba(255,255,255,0.66))" };
 
   const selectedKind = String(selected?.sourceKind || "ordinal").toLowerCase();
-  const selectedContentUrl = String(selected?.content || selected?.preview || "").trim();
-  const selectedBucket = contentTypeBucket(selected?.contentType);
   const selectedMetadata = selectedKind === "counterparty" ? counterpartyMetadataFor(selected, counterpartyMetadataMap) : null;
+  const selectedCounterpartyMedia = selectedKind === "counterparty" ? counterpartyMediaFor(selected, counterpartyMetadataMap) : null;
+  const selectedContentUrl = String(
+    selectedKind === "counterparty"
+      ? (selectedCounterpartyMedia?.content_url || selectedCounterpartyMedia?.preview_url || selected?.content || selected?.preview || "")
+      : (selected?.content || selected?.preview || "")
+  ).trim();
+  const selectedBucket = contentTypeBucket(selectedKind === "counterparty" ? (selectedCounterpartyMedia?.content_type || selected?.contentType) : selected?.contentType);
 
   return (
     <div style={panelStyle}>
@@ -765,8 +1126,8 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
                       <td style={tdStyle}>{renderPreview(it, { fallbackLabel: isCounterparty ? "XCP" : "ORD", hidden: hideTableData })}</td>
                       <td style={tdStyle}><span style={typeBadgeStyle(bucket)}>{isCounterparty ? "Counterparty asset" : (it.contentType || bucket)}</span></td>
                       <td style={tdStyle}>
-                        <div style={{ fontWeight: 900 }}>{isCounterparty ? it.asset : (it.inscriptionNumber !== null && it.inscriptionNumber !== undefined ? `Inscription #${it.inscriptionNumber}` : "Inscription")}</div>
-                        <div style={{ ...mutedStyle, fontSize: 11 }}>{isCounterparty ? (firstText(it.assetLongname, it.assetMetadata?.issuer ? `Issuer ${maskMiddle(it.assetMetadata.issuer, 6, 4)}` : "", "Protocol balance")) : (bucket === "external" ? "External-open only" : "Safe preview eligible")}</div>
+                        <div style={{ fontWeight: 900 }}>{isCounterparty ? firstText(it.mediaName, it.asset) : (it.inscriptionNumber !== null && it.inscriptionNumber !== undefined ? `Inscription #${it.inscriptionNumber}` : "Inscription")}</div>
+                        <div style={{ ...mutedStyle, fontSize: 11 }}>{isCounterparty ? (firstText(it.assetLongname, it.mediaDescription, it.assetMetadata?.issuer ? `Issuer ${maskMiddle(it.assetMetadata.issuer, 6, 4)}` : "", "Protocol balance")) : (bucket === "external" ? "External-open only" : "Safe preview eligible")}</div>
                       </td>
                       <td style={tdStyle}>{isCounterparty ? "Counterparty" : "Ordinals"}</td>
                       <td style={tdStyle}>{isCounterparty ? "Counterparty API" : "UniSat"}</td>
@@ -796,10 +1157,23 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
               <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: 190, border: "1px solid rgba(255,255,255,0.10)", borderRadius: 12, background: "rgba(0,0,0,0.18)", overflow: "hidden" }}>
                 {hideTableData ? (
                   <div style={{ padding: 16, textAlign: "center", ...mutedStyle, fontWeight: 900 }}>••••</div>
+                ) : selectedKind === "counterparty" && selectedContentUrl && selectedBucket === "image" ? (
+                  <ResilientMediaImage
+                    alt="selected Counterparty asset media"
+                    src={selectedContentUrl}
+                    candidates={selectedCounterpartyMedia?.content_url_candidates || selectedCounterpartyMedia?.preview_url_candidates || selectedCounterpartyMedia?.image_url_candidates}
+                    loading="eager"
+                    style={{ maxWidth: "100%", maxHeight: 260, objectFit: "contain" }}
+                    fallbackStyle={{ padding: 16, textAlign: "center", ...mutedStyle }}
+                  />
+                ) : selectedKind === "counterparty" && selectedContentUrl && selectedBucket === "video" ? (
+                  <video src={selectedContentUrl} controls style={{ maxWidth: "100%", maxHeight: 260 }} />
+                ) : selectedKind === "counterparty" && selectedContentUrl && selectedBucket === "audio" ? (
+                  <audio src={selectedContentUrl} controls style={{ width: "92%" }} />
                 ) : selectedKind === "counterparty" ? (
                   <div style={{ padding: 18, textAlign: "center" }}>
-                    <div style={{ fontSize: 26, fontWeight: 950 }}>{selected.asset || "Counterparty"}</div>
-                    <div style={{ marginTop: 8, ...mutedStyle }}>{selectedMetadata?.asset_longname || "Counterparty asset balance"}</div>
+                    <div style={{ fontSize: 26, fontWeight: 950 }}>{firstText(selectedCounterpartyMedia?.name, selected.asset, "Counterparty")}</div>
+                    <div style={{ marginTop: 8, ...mutedStyle }}>{selectedMetadata?.asset_longname || selectedCounterpartyMedia?.description || "Counterparty asset balance"}</div>
                     <div style={{ marginTop: 8, fontWeight: 900 }}>{fmtQuantityMaybe(selected.quantity)}</div>
                     <div style={{ marginTop: 8, display: "flex", gap: 6, justifyContent: "center", flexWrap: "wrap" }}>
                       <span style={typeBadgeStyle("counterparty")}>Divisible: {boolLabel(selectedMetadata?.divisible)}</span>
@@ -830,12 +1204,17 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
                     <div title={selectedMetadata?.issuer}><b>Issuer / Owner:</b> {hideTableData ? "••••" : maskMiddle(selectedMetadata?.issuer, 10, 10)}</div>
                     <div><b>Divisible:</b> {hideTableData ? "••••" : boolLabel(selectedMetadata?.divisible)}</div>
                     <div><b>Locked:</b> {hideTableData ? "••••" : boolLabel(selectedMetadata?.locked)}</div>
-                    <div title={selectedMetadata?.description}><b>Description:</b> {hideTableData ? "••••" : (selectedMetadata?.description || "—")}</div>
+                    <div title={selectedMetadata?.description}><b>Description:</b> {hideTableData ? "••••" : (selectedCounterpartyMedia?.description || selectedMetadata?.description || "—")}</div>
+                    <div title={selectedCounterpartyMedia?.name}><b>Media Name:</b> {hideTableData ? "••••" : (selectedCounterpartyMedia?.name || "—")}</div>
+                    <div title={selectedCounterpartyMedia?.content_url}><b>Media URL:</b> {hideTableData ? "••••" : maskMiddle(selectedCounterpartyMedia?.content_url, 18, 14)}</div>
+                    <div title={selectedMetadata?.external_metadata_url}><b>Metadata URL:</b> {hideTableData ? "••••" : maskMiddle(selectedMetadata?.external_metadata_url, 18, 14)}</div>
                     <div title={selected.address}><b>Address:</b> {hideTableData ? "••••" : maskMiddle(selected.address, 10, 10)}</div>
                     <div title={selected.utxo || selected.location}><b>UTXO:</b> {hideTableData ? "••••" : maskMiddle(selected.utxo || selected.location, 10, 10)}</div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 4 }}>
                       <button type="button" style={{ ...buttonStyle, padding: "5px 8px" }} onClick={() => copyTextSafe(selected.asset)}>Copy Asset</button>
                       {selectedMetadata?.issuer ? <button type="button" style={{ ...buttonStyle, padding: "5px 8px" }} onClick={() => copyTextSafe(selectedMetadata.issuer)}>Copy Issuer</button> : null}
+                      {selectedCounterpartyMedia?.content_url ? <a href={selectedCounterpartyMedia.content_url} target="_blank" rel="noreferrer" style={{ ...buttonStyle, padding: "5px 8px", textDecoration: "none" }}>Open media</a> : null}
+                      {selectedMetadata?.external_metadata_url ? <a href={selectedMetadata.external_metadata_url} target="_blank" rel="noreferrer" style={{ ...buttonStyle, padding: "5px 8px", textDecoration: "none" }}>Open metadata</a> : null}
                     </div>
                   </>
                 ) : (
@@ -858,7 +1237,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
           )}
 
           <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.10)", ...mutedStyle, fontSize: 12, lineHeight: 1.45 }}>
-            Safe inline preview is limited to image/video/audio/text/json. Counterparty rows are balance metadata only. HTML, SVG, scripts, and unknown MIME types should be opened externally only.
+            Safe inline preview is limited to image/video/audio/text/json. Counterparty media is read from external JSON metadata URLs when available. HTML, SVG, scripts, and unknown MIME types should be opened externally only.
           </div>
           {providerInfo?.utt_policy ? (
             <div style={{ marginTop: 8, ...mutedStyle, fontSize: 12 }}>Policy: {providerInfo.utt_policy}</div>

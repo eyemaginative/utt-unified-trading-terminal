@@ -102,6 +102,7 @@ import VolumeWindow from "./features/scanners/VolumeWindow";
 import LedgerWindow from "./features/basis/LedgerWindow";
 import WalletAddressesWindow from "./features/wallets/WalletAddressesWindow";
 import TokenRegistryWindow from "./features/registry/TokenRegistryWindow";
+import NftCollectiblesWindow from "./features/nfts/NftCollectiblesWindow";
 // Fallback base styling (global). Header gets its own overrides driven by the Tables theme bus.
 // NOTE: Most surfaces now reference CSS vars so App shell can follow Tables theme (without fully re-theming every widget yet).
 const fallbackStyles = {
@@ -2153,6 +2154,7 @@ export default function App() {
       walletAddresses: "wallet_addresses",
       deposits: "deposits",
       tokenRegistry: "token_registry",
+      nftCollectibles: "nft_collectibles",
     }),
     []
   );
@@ -2209,6 +2211,14 @@ export default function App() {
       open: false,
       width: 980,
       height: 620,
+      payload: { focusSeq: 0 },
+    },
+    {
+      id: TOOL_IDS.nftCollectibles,
+      title: "NFTs / Collectibles",
+      open: false,
+      width: 1120,
+      height: 700,
       payload: { focusSeq: 0 },
     },
     {
@@ -5713,6 +5723,15 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
               />
             );
 
+
+          if (w.id === TOOL_IDS.nftCollectibles)
+            return (
+              <NftCollectiblesWindow
+                {...common}
+                apiBase={API_BASE}
+                hideTableData={hideTableDataGlobal}
+              />
+            );
 
 
           if (w.id === TOOL_IDS.walletAddresses)

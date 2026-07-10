@@ -6760,20 +6760,33 @@ const autoFitBanner = async () => {
 	        const titleLower = String(w?.title || "").toLowerCase();
 	        const isLedger = idLower === "ledger" || titleLower === "ledger";
 	        const isWalletAddresses = idLower === "wallet_addresses" || titleLower === "wallet addresses";
+	        const isNftCollectibles =
+	          idLower === "nft_collectibles" ||
+	          idLower === "nfts" ||
+	          titleLower.includes("nft") ||
+	          titleLower.includes("collectibles");
 	        const isTokenRegistry =
 	          idLower === "tokens" ||
 	          idLower === "token_registry" ||
 	          titleLower === "tokens" ||
 	          titleLower === "token registry";
-	        const cleanTitle = isTokenRegistry ? "Token Registry" : w.title;
+	        const cleanTitle = isTokenRegistry ? "Token Registry" : isNftCollectibles ? "NFTs / Collectibles" : w.title;
 	        return (
 	          <ToolChip
 	            key={w.id}
 	            title={cleanTitle}
-	            subLabel={isLedger || isTokenRegistry ? null : isWalletAddresses ? (hideTableDataGlobal ? "••••" : "On-chain") : "—"}
+	            subLabel={
+	              isLedger || isTokenRegistry
+	                ? null
+	                : isWalletAddresses
+	                  ? (hideTableDataGlobal ? "••••" : "On-chain")
+	                  : isNftCollectibles
+	                    ? (hideTableDataGlobal ? "••••" : "UniSat / Ordinals")
+	                    : "—"
+	            }
 	            showStatus={!isLedger && !isTokenRegistry}
 	            showSubLabel={!isLedger && !isTokenRegistry}
-	            minWidth={isLedger ? 104 : isTokenRegistry ? 134 : undefined}
+	            minWidth={isLedger ? 104 : isTokenRegistry ? 134 : isNftCollectibles ? 168 : undefined}
 	            isOpen={!!w.isOpen || !!w.open}
 	            onClick={() => toggleToolWindow?.(w.id)}
 	          />

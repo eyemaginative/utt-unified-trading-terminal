@@ -1217,6 +1217,94 @@ async function appGetCounterpartyAddressNoPrompt() {
   return "";
 }
 
+function appNormalizeUniSatBtcBalanceToBtc(payload) {
+  if (payload === null || payload === undefined || payload === "") return null;
+
+  if (typeof payload === "number" || typeof payload === "string") {
+    const n = appFiniteNumberOrNull(payload);
+    if (n === null) return null;
+    // Primitive payloads are ambiguous. Treat large integer-like values as satoshis;
+    // otherwise leave BTC-like decimal values alone.
+    return n > 21_000_000 ? n / 100_000_000 : n;
+  }
+
+  if (!payload || typeof payload !== "object") return null;
+
+  const directBtc = appFiniteNumberOrNull(
+    payload?.btc ??
+    payload?.btc_balance ??
+    payload?.balance_btc ??
+    payload?.balanceBtc ??
+    payload?.amount_btc ??
+    payload?.amountBtc
+  );
+  if (directBtc !== null) return directBtc;
+
+  const explicitSats = appFiniteNumberOrNull(
+    payload?.satoshis ??
+    payload?.sats ??
+    payload?.balance_sats ??
+    payload?.balanceSats ??
+    payload?.amount_sats ??
+    payload?.amountSats
+  );
+  if (explicitSats !== null) return explicitSats / 100_000_000;
+
+  const totalSats = appFiniteNumberOrNull(payload?.total);
+  if (totalSats !== null) return totalSats / 100_000_000;
+
+  const confirmedSats = appFiniteNumberOrNull(payload?.confirmed);
+  const unconfirmedSats = appFiniteNumberOrNull(payload?.unconfirmed) ?? 0;
+  if (confirmedSats !== null) return (confirmedSats + unconfirmedSats) / 100_000_000;
+
+  const genericBalance = appFiniteNumberOrNull(payload?.balance ?? payload?.amount ?? payload?.value);
+  if (genericBalance !== null) {
+    return genericBalance > 21_000_000 ? genericBalance / 100_000_000 : genericBalance;
+  }
+
+  return null;
+}
+
+async function appFetchCounterpartyBtcBalanceRow(addressMaybe = "") {
+  const address = String(addressMaybe || "").trim();
+  if (!address) return null;
+
+  try {
+    const provider = typeof window !== "undefined" ? window.unisat : null;
+    if (!provider || typeof provider.getBalance !== "function") return null;
+
+    // getBalance is read-only and should not prompt once UniSat has already been connected.
+    const payload = await provider.getBalance();
+    const btc = appNormalizeUniSatBtcBalanceToBtc(payload);
+    if (btc === null || !Number.isFinite(Number(btc))) return null;
+
+    return withBalanceBasisFields({
+      venue: "counterparty",
+      source_type: "Bitcoin wallet",
+      network: "bitcoin",
+      chain: "bitcoin",
+      wallet_id: "counterparty_unisat",
+      address,
+      wallet_address: address,
+      asset: "BTC",
+      symbol: "BTC",
+      total: btc,
+      available: btc,
+      hold: 0,
+      px_usd: null,
+      total_usd: null,
+      available_usd: null,
+      hold_usd: null,
+      usd_source_symbol: "—",
+      balance_status: "wallet_live",
+      basis_status: "not_loaded",
+      raw_btc_balance: payload,
+    });
+  } catch {
+    return null;
+  }
+}
+
 function appExtractCounterpartyBalanceRows(payload) {
   if (Array.isArray(payload)) return payload.filter((x) => x && typeof x === "object");
   if (!payload || typeof payload !== "object") return [];
@@ -1282,12 +1370,20 @@ function appNormalizeCounterpartyBalanceRows(payload, addressMaybe = "") {
 async function appFetchCounterpartyPortfolioBalanceRows() {
   const address = await appGetCounterpartyAddressNoPrompt();
   if (!address) return [];
+
+  let counterpartyRows = [];
   try {
     const data = await appFetchJson(`/api/counterparty/address/${encodeURIComponent(address)}/balances`);
-    return appNormalizeCounterpartyBalanceRows(data, address);
+    counterpartyRows = appNormalizeCounterpartyBalanceRows(data, address);
   } catch {
-    return [];
+    counterpartyRows = [];
   }
+
+  const btcRow = await appFetchCounterpartyBtcBalanceRow(address);
+  if (!btcRow) return counterpartyRows;
+
+  const hasBtc = (counterpartyRows || []).some((row) => String(row?.asset || "").trim().toUpperCase() === "BTC");
+  return hasBtc ? counterpartyRows : [btcRow, ...counterpartyRows];
 }
 
 function appCounterpartyRowsTotalUsd(rowsMaybe) {

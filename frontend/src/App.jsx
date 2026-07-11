@@ -315,7 +315,7 @@ const ALL_VENUES_VALUE = "ALL";
 
 // NOTE: This list is used for *core trading/balances polling* fallback.
 // Do not restrict it to “discovery-capable” venues.
-const DEFAULT_SUPPORTED_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "okx"];
+const DEFAULT_SUPPORTED_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "okx", "counterparty"];
 
 // Frontend-only DEX venues whose backend route exists before the generic venues registry advertises them.
 // Keep these opt-in through the normal Manage-venues UI override.
@@ -904,6 +904,7 @@ function withBalanceBasisFields(row) {
 // from live wallet/RPC paths only when an address is available.
 // ─────────────────────────────────────────────────────────────
 const APP_SOL_MINT = "So11111111111111111111111111111111111111112";
+const APP_COUNTERPARTY_UNISAT_ADDR_LS_KEY = "utt_nft_unisat_address_v1";
 
 function appFiniteNumberOrNull(v) {
   if (v === null || v === undefined || v === "") return null;
@@ -1187,6 +1188,119 @@ function appWalletSnapshotIsUserPortfolioRow(row) {
   if (combined.includes("bridge") || combined.includes("treasury") || combined.includes("reserve")) return false;
 
   return true;
+}
+
+
+async function appGetCounterpartyAddressNoPrompt() {
+  try {
+    const saved = localStorage.getItem(APP_COUNTERPARTY_UNISAT_ADDR_LS_KEY) || "";
+    if (String(saved || "").trim()) return String(saved || "").trim();
+  } catch {
+    // ignore storage errors
+  }
+
+  try {
+    const provider = typeof window !== "undefined" ? window.unisat : null;
+    if (provider && typeof provider.getAccounts === "function") {
+      const accounts = await provider.getAccounts();
+      const arr = Array.isArray(accounts) ? accounts : [];
+      const addr = String(arr[0] || "").trim();
+      if (addr) {
+        try { localStorage.setItem(APP_COUNTERPARTY_UNISAT_ADDR_LS_KEY, addr); } catch {}
+        return addr;
+      }
+    }
+  } catch {
+    // Do not prompt from the main balances table. User can connect in NFTs / Collectibles.
+  }
+
+  return "";
+}
+
+function appExtractCounterpartyBalanceRows(payload) {
+  if (Array.isArray(payload)) return payload.filter((x) => x && typeof x === "object");
+  if (!payload || typeof payload !== "object") return [];
+  const containers = [payload.items, payload.balances, payload.rows, payload.records, payload.result, payload.data, payload.raw];
+  for (const c of containers) {
+    if (Array.isArray(c)) return c.filter((x) => x && typeof x === "object");
+    if (c && typeof c === "object") {
+      const nested = appExtractCounterpartyBalanceRows(c);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
+}
+
+function appNormalizeCounterpartyBalanceRows(payload, addressMaybe = "") {
+  const address = String(addressMaybe || payload?.address || "").trim();
+  const rows = appExtractCounterpartyBalanceRows(payload);
+  return (rows || []).map((row) => {
+    const asset = String(row?.asset || row?.asset_name || row?.assetName || row?.symbol || "").trim().toUpperCase();
+    if (!asset) return null;
+    const qty = appFiniteNumberOrNull(
+      row?.quantity_normalized ??
+      row?.normalized_quantity ??
+      row?.quantityNormalized ??
+      row?.balance_normalized ??
+      row?.balanceNormalized ??
+      row?.quantity ??
+      row?.balance ??
+      row?.qty ??
+      row?.amount
+    ) ?? 0;
+    const hold = appFiniteNumberOrNull(row?.hold ?? row?.reserved ?? row?.locked) ?? 0;
+    const available = appFiniteNumberOrNull(row?.available ?? row?.spendable ?? row?.free) ?? qty;
+    const rowAddress = String(row?.address || row?.utxo_address || row?.utxoAddress || address || "").trim();
+    const utxo = String(row?.utxo || row?.location || row?.output || "").trim();
+    return withBalanceBasisFields({
+      ...row,
+      venue: "counterparty",
+      source_type: "Counterparty wallet",
+      network: "bitcoin",
+      chain: "bitcoin",
+      wallet_id: "counterparty_unisat",
+      address: rowAddress,
+      wallet_address: rowAddress,
+      utxo,
+      asset,
+      symbol: asset,
+      asset_longname: row?.asset_longname || row?.assetLongname || null,
+      total: qty,
+      available,
+      hold,
+      px_usd: null,
+      total_usd: null,
+      available_usd: null,
+      hold_usd: null,
+      usd_source_symbol: "—",
+      balance_status: "wallet_live",
+      basis_status: "not_loaded",
+    });
+  }).filter(Boolean);
+}
+
+async function appFetchCounterpartyPortfolioBalanceRows() {
+  const address = await appGetCounterpartyAddressNoPrompt();
+  if (!address) return [];
+  try {
+    const data = await appFetchJson(`/api/counterparty/address/${encodeURIComponent(address)}/balances`);
+    return appNormalizeCounterpartyBalanceRows(data, address);
+  } catch {
+    return [];
+  }
+}
+
+function appCounterpartyRowsTotalUsd(rowsMaybe) {
+  let total = 0;
+  let hasUsd = false;
+  for (const row of rowsMaybe || []) {
+    const n = appFiniteNumberOrNull(row?.total_usd);
+    if (n !== null) {
+      total += n;
+      hasUsd = true;
+    }
+  }
+  return hasUsd ? total : null;
 }
 
 async function appFetchWalletAddressSnapshotPortfolioTotalsUsd() {
@@ -2492,6 +2606,10 @@ export default function App() {
 
       if (row?.enabled === false) return false;
 
+      // Counterparty balances are browser-wallet/address scoped and loaded through
+      // /api/counterparty/address/{address}/balances, not the CEX balance snapshot refresh path.
+      if (v === "counterparty" && c === "balances") return true;
+
       // DEX venues are swap/status based, but we still surface them as trade/orderbook-capable
       // so the widgets mount. Routing/status behavior is handled inside each widget.
       if (
@@ -3760,8 +3878,9 @@ export default function App() {
     const reqId = ++balancesReqIdRef.current;
 
     const isAllVenuesView = venue === ALL_VENUES_VALUE;
+    const isCounterpartyView = normalizeVenue(venue) === "counterparty";
 
-    if (!isAllVenuesView) {
+    if (!isAllVenuesView && !isCounterpartyView) {
       const vNorm = normalizeVenue(venue);
       if (vNorm && !venueSupports(vNorm, "balances")) {
         setError(`Balances are not supported for venue "${prettyVenueName(vNorm)}". Select a balances-capable venue or use ALL.`);
@@ -3772,7 +3891,7 @@ export default function App() {
 
     // Some venue-like sources are valid for markets/activity but are not balances-refreshable on the backend.
     // If they slip into the ALL candidate list, /api/balances/refresh will 422 and poison the fan-out.
-    const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration"]);
+    const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty"]);
     const filterBalancesRefreshVenues = (arr) =>
       (arr || []).filter((v) => {
         const vNorm = normalizeVenue(v);
@@ -3790,6 +3909,23 @@ export default function App() {
     try {
       setLoadingBalances(true);
       setError(null);
+
+      if (isCounterpartyView) {
+        const address = await appGetCounterpartyAddressNoPrompt();
+        if (!address) {
+          if (balancesReqIdRef.current !== reqId) return;
+          setBalances([]);
+          setPortfolioTotalUsd(null);
+          setError("Counterparty balances need a UniSat address. Open NFTs / Collectibles and connect UniSat first, then refresh Balances again.");
+          return;
+        }
+        const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows();
+        if (balancesReqIdRef.current !== reqId) return;
+        setBalances(counterpartyRows);
+        const cpTotalUsd = appCounterpartyRowsTotalUsd(counterpartyRows);
+        setPortfolioTotalUsd(cpTotalUsd);
+        return;
+      }
 
       if (isAllVenuesView) {
         for (const v of venuesToUse) {
@@ -3862,8 +3998,20 @@ export default function App() {
       if (baseItems.length === 0) {
         let emptyViewTotal = 0;
         if (isAllVenuesView) {
-          const dexTotals = await appFetchDexPortfolioTotalsUsd();
-          emptyViewTotal = Number.isFinite(Number(dexTotals?.totalUsd)) ? Number(dexTotals.totalUsd) : 0;
+          const walletSnapshotRowsForEmptyAllView = await appFetchWalletAddressSnapshotPortfolioBalanceRows();
+          const liveDexRowsForEmptyAllView = await appFetchDexPortfolioBalanceRows();
+          const dexBalanceRowsForEmptyAllView = appFilterLiveDexRowsAlreadyCoveredByWalletSnapshots(liveDexRowsForEmptyAllView, walletSnapshotRowsForEmptyAllView);
+          const counterpartyRowsForEmptyAllView = await appFetchCounterpartyPortfolioBalanceRows();
+          const emptyDisplayRows = [
+            ...walletSnapshotRowsForEmptyAllView,
+            ...dexBalanceRowsForEmptyAllView,
+            ...counterpartyRowsForEmptyAllView,
+          ];
+          for (const row of emptyDisplayRows) {
+            const tu = appFiniteNumberOrNull(row?.total_usd);
+            if (tu !== null) emptyViewTotal += tu;
+          }
+          setBalances(emptyDisplayRows);
           setPortfolioTotalUsdAllVenues(emptyViewTotal);
           setPortfolioAllVenuesUpdatedAt(Date.now());
         }
@@ -3928,19 +4076,21 @@ export default function App() {
 
       let walletSnapshotRowsForCurrentAllView = [];
       let dexBalanceRowsForCurrentAllView = [];
+      let counterpartyRowsForCurrentAllView = [];
       if (isAllVenuesView) {
         walletSnapshotRowsForCurrentAllView = await appFetchWalletAddressSnapshotPortfolioBalanceRows();
         const liveDexRows = await appFetchDexPortfolioBalanceRows();
         dexBalanceRowsForCurrentAllView = appFilterLiveDexRowsAlreadyCoveredByWalletSnapshots(liveDexRows, walletSnapshotRowsForCurrentAllView);
+        counterpartyRowsForCurrentAllView = await appFetchCounterpartyPortfolioBalanceRows();
 
-        for (const row of [...walletSnapshotRowsForCurrentAllView, ...dexBalanceRowsForCurrentAllView]) {
+        for (const row of [...walletSnapshotRowsForCurrentAllView, ...dexBalanceRowsForCurrentAllView, ...counterpartyRowsForCurrentAllView]) {
           const tu = Number(row?.total_usd);
           if (Number.isFinite(tu)) unifiedPortCurrentView += tu;
         }
       }
 
       const displayMerged = isAllVenuesView
-        ? [...merged, ...walletSnapshotRowsForCurrentAllView, ...dexBalanceRowsForCurrentAllView]
+        ? [...merged, ...walletSnapshotRowsForCurrentAllView, ...dexBalanceRowsForCurrentAllView, ...counterpartyRowsForCurrentAllView]
         : merged;
 
       setBalances(displayMerged);
@@ -3994,6 +4144,9 @@ export default function App() {
       const dexTotals = await appFetchDexPortfolioTotalsUsd();
       const dexTotal = Number.isFinite(Number(dexTotals?.totalUsd)) ? Number(dexTotals.totalUsd) : 0;
       allTotal += dexTotal;
+      const counterpartyRowsForTotal = await appFetchCounterpartyPortfolioBalanceRows();
+      const counterpartyTotalForTotal = appCounterpartyRowsTotalUsd(counterpartyRowsForTotal);
+      if (counterpartyTotalForTotal !== null) allTotal += counterpartyTotalForTotal;
 
       const finalTotal = Number.isFinite(allTotal) ? allTotal : null;
       setPortfolioTotalUsdAllVenues(finalTotal);
@@ -4021,7 +4174,7 @@ export default function App() {
   // Recompute ONLY the header “All Venues” total without depending on current tab/venue.
   async function refreshAllVenuesTotalOnlySafe() {
     try {
-      const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration"]);
+      const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty"]);
       const balancesVenueCandidates = (
         balancesVenuesList && balancesVenuesList.length > 0
           ? balancesVenuesList
@@ -4072,6 +4225,9 @@ export default function App() {
       const dexTotals = await appFetchDexPortfolioTotalsUsd();
       const dexTotal = Number.isFinite(Number(dexTotals?.totalUsd)) ? Number(dexTotals.totalUsd) : 0;
       totalUsd += dexTotal;
+      const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows();
+      const counterpartyTotal = appCounterpartyRowsTotalUsd(counterpartyRows);
+      if (counterpartyTotal !== null) totalUsd += counterpartyTotal;
 
       const finalTotal = Number.isFinite(totalUsd) ? totalUsd : null;
 
@@ -5159,7 +5315,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
 
         // Keep background polling aligned with the manual ALL-venues refresh filtering.
         // These venue-like sources are not balances-refreshable on the backend.
-        const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration"]);
+        const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty"]);
         const balancesVenueCandidates = (balancesVenuesList.length > 0 ? balancesVenuesList : supportedVenues)
           .map((v) => normalizeVenue(v))
           .filter((v) => v && v !== ALL_VENUES_VALUE)

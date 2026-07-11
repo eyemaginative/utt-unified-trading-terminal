@@ -38,6 +38,30 @@ def counterparty_assets_metadata(
     return _adapter().get_assets_metadata(asset_list, limit=limit)
 
 
+@router.get("/assets/{asset}/orders")
+def counterparty_asset_orders(
+    asset: str,
+    limit: int = Query(default=50, ge=1, le=500),
+) -> Dict[str, Any]:
+    return _raise_if_failed(_adapter().get_asset_orders(asset=asset, limit=limit), label="counterparty_asset_orders_failed")
+
+
+@router.get("/assets/{asset}/dispensers")
+def counterparty_asset_dispensers(
+    asset: str,
+    limit: int = Query(default=50, ge=1, le=500),
+) -> Dict[str, Any]:
+    return _raise_if_failed(_adapter().get_asset_dispensers(asset=asset, limit=limit), label="counterparty_asset_dispensers_failed")
+
+
+@router.get("/assets/{asset}/market_context")
+def counterparty_asset_market_context(
+    asset: str,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> Dict[str, Any]:
+    return _adapter().get_asset_market_context(asset=asset, limit=limit)
+
+
 @router.get("/assets/{asset}")
 def counterparty_asset(asset: str) -> Dict[str, Any]:
     return _raise_if_failed(_adapter().get_asset(asset), label="counterparty_asset_lookup_failed")

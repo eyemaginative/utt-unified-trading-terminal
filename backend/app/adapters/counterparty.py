@@ -31,6 +31,10 @@ class CounterpartyAdapter:
             self.timeout_s = float(timeout_s if timeout_s is not None else (os.getenv("COUNTERPARTY_TIMEOUT_S") or "15"))
         except Exception:
             self.timeout_s = 15.0
+        # Small in-process helper cache used only for order/dispenser quantity
+        # normalization.  It stores display decimals inferred from Counterparty
+        # asset metadata and never stores secrets or wallet data.
+        self._quantity_decimals_cache: Dict[str, int] = {"BTC": 8, "XCP": 8}
 
     # ------------------------------------------------------------------
     # Low-level HTTP helpers
@@ -1142,6 +1146,306 @@ class CounterpartyAdapter:
             "raw_item": row,
         }
 
+
+    # ------------------------------------------------------------------
+    # Counterparty market/order/dispenser normalization helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _status_text(row: Dict[str, Any]) -> str:
+        raw = CounterpartyAdapter._first_present(
+            row,
+            (
+                "status",
+                "status_text",
+                "statusText",
+                "order_status",
+                "orderStatus",
+                "state",
+                "dispense_status",
+                "dispenser_status",
+            ),
+        )
+        if raw is None:
+            return ""
+        # Counterparty Core dispenser status can be numeric in some payloads.
+        # Keep the original value visible but provide useful labels for the
+        # common open/closed cases.
+        try:
+            n = int(raw)
+            if n == 0:
+                return "open"
+            if n == 10:
+                return "closed"
+        except Exception:
+            pass
+        return str(raw or "").strip()
+
+    @staticmethod
+    def _is_open_status(status: Any) -> bool:
+        s = str(status or "").strip().lower()
+        if not s:
+            return True
+        terminal_bits = (
+            "cancel",
+            "filled",
+            "expired",
+            "closed",
+            "complete",
+            "invalid",
+            "drop",
+            "dropped",
+            "fail",
+        )
+        return not any(bit in s for bit in terminal_bits)
+
+    def _asset_display_decimals(self, asset: Any) -> int:
+        a_norm = str(asset or "").strip().upper()
+        if not a_norm:
+            return 8
+        if a_norm in self._quantity_decimals_cache:
+            return int(self._quantity_decimals_cache[a_norm])
+        if a_norm in {"BTC", "XCP"}:
+            self._quantity_decimals_cache[a_norm] = 8
+            return 8
+        try:
+            info = self.get_asset(a_norm)
+            meta = info.get("metadata") if isinstance(info, dict) else None
+            divisible = meta.get("divisible") if isinstance(meta, dict) else None
+            decimals = 8 if divisible is True else 0 if divisible is False else 8
+        except Exception:
+            # Conservative fallback for unknown Counterparty assets.  If the API
+            # supplies *_normalized fields those are preferred before this path.
+            decimals = 8
+        self._quantity_decimals_cache[a_norm] = int(decimals)
+        return int(decimals)
+
+    def _quantity_from_row(self, row: Dict[str, Any], asset: Any, normalized_keys: Tuple[str, ...], raw_keys: Tuple[str, ...]) -> Optional[float]:
+        for key in normalized_keys:
+            value = self._as_float(row.get(key))
+            if value is not None:
+                return float(value)
+
+        raw_value = None
+        for key in raw_keys:
+            if key in row and row.get(key) not in (None, ""):
+                raw_value = row.get(key)
+                break
+        if raw_value is None:
+            return None
+
+        # If a downstream explorer already returns a decimal string here, treat
+        # it as display units.  Counterparty Core integer fields normally use
+        # atomic units for divisible assets.
+        raw_text = str(raw_value).strip()
+        raw_number = self._as_float(raw_value)
+        if raw_number is None:
+            return None
+        if "." in raw_text:
+            return float(raw_number)
+
+        decimals = self._asset_display_decimals(asset)
+        if decimals <= 0:
+            return float(raw_number)
+        return float(raw_number) / float(10 ** decimals)
+
+    def _normalize_order_row(self, row: Dict[str, Any], asset: str) -> Dict[str, Any]:
+        asset_norm = str(asset or "").strip().upper()
+        give_asset = str(self._first_present(row, ("give_asset", "giveAsset", "base_asset", "baseAsset", "sell_asset")) or "").strip().upper()
+        get_asset = str(self._first_present(row, ("get_asset", "getAsset", "quote_asset", "quoteAsset", "buy_asset")) or "").strip().upper()
+
+        give_qty = self._quantity_from_row(
+            row,
+            give_asset,
+            ("give_quantity_normalized", "giveQuantityNormalized", "give_normalized", "give_display_quantity"),
+            ("give_quantity", "giveQuantity", "give_amount", "giveAmount"),
+        )
+        get_qty = self._quantity_from_row(
+            row,
+            get_asset,
+            ("get_quantity_normalized", "getQuantityNormalized", "get_normalized", "get_display_quantity"),
+            ("get_quantity", "getQuantity", "get_amount", "getAmount"),
+        )
+        give_remaining = self._quantity_from_row(
+            row,
+            give_asset,
+            ("give_remaining_normalized", "giveRemainingNormalized", "give_remaining_display"),
+            ("give_remaining", "giveRemaining"),
+        )
+        get_remaining = self._quantity_from_row(
+            row,
+            get_asset,
+            ("get_remaining_normalized", "getRemainingNormalized", "get_remaining_display"),
+            ("get_remaining", "getRemaining"),
+        )
+
+        side = "related"
+        quote_asset = ""
+        base_quantity = None
+        quote_quantity = None
+        base_remaining = None
+        quote_remaining = None
+        if give_asset == asset_norm:
+            side = "ask"
+            quote_asset = get_asset
+            base_quantity = give_qty
+            quote_quantity = get_qty
+            base_remaining = give_remaining
+            quote_remaining = get_remaining
+        elif get_asset == asset_norm:
+            side = "bid"
+            quote_asset = give_asset
+            base_quantity = get_qty
+            quote_quantity = give_qty
+            base_remaining = get_remaining
+            quote_remaining = give_remaining
+
+        explicit_price = self._as_float(self._first_present(row, ("price", "unit_price", "unitPrice", "rate")))
+        price = explicit_price
+        if price is None and base_quantity not in (None, 0) and quote_quantity is not None:
+            try:
+                price = float(quote_quantity) / float(base_quantity)
+            except Exception:
+                price = None
+
+        status = self._status_text(row)
+        tx_hash = str(self._first_present(row, ("tx_hash", "txHash", "txid", "order_hash", "hash")) or "").strip()
+        source = str(self._first_present(row, ("source", "address", "source_address", "sourceAddress")) or "").strip()
+
+        return {
+            "asset": asset_norm,
+            "side": side,
+            "quote_asset": quote_asset or None,
+            "price": price,
+            "base_quantity": base_quantity,
+            "quote_quantity": quote_quantity,
+            "base_remaining": base_remaining,
+            "quote_remaining": quote_remaining,
+            "give_asset": give_asset or None,
+            "give_quantity": give_qty,
+            "give_remaining": give_remaining,
+            "get_asset": get_asset or None,
+            "get_quantity": get_qty,
+            "get_remaining": get_remaining,
+            "status": status,
+            "is_open": self._is_open_status(status),
+            "source": source or None,
+            "tx_hash": tx_hash or None,
+            "block_index": self._first_present(row, ("block_index", "blockIndex", "block")),
+            "expiration": self._first_present(row, ("expiration", "expire_index", "expireIndex")),
+            "raw_item": row,
+        }
+
+    def _normalize_dispenser_row(self, row: Dict[str, Any], asset: str) -> Dict[str, Any]:
+        asset_norm = str(asset or self._first_present(row, ("asset", "give_asset", "giveAsset")) or "").strip().upper()
+        give_asset = str(self._first_present(row, ("asset", "give_asset", "giveAsset")) or asset_norm).strip().upper()
+        give_quantity = self._quantity_from_row(
+            row,
+            give_asset,
+            ("give_quantity_normalized", "giveQuantityNormalized", "quantity_normalized", "quantityNormalized"),
+            ("give_quantity", "giveQuantity", "quantity", "amount"),
+        )
+        escrow_quantity = self._quantity_from_row(
+            row,
+            give_asset,
+            ("escrow_quantity_normalized", "escrowQuantityNormalized", "escrow_normalized"),
+            ("escrow_quantity", "escrowQuantity"),
+        )
+        give_remaining = self._quantity_from_row(
+            row,
+            give_asset,
+            ("give_remaining_normalized", "giveRemainingNormalized", "remaining_normalized"),
+            ("give_remaining", "giveRemaining", "remaining", "remaining_quantity"),
+        )
+        satoshirate = self._as_int(self._first_present(row, ("satoshirate", "satoshi_rate", "satoshiRate", "rate", "price_sats")))
+        price_btc = float(satoshirate) / 100000000.0 if satoshirate is not None else None
+        price_btc_per_unit = None
+        if price_btc is not None and give_quantity not in (None, 0):
+            try:
+                price_btc_per_unit = float(price_btc) / float(give_quantity)
+            except Exception:
+                price_btc_per_unit = None
+
+        status = self._status_text(row)
+        tx_hash = str(self._first_present(row, ("tx_hash", "txHash", "txid", "dispenser_tx_hash", "hash")) or "").strip()
+        source = str(self._first_present(row, ("source", "address", "source_address", "sourceAddress")) or "").strip()
+
+        return {
+            "asset": asset_norm,
+            "give_asset": give_asset or None,
+            "give_quantity": give_quantity,
+            "escrow_quantity": escrow_quantity,
+            "give_remaining": give_remaining,
+            "satoshirate": satoshirate,
+            "price_btc": price_btc,
+            "price_btc_per_unit": price_btc_per_unit,
+            "quote_asset": "BTC" if satoshirate is not None else None,
+            "status": status,
+            "is_open": self._is_open_status(status),
+            "source": source or None,
+            "tx_hash": tx_hash or None,
+            "oracle_address": self._first_present(row, ("oracle_address", "oracleAddress")),
+            "block_index": self._first_present(row, ("block_index", "blockIndex", "block")),
+            "raw_item": row,
+        }
+
+    @staticmethod
+    def _market_items(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return CounterpartyAdapter._items_from_payload(result.get("raw") if isinstance(result, dict) else result)
+
+    def _quote_summary(self, asset: str, orders: List[Dict[str, Any]], dispensers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        by_quote: Dict[str, Dict[str, Any]] = {}
+
+        def bucket(quote_asset: Any) -> Dict[str, Any]:
+            q = str(quote_asset or "").strip().upper() or "UNKNOWN"
+            if q not in by_quote:
+                by_quote[q] = {"quote_asset": q, "bids": [], "asks": []}
+            return by_quote[q]
+
+        for order in orders or []:
+            if not order.get("is_open"):
+                continue
+            price = self._as_float(order.get("price"))
+            if price is None or price <= 0:
+                continue
+            b = bucket(order.get("quote_asset"))
+            if order.get("side") == "bid":
+                b["bids"].append(order)
+            elif order.get("side") == "ask":
+                b["asks"].append(order)
+
+        for disp in dispensers or []:
+            if not disp.get("is_open"):
+                continue
+            price = self._as_float(disp.get("price_btc_per_unit")) or self._as_float(disp.get("price_btc"))
+            if price is None or price <= 0:
+                continue
+            synthetic = {**disp, "side": "ask", "price": price, "quote_asset": "BTC", "source_type": "dispenser"}
+            bucket("BTC")["asks"].append(synthetic)
+
+        summaries: List[Dict[str, Any]] = []
+        for q, data in sorted(by_quote.items(), key=lambda kv: kv[0]):
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            best_bid = max(bids, key=lambda x: float(x.get("price") or 0), default=None)
+            best_ask = min(asks, key=lambda x: float(x.get("price") or 0), default=None)
+            bid_px = self._as_float(best_bid.get("price")) if isinstance(best_bid, dict) else None
+            ask_px = self._as_float(best_ask.get("price")) if isinstance(best_ask, dict) else None
+            spread = ask_px - bid_px if bid_px is not None and ask_px is not None else None
+            spread_pct = (spread / bid_px * 100.0) if spread is not None and bid_px not in (None, 0) else None
+            summaries.append({
+                "quote_asset": q,
+                "best_bid": bid_px,
+                "best_ask": ask_px,
+                "spread": spread,
+                "spread_pct": spread_pct,
+                "bid_count": len(bids),
+                "ask_count": len(asks),
+                "best_bid_row": best_bid,
+                "best_ask_row": best_ask,
+            })
+        return summaries
+
     # ------------------------------------------------------------------
     # Read endpoints
     # ------------------------------------------------------------------
@@ -1409,3 +1713,96 @@ class CounterpartyAdapter:
             candidates.append((f"/v2/assets/{a}/orders", {"limit": lim}))
         candidates.append(("/api/orders", params))
         return self._first_ok(candidates)
+
+    def get_asset_orders(self, asset: str, limit: int = 50) -> Dict[str, Any]:
+        a_norm = str(asset or "").strip().upper()
+        lim = max(1, min(int(limit or 50), 500))
+        a = quote(a_norm, safe="")
+        candidates: List[Tuple[str, Optional[Dict[str, Any]]]] = [
+            (f"/v2/assets/{a}/orders", {"limit": lim}),
+            ("/v2/orders", {"asset": a_norm, "limit": lim}),
+            ("/v2/orders", {"give_asset": a_norm, "limit": lim}),
+            ("/v2/orders", {"get_asset": a_norm, "limit": lim}),
+            ("/api/orders", {"asset": a_norm, "limit": lim}),
+        ]
+        result = self._first_ok(candidates)
+        items = []
+        if result.get("ok"):
+            rows = self._market_items(result)
+            for row in rows:
+                give_asset = str(self._first_present(row, ("give_asset", "giveAsset", "base_asset", "baseAsset", "sell_asset")) or "").strip().upper()
+                get_asset = str(self._first_present(row, ("get_asset", "getAsset", "quote_asset", "quoteAsset", "buy_asset")) or "").strip().upper()
+                if a_norm and a_norm not in {give_asset, get_asset}:
+                    continue
+                items.append(self._normalize_order_row(row, a_norm))
+        return {
+            "ok": bool(result.get("ok")),
+            "asset": a_norm,
+            "count": len(items),
+            "items": items,
+            "source_path": result.get("path"),
+            "errors": result.get("errors") or [],
+            "raw": result.get("raw"),
+            "read_only": True,
+        }
+
+    def get_asset_dispensers(self, asset: str, limit: int = 50) -> Dict[str, Any]:
+        a_norm = str(asset or "").strip().upper()
+        lim = max(1, min(int(limit or 50), 500))
+        a = quote(a_norm, safe="")
+        candidates: List[Tuple[str, Optional[Dict[str, Any]]]] = [
+            (f"/v2/assets/{a}/dispensers", {"limit": lim}),
+            ("/v2/dispensers", {"asset": a_norm, "limit": lim}),
+            ("/v2/dispensers", {"give_asset": a_norm, "limit": lim}),
+            ("/api/dispensers", {"asset": a_norm, "limit": lim}),
+            (f"/api/assets/{a}/dispensers", {"limit": lim}),
+        ]
+        result = self._first_ok(candidates)
+        items = []
+        if result.get("ok"):
+            rows = self._market_items(result)
+            for row in rows:
+                row_asset = str(self._first_present(row, ("asset", "give_asset", "giveAsset")) or "").strip().upper()
+                if a_norm and row_asset and row_asset != a_norm:
+                    continue
+                items.append(self._normalize_dispenser_row(row, a_norm))
+        return {
+            "ok": bool(result.get("ok")),
+            "asset": a_norm,
+            "count": len(items),
+            "items": items,
+            "source_path": result.get("path"),
+            "errors": result.get("errors") or [],
+            "raw": result.get("raw"),
+            "read_only": True,
+        }
+
+    def get_asset_market_context(self, asset: str, limit: int = 50) -> Dict[str, Any]:
+        a_norm = str(asset or "").strip().upper()
+        lim = max(1, min(int(limit or 50), 200))
+        orders = self.get_asset_orders(a_norm, limit=lim)
+        dispensers = self.get_asset_dispensers(a_norm, limit=lim)
+        order_items = orders.get("items") or []
+        dispenser_items = dispensers.get("items") or []
+        quotes = self._quote_summary(a_norm, order_items, dispenser_items)
+        return {
+            "ok": True,
+            "asset": a_norm,
+            "orders": order_items,
+            "orders_source_path": orders.get("source_path"),
+            "orders_errors": orders.get("errors") or [],
+            "dispensers": dispenser_items,
+            "dispensers_source_path": dispensers.get("source_path"),
+            "dispensers_errors": dispensers.get("errors") or [],
+            "quotes": quotes,
+            "summary": {
+                "orders": len(order_items),
+                "open_orders": sum(1 for x in order_items if x.get("is_open")),
+                "dispensers": len(dispenser_items),
+                "open_dispensers": sum(1 for x in dispenser_items if x.get("is_open")),
+                "quote_count": len(quotes),
+            },
+            "read_only": True,
+            "signing": "not_available_in_this_tranche",
+            "compose": "later_unsigned_psbt_or_wallet_flow",
+        }

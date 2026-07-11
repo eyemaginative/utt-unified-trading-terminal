@@ -39,6 +39,27 @@ function fmtBtcFromSats(v) {
   return `${(n / 100000000).toFixed(8)} BTC`;
 }
 
+function fmtMarketQty(v) {
+  const n = finiteNumberOrNull(v);
+  if (n === null) return "—";
+  const abs = Math.abs(n);
+  const digits = abs >= 1000 ? 4 : abs >= 1 ? 8 : 10;
+  return n.toLocaleString(undefined, { maximumFractionDigits: digits });
+}
+
+function fmtMarketPrice(v, quoteAsset = "") {
+  const n = finiteNumberOrNull(v);
+  if (n === null) return "—";
+  const abs = Math.abs(n);
+  const digits = abs >= 1000 ? 4 : abs >= 1 ? 8 : 10;
+  const suffix = quoteAsset ? ` ${quoteAsset}` : "";
+  return `${n.toLocaleString(undefined, { maximumFractionDigits: digits })}${suffix}`;
+}
+
+function compactMarketRows(rowsMaybe, limit = 6) {
+  return asArray(rowsMaybe).slice(0, Math.max(1, Number(limit) || 6));
+}
+
 function fmtTimeMaybe(v) {
   if (v === null || v === undefined || v === "") return "—";
   const n = Number(v);
@@ -689,6 +710,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   const [counterpartyMetadataMap, setCounterpartyMetadataMap] = useState({});
   const [counterpartyMetadataLoading, setCounterpartyMetadataLoading] = useState(false);
   const [counterpartyMetadataErr, setCounterpartyMetadataErr] = useState("");
+  const [counterpartyMarketByAsset, setCounterpartyMarketByAsset] = useState({});
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [query, setQuery] = useState("");
@@ -697,6 +719,7 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   const [selected, setSelected] = useState(null);
   const [updatedAt, setUpdatedAt] = useState(null);
   const counterpartyMetadataLoadSeqRef = useRef(0);
+  const counterpartyMarketLoadSeqRef = useRef(0);
 
   useEffect(() => {
     setProviderPresent(!!getUnisatProvider());
@@ -851,6 +874,64 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
       setCounterpartyLoading(false);
     }
   }
+
+  async function loadCounterpartyMarketContext(assetMaybe, opts = {}) {
+    const asset = String(assetMaybe || "").trim().toUpperCase();
+    if (!asset) return null;
+
+    const force = !!opts.force;
+    const existing = counterpartyMarketByAsset?.[asset];
+    if (!force && existing?.data && !existing?.error) return existing.data;
+
+    const seq = counterpartyMarketLoadSeqRef.current + 1;
+    counterpartyMarketLoadSeqRef.current = seq;
+    setCounterpartyMarketByAsset((prev) => ({
+      ...(prev || {}),
+      [asset]: {
+        ...(prev?.[asset] || {}),
+        loading: true,
+        error: "",
+      },
+    }));
+
+    try {
+      const payload = await fetchJsonMaybe(apiBase, `/api/counterparty/assets/${encodeURIComponent(asset)}/market_context?limit=50`);
+      if (counterpartyMarketLoadSeqRef.current === seq) {
+        setCounterpartyMarketByAsset((prev) => ({
+          ...(prev || {}),
+          [asset]: {
+            data: payload,
+            loading: false,
+            error: "",
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+      }
+      return payload;
+    } catch (e) {
+      const msg = String(e?.message || e || "Failed to load Counterparty market context.");
+      if (counterpartyMarketLoadSeqRef.current === seq) {
+        setCounterpartyMarketByAsset((prev) => ({
+          ...(prev || {}),
+          [asset]: {
+            ...(prev?.[asset] || {}),
+            loading: false,
+            error: msg,
+          },
+        }));
+      }
+      return null;
+    }
+  }
+
+  useEffect(() => {
+    const asset = String(selected?.sourceKind || "").toLowerCase() === "counterparty"
+      ? String(selected?.asset || "").trim().toUpperCase()
+      : "";
+    if (!asset) return;
+    loadCounterpartyMarketContext(asset).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiBase, selected?.sourceKind, selected?.asset]);
 
   async function loadInscriptions(nextCursor = 0, opts = {}) {
     const provider = getUnisatProvider();
@@ -1009,6 +1090,13 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
       : (selected?.content || selected?.preview || "")
   ).trim();
   const selectedBucket = contentTypeBucket(selectedKind === "counterparty" ? (selectedCounterpartyMedia?.content_type || selected?.contentType) : selected?.contentType);
+  const selectedCounterpartyMarketState = selectedKind === "counterparty"
+    ? (counterpartyMarketByAsset?.[String(selected?.asset || "").trim().toUpperCase()] || null)
+    : null;
+  const selectedCounterpartyMarket = selectedCounterpartyMarketState?.data || null;
+  const selectedCounterpartyQuotes = asArray(selectedCounterpartyMarket?.quotes);
+  const selectedCounterpartyOrders = compactMarketRows(selectedCounterpartyMarket?.orders, 6);
+  const selectedCounterpartyDispensers = compactMarketRows(selectedCounterpartyMarket?.dispensers, 6);
 
   return (
     <div style={panelStyle}>
@@ -1215,6 +1303,93 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
                       {selectedMetadata?.issuer ? <button type="button" style={{ ...buttonStyle, padding: "5px 8px" }} onClick={() => copyTextSafe(selectedMetadata.issuer)}>Copy Issuer</button> : null}
                       {selectedCounterpartyMedia?.content_url ? <a href={selectedCounterpartyMedia.content_url} target="_blank" rel="noreferrer" style={{ ...buttonStyle, padding: "5px 8px", textDecoration: "none" }}>Open media</a> : null}
                       {selectedMetadata?.external_metadata_url ? <a href={selectedMetadata.external_metadata_url} target="_blank" rel="noreferrer" style={{ ...buttonStyle, padding: "5px 8px", textDecoration: "none" }}>Open metadata</a> : null}
+                    </div>
+
+                    <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.10)", display: "grid", gap: 8 }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                        <div>
+                          <b>Market context</b>
+                          <div style={{ ...mutedStyle, fontSize: 11 }}>Read-only orders / dispensers. No compose, sign, send, or broadcast.</div>
+                        </div>
+                        <button
+                          type="button"
+                          style={{ ...buttonStyle, padding: "4px 7px", fontSize: 11, opacity: selected?.asset ? 1 : 0.55 }}
+                          disabled={!selected?.asset || selectedCounterpartyMarketState?.loading}
+                          onClick={() => loadCounterpartyMarketContext(selected.asset, { force: true })}
+                        >
+                          {selectedCounterpartyMarketState?.loading ? "Loading…" : "Refresh market"}
+                        </button>
+                      </div>
+
+                      {selectedCounterpartyMarketState?.error ? (
+                        <div style={{ color: "#ffb86b", fontSize: 12, whiteSpace: "pre-wrap" }}>{selectedCounterpartyMarketState.error}</div>
+                      ) : null}
+
+                      {selectedCounterpartyMarket ? (
+                        <>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6 }}>
+                            <div style={{ ...cardStyle, padding: 8 }}><div style={mutedStyle}>Open Orders</div><div style={{ fontWeight: 900 }}>{hideTableData ? "••••" : (selectedCounterpartyMarket.summary?.open_orders ?? 0).toLocaleString()}</div></div>
+                            <div style={{ ...cardStyle, padding: 8 }}><div style={mutedStyle}>Dispensers</div><div style={{ fontWeight: 900 }}>{hideTableData ? "••••" : (selectedCounterpartyMarket.summary?.open_dispensers ?? 0).toLocaleString()}</div></div>
+                            <div style={{ ...cardStyle, padding: 8 }}><div style={mutedStyle}>Quotes</div><div style={{ fontWeight: 900 }}>{hideTableData ? "••••" : (selectedCounterpartyMarket.summary?.quote_count ?? selectedCounterpartyQuotes.length).toLocaleString()}</div></div>
+                          </div>
+
+                          {selectedCounterpartyQuotes.length ? (
+                            <div style={{ display: "grid", gap: 4 }}>
+                              <div style={{ fontWeight: 900 }}>Best bid / ask</div>
+                              {selectedCounterpartyQuotes.slice(0, 4).map((q) => (
+                                <div key={q.quote_asset || "quote"} style={{ display: "grid", gridTemplateColumns: "70px 1fr 1fr", gap: 6, fontSize: 12 }}>
+                                  <span style={mutedStyle}>{q.quote_asset || "—"}</span>
+                                  <span>Bid {hideTableData ? "••••" : fmtMarketPrice(q.best_bid, q.quote_asset)}</span>
+                                  <span>Ask {hideTableData ? "••••" : fmtMarketPrice(q.best_ask, q.quote_asset)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          ) : <div style={{ ...mutedStyle, fontSize: 12 }}>No computable bid/ask quote returned yet.</div>}
+
+                          {selectedCounterpartyOrders.length ? (
+                            <div style={{ overflowX: "auto" }}>
+                              <div style={{ fontWeight: 900, marginBottom: 4 }}>Open / recent orders</div>
+                              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                                <thead><tr><th style={thStyle}>Side</th><th style={thStyle}>Quote</th><th style={thStyle}>Price</th><th style={thStyle}>Qty Rem</th><th style={thStyle}>Status</th></tr></thead>
+                                <tbody>
+                                  {selectedCounterpartyOrders.map((o, idx) => (
+                                    <tr key={`${o.tx_hash || "order"}:${idx}`}>
+                                      <td style={tdStyle}>{String(o.side || "—").toUpperCase()}</td>
+                                      <td style={tdStyle}>{o.quote_asset || "—"}</td>
+                                      <td style={tdStyle}>{hideTableData ? "••••" : fmtMarketPrice(o.price, o.quote_asset)}</td>
+                                      <td style={tdStyle}>{hideTableData ? "••••" : fmtMarketQty(o.base_remaining ?? o.base_quantity)}</td>
+                                      <td style={tdStyle}>{o.status || "—"}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ) : <div style={{ ...mutedStyle, fontSize: 12 }}>No order rows returned for this asset.</div>}
+
+                          {selectedCounterpartyDispensers.length ? (
+                            <div style={{ overflowX: "auto" }}>
+                              <div style={{ fontWeight: 900, marginBottom: 4 }}>Dispensers</div>
+                              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                                <thead><tr><th style={thStyle}>Source</th><th style={thStyle}>Qty</th><th style={thStyle}>BTC / Unit</th><th style={thStyle}>Status</th></tr></thead>
+                                <tbody>
+                                  {selectedCounterpartyDispensers.map((d, idx) => (
+                                    <tr key={`${d.tx_hash || "dispenser"}:${idx}`}>
+                                      <td style={tdStyle} title={d.source || ""}>{hideTableData ? "••••" : maskMiddle(d.source, 6, 5)}</td>
+                                      <td style={tdStyle}>{hideTableData ? "••••" : fmtMarketQty(d.give_remaining ?? d.give_quantity)}</td>
+                                      <td style={tdStyle}>{hideTableData ? "••••" : fmtMarketPrice(d.price_btc_per_unit ?? d.price_btc, "BTC")}</td>
+                                      <td style={tdStyle}>{d.status || "—"}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ) : <div style={{ ...mutedStyle, fontSize: 12 }}>No dispenser rows returned for this asset.</div>}
+                        </>
+                      ) : selectedCounterpartyMarketState?.loading ? (
+                        <div style={{ ...mutedStyle, fontSize: 12 }}>Loading read-only market context…</div>
+                      ) : (
+                        <div style={{ ...mutedStyle, fontSize: 12 }}>Select Refresh market to load read-only order / dispenser context.</div>
+                      )}
                     </div>
                   </>
                 ) : (

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
@@ -22,6 +23,7 @@ class CounterpartyAdapter:
     """
 
     venue = "counterparty"
+    _MARKET_CONTEXT_CACHE: Dict[str, Dict[str, Any]] = {}
 
     def __init__(self, base_url: Optional[str] = None, timeout_s: Optional[float] = None):
         fn = getattr(settings, "counterparty_effective_base_url", None)
@@ -34,7 +36,7 @@ class CounterpartyAdapter:
         # Small in-process helper cache used only for order/dispenser quantity
         # normalization.  It stores display decimals inferred from Counterparty
         # asset metadata and never stores secrets or wallet data.
-        self._quantity_decimals_cache: Dict[str, int] = {"BTC": 8, "XCP": 8}
+        self._quantity_decimals_cache: Dict[str, int] = {"BTC": 8, "XCP": 8, "BITCRYSTALS": 8, "PEPECASH": 8}
 
     # ------------------------------------------------------------------
     # Low-level HTTP helpers
@@ -1199,28 +1201,101 @@ class CounterpartyAdapter:
         )
         return not any(bit in s for bit in terminal_bits)
 
+    @staticmethod
+    def _decimals_from_divisible(divisible: Any, *, fallback: int = 8) -> int:
+        parsed = CounterpartyAdapter._as_bool(divisible)
+        if parsed is True:
+            return 8
+        if parsed is False:
+            return 0
+        return int(fallback)
+
+    @classmethod
+    def _divisible_hint_from_row(cls, row: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[bool]:
+        for key in keys:
+            if key in row and row.get(key) not in (None, ""):
+                parsed = cls._as_bool(row.get(key))
+                if parsed is not None:
+                    return parsed
+        return None
+
+    def _asset_divisible_fast(self, asset: Any) -> Optional[bool]:
+        """Return Counterparty divisibility without fetching external media.
+
+        Balance normalization must be cheap and deterministic.  Calling
+        get_asset() here would also run external metadata/media probes for
+        collectible images, which is unnecessary and can make balance loads
+        slow.  This helper only reads the protocol asset record.
+        """
+        a_norm = str(asset or "").strip().upper()
+        if not a_norm:
+            return None
+        if a_norm in self._quantity_decimals_cache:
+            return int(self._quantity_decimals_cache[a_norm]) > 0
+        if a_norm in {"BTC", "XCP", "BITCRYSTALS", "PEPECASH"}:
+            self._quantity_decimals_cache[a_norm] = 8
+            return True
+        try:
+            a = quote(a_norm, safe="")
+            result = self._first_ok([
+                (f"/v2/assets/{a}", None),
+                (f"/v2/assets/{a}/info", None),
+                (f"/api/assets/{a}", None),
+                (f"/assets/{a}", None),
+            ])
+            if result.get("ok"):
+                row = self._first_dict_from_payload(result.get("raw"))
+                divisible = self._as_bool(self._first_present(row, ("divisible", "is_divisible", "isDivisible")))
+                if divisible is not None:
+                    self._quantity_decimals_cache[a_norm] = 8 if divisible else 0
+                    return bool(divisible)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _balance_quantity_key_is_atomic(source_path: Optional[str], key: str) -> bool:
+        """Counterparty Core v2 balance rows expose `quantity` in base units.
+
+        Asset metadata/supply uses display normalization elsewhere, but address
+        balance snapshots from /v2/addresses/.../balances return integer
+        quantities for divisible assets.  Treat only known Counterparty Core
+        balance paths this way so explorer-style display payloads are not
+        accidentally divided.
+        """
+        k = str(key or "").strip()
+        if k not in {"quantity", "balance", "qty", "amount"}:
+            return False
+        p = str(source_path or "").strip().lower()
+        return p.startswith("/v2/addresses/") or p.startswith("/v2/balances")
+
     def _asset_display_decimals(self, asset: Any) -> int:
         a_norm = str(asset or "").strip().upper()
         if not a_norm:
             return 8
         if a_norm in self._quantity_decimals_cache:
             return int(self._quantity_decimals_cache[a_norm])
-        if a_norm in {"BTC", "XCP"}:
-            self._quantity_decimals_cache[a_norm] = 8
+        divisible = self._asset_divisible_fast(a_norm)
+        if divisible is True:
             return 8
-        try:
-            info = self.get_asset(a_norm)
-            meta = info.get("metadata") if isinstance(info, dict) else None
-            divisible = meta.get("divisible") if isinstance(meta, dict) else None
-            decimals = 8 if divisible is True else 0 if divisible is False else 8
-        except Exception:
-            # Conservative fallback for unknown Counterparty assets.  If the API
-            # supplies *_normalized fields those are preferred before this path.
-            decimals = 8
-        self._quantity_decimals_cache[a_norm] = int(decimals)
-        return int(decimals)
+        if divisible is False:
+            return 0
+        # Conservative fallback for unknown Counterparty assets in market rows.
+        # Address balances use stricter source-aware logic below.  Do not cache
+        # this fallback, because an unknown non-divisible asset should not poison
+        # later balance normalization.
+        return 8
 
-    def _quantity_from_row(self, row: Dict[str, Any], asset: Any, normalized_keys: Tuple[str, ...], raw_keys: Tuple[str, ...]) -> Optional[float]:
+
+    def _quantity_from_row(
+        self,
+        row: Dict[str, Any],
+        asset: Any,
+        normalized_keys: Tuple[str, ...],
+        raw_keys: Tuple[str, ...],
+        *,
+        divisible_hint: Optional[bool] = None,
+    ) -> Optional[float]:
         for key in normalized_keys:
             value = self._as_float(row.get(key))
             if value is not None:
@@ -1244,7 +1319,7 @@ class CounterpartyAdapter:
         if "." in raw_text:
             return float(raw_number)
 
-        decimals = self._asset_display_decimals(asset)
+        decimals = self._decimals_from_divisible(divisible_hint, fallback=self._asset_display_decimals(asset)) if divisible_hint is not None else self._asset_display_decimals(asset)
         if decimals <= 0:
             return float(raw_number)
         return float(raw_number) / float(10 ** decimals)
@@ -1253,30 +1328,36 @@ class CounterpartyAdapter:
         asset_norm = str(asset or "").strip().upper()
         give_asset = str(self._first_present(row, ("give_asset", "giveAsset", "base_asset", "baseAsset", "sell_asset")) or "").strip().upper()
         get_asset = str(self._first_present(row, ("get_asset", "getAsset", "quote_asset", "quoteAsset", "buy_asset")) or "").strip().upper()
+        give_divisible_hint = self._divisible_hint_from_row(row, ("give_asset_divisible", "giveAssetDivisible", "give_divisible", "giveDivisible"))
+        get_divisible_hint = self._divisible_hint_from_row(row, ("get_asset_divisible", "getAssetDivisible", "get_divisible", "getDivisible"))
 
         give_qty = self._quantity_from_row(
             row,
             give_asset,
             ("give_quantity_normalized", "giveQuantityNormalized", "give_normalized", "give_display_quantity"),
             ("give_quantity", "giveQuantity", "give_amount", "giveAmount"),
+            divisible_hint=give_divisible_hint,
         )
         get_qty = self._quantity_from_row(
             row,
             get_asset,
             ("get_quantity_normalized", "getQuantityNormalized", "get_normalized", "get_display_quantity"),
             ("get_quantity", "getQuantity", "get_amount", "getAmount"),
+            divisible_hint=get_divisible_hint,
         )
         give_remaining = self._quantity_from_row(
             row,
             give_asset,
             ("give_remaining_normalized", "giveRemainingNormalized", "give_remaining_display"),
             ("give_remaining", "giveRemaining"),
+            divisible_hint=give_divisible_hint,
         )
         get_remaining = self._quantity_from_row(
             row,
             get_asset,
             ("get_remaining_normalized", "getRemainingNormalized", "get_remaining_display"),
             ("get_remaining", "getRemaining"),
+            divisible_hint=get_divisible_hint,
         )
 
         side = "related"
@@ -1339,23 +1420,27 @@ class CounterpartyAdapter:
     def _normalize_dispenser_row(self, row: Dict[str, Any], asset: str) -> Dict[str, Any]:
         asset_norm = str(asset or self._first_present(row, ("asset", "give_asset", "giveAsset")) or "").strip().upper()
         give_asset = str(self._first_present(row, ("asset", "give_asset", "giveAsset")) or asset_norm).strip().upper()
+        give_divisible_hint = self._divisible_hint_from_row(row, ("asset_divisible", "assetDivisible", "give_asset_divisible", "giveAssetDivisible", "divisible"))
         give_quantity = self._quantity_from_row(
             row,
             give_asset,
             ("give_quantity_normalized", "giveQuantityNormalized", "quantity_normalized", "quantityNormalized"),
             ("give_quantity", "giveQuantity", "quantity", "amount"),
+            divisible_hint=give_divisible_hint,
         )
         escrow_quantity = self._quantity_from_row(
             row,
             give_asset,
             ("escrow_quantity_normalized", "escrowQuantityNormalized", "escrow_normalized"),
             ("escrow_quantity", "escrowQuantity"),
+            divisible_hint=give_divisible_hint,
         )
         give_remaining = self._quantity_from_row(
             row,
             give_asset,
             ("give_remaining_normalized", "giveRemainingNormalized", "remaining_normalized"),
             ("give_remaining", "giveRemaining", "remaining", "remaining_quantity"),
+            divisible_hint=give_divisible_hint,
         )
         satoshirate = self._as_int(self._first_present(row, ("satoshirate", "satoshi_rate", "satoshiRate", "rate", "price_sats")))
         price_btc = float(satoshirate) / 100000000.0 if satoshirate is not None else None
@@ -1595,9 +1680,118 @@ class CounterpartyAdapter:
             "read_only": True,
         }
 
+
+    def _normalize_address_balance_row(self, row: Dict[str, Any], *, source_path: Optional[str] = None) -> Dict[str, Any]:
+        asset = str(self._first_present(row, ("asset", "asset_name", "assetName", "symbol")) or "").strip().upper()
+        longname = str(self._first_present(row, ("asset_longname", "assetLongname", "longname", "asset_long_name")) or "").strip()
+        divisible = self._as_bool(self._first_present(row, ("divisible", "is_divisible", "isDivisible")))
+
+        normalized_keys = (
+            "quantity_normalized",
+            "normalized_quantity",
+            "quantityNormalized",
+            "balance_normalized",
+            "balanceNormalized",
+            "qty_normalized",
+        )
+        explicit_atomic_keys = (
+            "quantity_atomic",
+            "balance_atomic",
+            "raw_quantity",
+            "rawQuantity",
+            "quantity_raw",
+            "balance_raw",
+        )
+        display_quantity_keys = ("quantity", "balance", "qty", "amount")
+
+        raw_display_value = None
+        for key in display_quantity_keys:
+            if key in row and row.get(key) not in (None, ""):
+                raw_display_value = row.get(key)
+                break
+
+        # Counterparty Core v2 address balances frequently omit `divisible` but
+        # expose integer `quantity` in base units for divisible assets.  That is
+        # why XCP and BITCRYSTALS can appear 1e8 too large if the UI treats
+        # `quantity` as already-display units.  Infer divisibility cheaply for
+        # known or obviously-atomic rows; otherwise preserve old display behavior
+        # for small non-divisible collectibles.
+        if divisible is None:
+            if asset in self._quantity_decimals_cache:
+                divisible = int(self._quantity_decimals_cache[asset]) > 0
+            else:
+                raw_int = self._as_int(raw_display_value)
+                cardish = asset.endswith("CARD") or asset.endswith("CD")
+                if raw_int is not None and abs(int(raw_int)) >= 100000000 and not cardish:
+                    inferred = self._asset_divisible_fast(asset)
+                    if inferred is not None:
+                        divisible = bool(inferred)
+
+        decimals = self._decimals_from_divisible(divisible, fallback=0)
+
+        quantity_source = None
+        units = None
+        for key in normalized_keys:
+            units = self._as_float(row.get(key))
+            if units is not None:
+                quantity_source = key
+                break
+
+        atomic = None
+        if units is None:
+            for key in explicit_atomic_keys:
+                atomic = self._as_int(row.get(key))
+                if atomic is not None:
+                    quantity_source = key
+                    break
+
+            if atomic is not None:
+                units = float(atomic) / float(10 ** int(decimals or 0)) if decimals > 0 else float(atomic)
+            else:
+                raw_units = None
+                raw_key = None
+                for key in display_quantity_keys:
+                    raw_units = self._as_float(row.get(key))
+                    if raw_units is not None:
+                        raw_key = key
+                        break
+
+                if raw_units is None:
+                    units = 0.0
+                    atomic = 0
+                    quantity_source = None
+                else:
+                    raw_text = str(row.get(raw_key) or "").strip()
+                    raw_int = self._as_int(row.get(raw_key))
+                    if decimals > 0 and raw_int is not None and "." not in raw_text and self._balance_quantity_key_is_atomic(source_path, str(raw_key or "")):
+                        atomic = int(raw_int)
+                        units = float(atomic) / float(10 ** int(decimals or 0))
+                        quantity_source = f"{raw_key}_atomic_inferred"
+                    else:
+                        units = float(raw_units)
+                        atomic = int(round(float(units) * float(10 ** int(decimals or 0)))) if decimals > 0 else int(round(float(units)))
+                        quantity_source = raw_key
+        else:
+            atomic = int(round(float(units) * float(10 ** int(decimals or 0)))) if decimals > 0 else int(round(float(units)))
+
+        return {
+            **row,
+            "asset": asset,
+            "asset_longname": longname or row.get("asset_longname") or row.get("assetLongname"),
+            "quantity": float(units or 0.0),
+            "quantity_normalized": float(units or 0.0),
+            "quantity_atomic": int(atomic or 0),
+            "decimals": int(decimals or 0),
+            "divisible": divisible,
+            "quantity_source": quantity_source,
+            "source_path": source_path,
+            "raw_item": row,
+        }
+
+
     def get_address_balances(self, address: str) -> Dict[str, Any]:
         addr = quote(str(address or "").strip(), safe="")
-        return self._first_ok([
+        result = self._first_ok([
             (f"/v2/addresses/{addr}/balances", None),
             (f"/v2/balances/{addr}", None),
             ("/v2/balances", {"address": str(address or "").strip()}),
@@ -1605,6 +1799,22 @@ class CounterpartyAdapter:
             ("/api/balances", {"address": str(address or "").strip()}),
             (f"/balances/{addr}", None),
         ])
+        if not result.get("ok"):
+            return result
+
+        raw_items = self._items_from_payload(result.get("raw"))
+        items = [
+            self._normalize_address_balance_row(row, source_path=result.get("path"))
+            for row in raw_items
+            if isinstance(row, dict)
+        ]
+        return {
+            **result,
+            "address": str(address or "").strip(),
+            "count": len(items),
+            "items": items,
+            "read_only": True,
+        }
 
     def get_address_asset_balance(self, address: str, asset: str) -> Dict[str, Any]:
         asset_norm = str(asset or "").strip().upper()
@@ -1620,7 +1830,7 @@ class CounterpartyAdapter:
                 "errors": balances.get("errors") or [],
             }
 
-        items = self._items_from_payload(balances.get("raw"))
+        items = balances.get("items") if isinstance(balances.get("items"), list) else self._items_from_payload(balances.get("raw"))
         matched = None
         for row in items:
             if self._asset_matches(row, asset_norm):
@@ -1628,69 +1838,86 @@ class CounterpartyAdapter:
                 break
 
         if matched is None:
+            decimals = self._asset_display_decimals(asset_norm)
             return {
                 "ok": True,
                 "address": address,
                 "asset": asset_norm,
                 "quantity": 0.0,
+                "quantity_normalized": 0.0,
                 "quantity_atomic": 0,
-                "decimals": 8,
+                "decimals": int(decimals or 0),
                 "source_path": balances.get("path"),
                 "raw": balances.get("raw"),
             }
 
-        divisible = matched.get("divisible")
-        decimals = 8 if divisible is not False else 0
-
-        normalized_keys = ("quantity_normalized", "normalized_quantity", "quantityNormalized", "balance_normalized", "balanceNormalized", "qty_normalized")
-        explicit_atomic_keys = ("quantity_atomic", "balance_atomic", "raw_quantity", "rawQuantity", "quantity_raw", "balance_raw")
-        display_quantity_keys = ("quantity", "balance", "qty", "amount")
-
-        units = None
-        quantity_source = None
-        for k in normalized_keys:
-            units = self._as_float(matched.get(k))
-            if units is not None:
-                quantity_source = k
-                break
-
-        atomic = None
-        if units is None:
-            # Counterparty Core v2 address-balance rows commonly expose `quantity`
-            # as a display quantity already (for example, FREESPIN quantity=1500),
-            # while older/explorer payloads may expose explicit atomic/raw fields.
-            # Only divide by decimals when an explicitly atomic/raw key is present.
-            for k in explicit_atomic_keys:
-                atomic = self._as_int(matched.get(k))
-                if atomic is not None:
-                    quantity_source = k
-                    break
-
-            if atomic is not None:
-                units = float(atomic) / (10 ** int(decimals or 0))
-            else:
-                for k in display_quantity_keys:
-                    units = self._as_float(matched.get(k))
-                    if units is not None:
-                        quantity_source = k
-                        break
-                if units is None:
-                    units = 0.0
-                atomic = int(round(float(units) * (10 ** int(decimals or 0))))
-        else:
-            atomic = int(round(float(units) * (10 ** int(decimals or 0))))
+        normalized = matched if matched.get("quantity_normalized") is not None else self._normalize_address_balance_row(matched, source_path=balances.get("path"))
 
         return {
             "ok": True,
             "address": address,
             "asset": asset_norm,
-            "quantity": float(units or 0.0),
-            "quantity_atomic": int(atomic or 0),
-            "decimals": int(decimals or 0),
-            "quantity_source": quantity_source,
+            "quantity": float(normalized.get("quantity_normalized") or normalized.get("quantity") or 0.0),
+            "quantity_normalized": float(normalized.get("quantity_normalized") or normalized.get("quantity") or 0.0),
+            "quantity_atomic": int(normalized.get("quantity_atomic") or 0),
+            "decimals": int(normalized.get("decimals") or 0),
+            "divisible": normalized.get("divisible"),
+            "quantity_source": normalized.get("quantity_source"),
             "source_path": balances.get("path"),
-            "raw_item": matched,
+            "raw_item": normalized.get("raw_item") if isinstance(normalized.get("raw_item"), dict) else matched,
             "raw": balances.get("raw"),
+        }
+
+    def get_address_balances_audit(self, address: str, assets: Optional[List[str]] = None) -> Dict[str, Any]:
+        requested = [str(a or "").strip().upper() for a in (assets or []) if str(a or "").strip()]
+        balances = self.get_address_balances(address)
+        if not balances.get("ok"):
+            return {"ok": False, "address": address, "items": [], "errors": balances.get("errors") or []}
+
+        rows = balances.get("items") if isinstance(balances.get("items"), list) else []
+        by_asset = {str(row.get("asset") or "").strip().upper(): row for row in rows if isinstance(row, dict)}
+        wanted = requested or sorted(by_asset.keys())
+
+        out = []
+        for asset_name in wanted:
+            row = by_asset.get(asset_name)
+            if row:
+                out.append({
+                    "asset": asset_name,
+                    "present": True,
+                    "quantity": float(row.get("quantity_normalized") or row.get("quantity") or 0.0),
+                    "quantity_normalized": float(row.get("quantity_normalized") or row.get("quantity") or 0.0),
+                    "quantity_atomic": int(row.get("quantity_atomic") or 0),
+                    "decimals": int(row.get("decimals") or 0),
+                    "divisible": row.get("divisible"),
+                    "quantity_source": row.get("quantity_source"),
+                    "source_path": row.get("source_path") or balances.get("path"),
+                    "raw_item": row.get("raw_item") if isinstance(row.get("raw_item"), dict) else row,
+                })
+            else:
+                decimals = self._asset_display_decimals(asset_name)
+                out.append({
+                    "asset": asset_name,
+                    "present": False,
+                    "quantity": 0.0,
+                    "quantity_normalized": 0.0,
+                    "quantity_atomic": 0,
+                    "decimals": int(decimals or 0),
+                    "divisible": True if int(decimals or 0) == 8 else False if int(decimals or 0) == 0 else None,
+                    "quantity_source": "missing",
+                    "source_path": balances.get("path"),
+                    "raw_item": None,
+                })
+
+        return {
+            "ok": True,
+            "address": str(address or "").strip(),
+            "requested": wanted,
+            "count": len(out),
+            "items": out,
+            "all_balance_count": len(rows),
+            "source_path": balances.get("path"),
+            "read_only": True,
         }
 
     def get_address_sends(self, address: str, limit: int = 50) -> Dict[str, Any]:
@@ -1714,16 +1941,17 @@ class CounterpartyAdapter:
         candidates.append(("/api/orders", params))
         return self._first_ok(candidates)
 
-    def get_asset_orders(self, asset: str, limit: int = 50) -> Dict[str, Any]:
+    def get_asset_orders(self, asset: str, limit: int = 50, open_only: bool = False) -> Dict[str, Any]:
         a_norm = str(asset or "").strip().upper()
         lim = max(1, min(int(limit or 50), 500))
         a = quote(a_norm, safe="")
+        status_params = {"status": "open"} if open_only else {}
         candidates: List[Tuple[str, Optional[Dict[str, Any]]]] = [
-            (f"/v2/assets/{a}/orders", {"limit": lim}),
-            ("/v2/orders", {"asset": a_norm, "limit": lim}),
-            ("/v2/orders", {"give_asset": a_norm, "limit": lim}),
-            ("/v2/orders", {"get_asset": a_norm, "limit": lim}),
-            ("/api/orders", {"asset": a_norm, "limit": lim}),
+            (f"/v2/assets/{a}/orders", {"limit": lim, **status_params}),
+            ("/v2/orders", {"asset": a_norm, "limit": lim, **status_params}),
+            ("/v2/orders", {"give_asset": a_norm, "limit": lim, **status_params}),
+            ("/v2/orders", {"get_asset": a_norm, "limit": lim, **status_params}),
+            ("/api/orders", {"asset": a_norm, "limit": lim, **status_params}),
         ]
         result = self._first_ok(candidates)
         items = []
@@ -1734,7 +1962,10 @@ class CounterpartyAdapter:
                 get_asset = str(self._first_present(row, ("get_asset", "getAsset", "quote_asset", "quoteAsset", "buy_asset")) or "").strip().upper()
                 if a_norm and a_norm not in {give_asset, get_asset}:
                     continue
-                items.append(self._normalize_order_row(row, a_norm))
+                normalized = self._normalize_order_row(row, a_norm)
+                if open_only and not normalized.get("is_open"):
+                    continue
+                items.append(normalized)
         return {
             "ok": bool(result.get("ok")),
             "asset": a_norm,
@@ -1743,19 +1974,24 @@ class CounterpartyAdapter:
             "source_path": result.get("path"),
             "errors": result.get("errors") or [],
             "raw": result.get("raw"),
+            "open_only": bool(open_only),
             "read_only": True,
         }
 
-    def get_asset_dispensers(self, asset: str, limit: int = 50) -> Dict[str, Any]:
+    def get_asset_dispensers(self, asset: str, limit: int = 50, open_only: bool = False) -> Dict[str, Any]:
         a_norm = str(asset or "").strip().upper()
         lim = max(1, min(int(limit or 50), 500))
         a = quote(a_norm, safe="")
+        # Counterparty Core uses numeric status=0 for open dispensers.  Some
+        # explorer-style APIs use text status=open.  Try text first; if ignored,
+        # the local open_only filter below still keeps the UI context focused.
+        status_params = {"status": "open"} if open_only else {}
         candidates: List[Tuple[str, Optional[Dict[str, Any]]]] = [
-            (f"/v2/assets/{a}/dispensers", {"limit": lim}),
-            ("/v2/dispensers", {"asset": a_norm, "limit": lim}),
-            ("/v2/dispensers", {"give_asset": a_norm, "limit": lim}),
-            ("/api/dispensers", {"asset": a_norm, "limit": lim}),
-            (f"/api/assets/{a}/dispensers", {"limit": lim}),
+            (f"/v2/assets/{a}/dispensers", {"limit": lim, **status_params}),
+            ("/v2/dispensers", {"asset": a_norm, "limit": lim, **status_params}),
+            ("/v2/dispensers", {"give_asset": a_norm, "limit": lim, **status_params}),
+            ("/api/dispensers", {"asset": a_norm, "limit": lim, **status_params}),
+            (f"/api/assets/{a}/dispensers", {"limit": lim, **status_params}),
         ]
         result = self._first_ok(candidates)
         items = []
@@ -1765,7 +2001,10 @@ class CounterpartyAdapter:
                 row_asset = str(self._first_present(row, ("asset", "give_asset", "giveAsset")) or "").strip().upper()
                 if a_norm and row_asset and row_asset != a_norm:
                     continue
-                items.append(self._normalize_dispenser_row(row, a_norm))
+                normalized = self._normalize_dispenser_row(row, a_norm)
+                if open_only and not normalized.get("is_open"):
+                    continue
+                items.append(normalized)
         return {
             "ok": bool(result.get("ok")),
             "asset": a_norm,
@@ -1774,18 +2013,67 @@ class CounterpartyAdapter:
             "source_path": result.get("path"),
             "errors": result.get("errors") or [],
             "raw": result.get("raw"),
+            "open_only": bool(open_only),
             "read_only": True,
         }
 
-    def get_asset_market_context(self, asset: str, limit: int = 50) -> Dict[str, Any]:
+    @staticmethod
+    def _market_context_cache_ttl_s() -> int:
+        try:
+            return max(0, min(int(os.getenv("COUNTERPARTY_MARKET_CONTEXT_CACHE_TTL_S") or "45"), 3600))
+        except Exception:
+            return 45
+
+    @classmethod
+    def _market_context_cache_get(cls, key: str) -> Optional[Dict[str, Any]]:
+        ttl = cls._market_context_cache_ttl_s()
+        if ttl <= 0:
+            return None
+        row = cls._MARKET_CONTEXT_CACHE.get(key)
+        if not isinstance(row, dict):
+            return None
+        ts = float(row.get("ts") or 0)
+        if not ts or time.time() - ts > ttl:
+            try:
+                cls._MARKET_CONTEXT_CACHE.pop(key, None)
+            except Exception:
+                pass
+            return None
+        data = row.get("data")
+        if isinstance(data, dict):
+            return {**data, "cache_hit": True, "cache_ttl_s": ttl}
+        return None
+
+    @classmethod
+    def _market_context_cache_put(cls, key: str, data: Dict[str, Any]) -> None:
+        ttl = cls._market_context_cache_ttl_s()
+        if ttl <= 0 or not isinstance(data, dict):
+            return
+        try:
+            # Keep this intentionally small; market context is UI acceleration,
+            # not a durable ledger or trading cache.
+            if len(cls._MARKET_CONTEXT_CACHE) > 250:
+                oldest = sorted(cls._MARKET_CONTEXT_CACHE.items(), key=lambda kv: float((kv[1] or {}).get("ts") or 0))[:50]
+                for k, _v in oldest:
+                    cls._MARKET_CONTEXT_CACHE.pop(k, None)
+            cls._MARKET_CONTEXT_CACHE[key] = {"ts": time.time(), "data": data}
+        except Exception:
+            pass
+
+    def get_asset_market_context(self, asset: str, limit: int = 50, open_only: bool = True) -> Dict[str, Any]:
         a_norm = str(asset or "").strip().upper()
         lim = max(1, min(int(limit or 50), 200))
-        orders = self.get_asset_orders(a_norm, limit=lim)
-        dispensers = self.get_asset_dispensers(a_norm, limit=lim)
+        cache_key = f"{a_norm}|{lim}|open:{1 if open_only else 0}"
+        cached = self._market_context_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        orders = self.get_asset_orders(a_norm, limit=lim, open_only=open_only)
+        dispensers = self.get_asset_dispensers(a_norm, limit=lim, open_only=open_only)
         order_items = orders.get("items") or []
         dispenser_items = dispensers.get("items") or []
         quotes = self._quote_summary(a_norm, order_items, dispenser_items)
-        return {
+        response = {
             "ok": True,
             "asset": a_norm,
             "orders": order_items,
@@ -1802,7 +2090,10 @@ class CounterpartyAdapter:
                 "open_dispensers": sum(1 for x in dispenser_items if x.get("is_open")),
                 "quote_count": len(quotes),
             },
+            "open_only": bool(open_only),
             "read_only": True,
             "signing": "not_available_in_this_tranche",
             "compose": "later_unsigned_psbt_or_wallet_flow",
         }
+        self._market_context_cache_put(cache_key, response)
+        return response

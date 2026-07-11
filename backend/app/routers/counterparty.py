@@ -42,29 +42,41 @@ def counterparty_assets_metadata(
 def counterparty_asset_orders(
     asset: str,
     limit: int = Query(default=50, ge=1, le=500),
+    open_only: bool = Query(default=False, description="If true, return only locally-open order rows when possible."),
 ) -> Dict[str, Any]:
-    return _raise_if_failed(_adapter().get_asset_orders(asset=asset, limit=limit), label="counterparty_asset_orders_failed")
+    return _raise_if_failed(_adapter().get_asset_orders(asset=asset, limit=limit, open_only=open_only), label="counterparty_asset_orders_failed")
 
 
 @router.get("/assets/{asset}/dispensers")
 def counterparty_asset_dispensers(
     asset: str,
     limit: int = Query(default=50, ge=1, le=500),
+    open_only: bool = Query(default=False, description="If true, return only locally-open dispenser rows when possible."),
 ) -> Dict[str, Any]:
-    return _raise_if_failed(_adapter().get_asset_dispensers(asset=asset, limit=limit), label="counterparty_asset_dispensers_failed")
+    return _raise_if_failed(_adapter().get_asset_dispensers(asset=asset, limit=limit, open_only=open_only), label="counterparty_asset_dispensers_failed")
 
 
 @router.get("/assets/{asset}/market_context")
 def counterparty_asset_market_context(
     asset: str,
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=25, ge=1, le=200),
+    open_only: bool = Query(default=True, description="Default true for fast trading context; set false for historical rows."),
 ) -> Dict[str, Any]:
-    return _adapter().get_asset_market_context(asset=asset, limit=limit)
+    return _adapter().get_asset_market_context(asset=asset, limit=limit, open_only=open_only)
 
 
 @router.get("/assets/{asset}")
 def counterparty_asset(asset: str) -> Dict[str, Any]:
     return _raise_if_failed(_adapter().get_asset(asset), label="counterparty_asset_lookup_failed")
+
+
+@router.get("/address/{address}/balances/audit")
+def counterparty_address_balances_audit(
+    address: str,
+    assets: str = Query(default="XCP,BITCRYSTALS", description="Comma-separated assets to audit from one Counterparty balance snapshot."),
+) -> Dict[str, Any]:
+    asset_list = [a.strip() for a in str(assets or "").split(",") if a.strip()]
+    return _adapter().get_address_balances_audit(address=address, assets=asset_list)
 
 
 @router.get("/address/{address}/balances")

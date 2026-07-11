@@ -905,6 +905,7 @@ function withBalanceBasisFields(row) {
 // ─────────────────────────────────────────────────────────────
 const APP_SOL_MINT = "So11111111111111111111111111111111111111112";
 const APP_COUNTERPARTY_UNISAT_ADDR_LS_KEY = "utt_nft_unisat_address_v1";
+const APP_COUNTERPARTY_UNISAT_BTC_BALANCE_LS_KEY = "utt_counterparty_unisat_btc_balance_v1";
 
 function appFiniteNumberOrNull(v) {
   if (v === null || v === undefined || v === "") return null;
@@ -1217,6 +1218,44 @@ async function appGetCounterpartyAddressNoPrompt() {
   return "";
 }
 
+async function appGetCounterpartyAddressWithPrompt(opts = {}) {
+  const forcePrompt = !!opts?.forcePrompt;
+  if (!forcePrompt) {
+    const existing = await appGetCounterpartyAddressNoPrompt();
+    if (existing) return existing;
+  }
+
+  try {
+    const provider = typeof window !== "undefined" ? window.unisat : null;
+    if (!provider) return "";
+
+    let accounts = [];
+    if (typeof provider.requestAccounts === "function") {
+      accounts = await provider.requestAccounts();
+    } else if (typeof provider.connect === "function") {
+      const connected = await provider.connect();
+      accounts = Array.isArray(connected) ? connected : (connected?.accounts || connected?.addresses || []);
+    } else if (typeof provider.getAccounts === "function") {
+      accounts = await provider.getAccounts();
+    }
+
+    if ((!Array.isArray(accounts) || accounts.length === 0) && typeof provider.getAccounts === "function") {
+      accounts = await provider.getAccounts();
+    }
+
+    const arr = Array.isArray(accounts) ? accounts : [];
+    const addr = String(arr[0] || "").trim();
+    if (addr) {
+      try { localStorage.setItem(APP_COUNTERPARTY_UNISAT_ADDR_LS_KEY, addr); } catch {}
+      return addr;
+    }
+  } catch {
+    // User may reject the UniSat prompt; caller will surface a non-fatal message.
+  }
+
+  return "";
+}
+
 function appNormalizeUniSatBtcBalanceToBtc(payload) {
   if (payload === null || payload === undefined || payload === "") return null;
 
@@ -1265,44 +1304,119 @@ function appNormalizeUniSatBtcBalanceToBtc(payload) {
   return null;
 }
 
-async function appFetchCounterpartyBtcBalanceRow(addressMaybe = "") {
-  const address = String(addressMaybe || "").trim();
-  if (!address) return null;
+function appBuildCounterpartyBtcBalanceRow({ address, btc, payload = null, status = "wallet_live", stale = false, fetchedAt = null } = {}) {
+  const addr = String(address || "").trim();
+  const qty = appFiniteNumberOrNull(btc);
+  if (!addr || qty === null || !Number.isFinite(Number(qty))) return null;
 
+  return withBalanceBasisFields({
+    venue: "counterparty",
+    source_type: stale ? "Bitcoin wallet cache" : "Bitcoin wallet",
+    network: "bitcoin",
+    chain: "bitcoin",
+    wallet_id: "counterparty_unisat",
+    address: addr,
+    wallet_address: addr,
+    asset: "BTC",
+    symbol: "BTC",
+    total: qty,
+    available: qty,
+    hold: 0,
+    px_usd: null,
+    total_usd: null,
+    available_usd: null,
+    hold_usd: null,
+    usd_source_symbol: "—",
+    balance_status: status,
+    balance_stale: !!stale,
+    fetched_at: fetchedAt || null,
+    basis_status: "not_loaded",
+    raw_btc_balance: payload,
+  });
+}
+
+function appReadCachedCounterpartyBtcBalanceRow(addressMaybe = "") {
   try {
-    const provider = typeof window !== "undefined" ? window.unisat : null;
-    if (!provider || typeof provider.getBalance !== "function") return null;
+    const raw = localStorage.getItem(APP_COUNTERPARTY_UNISAT_BTC_BALANCE_LS_KEY) || "";
+    const cached = safeParseJson(raw);
+    if (!cached || typeof cached !== "object") return null;
 
-    // getBalance is read-only and should not prompt once UniSat has already been connected.
-    const payload = await provider.getBalance();
-    const btc = appNormalizeUniSatBtcBalanceToBtc(payload);
-    if (btc === null || !Number.isFinite(Number(btc))) return null;
+    const requested = String(addressMaybe || "").trim().toLowerCase();
+    const cachedAddress = String(cached.address || "").trim();
+    if (!cachedAddress) return null;
+    if (requested && cachedAddress.toLowerCase() !== requested) return null;
 
-    return withBalanceBasisFields({
-      venue: "counterparty",
-      source_type: "Bitcoin wallet",
-      network: "bitcoin",
-      chain: "bitcoin",
-      wallet_id: "counterparty_unisat",
-      address,
-      wallet_address: address,
-      asset: "BTC",
-      symbol: "BTC",
-      total: btc,
-      available: btc,
-      hold: 0,
-      px_usd: null,
-      total_usd: null,
-      available_usd: null,
-      hold_usd: null,
-      usd_source_symbol: "—",
-      balance_status: "wallet_live",
-      basis_status: "not_loaded",
-      raw_btc_balance: payload,
+    return appBuildCounterpartyBtcBalanceRow({
+      address: cachedAddress,
+      btc: cached.btc,
+      payload: cached.raw_btc_balance || null,
+      status: "wallet_cached",
+      stale: true,
+      fetchedAt: cached.fetched_at || null,
     });
   } catch {
     return null;
   }
+}
+
+function appWriteCachedCounterpartyBtcBalanceRow(row, payload = null) {
+  try {
+    const address = String(row?.address || row?.wallet_address || "").trim();
+    const btc = appFiniteNumberOrNull(row?.total);
+    if (!address || btc === null) return;
+    localStorage.setItem(
+      APP_COUNTERPARTY_UNISAT_BTC_BALANCE_LS_KEY,
+      JSON.stringify({
+        address,
+        btc,
+        fetched_at: new Date().toISOString(),
+        raw_btc_balance: payload || row?.raw_btc_balance || null,
+      })
+    );
+  } catch {
+    // ignore storage/cache failures
+  }
+}
+
+async function appFetchCounterpartyBtcBalanceRow(addressMaybe = "", opts = {}) {
+  let address = String(addressMaybe || "").trim();
+  const allowPrompt = !!opts?.allowPrompt;
+
+  if (!address && allowPrompt) {
+    address = await appGetCounterpartyAddressWithPrompt();
+  }
+  if (!address) return appReadCachedCounterpartyBtcBalanceRow(addressMaybe);
+
+  const readLive = async () => {
+    const provider = typeof window !== "undefined" ? window.unisat : null;
+    if (!provider || typeof provider.getBalance !== "function") return null;
+    const payload = await provider.getBalance();
+    const btc = appNormalizeUniSatBtcBalanceToBtc(payload);
+    if (btc === null || !Number.isFinite(Number(btc))) return null;
+    const row = appBuildCounterpartyBtcBalanceRow({ address, btc, payload, status: "wallet_live", stale: false, fetchedAt: new Date().toISOString() });
+    if (row) appWriteCachedCounterpartyBtcBalanceRow(row, payload);
+    return row;
+  };
+
+  try {
+    const row = await readLive();
+    if (row) return row;
+  } catch {
+    // If UniSat auto-disconnected, optionally prompt/reconnect below.
+  }
+
+  if (allowPrompt) {
+    try {
+      const promptedAddress = await appGetCounterpartyAddressWithPrompt({ forcePrompt: true });
+      if (promptedAddress) address = promptedAddress;
+      const row = await readLive();
+      if (row) return row;
+    } catch {
+      // fall through to cache
+    }
+  }
+
+  return appReadCachedCounterpartyBtcBalanceRow(address);
 }
 
 function appExtractCounterpartyBalanceRows(payload) {
@@ -1367,8 +1481,10 @@ function appNormalizeCounterpartyBalanceRows(payload, addressMaybe = "") {
   }).filter(Boolean);
 }
 
-async function appFetchCounterpartyPortfolioBalanceRows() {
-  const address = await appGetCounterpartyAddressNoPrompt();
+async function appFetchCounterpartyPortfolioBalanceRows(opts = {}) {
+  const allowPrompt = !!opts?.allowPrompt;
+  const explicitAddress = String(opts?.address || "").trim();
+  const address = explicitAddress || (allowPrompt ? await appGetCounterpartyAddressWithPrompt() : await appGetCounterpartyAddressNoPrompt());
   if (!address) return [];
 
   let counterpartyRows = [];
@@ -1379,7 +1495,7 @@ async function appFetchCounterpartyPortfolioBalanceRows() {
     counterpartyRows = [];
   }
 
-  const btcRow = await appFetchCounterpartyBtcBalanceRow(address);
+  const btcRow = await appFetchCounterpartyBtcBalanceRow(address, { allowPrompt });
   if (!btcRow) return counterpartyRows;
 
   const hasBtc = (counterpartyRows || []).some((row) => String(row?.asset || "").trim().toUpperCase() === "BTC");
@@ -4007,19 +4123,23 @@ export default function App() {
       setError(null);
 
       if (isCounterpartyView) {
-        const address = await appGetCounterpartyAddressNoPrompt();
+        const address = await appGetCounterpartyAddressWithPrompt();
         if (!address) {
           if (balancesReqIdRef.current !== reqId) return;
           setBalances([]);
           setPortfolioTotalUsd(null);
-          setError("Counterparty balances need a UniSat address. Open NFTs / Collectibles and connect UniSat first, then refresh Balances again.");
+          setError("Counterparty balances need UniSat. Connect or unlock UniSat, then refresh Balances again.");
           return;
         }
-        const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows();
+        const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows({ address, allowPrompt: true });
         if (balancesReqIdRef.current !== reqId) return;
         setBalances(counterpartyRows);
         const cpTotalUsd = appCounterpartyRowsTotalUsd(counterpartyRows);
         setPortfolioTotalUsd(cpTotalUsd);
+        const btcRow = (counterpartyRows || []).find((row) => String(row?.asset || "").trim().toUpperCase() === "BTC");
+        if (btcRow?.balance_stale) {
+          setError("Counterparty BTC is showing the last cached UniSat balance. Unlock/connect UniSat and refresh to update it live.");
+        }
         return;
       }
 

@@ -25,7 +25,12 @@ const LS_OT_COUNTERPARTY_BTC_BALANCE = "utt_counterparty_unisat_btc_balance_v1";
 
 function isCounterpartyVenueKey(value) {
   const v = String(value || "").toLowerCase().trim();
-  return v === "counterparty" || v === "counterparty_unisat" || v === "bitcoin_counterparty";
+  return (
+    v === "counterparty" ||
+    v === "counterparty_unisat" ||
+    v === "bitcoin_counterparty" ||
+    v.includes("counterparty")
+  );
 }
 
 function normalizeCounterpartyAsset(asset) {
@@ -47,6 +52,49 @@ function counterpartyPairParts(symbol) {
   const parts = canon.split("-").map((x) => x.trim()).filter(Boolean);
   if (parts.length !== 2) return { base: "", quote: "", symbol: canon };
   return { base: parts[0], quote: parts[1], symbol: canon };
+}
+
+function counterpartyRequestSymbolRaw(symbol) {
+  return String(symbol || "").trim().toUpperCase().replace(/[\\/_]/g, "-");
+}
+
+function counterpartyBookRows(payload, sideName) {
+  if (!payload || typeof payload !== "object") return [];
+  const side = String(sideName || "").toLowerCase().trim();
+  const keys = side === "asks"
+    ? ["asks", "ask_levels", "askLevels", "sell", "sells"]
+    : ["bids", "bid_levels", "bidLevels", "buy", "buys"];
+  for (const key of keys) {
+    const rows = payload?.[key];
+    if (Array.isArray(rows)) return rows;
+  }
+  return [];
+}
+
+function counterpartyBookRowCount(payload) {
+  return counterpartyBookRows(payload, "bids").length + counterpartyBookRows(payload, "asks").length;
+}
+
+
+function counterpartyPreviewRules(symbol, venue = "counterparty") {
+  const parts = counterpartyPairParts(symbol);
+  const priceDecimals = parts.quote === "BTC" || parts.quote === "XCP" ? 8 : 8;
+  const base = String(parts.base || "").toUpperCase();
+  const wholeUnitAsset = base.endsWith("CARD") || base.endsWith("CD");
+  return {
+    venue: String(venue || "counterparty").toLowerCase().trim() || "counterparty",
+    symbol: parts.symbol || normalizeCounterpartySymbol(symbol),
+    type: "counterparty_preview",
+    price_decimals: priceDecimals,
+    qty_decimals: wholeUnitAsset ? 0 : 8,
+    price_increment: 0.00000001,
+    qty_increment: wholeUnitAsset ? 1 : 0.00000001,
+    base_increment: wholeUnitAsset ? 1 : 0.00000001,
+    min_qty: 0,
+    min_notional: 0,
+    errors: [],
+    warnings: ["Counterparty ticket is preview-only; unsigned compose/sign/broadcast is not enabled in this tranche."],
+  };
 }
 
 function otCounterpartyFiniteNumberOrNull(value) {
@@ -2037,12 +2085,17 @@ export default function OrderTicketWidget({
       hoverLines.push(`Missing: ${missing.join(", ")}`);
     }
 
+    const counterpartyReadOnly = venueId.includes("counterparty");
+    const inlineText = counterpartyReadOnly
+      ? "Counterparty: read-only preview · submit disabled"
+      : `${title} · ${inlineParts.join(" · ")}`;
+
     return {
       ok,
       title,
       lines,
       missing,
-      inlineText: `${title} · ${inlineParts.join(" · ")}`,
+      inlineText,
       hoverTitle: hoverLines.join("\n"),
     };
   }, [tradeGate, effectiveVenue]);
@@ -2845,23 +2898,8 @@ export default function OrderTicketWidget({
       return;
     }
 
-    if (isCounterpartyVenue) {
-      const parts = counterpartyPairParts(s);
-      const priceDecimals = parts.quote === "BTC" || parts.quote === "XCP" ? 8 : 8;
-      setRules({
-        venue: v,
-        symbol: parts.symbol || normalizeCounterpartySymbol(s),
-        type: "counterparty_preview",
-        price_decimals: priceDecimals,
-        qty_decimals: 8,
-        price_increment: 0.00000001,
-        qty_increment: 0.00000001,
-        base_increment: 0.00000001,
-        min_qty: 0,
-        min_notional: 0,
-        errors: [],
-        warnings: ["Counterparty ticket is preview-only; unsigned compose/sign/broadcast is not enabled in this tranche."],
-      });
+    if (isCounterpartyVenue || isCounterpartyVenueKey(v)) {
+      setRules(counterpartyPreviewRules(s, v));
       setRulesErr(null);
       setRulesLoading(false);
       return;
@@ -2964,9 +3002,22 @@ export default function OrderTicketWidget({
         const vLower = String(v || "").trim().toLowerCase();
         const errMsg = extractRulesError(e);
 
-        // Solana-Jupiter is swap-style; if backend doesn't implement get_order_rules yet,
-        // fall back to sane decimals so UI doesn't clamp to 0 and block.
+        // Counterparty is preview-only in this tranche.  Never let a generic
+        // get_order_rules adapter miss collapse BTC/XCP-quoted prices to 0 decimals.
         if (
+          isCounterpartyVenueKey(vLower) &&
+          typeof errMsg === "string" &&
+          (
+            errMsg.toLowerCase().includes("does not implement get_order_rules") ||
+            errMsg.toLowerCase().includes("constraints unknown") ||
+            errMsg.toLowerCase().includes("404")
+          )
+        ) {
+          setRules(counterpartyPreviewRules(s, vLower));
+          setRulesErr(null);
+        } else if (
+          // Solana-Jupiter is swap-style; if backend doesn't implement get_order_rules yet,
+          // fall back to sane decimals so UI doesn't clamp to 0 and block.
           (vLower === "solana_jupiter" || vLower === "solana-dex" || vLower.startsWith("solana_")) &&
           typeof errMsg === "string" &&
           (
@@ -3035,8 +3086,10 @@ export default function OrderTicketWidget({
       return;
     }
 
+    const rawSym = counterpartyRequestSymbolRaw(otSymbol);
     const sym = normalizeCounterpartySymbol(otSymbol);
-    if (!apiBase || !sym || !sym.includes("-")) {
+    const candidateSymbols = Array.from(new Set([rawSym, sym].map((x) => String(x || "").trim()).filter((x) => x && x.includes("-"))));
+    if (!apiBase || candidateSymbols.length === 0) {
       setCounterpartyBook(null);
       setCounterpartyBookError(null);
       setCounterpartyBookLoading(false);
@@ -3051,19 +3104,38 @@ export default function OrderTicketWidget({
         setCounterpartyBookLoading(true);
         setCounterpartyBookError(null);
         const base = String(apiBase || "").replace(/\/+$/, "");
-        const url = new URL(`${base}/api/counterparty/orderbook`);
-        url.searchParams.set("symbol", sym);
-        url.searchParams.set("depth", "25");
-        url.searchParams.set("open_only", "true");
-        url.searchParams.set("_ts", String(Date.now()));
-        const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
-        const body = await r.json().catch(() => null);
-        if (!r.ok || body?.ok === false) {
-          const msg = body?.detail || body?.error || `HTTP ${r.status}`;
-          throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+        let bestBody = null;
+        let bestCount = -1;
+        let lastError = null;
+
+        for (const candidateSymbol of candidateSymbols) {
+          try {
+            const url = new URL(`${base}/api/counterparty/orderbook`);
+            url.searchParams.set("symbol", candidateSymbol);
+            url.searchParams.set("depth", "25");
+            url.searchParams.set("open_only", "true");
+            url.searchParams.set("_ts", String(Date.now()));
+            const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+            const body = await r.json().catch(() => null);
+            if (!r.ok || body?.ok === false) {
+              const msg = body?.detail || body?.error || `HTTP ${r.status}`;
+              throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+            }
+
+            const rowCount = counterpartyBookRowCount(body);
+            if (!bestBody || rowCount > bestCount) {
+              bestBody = body || null;
+              bestCount = rowCount;
+            }
+            if (rowCount > 0) break;
+          } catch (e) {
+            lastError = e;
+          }
         }
+
+        if (!bestBody && lastError) throw lastError;
         if (cancelled || counterpartyBookReqRef.current !== reqId) return;
-        setCounterpartyBook(body || null);
+        setCounterpartyBook(bestBody ? { ...bestBody, ticket_candidate_symbols: candidateSymbols, ticket_best_row_count: Math.max(bestCount, 0) } : null);
       } catch (e) {
         if (cancelled || counterpartyBookReqRef.current !== reqId) return;
         setCounterpartyBook(null);
@@ -3333,9 +3405,9 @@ export default function OrderTicketWidget({
   useEffect(() => {
     if (limitEditingRef.current) return;
 
-    // DEX (Solana) venues: limit price is informational for swap-style flows.
-    // Do NOT clamp/round it using CEX-style venue rules (which may be unknown and default to 0 decimals).
-    if (isDexSwapVenue) return;
+    // DEX / Counterparty preview venues: do not CEX-normalize the user-entered limit.
+    // Counterparty BTC/XCP prices can be tiny; stale generic rules can otherwise round them to 0.
+    if (isDexSwapVenue || isCounterpartyVenue) return;
 
     const lp = String(limitPrice ?? "");
     if (!lp) return;
@@ -3349,7 +3421,7 @@ export default function OrderTicketWidget({
       setLimitPrice(normalized);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rules, side, limitPrice]);
+  }, [rules, side, limitPrice, isDexSwapVenue, isCounterpartyVenue]);
 
   // ─────────────────────────────────────────────────────────────
   // Effective min qty (gated to Crypto.com only)
@@ -4151,6 +4223,33 @@ export default function OrderTicketWidget({
 
   const notional = useMemo(() => (qtyNum === null || pxNum === null ? null : qtyNum * pxNum), [qtyNum, pxNum]);
 
+  const buySpendQuote = useMemo(() => {
+    if (side !== "buy") return null;
+
+    // Solana DEX BUY spends quote = Total field
+    if (isDexSwapVenue) {
+      return totalQuoteNum === null ? null : totalQuoteNum;
+    }
+
+    // CEX BUY spends quote = qty * limit
+    if (qtyNum === null || pxNum === null) return null;
+    const spend = qtyNum * pxNum;
+    return Number.isFinite(spend) ? spend : null;
+  }, [side, isDexSwapVenue, qtyNum, pxNum, totalQuoteNum]);
+
+  const buySpendCapacityQuote = useMemo(() => {
+    if (side !== "buy") return null;
+    const qAvail = toFiniteOrNull(quoteAvail);
+    if (qAvail === null || qAvail < 0) return null;
+    return qAvail;
+  }, [side, quoteAvail]);
+
+  const sellCapacity = useMemo(() => {
+    if (side !== "sell") return null;
+    const bAvail = toFiniteOrNull(baseAvail);
+    return bAvail === null ? null : bAvail;
+  }, [side, baseAvail]);
+
   const qtyFromTotal = useMemo(() => {
     if (pxNum === null || totalQuoteNum === null) return null;
 
@@ -4334,8 +4433,8 @@ export default function OrderTicketWidget({
     if (isCounterpartyVenue) {
       const parts = counterpartyPairParts(otSymbol);
       const canonSymbol = parts.symbol || normalizeCounterpartySymbol(otSymbol);
-      const bids = Array.isArray(counterpartyBook?.bids) ? counterpartyBook.bids : [];
-      const asks = Array.isArray(counterpartyBook?.asks) ? counterpartyBook.asks : [];
+      const bids = counterpartyBookRows(counterpartyBook, "bids");
+      const asks = counterpartyBookRows(counterpartyBook, "asks");
       const executableSideRows = side === "buy" ? asks : bids;
 
       lines.push("Counterparty ticket is preview-only. Compose, UniSat signing, and broadcast are intentionally disabled in this tranche.");
@@ -4707,32 +4806,6 @@ export default function OrderTicketWidget({
     return true;
   }, [canSubmitBase, preTrade]);
 
-  const buySpendQuote = useMemo(() => {
-    if (side !== "buy") return null;
-
-    // Solana DEX BUY spends quote = Total field
-    if (isDexSwapVenue) {
-      return totalQuoteNum === null ? null : totalQuoteNum;
-    }
-
-    // CEX BUY spends quote = qty * limit
-    if (qtyNum === null || pxNum === null) return null;
-    const spend = qtyNum * pxNum;
-    return Number.isFinite(spend) ? spend : null;
-  }, [side, isDexSwapVenue, qtyNum, pxNum, totalQuoteNum]);
-
-  const buySpendCapacityQuote = useMemo(() => {
-    if (side !== "buy") return null;
-    const qAvail = toFiniteOrNull(quoteAvail);
-    if (qAvail === null || qAvail < 0) return null;
-    return qAvail;
-  }, [side, quoteAvail]);
-
-  const sellCapacity = useMemo(() => {
-    if (side !== "sell") return null;
-    const bAvail = toFiniteOrNull(baseAvail);
-    return bAvail === null ? null : bAvail;
-  }, [side, baseAvail]);
 
   const balanceWarning = useMemo(() => {
     if (side === "buy") {
@@ -5763,6 +5836,53 @@ async function submitLimitOrder() {
   const rowTightStyle = { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 6 };
   const sectionGap = 6;
 
+  const noticeBoxBaseStyle = {
+    marginTop: 6,
+    padding: "7px 9px",
+    borderRadius: 10,
+    fontSize: 11,
+    lineHeight: 1.3,
+    whiteSpace: "normal",
+    overflow: "visible",
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
+    maxWidth: "100%",
+    boxSizing: "border-box",
+    display: "block",
+    flex: "0 0 auto",
+  };
+
+  const noticeTitleStyle = {
+    fontWeight: 900,
+    lineHeight: 1.25,
+    marginBottom: 4,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
+  };
+
+  const noticeLineStyle = {
+    display: "block",
+    lineHeight: 1.3,
+    marginTop: 2,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
+  };
+
+  const noticeBulletLineStyle = {
+    display: "grid",
+    gridTemplateColumns: "10px minmax(0, 1fr)",
+    columnGap: 4,
+    alignItems: "start",
+    lineHeight: 1.3,
+    marginTop: 2,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
+  };
+
+  const noticeBulletStyle = {
+    lineHeight: 1.3,
+    opacity: 0.9,
+  };
 
   const ticketScrollBodyStyle = {
     display: "flex",
@@ -6195,14 +6315,7 @@ async function submitLimitOrder() {
         {showTradeGateStatus && tradeGateDisplay && (
           <div
             style={{
-              marginTop: 6,
-              padding: "6px 8px",
-              borderRadius: 10,
-              fontSize: 11,
-              lineHeight: 1.2,
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
+              ...noticeBoxBaseStyle,
               border: tradeGateDisplay.ok ? "1px solid rgba(46, 204, 113, 0.30)" : "1px solid rgba(245, 158, 11, 0.35)",
               background: tradeGateDisplay.ok ? "rgba(46, 204, 113, 0.07)" : "rgba(120, 72, 16, 0.14)",
               color: tradeGateDisplay.ok ? "#c9f7d7" : "#ffe2a6",
@@ -6210,7 +6323,7 @@ async function submitLimitOrder() {
             }}
             title={tradeGateDisplay.hoverTitle}
           >
-            <div style={{ fontWeight: 900, overflow: "hidden", textOverflow: "ellipsis" }}>
+            <div style={{ ...noticeTitleStyle, marginBottom: 0 }}>
               {tradeGateDisplay.inlineText}
             </div>
           </div>
@@ -6219,18 +6332,13 @@ async function submitLimitOrder() {
         {rulesBanner && (
           <div
             style={{
-              marginTop: 6,
-              padding: "6px 8px",
-              borderRadius: 10,
-              fontSize: 11,
-              lineHeight: 1.15,
-              whiteSpace: "pre-wrap",
+              ...noticeBoxBaseStyle,
               ...rulesBannerStyle,
             }}
             title="Policy/rules checks are advisory; backend/venue may still accept/reject."
           >
             {rulesBanner.lines.map((ln, i) => (
-              <div key={i}>{ln}</div>
+              <div key={i} style={noticeLineStyle}>{ln}</div>
             ))}
           </div>
         )}
@@ -6238,20 +6346,18 @@ async function submitLimitOrder() {
         {preTrade && (
           <div
             style={{
-              marginTop: 6,
-              padding: "6px 8px",
-              borderRadius: 10,
-              fontSize: 11,
-              lineHeight: 1.15,
-              whiteSpace: "pre-wrap",
+              ...noticeBoxBaseStyle,
               ...preTradeStyle,
             }}
             title="Pre-trade checks use venue constraints (min + increments). When checks fail and rules are known, submit is blocked."
           >
-            <div style={{ fontWeight: 900, marginBottom: preTrade.lines?.length ? 4 : 0 }}>{preTrade.title}</div>
+            <div style={{ ...noticeTitleStyle, marginBottom: preTrade.lines?.length ? 4 : 0 }}>{preTrade.title}</div>
             {Array.isArray(preTrade.lines) &&
               preTrade.lines.map((ln, i) => (
-                <div key={i}>• {ln}</div>
+                <div key={i} style={noticeBulletLineStyle}>
+                  <span style={noticeBulletStyle}>•</span>
+                  <span>{ln}</span>
+                </div>
               ))}
           </div>
         )}
@@ -6364,8 +6470,8 @@ async function submitLimitOrder() {
 
                 const cleaned = sanitizeDecimalInput(e.target.value);
 
-                // Solana DEX venues: keep the user-picked decimal price as-is; do not CEX-normalize.
-                if (isDexSwapVenue) {
+                // DEX / Counterparty preview venues: keep the user-picked decimal price as-is; do not CEX-normalize.
+                if (isDexSwapVenue || isCounterpartyVenue) {
                   setLimitPrice(cleaned);
                   return;
                 }
@@ -6392,8 +6498,8 @@ async function submitLimitOrder() {
 
                 if (!limitPrice) return;
 
-                // Solana DEX venues: do not clamp/round limit price on blur.
-                if (isDexSwapVenue) return;
+                // DEX / Counterparty preview venues: do not clamp/round limit price on blur.
+                if (isDexSwapVenue || isCounterpartyVenue) return;
 
                 const normalized = normalizeLimitPriceStr(limitPrice, rules, side);
                 if (normalized && normalized !== String(limitPrice)) setLimitPrice(normalized);
@@ -6700,7 +6806,7 @@ async function submitLimitOrder() {
                 Read-only preview. Uses UniSat for BTC and /api/counterparty/address balances for XCP / BITCRYSTALS.
               </span>
               <span style={{ ...safeMuted, fontSize: 11 }}>
-                Book: {counterpartyBookLoading ? "loading…" : counterpartyBookError ? "unavailable" : `${Array.isArray(counterpartyBook?.bids) ? counterpartyBook.bids.length : 0} bids / ${Array.isArray(counterpartyBook?.asks) ? counterpartyBook.asks.length : 0} asks`}
+                Book: {counterpartyBookLoading ? "loading…" : counterpartyBookError ? "unavailable" : `${counterpartyBookRows(counterpartyBook, "bids").length} bids / ${counterpartyBookRows(counterpartyBook, "asks").length} asks`}
               </span>
             </div>
           )}

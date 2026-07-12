@@ -2,11 +2,22 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
+from pydantic import BaseModel
 
 from ..adapters.counterparty import CounterpartyAdapter
 
 router = APIRouter(prefix="/api/counterparty", tags=["counterparty"])
+
+
+class CounterpartyComposePreviewRequest(BaseModel):
+    source_address: str
+    symbol: str
+    side: str
+    quantity: float | str
+    limit_price: float | str
+    selected_level: Optional[Dict[str, Any]] = None
+    attempt_upstream: bool = True
 
 
 def _adapter() -> CounterpartyAdapter:
@@ -41,6 +52,31 @@ def counterparty_orderbook(
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=502, detail={"error": "counterparty_orderbook_failed", "message": str(e)}) from e
+
+
+
+
+@router.post("/compose/preview")
+def counterparty_compose_preview(req: CounterpartyComposePreviewRequest = Body(...)) -> Dict[str, Any]:
+    """Return an unsigned Counterparty compose preview only.
+
+    This route does not sign, submit, broadcast, write orders, mutate balances,
+    or touch FIFO/basis/ledger state.
+    """
+    try:
+        return _adapter().preview_compose(
+            source_address=req.source_address,
+            symbol=req.symbol,
+            side=req.side,
+            quantity=req.quantity,
+            limit_price=req.limit_price,
+            selected_level=req.selected_level,
+            attempt_upstream=bool(req.attempt_upstream),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "counterparty_compose_preview_failed", "message": str(e)}) from e
 
 
 @router.get("/assets/metadata")

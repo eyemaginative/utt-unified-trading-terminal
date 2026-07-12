@@ -76,6 +76,47 @@ function counterpartyBookRowCount(payload) {
 }
 
 
+function counterpartyBookRowPrice(row) {
+  return otCounterpartyFiniteNumberOrNull(row?.price ?? row?.displayPrice ?? row?.limitPrice ?? row?.rate);
+}
+
+function counterpartyPickBookRowForTicket(payload, side, limitPrice) {
+  const rows = counterpartyBookRows(payload, String(side || "").toLowerCase() === "buy" ? "asks" : "bids");
+  if (!rows.length) return null;
+  const wanted = otCounterpartyFiniteNumberOrNull(expandExponential(limitPrice));
+  if (wanted !== null) {
+    let best = null;
+    let bestDelta = Infinity;
+    for (const row of rows) {
+      const px = counterpartyBookRowPrice(row);
+      if (px === null || px <= 0) continue;
+      const delta = Math.abs(px - wanted);
+      if (delta < bestDelta) {
+        best = row;
+        bestDelta = delta;
+      }
+    }
+    if (best && bestDelta <= Math.max(1e-12, Math.abs(wanted) * 0.000001)) return best;
+  }
+  return rows[0] || null;
+}
+
+function counterpartySafeBookLevelForPreview(row) {
+  if (!row || typeof row !== "object") return null;
+  const out = {};
+  for (const key of ["price", "size", "side", "quote_asset", "source_type", "source", "tx_hash", "status", "satoshirate"]) {
+    if (row[key] !== undefined && row[key] !== null && row[key] !== "") out[key] = row[key];
+  }
+  if (row.raw_dispenser && typeof row.raw_dispenser === "object") {
+    out.raw_dispenser = row.raw_dispenser;
+  }
+  if (row.raw_order && typeof row.raw_order === "object") {
+    out.raw_order = row.raw_order;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+
 function counterpartyPreviewRules(symbol, venue = "counterparty") {
   const parts = counterpartyPairParts(symbol);
   const priceDecimals = parts.quote === "BTC" || parts.quote === "XCP" ? 8 : 8;
@@ -4807,6 +4848,16 @@ export default function OrderTicketWidget({
   }, [canSubmitBase, preTrade]);
 
 
+  const canCounterpartyComposePreview = useMemo(() => {
+  if (!isCounterpartyVenue) return false;
+  if (!String(otSymbol || "").trim()) return false;
+  if (!(side === "buy" || side === "sell")) return false;
+  return qtyNum !== null && pxNum !== null;
+  }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum]);
+
+  const primaryActionDisabled = submitting || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
+
+
   const balanceWarning = useMemo(() => {
     if (side === "buy") {
       if (!quoteAsset) return null;
@@ -5601,6 +5652,73 @@ async function submitPolkadotSwapOrder() {
 }
 
 
+async function previewCounterpartyCompose() {
+  if (!isCounterpartyVenue) return;
+  if (!canCounterpartyComposePreview) {
+    onToast?.({ kind: "warn", msg: "Fill Counterparty symbol, qty, and limit price before previewing unsigned compose." });
+    return;
+  }
+
+  setSubmitting(true);
+  setSubmitError(null);
+  setSubmitOk(null);
+  openSubmitResultModal(
+    "info",
+    { ok: true, venue: "counterparty", stage: "compose_preview", symbol: otSymbol, side, read_only: true },
+    "Building Counterparty Compose Preview"
+  );
+
+  try {
+    if (!apiBase) throw new Error("apiBase not set");
+    const sourceAddress = await getCounterpartyAddressWithPrompt({ forcePrompt: true });
+    if (!sourceAddress) throw new Error("Connect or unlock UniSat to choose the Counterparty source address.");
+
+    const selectedLevel = counterpartySafeBookLevelForPreview(
+      counterpartyPickBookRowForTicket(counterpartyBook, side, limitPrice)
+    );
+
+    const payload = {
+      source_address: sourceAddress,
+      symbol: counterpartyRequestSymbolRaw(otSymbol),
+      side,
+      quantity: String(qty),
+      limit_price: String(expandExponential(limitPrice)),
+      total_quote: notional === null ? null : String(notional),
+      selected_level: selectedLevel,
+      attempt_upstream: true,
+    };
+
+    const base = String(apiBase || "").replace(/\/+$/, "");
+    const headers = { "Content-Type": "application/json", Accept: "application/json" };
+    const tok = getAuthToken();
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+
+    const r = await fetch(`${base}/api/counterparty/compose/preview`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || body?.ok === false) {
+      const detail = body?.detail || body?.error || `HTTP ${r.status}`;
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+
+    setSubmitOk(body);
+    openSubmitResultModal(
+      body?.compose_ok ? "ok" : "info",
+      body,
+      body?.compose_ok ? "Unsigned Counterparty Compose Preview" : "Counterparty Compose Request Preview"
+    );
+  } catch (e) {
+    const msg = e?.message || "Failed to build Counterparty compose preview";
+    setSubmitError(msg);
+    openSubmitResultModal("error", msg, "Counterparty Compose Preview Failed");
+  } finally {
+    setSubmitting(false);
+  }
+}
+
 async function submitLimitOrder() {
   const tok = getAuthToken();
 
@@ -5732,6 +5850,10 @@ async function submitLimitOrder() {
       return;
     }
     setShowConfirm(false);
+    if (isCounterpartyVenue) {
+      void previewCounterpartyCompose();
+      return;
+    }
     // Surface immediate feedback and never allow a silent no-op.
     if (isPolkadotDexVenue) {
       openHydrationSubmitProgress("build", side);
@@ -6106,7 +6228,7 @@ async function submitLimitOrder() {
       if (side === "buy" && !polkadotEffectiveExactBuyEnabled) return "/api/polkadot_dex/hydration/swap_tx (BUY disabled; SELL enabled)";
       return `/api/polkadot_dex/hydration/swap_tx (${hydrationRouteModeLabel(preferredHydrationRouteMode)}) → SubWallet sign/send`;
     }
-    if (isCounterpartyVenue) return "/api/counterparty/orderbook + /api/counterparty/address/{address}/balances (preview only)";
+    if (isCounterpartyVenue) return "/api/counterparty/compose/preview (unsigned preview only)";
     if (!isSolanaDexVenue) return "/api/trade/order";
     if (isSolanaLimitMode) return "/api/solana_dex/jupiter/trigger/create_order";
     const v = String(effectiveVenue || "").toLowerCase().trim();
@@ -7055,24 +7177,28 @@ async function submitLimitOrder() {
           <button
             style={{
               ...safeButton,
-              ...(submitting || !canSubmit ? safeButtonDisabled : {}),
+              ...(primaryActionDisabled ? safeButtonDisabled : {}),
               padding: "9px 12px",
               fontWeight: 900,
             }}
-            disabled={submitting || !canSubmit}
-            onClick={openConfirm}
+            disabled={primaryActionDisabled}
+            onClick={isCounterpartyVenue ? previewCounterpartyCompose : openConfirm}
             title={
-              !canSubmitBase
-                ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isDexSwapVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
-                : preTrade?.block
-                  ? "Blocked by pre-trade checks"
-                  : "Review and confirm order"
+              isCounterpartyVenue
+                ? canCounterpartyComposePreview
+                  ? "Preview unsigned Counterparty compose payload. No signing or broadcast."
+                  : "Fill Counterparty symbol, qty, and limit price"
+                : !canSubmitBase
+                  ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isDexSwapVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
+                  : preTrade?.block
+                    ? "Blocked by pre-trade checks"
+                    : "Review and confirm order"
             }
           >
             {submitting
               ? "Submitting…"
               : isCounterpartyVenue
-                ? side === "buy" ? "Preview Buy" : "Preview Sell"
+                ? "Preview Unsigned Compose"
                 : isSolanaLimitMode
                 ? side === "buy" ? "Place Buy Limit" : "Place Sell Limit"
                 : isDexSwapVenue

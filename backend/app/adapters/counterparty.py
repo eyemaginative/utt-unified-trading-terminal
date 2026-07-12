@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+from decimal import Decimal, ROUND_FLOOR
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
@@ -1704,6 +1705,228 @@ class CounterpartyAdapter:
             "read_only": True,
             "signing": "not_available_in_this_tranche",
             "compose": "later_unsigned_psbt_or_wallet_flow",
+        }
+
+    # ------------------------------------------------------------------
+    # Unsigned compose preview helpers
+    # ------------------------------------------------------------------
+
+    def _post_json(self, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not self.base_url.startswith(("https://", "http://")):
+            raise ValueError("COUNTERPARTY_API_BASE_URL must start with http:// or https://")
+        with httpx.Client(timeout=self.timeout_s, headers={"accept": "application/json", "content-type": "application/json"}) as client:
+            r = client.post(self._url(path), json=payload or {})
+        body_preview = (r.text or "")[:800]
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code} from Counterparty API path={path!r} body={body_preview}")
+        try:
+            data = r.json()
+        except Exception as e:
+            raise RuntimeError(f"Non-JSON from Counterparty API path={path!r} body={body_preview}") from e
+        return data if isinstance(data, dict) else {"data": data}
+
+    @staticmethod
+    def _decimal_or_none(value: Any) -> Optional[Decimal]:
+        if value is None or value == "":
+            return None
+        try:
+            d = Decimal(str(value).replace(",", "").strip())
+        except Exception:
+            return None
+        if not d.is_finite():
+            return None
+        return d
+
+    @staticmethod
+    def _decimal_plain(value: Optional[Decimal], *, max_places: int = 18) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            q = value.quantize(Decimal(1) / (Decimal(10) ** max(0, min(int(max_places), 18))))
+            s = format(q, "f")
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s or "0"
+        except Exception:
+            try:
+                return format(value, "f")
+            except Exception:
+                return str(value)
+
+    def _display_quantity_to_atomic(self, asset: Any, quantity: Any) -> Optional[int]:
+        d = self._decimal_or_none(quantity)
+        if d is None or d < 0:
+            return None
+        decimals = max(0, min(int(self._asset_display_decimals(asset)), 18))
+        scaled = (d * (Decimal(10) ** decimals)).to_integral_value(rounding=ROUND_FLOOR)
+        try:
+            return int(scaled)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _selected_counterparty_book_row(row: Any) -> Dict[str, Any]:
+        return row if isinstance(row, dict) else {}
+
+    def _compose_try_candidates(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        errors: List[Dict[str, Any]] = []
+        for candidate in candidates or []:
+            method = str(candidate.get("method") or "GET").strip().upper()
+            path = str(candidate.get("path") or "").strip()
+            params = candidate.get("params") if isinstance(candidate.get("params"), dict) else {}
+            json_payload = candidate.get("json") if isinstance(candidate.get("json"), dict) else {}
+            if not path:
+                continue
+            try:
+                if method == "POST":
+                    raw = self._post_json(path, payload=json_payload or params)
+                else:
+                    raw = self._get_json(path, params=params)
+                return {"ok": True, "candidate": candidate, "raw": raw}
+            except Exception as e:
+                errors.append({"candidate": candidate, "error": str(e)[:1000]})
+        return {"ok": False, "errors": errors}
+
+    def preview_compose(
+        self,
+        *,
+        source_address: str,
+        symbol: str,
+        side: str,
+        quantity: Any,
+        limit_price: Any,
+        selected_level: Optional[Dict[str, Any]] = None,
+        attempt_upstream: bool = True,
+    ) -> Dict[str, Any]:
+        """Build a read-only unsigned Counterparty compose preview.
+
+        This endpoint never signs and never broadcasts.  If attempt_upstream is
+        true, it probes Counterparty Core compose endpoints and returns the
+        unsigned compose response or the upstream errors for review.
+        """
+        source = str(source_address or "").strip()
+        if not source:
+            raise ValueError("source_address is required for Counterparty compose preview")
+
+        trade_side = str(side or "").strip().lower()
+        if trade_side not in {"buy", "sell"}:
+            raise ValueError("side must be buy or sell")
+
+        base, quote_asset, symbol_canon = self._parse_orderbook_symbol(symbol)
+        qty_dec = self._decimal_or_none(quantity)
+        px_dec = self._decimal_or_none(limit_price)
+        if qty_dec is None or qty_dec <= 0:
+            raise ValueError("quantity must be positive")
+        if px_dec is None or px_dec <= 0:
+            raise ValueError("limit_price must be positive")
+
+        quote_qty_dec = qty_dec * px_dec
+        base_atomic = self._display_quantity_to_atomic(base, qty_dec)
+        quote_atomic = self._display_quantity_to_atomic(quote_asset, quote_qty_dec)
+        btc_sats = self._display_quantity_to_atomic("BTC", quote_qty_dec) if quote_asset == "BTC" else None
+        level = self._selected_counterparty_book_row(selected_level)
+        level_source_type = str(level.get("source_type") or "").strip().lower()
+        level_source = str(level.get("source") or "").strip()
+        dispenser_like = trade_side == "buy" and quote_asset == "BTC" and ("dispenser" in level_source_type or bool(level.get("raw_dispenser")))
+
+        if trade_side == "buy":
+            give_asset = quote_asset
+            give_quantity_display = quote_qty_dec
+            give_quantity_atomic = quote_atomic
+            get_asset = base
+            get_quantity_display = qty_dec
+            get_quantity_atomic = base_atomic
+        else:
+            give_asset = base
+            give_quantity_display = qty_dec
+            give_quantity_atomic = base_atomic
+            get_asset = quote_asset
+            get_quantity_display = quote_qty_dec
+            get_quantity_atomic = quote_atomic
+
+        compose_kind = "dispenser_dispense" if dispenser_like else "order"
+        escaped_source = quote(source, safe="")
+        candidates: List[Dict[str, Any]] = []
+
+        if compose_kind == "dispenser_dispense":
+            destination = level_source
+            if not destination:
+                compose_kind = "order"
+            else:
+                dispense_params = {
+                    "destination": destination,
+                    "dispenser": destination,
+                    "asset": base,
+                    "quantity": base_atomic,
+                    "quantity_normalized": self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base)),
+                    "btc_amount": btc_sats,
+                    "satoshirate": level.get("satoshirate"),
+                }
+                compact_dispense_params = {k: v for k, v in dispense_params.items() if v not in (None, "")}
+                for path in (
+                    f"/v2/addresses/{escaped_source}/compose/dispense",
+                    f"/v2/addresses/{escaped_source}/compose/dispenser/dispense",
+                    f"/api/addresses/{escaped_source}/compose/dispense",
+                ):
+                    candidates.append({"method": "GET", "path": path, "params": compact_dispense_params})
+
+        if compose_kind == "order":
+            order_params = {
+                "give_asset": give_asset,
+                "give_quantity": give_quantity_atomic,
+                "get_asset": get_asset,
+                "get_quantity": get_quantity_atomic,
+                "expiration": 1000,
+                "fee_required": 0,
+                "fee_provided": 0,
+            }
+            compact_order_params = {k: v for k, v in order_params.items() if v not in (None, "")}
+            for path in (
+                f"/v2/addresses/{escaped_source}/compose/order",
+                f"/api/addresses/{escaped_source}/compose/order",
+            ):
+                candidates.append({"method": "GET", "path": path, "params": compact_order_params})
+
+        compose_probe = {"ok": False, "skipped": True, "reason": "attempt_upstream=false"}
+        if attempt_upstream:
+            compose_probe = self._compose_try_candidates(candidates)
+
+        return {
+            "ok": True,
+            "venue": self.venue,
+            "symbol": symbol_canon,
+            "symbol_canon": symbol_canon,
+            "base_asset": base,
+            "quote_asset": quote_asset,
+            "side": trade_side,
+            "source_address": source,
+            "compose_kind": compose_kind,
+            "quantity": self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base)),
+            "limit_price": self._decimal_plain(px_dec, max_places=self._asset_display_decimals(quote_asset)),
+            "quote_total": self._decimal_plain(quote_qty_dec, max_places=self._asset_display_decimals(quote_asset)),
+            "give_asset": give_asset,
+            "give_quantity": self._decimal_plain(give_quantity_display, max_places=self._asset_display_decimals(give_asset)),
+            "give_quantity_atomic": give_quantity_atomic,
+            "get_asset": get_asset,
+            "get_quantity": self._decimal_plain(get_quantity_display, max_places=self._asset_display_decimals(get_asset)),
+            "get_quantity_atomic": get_quantity_atomic,
+            "selected_level": level or None,
+            "candidate_requests": candidates,
+            "attempted_upstream": bool(attempt_upstream),
+            "compose_ok": bool(compose_probe.get("ok")),
+            "compose_result": compose_probe.get("raw") if compose_probe.get("ok") else None,
+            "compose_candidate": compose_probe.get("candidate") if compose_probe.get("ok") else None,
+            "compose_errors": compose_probe.get("errors") or [],
+            "read_only": True,
+            "unsigned_only": True,
+            "signed": False,
+            "broadcast": False,
+            "signing": "not_performed",
+            "broadcasting": "not_performed",
+            "warnings": [
+                "Unsigned compose preview only. UTT did not sign or broadcast this transaction.",
+                "Review source address, assets, quantities, fee behavior, and selected order/dispenser details before enabling wallet signing.",
+            ],
         }
 
     # ------------------------------------------------------------------

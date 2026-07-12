@@ -1975,6 +1975,214 @@ class CounterpartyAdapter:
                 errors.append({"candidate": candidate, "error": str(e)[:1000]})
         return {"ok": False, "errors": errors}
 
+    @classmethod
+    def _compose_network_fee_info(cls, payload: Any) -> Dict[str, Any]:
+        """Extract a Bitcoin network fee only from explicitly named fee fields.
+
+        Counterparty compose responses are not consistent across deployments.
+        Avoid generic `fee` keys because protocol order fields such as
+        fee_required/fee_provided are not Bitcoin miner fees.
+        """
+        satoshi_keys = {
+            "btc_fee_satoshis",
+            "bitcoin_fee_satoshis",
+            "miner_fee_satoshis",
+            "network_fee_satoshis",
+            "fee_satoshis",
+            "btc_fee_sats",
+            "bitcoin_fee_sats",
+            "miner_fee_sats",
+            "network_fee_sats",
+            "fee_sats",
+            "tx_fee_satoshis",
+            "tx_fee_sats",
+        }
+        btc_keys = {
+            "btc_fee",
+            "bitcoin_fee",
+            "miner_fee_btc",
+            "network_fee_btc",
+            "tx_fee_btc",
+        }
+
+        found: Optional[Dict[str, Any]] = None
+
+        def walk(value: Any, path: str, depth: int) -> None:
+            nonlocal found
+            if found is not None or depth > 8:
+                return
+            if isinstance(value, dict):
+                for raw_key, child in value.items():
+                    key = str(raw_key or "").strip().lower()
+                    child_path = f"{path}.{raw_key}" if path else str(raw_key)
+                    if key in satoshi_keys:
+                        amount = cls._as_int(child)
+                        if amount is not None and amount >= 0:
+                            found = {"satoshis": int(amount), "source": child_path, "unit": "satoshis"}
+                            return
+                    if key in btc_keys:
+                        amount_btc = cls._decimal_or_none(child)
+                        if amount_btc is not None and amount_btc >= 0:
+                            sats = int((amount_btc * Decimal(100000000)).to_integral_value(rounding=ROUND_FLOOR))
+                            found = {"satoshis": sats, "source": child_path, "unit": "btc"}
+                            return
+                    walk(child, child_path, depth + 1)
+                    if found is not None:
+                        return
+            elif isinstance(value, list):
+                for idx, child in enumerate(value[:100]):
+                    walk(child, f"{path}[{idx}]", depth + 1)
+                    if found is not None:
+                        return
+
+        walk(payload, "", 0)
+        return found or {"satoshis": None, "source": None, "unit": None}
+
+    @classmethod
+    def _compose_insufficient_funds_info(cls, errors: Any) -> Dict[str, Any]:
+        """Classify Counterparty compose funding errors without hiding raw errors."""
+        rows = errors if isinstance(errors, list) else []
+        texts: List[str] = []
+        for row in rows:
+            if isinstance(row, dict):
+                for key in ("error", "message", "detail"):
+                    value = row.get(key)
+                    if value not in (None, ""):
+                        texts.append(str(value))
+            elif row not in (None, ""):
+                texts.append(str(row))
+
+        combined = "\n".join(texts)
+        lowered = combined.lower()
+        detected = "insufficient funds" in lowered or "not enough funds" in lowered
+        available_sats = None
+        required_sats = None
+
+        patterns = (
+            r"insufficient funds for the target amount:\s*([0-9,]+)\s*<\s*([0-9,]+)",
+            r"insufficient funds[^0-9]*([0-9,]+)\s*<\s*([0-9,]+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, combined, flags=re.IGNORECASE)
+            if not match:
+                continue
+            available_sats = cls._as_int(match.group(1))
+            required_sats = cls._as_int(match.group(2))
+            detected = True
+            break
+
+        shortfall_sats = None
+        if available_sats is not None and required_sats is not None:
+            shortfall_sats = max(0, int(required_sats) - int(available_sats))
+
+        return {
+            "detected": bool(detected),
+            "classification": "insufficient_target_funds" if detected else None,
+            "available_satoshis_reported": available_sats,
+            "required_target_satoshis_reported": required_sats,
+            "shortfall_target_satoshis": shortfall_sats,
+            "source": "compose_error" if detected else None,
+        }
+
+    def _compose_funding_requirements(
+        self,
+        *,
+        compose_kind: str,
+        quote_asset: str,
+        quote_quantity: Decimal,
+        immediate_btc_payment_satoshis: Optional[int],
+        attempt_upstream: bool,
+        compose_probe: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return normalized read-only funding information for UI presentation."""
+        quote_is_btc = str(quote_asset or "").strip().upper() == "BTC"
+        trade_value_sats = self._display_quantity_to_atomic("BTC", quote_quantity) if quote_is_btc else None
+        immediate_sats = (
+            int(immediate_btc_payment_satoshis)
+            if immediate_btc_payment_satoshis is not None and immediate_btc_payment_satoshis >= 0
+            else 0
+        )
+
+        fee_info = self._compose_network_fee_info(compose_probe.get("raw") if compose_probe.get("ok") else None)
+        fee_sats = fee_info.get("satoshis")
+        fee_known = fee_sats is not None
+        fee_sats_int = int(fee_sats) if fee_known else None
+
+        # For dispenser purchases, the target BTC amount is paid by this
+        # transaction. For protocol orders, the BTC amount is a trade
+        # commitment and the compose transaction's miner fee remains separate.
+        funding_scope = "dispenser_immediate_payment" if compose_kind == "dispenser_dispense" else "order_trade_commitment"
+        conservative_balance_requirement_sats = trade_value_sats if quote_is_btc else 0
+        if conservative_balance_requirement_sats is not None and fee_sats_int is not None:
+            conservative_balance_requirement_sats = int(conservative_balance_requirement_sats) + fee_sats_int
+
+        known_minimum_sats = immediate_sats + (fee_sats_int or 0)
+        estimated_total_sats = known_minimum_sats if fee_known else None
+
+        insuff = self._compose_insufficient_funds_info(compose_probe.get("errors") or [])
+        compose_ok = bool(compose_probe.get("ok"))
+
+        if insuff.get("detected"):
+            status = "insufficient_target_funds"
+            status_reason = "Counterparty Core reported that the source address could not fund the target BTC amount."
+        elif not attempt_upstream:
+            status = "preview_only_fee_unknown" if not fee_known else "preview_only_fee_known"
+            status_reason = "Upstream compose was not attempted; no authoritative miner-fee result is available."
+        elif compose_ok and fee_known:
+            status = "compose_ready_fee_known"
+            status_reason = "Unsigned compose succeeded and an explicit Bitcoin network fee was returned."
+        elif compose_ok:
+            status = "compose_ready_fee_unknown"
+            status_reason = "Unsigned compose succeeded, but Counterparty Core did not return an explicit Bitcoin network fee."
+        else:
+            status = "compose_failed_fee_unknown" if not fee_known else "compose_failed_fee_known"
+            status_reason = "Unsigned compose did not succeed; review compose_errors for the protocol-level cause."
+
+        return {
+            "asset": "BTC",
+            "funding_scope": funding_scope,
+            "trade_value_satoshis": int(trade_value_sats) if trade_value_sats is not None else None,
+            "trade_value_btc": self._decimal_plain(quote_quantity, max_places=8) if quote_is_btc else None,
+            "immediate_payment_satoshis": immediate_sats,
+            "immediate_payment_btc": self._decimal_plain(Decimal(immediate_sats) / Decimal(100000000), max_places=8),
+            "network_fee_status": "known" if fee_known else "unknown",
+            "network_fee_satoshis": fee_sats_int,
+            "network_fee_btc": (
+                self._decimal_plain(Decimal(fee_sats_int) / Decimal(100000000), max_places=8)
+                if fee_sats_int is not None
+                else None
+            ),
+            "network_fee_source": fee_info.get("source"),
+            "known_minimum_required_satoshis": known_minimum_sats,
+            "known_minimum_required_btc": self._decimal_plain(Decimal(known_minimum_sats) / Decimal(100000000), max_places=8),
+            "estimated_total_required_satoshis": estimated_total_sats,
+            "estimated_total_required_btc": (
+                self._decimal_plain(Decimal(estimated_total_sats) / Decimal(100000000), max_places=8)
+                if estimated_total_sats is not None
+                else None
+            ),
+            "conservative_balance_requirement_satoshis": conservative_balance_requirement_sats,
+            "conservative_balance_requirement_btc": (
+                self._decimal_plain(Decimal(conservative_balance_requirement_sats) / Decimal(100000000), max_places=8)
+                if conservative_balance_requirement_sats is not None
+                else None
+            ),
+            "insufficient_funds_detected": bool(insuff.get("detected")),
+            "insufficient_funds_classification": insuff.get("classification"),
+            "available_satoshis_reported": insuff.get("available_satoshis_reported"),
+            "required_target_satoshis_reported": insuff.get("required_target_satoshis_reported"),
+            "shortfall_target_satoshis": insuff.get("shortfall_target_satoshis"),
+            "status": status,
+            "status_reason": status_reason,
+            "fee_note": (
+                "Bitcoin network fee was explicitly returned by Counterparty Core."
+                if fee_known
+                else "Bitcoin network fee is unknown until Counterparty Core or the signing wallet provides an explicit estimate."
+            ),
+            "read_only": True,
+            "wallet_balance_not_mutated": True,
+        }
+
     def preview_compose(
         self,
         *,
@@ -2168,6 +2376,15 @@ class CounterpartyAdapter:
         if attempt_upstream:
             compose_probe = self._compose_try_candidates(candidates)
 
+        funding_requirements = self._compose_funding_requirements(
+            compose_kind=compose_kind,
+            quote_asset=quote_asset,
+            quote_quantity=quote_qty_dec,
+            immediate_btc_payment_satoshis=btc_sats if compose_kind == "dispenser_dispense" else 0,
+            attempt_upstream=bool(attempt_upstream),
+            compose_probe=compose_probe,
+        )
+
         return {
             "ok": True,
             "venue": self.venue,
@@ -2197,6 +2414,7 @@ class CounterpartyAdapter:
             "compose_result": compose_probe.get("raw") if compose_probe.get("ok") else None,
             "compose_candidate": compose_probe.get("candidate") if compose_probe.get("ok") else None,
             "compose_errors": compose_probe.get("errors") or [],
+            "funding_requirements": funding_requirements,
             "read_only": True,
             "unsigned_only": True,
             "signed": False,

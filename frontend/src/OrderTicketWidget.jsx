@@ -116,6 +116,112 @@ function counterpartySafeBookLevelForPreview(row) {
   return Object.keys(out).length ? out : null;
 }
 
+function counterpartySatoshisOrNull(value) {
+  const n = otCounterpartyFiniteNumberOrNull(value);
+  if (n === null || n < 0) return null;
+  return Math.floor(n);
+}
+
+function counterpartyBtcFromSatoshis(value) {
+  const sats = otCounterpartyFiniteNumberOrNull(value);
+  return sats === null ? null : sats / 100_000_000;
+}
+
+function counterpartyFormatBtc(value) {
+  const n = otCounterpartyFiniteNumberOrNull(value);
+  if (n === null) return "unknown";
+  return `${n.toLocaleString(undefined, { useGrouping: false, minimumFractionDigits: 0, maximumFractionDigits: 8 })} BTC`;
+}
+
+function counterpartyFormatSats(value) {
+  const sats = otCounterpartyFiniteNumberOrNull(value);
+  if (sats === null) return "unknown";
+  return `${Math.trunc(sats).toLocaleString()} sats`;
+}
+
+function counterpartyFundingSummaryView(payload, opts = {}) {
+  if (!payload || typeof payload !== "object") return null;
+  if (!isCounterpartyVenueKey(payload?.venue)) return null;
+
+  const funding = payload?.funding_requirements;
+  if (!funding || typeof funding !== "object") return null;
+
+  const walletBtc = otCounterpartyFiniteNumberOrNull(opts?.availableBtc);
+  const walletSats = walletBtc === null ? null : Math.floor(walletBtc * 100_000_000 + 1e-7);
+  const reportedAvailableSats = counterpartySatoshisOrNull(funding?.available_satoshis_reported);
+  const availableSats = walletSats !== null ? walletSats : reportedAvailableSats;
+  const availableSource = walletSats !== null
+    ? (opts?.stale ? "UniSat cached balance" : "UniSat live balance")
+    : reportedAvailableSats !== null
+      ? "Counterparty compose error"
+      : "Unavailable";
+
+  const tradeValueSats = counterpartySatoshisOrNull(funding?.trade_value_satoshis);
+  const immediatePaymentSats = counterpartySatoshisOrNull(funding?.immediate_payment_satoshis);
+  const feeSats = counterpartySatoshisOrNull(funding?.network_fee_satoshis);
+  const feeKnown = String(funding?.network_fee_status || "").toLowerCase() === "known" && feeSats !== null;
+  const conservativeRequiredSats = counterpartySatoshisOrNull(funding?.conservative_balance_requirement_satoshis);
+  const requiredSats = conservativeRequiredSats !== null
+    ? conservativeRequiredSats
+    : tradeValueSats !== null
+      ? tradeValueSats + (feeKnown ? feeSats : 0)
+      : null;
+
+  const backendInsufficient = funding?.insufficient_funds_detected === true;
+  let status = "BALANCE UNKNOWN";
+  let tone = "warn";
+  if (backendInsufficient) {
+    status = "INSUFFICIENT";
+    tone = "error";
+  } else if (availableSats !== null && requiredSats !== null && availableSats < requiredSats) {
+    status = "INSUFFICIENT";
+    tone = "error";
+  } else if (availableSats !== null && requiredSats !== null && feeKnown) {
+    status = "SUFFICIENT";
+    tone = "ok";
+  } else if (availableSats !== null && requiredSats !== null) {
+    status = tradeValueSats !== null ? "PAYMENT COVERED · FEE UNKNOWN" : "FEE UNKNOWN";
+    tone = "warn";
+  }
+
+  const tradeLabel = funding?.funding_scope === "dispenser_immediate_payment"
+    ? "Dispenser payment"
+    : "Order trade commitment";
+  const remainingAfterTradeSats = availableSats !== null && tradeValueSats !== null
+    ? availableSats - tradeValueSats
+    : null;
+  const remainingAfterRequiredSats = availableSats !== null && requiredSats !== null
+    ? availableSats - requiredSats
+    : null;
+
+  return {
+    status,
+    tone,
+    availableSource,
+    availableSats,
+    availableBtc: counterpartyBtcFromSatoshis(availableSats),
+    tradeLabel,
+    tradeValueApplicable: tradeValueSats !== null,
+    tradeValueSats,
+    tradeValueBtc: counterpartyBtcFromSatoshis(tradeValueSats),
+    immediatePaymentSats,
+    immediatePaymentBtc: counterpartyBtcFromSatoshis(immediatePaymentSats),
+    feeKnown,
+    feeSats,
+    feeBtc: counterpartyBtcFromSatoshis(feeSats),
+    requiredSats,
+    requiredBtc: counterpartyBtcFromSatoshis(requiredSats),
+    remainingAfterTradeSats,
+    remainingAfterTradeBtc: counterpartyBtcFromSatoshis(remainingAfterTradeSats),
+    remainingAfterRequiredSats,
+    remainingAfterRequiredBtc: counterpartyBtcFromSatoshis(remainingAfterRequiredSats),
+    fetchedAt: opts?.fetchedAt || null,
+    backendStatus: String(funding?.status || "").trim(),
+    backendReason: String(funding?.status_reason || "").trim(),
+    feeNote: String(funding?.fee_note || "").trim(),
+  };
+}
+
 
 function counterpartyPreviewRules(symbol, venue = "counterparty") {
   const parts = counterpartyPairParts(symbol);
@@ -2191,6 +2297,7 @@ export default function OrderTicketWidget({
   const [counterpartyBook, setCounterpartyBook] = useState(null);
   const [counterpartyBookLoading, setCounterpartyBookLoading] = useState(false);
   const [counterpartyBookError, setCounterpartyBookError] = useState(null);
+  const [counterpartyBtcBalanceMeta, setCounterpartyBtcBalanceMeta] = useState(null);
   const counterpartyBookReqRef = useRef(0);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
@@ -3883,6 +3990,17 @@ export default function OrderTicketWidget({
         const btcInfo = await fetchCounterpartyUniSatBtcBalance(address, { allowPrompt });
         if (btcInfo?.address && !address) address = btcInfo.address;
         addBtc(btcInfo);
+        const btcMetaValue = otCounterpartyFiniteNumberOrNull(btcInfo?.btc);
+        setCounterpartyBtcBalanceMeta(
+          btcMetaValue === null
+            ? null
+            : {
+                address: String(btcInfo?.address || address || "").trim() || null,
+                btc: btcMetaValue,
+                stale: btcInfo?.stale === true,
+                fetchedAt: btcInfo?.fetchedAt || null,
+              }
+        );
 
         if (!address && !nextAvail.BTC) {
           throw new Error("Connect or unlock UniSat to load Counterparty / Bitcoin balances.");
@@ -5705,10 +5823,15 @@ async function previewCounterpartyCompose() {
     }
 
     setSubmitOk(body);
+    const fundingInsufficient = body?.funding_requirements?.insufficient_funds_detected === true;
     openSubmitResultModal(
-      body?.compose_ok ? "ok" : "info",
+      fundingInsufficient ? "error" : body?.compose_ok ? "ok" : "info",
       body,
-      body?.compose_ok ? "Unsigned Counterparty Compose Preview" : "Counterparty Compose Request Preview"
+      fundingInsufficient
+        ? "Counterparty Compose Preview — Funding Shortfall"
+        : body?.compose_ok
+          ? "Unsigned Counterparty Compose Preview"
+          : "Counterparty Compose Request Preview"
     );
   } catch (e) {
     const msg = e?.message || "Failed to build Counterparty compose preview";
@@ -6218,6 +6341,17 @@ async function submitLimitOrder() {
     () => submitResultPayload !== null && submitResultKind !== null,
     [submitResultPayload, submitResultKind]
   );
+
+  const counterpartySubmitFunding = useMemo(() => {
+    const availableBtc =
+      otCounterpartyFiniteNumberOrNull(counterpartyBtcBalanceMeta?.btc) ??
+      otCounterpartyFiniteNumberOrNull(balAvail?.BTC?.available);
+    return counterpartyFundingSummaryView(submitResultPayload, {
+      availableBtc,
+      stale: counterpartyBtcBalanceMeta?.stale === true || String(balNotice || "").toLowerCase().includes("cached"),
+      fetchedAt: counterpartyBtcBalanceMeta?.fetchedAt || null,
+    });
+  }, [submitResultPayload, counterpartyBtcBalanceMeta, balAvail, balNotice]);
 
   const submitEndpointLabel = useMemo(() => {
     if (isPolkadotDexVenue) {
@@ -7443,6 +7577,122 @@ async function submitLimitOrder() {
                   flex: 1,
                 }}
               >
+                {counterpartySubmitFunding && (
+                  <div
+                    style={{
+                      marginBottom: 10,
+                      borderRadius: 12,
+                      border: `1px solid ${
+                        counterpartySubmitFunding.tone === "error"
+                          ? "#7a2b2b"
+                          : counterpartySubmitFunding.tone === "ok"
+                            ? "#1f6f3a"
+                            : "#6d5a1f"
+                      }`,
+                      background:
+                        counterpartySubmitFunding.tone === "error"
+                          ? "#160b0b"
+                          : counterpartySubmitFunding.tone === "ok"
+                            ? "#0f1a0f"
+                            : "#19160d",
+                      padding: 10,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 10,
+                        flexWrap: "wrap",
+                        marginBottom: 8,
+                      }}
+                    >
+                      <div style={{ fontSize: 12, fontWeight: 900 }}>Counterparty funding summary</div>
+                      <div
+                        style={{
+                          fontSize: 11,
+                          fontWeight: 900,
+                          color:
+                            counterpartySubmitFunding.tone === "error"
+                              ? "#ffb4b4"
+                              : counterpartySubmitFunding.tone === "ok"
+                                ? "#b8efc8"
+                                : "#f1d98a",
+                        }}
+                      >
+                        {counterpartySubmitFunding.status}
+                      </div>
+                    </div>
+
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(145px, 0.8fr) minmax(220px, 1.2fr)",
+                        gap: "6px 12px",
+                        fontSize: 11,
+                        lineHeight: 1.25,
+                      }}
+                    >
+                      <div style={{ color: "#a9a9a9" }}>Available BTC</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : `${counterpartyFormatBtc(counterpartySubmitFunding.availableBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.availableSats)})`}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Balance source</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : `${counterpartySubmitFunding.availableSource}${
+                              counterpartySubmitFunding.fetchedAt ? ` · ${counterpartySubmitFunding.fetchedAt}` : ""
+                            }`}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>{counterpartySubmitFunding.tradeLabel}</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitFunding.tradeValueApplicable
+                            ? `${counterpartyFormatBtc(counterpartySubmitFunding.tradeValueBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.tradeValueSats)})`
+                            : "Not applicable for this non-BTC quote"}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Bitcoin network fee</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitFunding.feeKnown
+                            ? `${counterpartyFormatBtc(counterpartySubmitFunding.feeBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.feeSats)})`
+                            : "Unknown — wallet/Core estimate not returned"}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Conservative requirement</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : `${counterpartyFormatBtc(counterpartySubmitFunding.requiredBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.requiredSats)})`}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Remaining after requirement</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : `${counterpartyFormatBtc(counterpartySubmitFunding.remainingAfterRequiredBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.remainingAfterRequiredSats)})`}
+                      </div>
+                    </div>
+
+                    {!hideTableData && (counterpartySubmitFunding.backendReason || counterpartySubmitFunding.feeNote) && (
+                      <div style={{ marginTop: 8, fontSize: 10.5, color: "#bdbdbd", lineHeight: 1.3 }}>
+                        {[counterpartySubmitFunding.backendReason, counterpartySubmitFunding.feeNote]
+                          .filter(Boolean)
+                          .join(" ")}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <pre
                   style={{
                     margin: 0,

@@ -4315,7 +4315,7 @@ export default function OrderTicketWidget({
   }, [side, hideTableData, quoteAsset, baseAsset, buySpendQuote, buySpendCapacityQuote, qtyNum, sellCapacity]);
 
   // NEW: helper to open the submission result modal deterministically
-  function openSubmitResultModal(kind, payload, title) {
+  function openSubmitResultModal(kind, payload, title, opts = {}) {
     const t = String(title || (kind === "error" ? "Order Submit Failed" : "Order Submit Result"));
     setSubmitResultKind(kind);
     setSubmitResultPayload(payload);
@@ -4336,7 +4336,13 @@ export default function OrderTicketWidget({
       }
     }
 
-    setShowSubmitResult(true);
+    if (opts?.show !== false) {
+      setShowSubmitResult(true);
+    }
+  }
+
+  function updateSubmitResultModal(kind, payload, title) {
+    openSubmitResultModal(kind, payload, title, { show: false });
   }
 
   // Hydration progress modal helper. BUY exact-out can be slower because it
@@ -5149,7 +5155,7 @@ async function submitLimitOrder() {
           post_submit_refresh: { status: "ok", venue: v, venue_orders: venueRefresh },
         };
         setSubmitOk(refreshedPayload);
-        openSubmitResultModal("ok", refreshedPayload, "Order Submitted — Venue State Refreshed");
+        updateSubmitResultModal("ok", refreshedPayload, "Order Submitted — Venue State Refreshed");
       } catch (refreshErr) {
         const refreshedPayload = {
           ...(j || {}),
@@ -5160,7 +5166,7 @@ async function submitLimitOrder() {
           },
         };
         setSubmitOk(refreshedPayload);
-        openSubmitResultModal("ok", refreshedPayload, "Order Submitted — Refresh Needs Retry");
+        updateSubmitResultModal("ok", refreshedPayload, "Order Submitted — Refresh Needs Retry");
       }
 
       // UPDATED: capture venue + base/quote at submit time and refresh deterministically.
@@ -5205,7 +5211,10 @@ async function submitLimitOrder() {
     // Surface immediate feedback and never allow a silent no-op.
     if (isPolkadotDexVenue) {
       openHydrationSubmitProgress("build", side);
-    } else {
+    } else if (isSolanaLimitMode || isSolanaDexVenue) {
+      // Wallet-mediated flows can take longer and still need an immediate progress modal.
+      // CEX limit orders show the result modal only after /api/trade/order returns,
+      // so the post-submit venue refresh cannot feel like a second confirmation popup.
       openSubmitResultModal("info", "Submitting…", "Submitting");
     }
     void (

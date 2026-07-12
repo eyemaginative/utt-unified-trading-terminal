@@ -326,7 +326,7 @@ const ARB_VENUES = ["coinbase", "kraken", "gemini", "robinhood", "dex_trade", "o
 
 // Venues that should mount OrderTicketWidget for read-only pretrade/rules inspection,
 // but must remain submit-blocked inside the ticket until trading is explicitly enabled.
-const READ_ONLY_ORDER_TICKET_VENUES = new Set([]);
+const READ_ONLY_ORDER_TICKET_VENUES = new Set(["counterparty"]);
 
 const LS_VISIBLE_WIDGETS = "utt_visible_widgets_v1";
 const LS_RIGHT_RAIL_SPLIT = "utt_right_rail_split_v1";

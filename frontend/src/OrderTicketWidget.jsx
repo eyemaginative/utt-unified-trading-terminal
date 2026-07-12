@@ -20,6 +20,229 @@ const LS_OT_HYDRATION_ROUTE = "utt_ot_hydration_route_mode_v1";
 const POLKADOT_APP_NAME = "UTT Unified Trading Terminal";
 const HYDRATION_ROUTER_BOOK_SIDE_TOLERANCE_BPS = 2;
 
+const LS_OT_COUNTERPARTY_UNISAT_ADDR = "utt_nft_unisat_address_v1";
+const LS_OT_COUNTERPARTY_BTC_BALANCE = "utt_counterparty_unisat_btc_balance_v1";
+
+function isCounterpartyVenueKey(value) {
+  const v = String(value || "").toLowerCase().trim();
+  return v === "counterparty" || v === "counterparty_unisat" || v === "bitcoin_counterparty";
+}
+
+function normalizeCounterpartyAsset(asset) {
+  const a = String(asset || "").trim().toUpperCase();
+  if (a === "BCY" || a === "BITCRYSTAL") return "BITCRYSTALS";
+  if (a === "XBT") return "BTC";
+  return a;
+}
+
+function normalizeCounterpartySymbol(symbol) {
+  const raw = String(symbol || "").trim().toUpperCase().replace(/[\\/_]/g, "-");
+  const parts = raw.split("-").map((x) => normalizeCounterpartyAsset(x)).filter(Boolean);
+  if (parts.length !== 2) return raw;
+  return `${parts[0]}-${parts[1]}`;
+}
+
+function counterpartyPairParts(symbol) {
+  const canon = normalizeCounterpartySymbol(symbol);
+  const parts = canon.split("-").map((x) => x.trim()).filter(Boolean);
+  if (parts.length !== 2) return { base: "", quote: "", symbol: canon };
+  return { base: parts[0], quote: parts[1], symbol: canon };
+}
+
+function otCounterpartyFiniteNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(String(value).replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeUniSatBtcBalanceToBtc(payload) {
+  if (payload === null || payload === undefined || payload === "") return null;
+
+  if (typeof payload === "number" || typeof payload === "string") {
+    const n = otCounterpartyFiniteNumberOrNull(payload);
+    if (n === null) return null;
+    return n > 21_000_000 ? n / 100_000_000 : n;
+  }
+
+  if (!payload || typeof payload !== "object") return null;
+
+  const directBtc = otCounterpartyFiniteNumberOrNull(
+    payload?.btc ??
+      payload?.btc_balance ??
+      payload?.balance_btc ??
+      payload?.balanceBtc ??
+      payload?.amount_btc ??
+      payload?.amountBtc
+  );
+  if (directBtc !== null) return directBtc;
+
+  const explicitSats = otCounterpartyFiniteNumberOrNull(
+    payload?.satoshis ??
+      payload?.sats ??
+      payload?.balance_sats ??
+      payload?.balanceSats ??
+      payload?.amount_sats ??
+      payload?.amountSats
+  );
+  if (explicitSats !== null) return explicitSats / 100_000_000;
+
+  const totalSats = otCounterpartyFiniteNumberOrNull(payload?.total);
+  if (totalSats !== null) return totalSats / 100_000_000;
+
+  const confirmedSats = otCounterpartyFiniteNumberOrNull(payload?.confirmed);
+  const unconfirmedSats = otCounterpartyFiniteNumberOrNull(payload?.unconfirmed) ?? 0;
+  if (confirmedSats !== null) return (confirmedSats + unconfirmedSats) / 100_000_000;
+
+  const genericBalance = otCounterpartyFiniteNumberOrNull(payload?.balance ?? payload?.amount ?? payload?.value);
+  if (genericBalance !== null) return genericBalance > 21_000_000 ? genericBalance / 100_000_000 : genericBalance;
+
+  return null;
+}
+
+async function getCounterpartyAddressNoPrompt() {
+  try {
+    const saved = localStorage.getItem(LS_OT_COUNTERPARTY_UNISAT_ADDR) || "";
+    if (String(saved || "").trim()) return String(saved || "").trim();
+  } catch {
+    // ignore storage errors
+  }
+
+  try {
+    const provider = typeof window !== "undefined" ? window.unisat : null;
+    if (provider && typeof provider.getAccounts === "function") {
+      const accounts = await provider.getAccounts();
+      const arr = Array.isArray(accounts) ? accounts : [];
+      const addr = String(arr[0] || "").trim();
+      if (addr) {
+        try { localStorage.setItem(LS_OT_COUNTERPARTY_UNISAT_ADDR, addr); } catch {}
+        return addr;
+      }
+    }
+  } catch {
+    // no prompt here
+  }
+
+  return "";
+}
+
+async function getCounterpartyAddressWithPrompt(opts = {}) {
+  const forcePrompt = !!opts?.forcePrompt;
+  if (!forcePrompt) {
+    const existing = await getCounterpartyAddressNoPrompt();
+    if (existing) return existing;
+  }
+
+  try {
+    const provider = typeof window !== "undefined" ? window.unisat : null;
+    if (!provider) return "";
+
+    let accounts = [];
+    if (typeof provider.requestAccounts === "function") accounts = await provider.requestAccounts();
+    else if (typeof provider.connect === "function") {
+      const connected = await provider.connect();
+      accounts = Array.isArray(connected) ? connected : (connected?.accounts || connected?.addresses || []);
+    } else if (typeof provider.getAccounts === "function") accounts = await provider.getAccounts();
+
+    if ((!Array.isArray(accounts) || accounts.length === 0) && typeof provider.getAccounts === "function") {
+      accounts = await provider.getAccounts();
+    }
+
+    const arr = Array.isArray(accounts) ? accounts : [];
+    const addr = String(arr[0] || "").trim();
+    if (addr) {
+      try { localStorage.setItem(LS_OT_COUNTERPARTY_UNISAT_ADDR, addr); } catch {}
+      return addr;
+    }
+  } catch {
+    // user may reject prompt
+  }
+
+  return "";
+}
+
+function readCachedCounterpartyBtcBalance(addressMaybe = "") {
+  try {
+    const raw = localStorage.getItem(LS_OT_COUNTERPARTY_BTC_BALANCE) || "";
+    if (!raw) return null;
+    const cached = JSON.parse(raw);
+    if (!cached || typeof cached !== "object") return null;
+    const requested = String(addressMaybe || "").trim().toLowerCase();
+    const cachedAddress = String(cached.address || "").trim();
+    if (!cachedAddress) return null;
+    if (requested && cachedAddress.toLowerCase() !== requested) return null;
+    const btc = otCounterpartyFiniteNumberOrNull(cached.btc);
+    if (btc === null) return null;
+    return { address: cachedAddress, btc, payload: cached.raw_btc_balance || null, stale: true, fetchedAt: cached.fetched_at || null };
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedCounterpartyBtcBalance({ address, btc, payload }) {
+  try {
+    const addr = String(address || "").trim();
+    const qty = otCounterpartyFiniteNumberOrNull(btc);
+    if (!addr || qty === null) return;
+    localStorage.setItem(
+      LS_OT_COUNTERPARTY_BTC_BALANCE,
+      JSON.stringify({ address: addr, btc: qty, fetched_at: new Date().toISOString(), raw_btc_balance: payload || null })
+    );
+  } catch {
+    // ignore cache failures
+  }
+}
+
+async function fetchCounterpartyUniSatBtcBalance(addressMaybe = "", opts = {}) {
+  let address = String(addressMaybe || "").trim();
+  const allowPrompt = !!opts?.allowPrompt;
+  if (!address && allowPrompt) address = await getCounterpartyAddressWithPrompt();
+  if (!address) return readCachedCounterpartyBtcBalance(addressMaybe);
+
+  const readLive = async () => {
+    const provider = typeof window !== "undefined" ? window.unisat : null;
+    if (!provider || typeof provider.getBalance !== "function") return null;
+    const payload = await provider.getBalance();
+    const btc = normalizeUniSatBtcBalanceToBtc(payload);
+    if (btc === null) return null;
+    writeCachedCounterpartyBtcBalance({ address, btc, payload });
+    return { address, btc, payload, stale: false, fetchedAt: new Date().toISOString() };
+  };
+
+  try {
+    const live = await readLive();
+    if (live) return live;
+  } catch {
+    // fall through to prompt/cache
+  }
+
+  if (allowPrompt) {
+    try {
+      const prompted = await getCounterpartyAddressWithPrompt({ forcePrompt: true });
+      if (prompted) address = prompted;
+      const live = await readLive();
+      if (live) return live;
+    } catch {
+      // fall through to cache
+    }
+  }
+
+  return readCachedCounterpartyBtcBalance(address);
+}
+
+function extractCounterpartyBalanceRows(payload) {
+  if (Array.isArray(payload)) return payload.filter((x) => x && typeof x === "object");
+  if (!payload || typeof payload !== "object") return [];
+  const containers = [payload.items, payload.balances, payload.rows, payload.records, payload.result, payload.data, payload.raw];
+  for (const c of containers) {
+    if (Array.isArray(c)) return c.filter((x) => x && typeof x === "object");
+    if (c && typeof c === "object") {
+      const nested = extractCounterpartyBalanceRows(c);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
+}
+
 function getPreferredSolanaWalletKey() {
   try { return localStorage.getItem(LS_OT_SOL_WALLET) || "solflare"; } catch { return "solflare"; }
 }
@@ -1836,6 +2059,7 @@ export default function OrderTicketWidget({
     const v = String(effectiveVenue || "").toLowerCase().trim();
     return v === "polkadot_hydration" || v === "hydration" || v === "polkadot_dex" || v.startsWith("polkadot_");
   }, [effectiveVenue]);
+  const isCounterpartyVenue = useMemo(() => isCounterpartyVenueKey(effectiveVenue), [effectiveVenue]);
   const isDexSwapVenue = isSolanaDexVenue || isPolkadotDexVenue;
   const isSolanaLimitMode = isSolanaJupiterVenue && solanaOrderMode === "limit";
   const [preferredSolanaWallet, setPreferredSolanaWallet] = useState(() => getPreferredSolanaWalletKey());
@@ -1870,6 +2094,10 @@ export default function OrderTicketWidget({
   const polkadotPriceStatusReqRef = useRef(0);
   const polkadotLiquidityReqRef = useRef(0);
   const polkadotSwapTxProbeReqRef = useRef(0);
+  const [counterpartyBook, setCounterpartyBook] = useState(null);
+  const [counterpartyBookLoading, setCounterpartyBookLoading] = useState(false);
+  const [counterpartyBookError, setCounterpartyBookError] = useState(null);
+  const counterpartyBookReqRef = useRef(0);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
   useEffect(() => { setPreferredHydrationRouteMode(preferredHydrationRouteMode); }, [preferredHydrationRouteMode]);
@@ -2297,7 +2525,7 @@ export default function OrderTicketWidget({
       quote = null;
     }
 
-    return { base, quote };
+    return { base: normalizeCounterpartyAsset(base), quote: normalizeCounterpartyAsset(quote) };
   }
 
   const { base: baseAsset, quote: quoteAsset } = useMemo(() => parseBaseQuote(otSymbol), [otSymbol]);
@@ -2617,6 +2845,28 @@ export default function OrderTicketWidget({
       return;
     }
 
+    if (isCounterpartyVenue) {
+      const parts = counterpartyPairParts(s);
+      const priceDecimals = parts.quote === "BTC" || parts.quote === "XCP" ? 8 : 8;
+      setRules({
+        venue: v,
+        symbol: parts.symbol || normalizeCounterpartySymbol(s),
+        type: "counterparty_preview",
+        price_decimals: priceDecimals,
+        qty_decimals: 8,
+        price_increment: 0.00000001,
+        qty_increment: 0.00000001,
+        base_increment: 0.00000001,
+        min_qty: 0,
+        min_notional: 0,
+        errors: [],
+        warnings: ["Counterparty ticket is preview-only; unsigned compose/sign/broadcast is not enabled in this tranche."],
+      });
+      setRulesErr(null);
+      setRulesLoading(false);
+      return;
+    }
+
     const reqId = ++rulesReqIdRef.current;
     let cancelled = false;
 
@@ -2775,7 +3025,60 @@ export default function OrderTicketWidget({
       cancelled = true;
       clearTimeout(t);
     };
-  }, [effectiveVenue, otSymbol, side, tif, postOnly, apiBase]);
+  }, [effectiveVenue, otSymbol, side, tif, postOnly, apiBase, isCounterpartyVenue]);
+
+  useEffect(() => {
+    if (!isCounterpartyVenue) {
+      setCounterpartyBook(null);
+      setCounterpartyBookError(null);
+      setCounterpartyBookLoading(false);
+      return;
+    }
+
+    const sym = normalizeCounterpartySymbol(otSymbol);
+    if (!apiBase || !sym || !sym.includes("-")) {
+      setCounterpartyBook(null);
+      setCounterpartyBookError(null);
+      setCounterpartyBookLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    const reqId = ++counterpartyBookReqRef.current;
+
+    const t = setTimeout(async () => {
+      try {
+        setCounterpartyBookLoading(true);
+        setCounterpartyBookError(null);
+        const base = String(apiBase || "").replace(/\/+$/, "");
+        const url = new URL(`${base}/api/counterparty/orderbook`);
+        url.searchParams.set("symbol", sym);
+        url.searchParams.set("depth", "25");
+        url.searchParams.set("open_only", "true");
+        url.searchParams.set("_ts", String(Date.now()));
+        const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+        const body = await r.json().catch(() => null);
+        if (!r.ok || body?.ok === false) {
+          const msg = body?.detail || body?.error || `HTTP ${r.status}`;
+          throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+        }
+        if (cancelled || counterpartyBookReqRef.current !== reqId) return;
+        setCounterpartyBook(body || null);
+      } catch (e) {
+        if (cancelled || counterpartyBookReqRef.current !== reqId) return;
+        setCounterpartyBook(null);
+        setCounterpartyBookError(e?.message || "Failed loading Counterparty orderbook preview.");
+      } finally {
+        if (cancelled || counterpartyBookReqRef.current !== reqId) return;
+        setCounterpartyBookLoading(false);
+      }
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [isCounterpartyVenue, apiBase, otSymbol]);
 
   // ─────────────────────────────────────────────────────────────
   // Helpers: formatting + increment math
@@ -3413,6 +3716,78 @@ export default function OrderTicketWidget({
 
     try {
       if (!apiBase) throw new Error("apiBase not set");
+
+      if (isCounterpartyVenue) {
+        const allowPrompt = !!force;
+        let address = allowPrompt ? await getCounterpartyAddressWithPrompt() : await getCounterpartyAddressNoPrompt();
+        const nextAvail = {};
+
+        const addBtc = (btcInfo) => {
+          const btc = otCounterpartyFiniteNumberOrNull(btcInfo?.btc);
+          if (btc === null) return false;
+          nextAvail.BTC = { available: btc, total: btc, hold: 0 };
+          if (btcInfo?.stale) {
+            setBalNotice("BTC balance is cached from UniSat. Unlock/connect UniSat and refresh for live sizing.");
+          }
+          return true;
+        };
+
+        if (address) {
+          try {
+            const url = new URL(`${apiBase}/api/counterparty/address/${encodeURIComponent(address)}/balances`);
+            url.searchParams.set("_ts", String(Date.now()));
+            const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+            const body = await r.json().catch(() => ({}));
+            if (!r.ok || body?.ok === false) {
+              const msg = body?.detail || body?.error || `HTTP ${r.status}`;
+              throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+            }
+
+            for (const row of extractCounterpartyBalanceRows(body)) {
+              const asset = normalizeCounterpartyAsset(row?.asset || row?.asset_name || row?.assetName || row?.symbol || "");
+              if (!asset) continue;
+              const qty = otCounterpartyFiniteNumberOrNull(
+                row?.quantity_normalized ??
+                  row?.normalized_quantity ??
+                  row?.quantityNormalized ??
+                  row?.balance_normalized ??
+                  row?.balanceNormalized ??
+                  row?.quantity ??
+                  row?.balance ??
+                  row?.qty ??
+                  row?.amount
+              ) ?? 0;
+              const hold = otCounterpartyFiniteNumberOrNull(row?.hold ?? row?.reserved ?? row?.locked) ?? 0;
+              const available = otCounterpartyFiniteNumberOrNull(row?.available ?? row?.spendable ?? row?.free) ?? qty;
+              nextAvail[asset] = { available, total: qty, hold };
+              if (asset === "BITCRYSTALS") nextAvail.BCY = { available, total: qty, hold };
+            }
+          } catch (e) {
+            if (!silent) setBalNotice(e?.message || "Counterparty asset balances unavailable; BTC may still load from UniSat/cache.");
+          }
+        }
+
+        const btcInfo = await fetchCounterpartyUniSatBtcBalance(address, { allowPrompt });
+        if (btcInfo?.address && !address) address = btcInfo.address;
+        addBtc(btcInfo);
+
+        if (!address && !nextAvail.BTC) {
+          throw new Error("Connect or unlock UniSat to load Counterparty / Bitcoin balances.");
+        }
+        if (!address && nextAvail.BTC) {
+          setBalNotice("Showing cached BTC only. Connect UniSat to load live BTC, XCP, and Counterparty asset balances.");
+        } else if (address && !nextAvail.BTC) {
+          setBalNotice("Counterparty assets loaded. BTC unavailable from UniSat; unlock/connect UniSat and refresh for BTC sizing.");
+        } else if (!btcInfo?.stale) {
+          setBalNotice(null);
+        }
+
+        const nextHash = computeBalHash(nextAvail);
+        const nextFocusHash = focusAssets ? computeFocusHash(nextAvail, focusAssets) : "";
+        setBalAvail(nextAvail);
+        return { avail: nextAvail, hash: nextHash, focusHash: nextFocusHash };
+      }
+
       // DEX-only: Solana venues do not have adapter-backed /api/balances/latest.
       if (isSolanaDexVenue) {
         let address = getInjectedSolanaPubkeyBase58();
@@ -3618,8 +3993,8 @@ export default function OrderTicketWidget({
     const v = String(venueOverride || effectiveVenue || "").toLowerCase().trim();
     if (!v) return false;
 
-    // DEX-only: Solana/Polkadot venues don't have a CEX adapter refresh path; just re-load wallet balances.
-    if (isDexSwapVenue) {
+    // DEX/browser-wallet venues don't have a CEX adapter refresh path; just re-load wallet balances.
+    if (isDexSwapVenue || isCounterpartyVenue) {
       const beforeFullHash = computeBalHash(balAvail);
       const beforeFocusHash = focusAssets ? computeFocusHash(balAvail, focusAssets) : "";
 
@@ -3727,13 +4102,13 @@ export default function OrderTicketWidget({
   }
 
   useEffect(() => {
-    if (isDexSwapVenue) {
+    if (isDexSwapVenue || isCounterpartyVenue) {
       setBalAvail({});
       setBalErr(null);
     }
     loadAvailBalances();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveVenue, apiBase, baseAsset, quoteAsset, isSolanaDexVenue, isPolkadotDexVenue, isDexSwapVenue, walletKitConnected, walletKitSelectedKey, solanaWalletState?.address, polkadotWalletState?.address]);
+  }, [effectiveVenue, apiBase, baseAsset, quoteAsset, isSolanaDexVenue, isPolkadotDexVenue, isDexSwapVenue, isCounterpartyVenue, walletKitConnected, walletKitSelectedKey, solanaWalletState?.address, polkadotWalletState?.address]);
 
   const baseBal = useMemo(() => (baseAsset ? (balAvail?.[baseAsset] ?? null) : null), [balAvail, baseAsset]);
   const quoteBal = useMemo(() => (quoteAsset ? (balAvail?.[quoteAsset] ?? null) : null), [balAvail, quoteAsset]);
@@ -3956,6 +4331,69 @@ export default function OrderTicketWidget({
 
     if (rulesLoading) return { status: "neutral", title: "Pre-trade checks: loading…", lines: [], block: false };
 
+    if (isCounterpartyVenue) {
+      const parts = counterpartyPairParts(otSymbol);
+      const canonSymbol = parts.symbol || normalizeCounterpartySymbol(otSymbol);
+      const bids = Array.isArray(counterpartyBook?.bids) ? counterpartyBook.bids : [];
+      const asks = Array.isArray(counterpartyBook?.asks) ? counterpartyBook.asks : [];
+      const executableSideRows = side === "buy" ? asks : bids;
+
+      lines.push("Counterparty ticket is preview-only. Compose, UniSat signing, and broadcast are intentionally disabled in this tranche.");
+      if (counterpartyBookLoading) lines.push("Counterparty book preview loading…");
+      if (counterpartyBookError) lines.push(hideTableData ? "Counterparty book preview unavailable." : `Counterparty book preview unavailable: ${counterpartyBookError}`);
+
+      if (!parts.base || !parts.quote) {
+        lines.push("Use a Counterparty pair like XCP-BTC, BITCRYSTALS-XCP, BITCRYSTALS-BTC, BCY-XCP, or BCY-BTC.");
+        fails.push("counterparty_symbol_invalid");
+      } else if (!(parts.quote === "BTC" || parts.quote === "XCP")) {
+        lines.push(`Unsupported Counterparty quote ${parts.quote}. This tranche supports BTC and XCP quotes.`);
+        fails.push("counterparty_quote_unsupported");
+      }
+
+      if (qtyNum === null) {
+        lines.push("Qty missing/invalid.");
+        fails.push("qty_missing");
+      }
+      if (pxNum === null) {
+        lines.push("Limit price missing/invalid.");
+        fails.push("px_missing");
+      }
+
+      if (parts.base && parts.quote && !counterpartyBookLoading && !counterpartyBookError && executableSideRows.length === 0) {
+        const label = side === "buy" ? "ask" : "bid";
+        lines.push(`No active Counterparty ${label} levels found for ${canonSymbol}. Preview only; no executable quote source yet.`);
+        fails.push("counterparty_book_empty");
+      }
+
+      if (side === "buy" && buySpendQuote !== null && buySpendCapacityQuote !== null && buySpendQuote > buySpendCapacityQuote + 1e-12) {
+        lines.push(
+          hideTableData
+            ? "Insufficient available balance for this Counterparty buy preview."
+            : `Insufficient ${parts.quote || quoteAsset} available: need ${buySpendQuote.toLocaleString(undefined, { maximumFractionDigits: 12 })}, have ${buySpendCapacityQuote.toLocaleString(undefined, { maximumFractionDigits: 12 })}.`
+        );
+        fails.push("counterparty_quote_balance");
+      }
+
+      if (side === "sell" && qtyNum !== null && sellCapacity !== null && qtyNum > sellCapacity + 1e-12) {
+        lines.push(
+          hideTableData
+            ? "Insufficient available balance for this Counterparty sell preview."
+            : `Insufficient ${parts.base || baseAsset} available: need ${qtyNum.toLocaleString(undefined, { maximumFractionDigits: 12 })}, have ${sellCapacity.toLocaleString(undefined, { maximumFractionDigits: 12 })}.`
+        );
+        fails.push("counterparty_base_balance");
+      }
+
+      if (balErr) lines.push(hideTableData ? "Counterparty balances unavailable." : `Counterparty balances: ${balErr}`);
+      if (balNotice) lines.push(hideTableData ? "Counterparty wallet notice." : balNotice);
+
+      return {
+        status: fails.length ? "warn" : "warn",
+        title: fails.length ? "Counterparty preview: needs attention" : "Counterparty preview: read-only",
+        lines,
+        block: true,
+        message: lines.join(" "),
+      };
+    }
 
     if (isSolanaLimitMode) {
       if (qtyNum === null) {
@@ -4220,6 +4658,17 @@ export default function OrderTicketWidget({
     polkadotStatusReason,
     polkadotLiquidityWarning,
     hydrationManualRouterPriceGuard,
+    isCounterpartyVenue,
+    counterpartyBook,
+    counterpartyBookLoading,
+    counterpartyBookError,
+    balErr,
+    balNotice,
+    buySpendQuote,
+    buySpendCapacityQuote,
+    sellCapacity,
+    baseAsset,
+    otSymbol,
   ]);
 
   const preTradeStyle = useMemo(() => {
@@ -4236,6 +4685,8 @@ export default function OrderTicketWidget({
     if (!v || !s) return false;
     if (!(side === "buy" || side === "sell")) return false;
 
+    if (isCounterpartyVenue) return qtyNum !== null && pxNum !== null;
+
     // Solana DEX venues are swap-style:
     // - BUY uses Total (quote spend)
     // - SELL uses Qty (base spend)
@@ -4248,7 +4699,7 @@ export default function OrderTicketWidget({
 
     // CEX-style limit order
     return qtyNum !== null && pxNum !== null;
-  }, [effectiveVenue, otSymbol, side, isDexSwapVenue, isSolanaLimitMode, qtyNum, pxNum, totalQuoteNum]);
+  }, [effectiveVenue, otSymbol, side, isDexSwapVenue, isSolanaLimitMode, isCounterpartyVenue, qtyNum, pxNum, totalQuoteNum]);
 
   const canSubmit = useMemo(() => {
     if (!canSubmitBase) return false;
@@ -5535,6 +5986,7 @@ async function submitLimitOrder() {
       if (side === "buy" && !polkadotEffectiveExactBuyEnabled) return "/api/polkadot_dex/hydration/swap_tx (BUY disabled; SELL enabled)";
       return `/api/polkadot_dex/hydration/swap_tx (${hydrationRouteModeLabel(preferredHydrationRouteMode)}) → SubWallet sign/send`;
     }
+    if (isCounterpartyVenue) return "/api/counterparty/orderbook + /api/counterparty/address/{address}/balances (preview only)";
     if (!isSolanaDexVenue) return "/api/trade/order";
     if (isSolanaLimitMode) return "/api/solana_dex/jupiter/trigger/create_order";
     const v = String(effectiveVenue || "").toLowerCase().trim();
@@ -5543,7 +5995,7 @@ async function submitLimitOrder() {
     if (routerMode === "ultra") return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute";
     if (routerMode === "metis") return "/api/solana_dex/jupiter/swap_tx";
     return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute → fallback /api/solana_dex/jupiter/swap_tx → fallback /api/solana_dex/raydium/swap_tx";
-  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotManualRouterFallbackAvailable, polkadotSyntheticPriceOnly, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
+  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, isCounterpartyVenue, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotManualRouterFallbackAvailable, polkadotSyntheticPriceOnly, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
 
   async function copySubmitResultToClipboard() {
     try {
@@ -5578,7 +6030,7 @@ async function submitLimitOrder() {
       { k: "Venue", v: hideVenueNames ? "••••" : v },
       { k: "Symbol", v: hideTableData ? "••••" : sym },
       { k: "Side", v: side.toUpperCase() },
-      { k: "Type", v: isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "LIMIT" : "SWAP") : isPolkadotDexVenue ? "SWAP" : "LIMIT" },
+      { k: "Type", v: isCounterpartyVenue ? "PREVIEW" : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "LIMIT" : "SWAP") : isPolkadotDexVenue ? "SWAP" : "LIMIT" },
       ...(isPolkadotDexVenue ? [{ k: "Route", v: polkadotManualRouterFallbackAvailable ? "Manual Router fallback" : hydrationRouteModeLabel(preferredHydrationRouteMode) }] : []),
       { k: "Qty", v: hideTableData ? "••••" : qStr },
       { k: "Limit", v: hideTableData ? "••••" : pxStr },
@@ -5609,6 +6061,7 @@ async function submitLimitOrder() {
     autoCalc,
     isSolanaJupiterVenue,
     isPolkadotDexVenue,
+    isCounterpartyVenue,
     preferredHydrationRouteMode,
     isSolanaLimitMode,
     solanaOrderMode,
@@ -6017,7 +6470,7 @@ async function submitLimitOrder() {
               style={{ ...safeButton, padding: "5px 8px", lineHeight: 1.05 }}
               onClick={() => refreshAvailBalances({ force: true, maxPolls: 2, pollBackoffMs: [800, 1200] })}
               disabled={balLoading}
-              title="Refresh balances from venue"
+              title={isCounterpartyVenue ? "Refresh Counterparty balances from UniSat / Counterparty API" : "Refresh balances from venue"}
             >
               {balLoading ? "…" : "Refresh"}
             </button>
@@ -6222,6 +6675,33 @@ async function submitLimitOrder() {
               >
                 <UnifiedWalletButton />
               </div>
+            </div>
+          )}
+
+
+          {isCounterpartyVenue && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+                marginTop: 6,
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.03)",
+                fontSize: 12,
+                opacity: 0.95,
+              }}
+            >
+              <span style={{ fontWeight: 800 }}>Counterparty / Bitcoin</span>
+              <span style={{ ...safeMuted, fontSize: 11 }}>
+                Read-only preview. Uses UniSat for BTC and /api/counterparty/address balances for XCP / BITCRYSTALS.
+              </span>
+              <span style={{ ...safeMuted, fontSize: 11 }}>
+                Book: {counterpartyBookLoading ? "loading…" : counterpartyBookError ? "unavailable" : `${Array.isArray(counterpartyBook?.bids) ? counterpartyBook.bids.length : 0} bids / ${Array.isArray(counterpartyBook?.asks) ? counterpartyBook.asks.length : 0} asks`}
+              </span>
             </div>
           )}
 
@@ -6460,7 +6940,7 @@ async function submitLimitOrder() {
         </div>
 
         <div style={{ marginTop: 6, ...safeMuted, fontSize: 12, lineHeight: 1.15 }}>
-          Type: <b>{isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
+          Type: <b>{isCounterpartyVenue ? "Preview" : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
           {isSolanaLimitMode ? <> • Expiry: <b>{hideTableData ? "••••" : solanaExpiryLabel}</b></> : null}
           {" "}• Est. Total ({totalLabel}): <b>{notional === null ? "—" : fmtNum ? fmtNum(notional) : String(notional)}</b>
         </div>
@@ -6485,7 +6965,9 @@ async function submitLimitOrder() {
           >
             {submitting
               ? "Submitting…"
-              : isSolanaLimitMode
+              : isCounterpartyVenue
+                ? side === "buy" ? "Preview Buy" : "Preview Sell"
+                : isSolanaLimitMode
                 ? side === "buy" ? "Place Buy Limit" : "Place Sell Limit"
                 : isDexSwapVenue
                   ? isPolkadotDexVenue

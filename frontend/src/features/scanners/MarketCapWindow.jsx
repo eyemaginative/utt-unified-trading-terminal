@@ -14,8 +14,13 @@ function trimApiBase(base) {
 
 const MARKET_METRICS_REQUEST_LIMIT = 1000;
 
-const MARKET_METRICS_BROWSER_CACHE_KEY = "utt.market_metrics.market_cap.summary.v9";
+const MARKET_METRICS_BROWSER_CACHE_KEY = "utt.market_metrics.summary.v10";
+const MARKET_METRICS_BROWSER_CACHE_EVENT = "utt:market-metrics-summary-v10";
 const MARKET_METRICS_BROWSER_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function browserMetricSnapshotIsComplete(snapshot) {
+  return Boolean(snapshot?.universeComplete === true && snapshot?.snapshotKind === "known_universe");
+}
 
 function readBrowserMetricSnapshot() {
   try {
@@ -34,14 +39,31 @@ function readBrowserMetricSnapshot() {
 
 function writeBrowserMetricSnapshot(snapshot) {
   try {
-    if (typeof window === "undefined" || !window.localStorage) return;
-    if (!snapshot || !Array.isArray(snapshot.rows) || !snapshot.rows.length) return;
-    window.localStorage.setItem(
-      MARKET_METRICS_BROWSER_CACHE_KEY,
-      JSON.stringify({ ...snapshot, cachedAt: Date.now() })
-    );
+    if (typeof window === "undefined" || !window.localStorage) return false;
+    if (!snapshot || !Array.isArray(snapshot.rows) || !snapshot.rows.length) return false;
+
+    const nextSnapshot = {
+      ...snapshot,
+      universeComplete: snapshot?.universeComplete === true,
+      snapshotKind: snapshot?.universeComplete === true ? "known_universe" : "owned_fallback",
+      cachedAt: Date.now(),
+    };
+    const current = readBrowserMetricSnapshot();
+
+    // Never let an owned-only timeout fallback replace the last complete known
+    // universe shared by the Market Cap and Volume windows.
+    if (browserMetricSnapshotIsComplete(current) && !browserMetricSnapshotIsComplete(nextSnapshot)) return false;
+
+    window.localStorage.setItem(MARKET_METRICS_BROWSER_CACHE_KEY, JSON.stringify(nextSnapshot));
+    try {
+      window.dispatchEvent(new CustomEvent(MARKET_METRICS_BROWSER_CACHE_EVENT, { detail: { snapshot: nextSnapshot } }));
+    } catch {
+      // Same-window synchronization is best-effort only.
+    }
+    return true;
   } catch {
     // Browser cache is best-effort only.
+    return false;
   }
 }
 
@@ -398,6 +420,7 @@ export default function MarketCapWindow({
   const [err, setErr] = useState("");
   const mountedRef = useRef(false);
   const requestSeqRef = useRef(0);
+  const snapshotCompleteRef = useRef(false);
 
   const selectedAsset = useMemo(() => assetFromSymbol(selectedSymbol), [selectedSymbol]);
   // PORT-METRICS.1 v9:
@@ -491,6 +514,17 @@ export default function MarketCapWindow({
     [height, onDragHandleMouseDown]
   );
 
+  function applyBrowserMetricSnapshot(snapshot) {
+    if (!snapshot?.rows?.length) return false;
+    setRows(snapshot.rows);
+    setOwnedAssetKeys(Array.isArray(snapshot.ownedAssetKeys) ? snapshot.ownedAssetKeys : []);
+    setPayloadSourceKeys(Array.isArray(snapshot.payloadSourceKeys) ? snapshot.payloadSourceKeys : []);
+    setPayloadCounts(snapshot.payloadCounts || {});
+    setLastUpdated(snapshot.lastUpdated || null);
+    snapshotCompleteRef.current = browserMetricSnapshotIsComplete(snapshot);
+    return true;
+  }
+
   async function doRefresh(options = {}) {
     const base = trimApiBase(apiBase);
     if (!base || busy) return;
@@ -545,6 +579,7 @@ export default function MarketCapWindow({
         throw new Error(msg);
       }
 
+      const dbUniverseComplete = Boolean(dbJson && Array.isArray(dbJson?.items));
       const nextOwnedRows = Array.isArray(ownedJson?.items) ? ownedJson.items : [];
       const nextDbRows = Array.isArray(dbJson?.items) ? dbJson.items : [];
       const nextRows = mergeMetricRows(nextDbRows, nextOwnedRows);
@@ -560,6 +595,20 @@ export default function MarketCapWindow({
       if (dbError) {
         nextErrors.push({ message: `Tracked/unowned market metrics unavailable: ${String(dbError?.message || dbError || "request failed")}` });
       }
+
+      if (!dbUniverseComplete) {
+        const completeSnapshot = readBrowserMetricSnapshot();
+        const retainedMessage = `Tracked/unowned market metrics unavailable: ${String(dbError?.message || "known-universe request failed")}; keeping last complete shared snapshot.`;
+        if (snapshotCompleteRef.current && rows.length) {
+          setErrors([{ message: retainedMessage }, ...nextErrors]);
+          return;
+        }
+        if (browserMetricSnapshotIsComplete(completeSnapshot) && applyBrowserMetricSnapshot(completeSnapshot)) {
+          setErrors([{ message: retainedMessage }, ...nextErrors]);
+          return;
+        }
+      }
+
       if (rows.length && marketCapRefreshLooksFailed(nextRows, nextErrors)) {
         setErr("Market cap refresh failed; keeping last good snapshot.");
         setErrors([
@@ -581,6 +630,7 @@ export default function MarketCapWindow({
         symbolCached: Number(dbJson?.market_data_symbol_cache_match_count ?? 0) || 0,
         pageRows: Number(dbJson?.market_data_market_page_live_fetch_count ?? 0) || 0,
         snapshot: Boolean(dbJson?.summary_snapshot),
+        universeComplete: dbUniverseComplete,
       };
       const nextLastUpdated = dbJson?.updated_at || ownedJson?.updated_at || new Date().toISOString();
 
@@ -590,13 +640,19 @@ export default function MarketCapWindow({
       setRows(nextRows);
       setErrors(nextErrors);
       setLastUpdated(nextLastUpdated);
-      writeBrowserMetricSnapshot({
-        rows: nextRows,
-        ownedAssetKeys: nextOwnedKeys,
-        payloadSourceKeys: nextSourceKeys,
-        payloadCounts: nextPayloadCounts,
-        lastUpdated: nextLastUpdated,
-      });
+      snapshotCompleteRef.current = dbUniverseComplete;
+
+      if (dbUniverseComplete) {
+        writeBrowserMetricSnapshot({
+          rows: nextRows,
+          ownedAssetKeys: nextOwnedKeys,
+          payloadSourceKeys: nextSourceKeys,
+          payloadCounts: nextPayloadCounts,
+          lastUpdated: nextLastUpdated,
+          universeComplete: true,
+          snapshotKind: "known_universe",
+        });
+      }
     } catch (e) {
       if (!mountedRef.current || requestSeqRef.current !== seq || isAbortLikeError(e)) return;
       const priorNote = rows.length ? "; keeping last good snapshot" : "";
@@ -606,13 +662,8 @@ export default function MarketCapWindow({
         return;
       }
       const cachedSnapshot = readBrowserMetricSnapshot();
-      if (!rows.length && cachedSnapshot?.rows?.length) {
-        setRows(cachedSnapshot.rows);
-        setOwnedAssetKeys(Array.isArray(cachedSnapshot.ownedAssetKeys) ? cachedSnapshot.ownedAssetKeys : []);
-        setPayloadSourceKeys(Array.isArray(cachedSnapshot.payloadSourceKeys) ? cachedSnapshot.payloadSourceKeys : []);
-        setPayloadCounts(cachedSnapshot.payloadCounts || {});
-        setLastUpdated(cachedSnapshot.lastUpdated || null);
-        setErrors([{ message: `${msg}; showing last browser-cached market metrics snapshot.` }]);
+      if (!rows.length && cachedSnapshot?.rows?.length && applyBrowserMetricSnapshot(cachedSnapshot)) {
+        setErrors([{ message: `${msg}; showing last complete shared browser-cached market metrics snapshot.` }]);
         return;
       }
       setErr(`${msg}${priorNote}`);
@@ -630,13 +681,25 @@ export default function MarketCapWindow({
   }, []);
 
   useEffect(() => {
-    const cachedSnapshot = readBrowserMetricSnapshot();
-    if (!cachedSnapshot?.rows?.length) return;
-    setRows(cachedSnapshot.rows);
-    setOwnedAssetKeys(Array.isArray(cachedSnapshot.ownedAssetKeys) ? cachedSnapshot.ownedAssetKeys : []);
-    setPayloadSourceKeys(Array.isArray(cachedSnapshot.payloadSourceKeys) ? cachedSnapshot.payloadSourceKeys : []);
-    setPayloadCounts(cachedSnapshot.payloadCounts || {});
-    setLastUpdated(cachedSnapshot.lastUpdated || null);
+    const applySharedSnapshot = (snapshotMaybe = null) => {
+      const snapshot = snapshotMaybe?.rows?.length ? snapshotMaybe : readBrowserMetricSnapshot();
+      if (!snapshot?.rows?.length) return;
+      applyBrowserMetricSnapshot(snapshot);
+    };
+    const onSharedSnapshot = (event) => applySharedSnapshot(event?.detail?.snapshot || null);
+    const onStorage = (event) => {
+      if (event?.key === MARKET_METRICS_BROWSER_CACHE_KEY) applySharedSnapshot();
+    };
+
+    applySharedSnapshot();
+    if (typeof window === "undefined") return undefined;
+    window.addEventListener(MARKET_METRICS_BROWSER_CACHE_EVENT, onSharedSnapshot);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(MARKET_METRICS_BROWSER_CACHE_EVENT, onSharedSnapshot);
+      window.removeEventListener("storage", onStorage);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {

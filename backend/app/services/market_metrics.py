@@ -517,6 +517,84 @@ def _db_metric_rows(
         return []
 
 
+def _db_latest_venue_symbol_rows(db: Any) -> List[Dict[str, Any]]:
+    """Return the latest active listing snapshot for every venue.
+
+    venue_symbols is append-only. A single global ORDER BY captured_at DESC
+    LIMIT can let one recently refreshed venue consume the entire context query,
+    which makes older Coinbase/Gemini/Crypto.com/Robinhood snapshots disappear
+    from Market Cap / Volume venue filters. Read each venue's latest snapshot
+    instead, while keeping the query read-only and schema-tolerant.
+    """
+    cols = _db_table_columns(db, "venue_symbols")
+    required = {"venue", "captured_at"}
+    if not required.issubset(cols):
+        return _db_metric_rows(
+            db,
+            table_name="venue_symbols",
+            column_names=("base_asset", "quote_asset", "symbol_canon", "venue", "captured_at", "is_active"),
+            order_column="captured_at",
+            limit=_db_owned_query_limit(1000),
+        )
+
+    selected = [
+        c
+        for c in ("base_asset", "quote_asset", "symbol_canon", "venue", "captured_at", "is_active")
+        if c in cols
+    ]
+    if not selected:
+        return []
+
+    raw_cap = _env_first(
+        "UTT_MARKET_METRICS_VENUE_SYMBOL_SNAPSHOT_ROW_CAP",
+        "MARKET_METRICS_VENUE_SYMBOL_SNAPSHOT_ROW_CAP",
+    )
+    try:
+        row_cap = int(float(raw_cap)) if str(raw_cap or "").strip() else 20000
+    except Exception:
+        row_cap = 20000
+    row_cap = max(1000, min(100000, row_cap))
+
+    try:
+        from sqlalchemy import text
+
+        select_sql = ", ".join(f'v."{c}" AS "{c}"' for c in selected)
+        active_sql = ' AND COALESCE(v."is_active", 1) = 1' if "is_active" in cols else ""
+        order_parts = ['LOWER(TRIM(CAST(v."venue" AS TEXT)))']
+        if "base_asset" in cols:
+            order_parts.append('UPPER(TRIM(CAST(v."base_asset" AS TEXT)))')
+        if "quote_asset" in cols:
+            order_parts.append('UPPER(TRIM(CAST(v."quote_asset" AS TEXT)))')
+        if "symbol_canon" in cols:
+            order_parts.append('UPPER(TRIM(CAST(v."symbol_canon" AS TEXT)))')
+        order_sql = ", ".join(order_parts)
+
+        sql = f"""
+            WITH latest AS (
+                SELECT
+                    LOWER(TRIM(CAST("venue" AS TEXT))) AS venue_key,
+                    MAX("captured_at") AS latest_captured_at
+                FROM "venue_symbols"
+                WHERE "venue" IS NOT NULL
+                  AND TRIM(CAST("venue" AS TEXT)) <> ''
+                  AND "captured_at" IS NOT NULL
+                GROUP BY LOWER(TRIM(CAST("venue" AS TEXT)))
+            )
+            SELECT {select_sql}
+            FROM "venue_symbols" v
+            JOIN latest l
+              ON LOWER(TRIM(CAST(v."venue" AS TEXT))) = l.venue_key
+             AND v."captured_at" = l.latest_captured_at
+            WHERE 1=1{active_sql}
+            ORDER BY {order_sql}
+            LIMIT :row_cap
+        """
+        rows = db.execute(text(sql), {"row_cap": int(row_cap)}).mappings().all()
+        return [dict(r) for r in rows or []]
+    except Exception:
+        return []
+
+
 def _db_market_metric_asset_context(limit: int = 1000) -> Dict[str, Dict[str, Any]]:
     """Return local asset context for owned/tracked source filtering.
 
@@ -600,13 +678,9 @@ def _db_market_metric_asset_context(limit: int = 1000) -> Dict[str, Dict[str, An
         ):
             _metric_context_add(ctx, r.get("symbol"), venue=r.get("venue"), chain=r.get("chain"), source="token_registry", owned=False)
 
-        for r in _db_metric_rows(
-            db,
-            table_name="venue_symbols",
-            column_names=("base_asset", "quote_asset", "symbol_canon", "venue", "captured_at"),
-            order_column="captured_at",
-            limit=query_limit,
-        ):
+        # venue_symbols is append-only. Read the latest complete snapshot for
+        # every venue instead of applying one global recent-row limit.
+        for r in _db_latest_venue_symbol_rows(db):
             venue = r.get("venue")
             _metric_context_add(ctx, r.get("base_asset") or r.get("symbol_canon"), venue=venue, source="venue_symbols", owned=False)
             _metric_context_add(ctx, r.get("quote_asset"), venue=venue, source="venue_symbols", owned=False)
@@ -685,6 +759,24 @@ def _venue_filter_options_from_context(asset_context: Dict[str, Dict[str, Any]])
     return sorted(keys)
 
 
+def _venue_asset_counts_from_context(asset_context: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    counts: Dict[str, Dict[str, int]] = {}
+    for ctx in (asset_context or {}).values():
+        if not isinstance(ctx, dict):
+            continue
+        tracked = {str(v or "").strip().lower() for v in (ctx.get("tracked_venues") or set()) if str(v or "").strip()}
+        owned = {str(v or "").strip().lower() for v in (ctx.get("owned_venues") or set()) if str(v or "").strip()}
+        for venue in tracked | owned:
+            row = counts.setdefault(venue, {"tracked": 0, "owned": 0, "unowned": 0})
+            if venue in tracked:
+                row["tracked"] += 1
+            if venue in owned:
+                row["owned"] += 1
+    for row in counts.values():
+        row["unowned"] = max(0, int(row.get("tracked", 0)) - int(row.get("owned", 0)))
+    return {k: counts[k] for k in sorted(counts)}
+
+
 def _summary_snapshot_refresh_current_context(
     payload: Dict[str, Any],
     *,
@@ -719,6 +811,8 @@ def _summary_snapshot_refresh_current_context(
         payload["owned_asset_source"] = owned_asset_source
         payload["asset_context"] = {k: _metric_context_public(v) for k, v in sorted(asset_context.items())}
         payload["venue_filter_options"] = _venue_filter_options_from_context(asset_context)
+        payload["venue_asset_counts"] = _venue_asset_counts_from_context(asset_context)
+        payload["venue_symbol_context_mode"] = "latest_snapshot_per_venue"
         payload["summary_snapshot_context_refreshed"] = True
     except Exception:
         # Snapshot context refresh is best-effort; never block window open.
@@ -952,6 +1046,7 @@ def _summary_snapshot_key(
         include_clean = _parse_assets(include_assets) if str(include_assets or "").strip() else []
     raw = json.dumps(
         {
+            "schema_version": "port_metrics_2_venue_universe",
             "mode": mode,
             "include_assets": include_clean,
             "limit": int(limit),
@@ -1956,6 +2051,8 @@ def get_market_metrics_summary(
         "include_assets": include_clean,
         "asset_context": {k: _metric_context_public(v) for k, v in sorted(asset_context.items())},
         "venue_filter_options": _venue_filter_options_from_context(asset_context),
+        "venue_asset_counts": _venue_asset_counts_from_context(asset_context),
+        "venue_symbol_context_mode": "latest_snapshot_per_venue",
         "items": items,
         "errors": errors,
         "cache": "miss",

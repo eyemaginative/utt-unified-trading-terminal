@@ -1768,6 +1768,72 @@ class CounterpartyAdapter:
     def _selected_counterparty_book_row(row: Any) -> Dict[str, Any]:
         return row if isinstance(row, dict) else {}
 
+    @staticmethod
+    def _compose_level_price_decimal(row: Dict[str, Any]) -> Optional[Decimal]:
+        if not isinstance(row, dict):
+            return None
+        for key in ("price", "displayPrice", "display_price", "limitPrice", "limit_price", "rate"):
+            if row.get(key) not in (None, ""):
+                d = CounterpartyAdapter._decimal_or_none(row.get(key))
+                if d is not None and d > 0:
+                    return d
+        return None
+
+    def _find_compose_book_level(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        limit_price: Decimal,
+        quantity: Decimal,
+        depth: int = 100,
+    ) -> Optional[Dict[str, Any]]:
+        """Best-effort local book match for compose preview.
+
+        The frontend normally passes the clicked orderbook row as selected_level.
+        Manual API smoke tests and some stale UI states may omit it.  In that
+        case, use the read-only orderbook to select an executable level so
+        BTC dispenser asks can still route to compose/dispense instead of
+        falling back to compose/order.
+        """
+        sym = str(symbol or "").strip().upper()
+        trade_side = str(side or "").strip().lower()
+        if not sym or trade_side not in {"buy", "sell"}:
+            return None
+        try:
+            book = self.get_orderbook(symbol=sym, depth=max(1, min(int(depth or 100), 200)), open_only=True)
+        except Exception:
+            return None
+        rows = book.get("asks") if trade_side == "buy" else book.get("bids")
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        candidates: List[Tuple[int, Decimal, int, Dict[str, Any]]] = []
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            px = self._compose_level_price_decimal(row)
+            if px is None or px <= 0:
+                continue
+            if trade_side == "buy" and px > limit_price:
+                continue
+            if trade_side == "sell" and px < limit_price:
+                continue
+            size_dec = self._decimal_or_none(row.get("size"))
+            size_ok = 1 if (size_dec is not None and size_dec >= quantity) else 0
+            is_dispenser = 1 if "dispenser" in str(row.get("source_type") or "").lower() or isinstance(row.get("raw_dispenser"), dict) else 0
+            # For BUY choose lowest executable ask. For SELL choose highest executable bid.
+            price_rank = px if trade_side == "buy" else -px
+            # Prefer levels large enough for the requested qty, then dispenser rows,
+            # then best executable price, preserving original order as final tie-break.
+            candidates.append((-size_ok, -is_dispenser, price_rank, idx, row))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        chosen = dict(candidates[0][4])
+        chosen.setdefault("selection_source", "auto_orderbook_match")
+        return chosen
+
     def _compose_try_candidates(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
         errors: List[Dict[str, Any]] = []
         for candidate in candidates or []:
@@ -1825,6 +1891,18 @@ class CounterpartyAdapter:
         quote_atomic = self._display_quantity_to_atomic(quote_asset, quote_qty_dec)
         btc_sats = self._display_quantity_to_atomic("BTC", quote_qty_dec) if quote_asset == "BTC" else None
         level = self._selected_counterparty_book_row(selected_level)
+        selected_level_source = "provided" if level else "none"
+        if not level:
+            auto_level = self._find_compose_book_level(
+                symbol=symbol_canon,
+                side=trade_side,
+                limit_price=px_dec,
+                quantity=qty_dec,
+            )
+            if auto_level:
+                level = auto_level
+                selected_level_source = "auto_orderbook_match"
+
         level_source_type = str(level.get("source_type") or "").strip().lower()
         level_source = str(level.get("source") or "").strip()
         level_tx_hash = str(level.get("tx_hash") or "").strip()
@@ -1835,6 +1913,11 @@ class CounterpartyAdapter:
             "Unsigned compose preview only. UTT did not sign or broadcast this transaction.",
             "Review source address, assets, quantities, fee behavior, and selected order/dispenser details before enabling wallet signing.",
         ]
+
+        if selected_level_source == "auto_orderbook_match":
+            warnings.append(
+                "No selected book level was supplied; UTT auto-selected a current executable Counterparty book level for compose preview."
+            )
 
         if dispenser_like and level_size_dec is not None and qty_dec > level_size_dec:
             warnings.append(
@@ -1948,6 +2031,7 @@ class CounterpartyAdapter:
             "get_quantity": self._decimal_plain(get_quantity_display, max_places=self._asset_display_decimals(get_asset)),
             "get_quantity_atomic": get_quantity_atomic,
             "selected_level": level or None,
+            "selected_level_source": selected_level_source,
             "candidate_requests": candidates,
             "attempted_upstream": bool(attempt_upstream),
             "compose_ok": bool(compose_probe.get("ok")),

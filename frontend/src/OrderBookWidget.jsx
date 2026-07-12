@@ -39,6 +39,26 @@ function isPolkadotHydrationVenueKey(v) {
   return key === "polkadot_hydration" || key === "hydration" || key === "polkadot_dex" || key.startsWith("polkadot_");
 }
 
+function isCounterpartyVenueKey(v) {
+  const key = String(v || "").toLowerCase().trim();
+  return key === "counterparty" || key === "counterparty_unisat" || key === "bitcoin_counterparty";
+}
+
+function counterpartyPairParts(symbol) {
+  const raw = String(symbol || "").trim().toUpperCase().replace(/[/_]/g, "-");
+  const parts = raw.split("-").map((x) => x.trim()).filter(Boolean);
+  if (parts.length !== 2) return { base: "", quote: "", symbol: raw };
+  const alias = (v) => {
+    const a = String(v || "").trim().toUpperCase();
+    if (a === "BCY" || a === "BITCRYSTAL") return "BITCRYSTALS";
+    if (a === "XBT") return "BTC";
+    return a;
+  };
+  const base = alias(parts[0]);
+  const quote = alias(parts[1]);
+  return { base, quote, symbol: base && quote ? `${base}-${quote}` : raw };
+}
+
 function normalizeHydrationRouteMode(v) {
   const raw = String(v || "auto").toLowerCase().trim();
   if (raw === "managed" || raw === "managed_sdk" || raw === "sdk_router" || raw === "sidecar") return "sdk";
@@ -498,6 +518,7 @@ export default function OrderBookWidget({
   }, [effectiveVenue]);
 
   const isPolkadotDexVenue = useMemo(() => isPolkadotHydrationVenueKey(effectiveVenue), [effectiveVenue]);
+  const isCounterpartyVenue = useMemo(() => isCounterpartyVenueKey(effectiveVenue), [effectiveVenue]);
 
   // Reset gating when venue changes
   useEffect(() => {
@@ -511,8 +532,8 @@ export default function OrderBookWidget({
     setHydrationPriceStatusError(null);
 
     // Prevent DEX-specific decimals from leaking into regular CEX venues.
-    if (!isSolJupVenue && !isPolkadotDexVenue) setSizeDecimals(null);
-  }, [effectiveVenue, isSolJupVenue, isPolkadotDexVenue]);
+    if (!isSolJupVenue && !isPolkadotDexVenue && !isCounterpartyVenue) setSizeDecimals(null);
+  }, [effectiveVenue, isSolJupVenue, isPolkadotDexVenue, isCounterpartyVenue]);
 
   useEffect(() => {
     if (!isSolJupVenue) return;
@@ -530,6 +551,14 @@ export default function OrderBookWidget({
     setObActiveRouter(null);
     setHydrationLiquidityWarning(null);
   }, [obHydrationRouteMode, isPolkadotDexVenue]);
+
+  useEffect(() => {
+    if (!isCounterpartyVenue) return;
+    pairNotFoundRef.current = false;
+    cooldownUntilRef.current = 0;
+    cooldownPowRef.current = 0;
+    setObActiveRouter(null);
+  }, [isCounterpartyVenue, obSymbol]);
 
 
   useEffect(() => {
@@ -758,6 +787,16 @@ function clampBox(next) {
       return;
     }
 
+    if (isCounterpartyVenueKey(v)) {
+      const parts = counterpartyPairParts(sym);
+      const quote = String(parts.quote || "").toUpperCase();
+      const base = String(parts.base || "").toUpperCase();
+      setPriceDecimals(quote === "BTC" || quote === "XCP" ? 8 : 8);
+      setPriceIncrement(null);
+      setSizeDecimals(base.endsWith("CARD") || base.endsWith("CD") ? 0 : 8);
+      return;
+    }
+
     try {
       const url = `${apiBase}/api/rules/order?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
         sym
@@ -818,7 +857,7 @@ function clampBox(next) {
     const v = Number(sz);
     if (!Number.isFinite(v)) return "—";
     // IMPORTANT: sizeDecimals is a DEX-only hint. Never apply it to regular CEX venues.
-    if ((isSolJupVenue || isPolkadotDexVenue) && Number.isFinite(Number(sizeDecimals))) {
+    if ((isSolJupVenue || isPolkadotDexVenue || isCounterpartyVenue) && Number.isFinite(Number(sizeDecimals))) {
       const d = clamp(Number(sizeDecimals), 0, 18);
       return v.toFixed(d);
     }
@@ -881,6 +920,11 @@ function clampBox(next) {
       const hydrationOrderbookUrl = `${apiBase}/api/polkadot_dex/hydration/orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
         String(depth)
       )}&route_mode=${encodeURIComponent(hydrationRouteMode)}${forceQ}&_ts=${Date.now()}`;
+      const counterpartyParts = counterpartyPairParts(sym);
+      const counterpartySymbol = counterpartyParts.symbol || sym;
+      const counterpartyOrderbookUrl = `${apiBase}/api/counterparty/orderbook?symbol=${encodeURIComponent(counterpartySymbol)}&depth=${encodeURIComponent(
+        String(depth)
+      )}&open_only=true${forceQ}&_ts=${Date.now()}`;
 
       if (isPolkadotHydration) {
         const sr = await fetch(hydrationStatusUrl, { signal: ac.signal, cache: "no-store" });
@@ -908,9 +952,11 @@ function clampBox(next) {
           ? rayUrl
           : isPolkadotHydration
             ? hydrationOrderbookUrl
-            : `${apiBase}/api/market/orderbook?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
-                sym
-              )}&depth=${encodeURIComponent(String(depth))}${forceQ}&_ts=${Date.now()}`;
+            : isCounterpartyVenueKey(v)
+              ? counterpartyOrderbookUrl
+              : `${apiBase}/api/market/orderbook?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
+                  sym
+                )}&depth=${encodeURIComponent(String(depth))}${forceQ}&_ts=${Date.now()}`;
 
       const shouldFallbackToRaydium = (txt) => {
         const low = String(txt || "").toLowerCase();
@@ -941,7 +987,9 @@ function clampBox(next) {
       let usedVenue = v;
       let usedRouter = isSolJup
         ? (routerMode === "raydium" ? "raydium" : (routerMode === "jupiter" ? "jupiter" : "ultra"))
-        : (isSolRay ? "raydium" : v || null);
+        : isCounterpartyVenueKey(v)
+          ? "counterparty"
+          : (isSolRay ? "raydium" : v || null);
 
       // handle 429 explicitly (cooldown)
       if (r.status === 429) {
@@ -1003,7 +1051,7 @@ function clampBox(next) {
       }
 
       // DEX-only formatting hints (opt-in by venue)
-      if (isSolJup || usedVenue === "solana_raydium" || isSolRay || isPolkadotHydration) {
+      if (isSolJup || usedVenue === "solana_raydium" || isSolRay || isPolkadotHydration || isCounterpartyVenueKey(usedVenue)) {
         const inferLevelDecimals = (levels) => {
           try {
             let best = 0;
@@ -1494,6 +1542,10 @@ function clampBox(next) {
                     : hydrationRouteModeLabel(obHydrationRouteMode)
                 }</b>
               </>
+            ) : isCounterpartyVenue ? (
+              <>
+                {" "}• Source: <b>orders / dispensers</b>
+              </>
             ) : null}
           </span>
         </div>
@@ -1535,6 +1587,7 @@ function clampBox(next) {
             Depth <b>{obDepth}</b> • Auto <b>{obAutoRefresh ? `${obAutoSeconds}s` : "off"}</b>
             {isSolJupVenue ? <> • Router <b>{String(obSolanaRouterMode || "auto")}</b></> : null}
             {isPolkadotDexVenue ? <> • Route <b>{hydrationRouteModeLabel(obHydrationRouteMode)}</b></> : null}
+            {isCounterpartyVenue ? <> • Read-only <b>Counterparty</b></> : null}
           </span>
           {isPolkadotDexVenue ? (
             <span

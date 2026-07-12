@@ -2818,9 +2818,10 @@ export default function App() {
 
       if (row?.enabled === false) return false;
 
-      // Counterparty balances are browser-wallet/address scoped and loaded through
-      // /api/counterparty/address/{address}/balances, not the CEX balance snapshot refresh path.
+      // Counterparty balances and protocol orderbooks are browser-wallet/protocol scoped,
+      // not served through the generic CEX adapter snapshot path.
       if (v === "counterparty" && c === "balances") return true;
+      if (v === "counterparty" && c === "orderbook") return true;
 
       // DEX venues are swap/status based, but we still surface them as trade/orderbook-capable
       // so the widgets mount. Routing/status behavior is handled inside each widget.

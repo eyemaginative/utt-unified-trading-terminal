@@ -29,6 +29,20 @@ def counterparty_unisat_provider() -> Dict[str, Any]:
     return _adapter().wallet_provider_info("unisat")
 
 
+@router.get("/orderbook")
+def counterparty_orderbook(
+    symbol: str = Query(..., description="Counterparty market symbol, e.g. XCP-BTC or BITCRYSTALS-XCP"),
+    depth: int = Query(default=25, ge=1, le=200),
+    open_only: bool = Query(default=True, description="If true, return only open locally-filtered order/dispenser rows."),
+) -> Dict[str, Any]:
+    try:
+        return _adapter().get_orderbook(symbol=symbol, depth=depth, open_only=open_only)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "counterparty_orderbook_failed", "message": str(e)}) from e
+
+
 @router.get("/assets/metadata")
 def counterparty_assets_metadata(
     assets: str = Query(default="", description="Comma-separated Counterparty asset names"),

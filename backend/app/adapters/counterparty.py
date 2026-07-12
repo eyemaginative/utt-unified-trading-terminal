@@ -1531,6 +1531,181 @@ class CounterpartyAdapter:
             })
         return summaries
 
+
+    # ------------------------------------------------------------------
+    # Read-only orderbook helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _canonical_market_asset(asset: Any) -> str:
+        a = str(asset or "").strip().upper()
+        aliases = {
+            "BCY": "BITCRYSTALS",
+            "BITCRYSTAL": "BITCRYSTALS",
+            "BITCRYSTALS": "BITCRYSTALS",
+            "XCP": "XCP",
+            "BTC": "BTC",
+            "XBT": "BTC",
+        }
+        return aliases.get(a, a)
+
+    @classmethod
+    def _parse_orderbook_symbol(cls, symbol: Any) -> Tuple[str, str, str]:
+        raw = str(symbol or "").strip().upper().replace("/", "-").replace("_", "-")
+        if not raw or "-" not in raw:
+            raise ValueError("Counterparty orderbook symbol must be BASE-QUOTE, e.g. XCP-BTC or BITCRYSTALS-XCP")
+        parts = [p.strip() for p in raw.split("-") if p.strip()]
+        if len(parts) != 2:
+            raise ValueError("Counterparty orderbook symbol must contain exactly one base and quote asset")
+        base = cls._canonical_market_asset(parts[0])
+        quote_asset = cls._canonical_market_asset(parts[1])
+        if not base or not quote_asset:
+            raise ValueError("Counterparty orderbook base and quote are required")
+        if base == quote_asset:
+            raise ValueError("Counterparty orderbook base and quote must be different")
+        return base, quote_asset, f"{base}-{quote_asset}"
+
+    @staticmethod
+    def _orderbook_level_size(row: Dict[str, Any]) -> Optional[float]:
+        for key in ("base_remaining", "base_quantity", "give_remaining", "give_quantity", "size"):
+            n = CounterpartyAdapter._as_float(row.get(key))
+            if n is not None and n > 0:
+                return float(n)
+        return None
+
+    @classmethod
+    def _orderbook_level_from_order(cls, row: Dict[str, Any], *, side: str, quote_asset: str) -> Optional[Dict[str, Any]]:
+        price = cls._as_float(row.get("price"))
+        size = cls._orderbook_level_size(row)
+        if price is None or price <= 0 or size is None or size <= 0:
+            return None
+        return {
+            "price": float(price),
+            "size": float(size),
+            "side": side,
+            "quote_asset": quote_asset,
+            "source_type": "counterparty_order",
+            "source": row.get("source"),
+            "tx_hash": row.get("tx_hash"),
+            "status": row.get("status"),
+            "raw_order": row,
+        }
+
+    @classmethod
+    def _orderbook_level_from_dispenser(cls, row: Dict[str, Any], *, quote_asset: str = "BTC") -> Optional[Dict[str, Any]]:
+        price = cls._as_float(row.get("price_btc_per_unit")) or cls._as_float(row.get("price_btc"))
+        size = None
+        for key in ("give_remaining", "escrow_quantity", "give_quantity", "size"):
+            n = cls._as_float(row.get(key))
+            if n is not None and n > 0:
+                size = float(n)
+                break
+        if price is None or price <= 0 or size is None or size <= 0:
+            return None
+        return {
+            "price": float(price),
+            "size": float(size),
+            "side": "ask",
+            "quote_asset": quote_asset,
+            "source_type": "counterparty_dispenser",
+            "source": row.get("source"),
+            "tx_hash": row.get("tx_hash"),
+            "status": row.get("status"),
+            "satoshirate": row.get("satoshirate"),
+            "raw_dispenser": row,
+        }
+
+    def get_orderbook(self, symbol: str, depth: int = 25, open_only: bool = True) -> Dict[str, Any]:
+        """Build a read-only Counterparty order/dispenser book for BASE-QUOTE.
+
+        This does not compose, sign, submit, or broadcast transactions.  It is a
+        normalized view for the generic OrderBookWidget.  BTC-quoted asks can be
+        sourced from open dispensers; protocol order rows supply asset/asset
+        bids and asks when available.
+        """
+        base, quote_asset, symbol_canon = self._parse_orderbook_symbol(symbol)
+        d = max(1, min(int(depth or 25), 200))
+        lim = max(25, min(max(d * 4, 50), 500))
+
+        orders_result = self.get_asset_orders(base, limit=lim, open_only=open_only)
+        orders = orders_result.get("items") or []
+
+        bids: List[Dict[str, Any]] = []
+        asks: List[Dict[str, Any]] = []
+        for row in orders:
+            if open_only and not row.get("is_open"):
+                continue
+            q = self._canonical_market_asset(row.get("quote_asset"))
+            if q != quote_asset:
+                continue
+            side = str(row.get("side") or "").strip().lower()
+            if side == "bid":
+                lvl = self._orderbook_level_from_order(row, side="bid", quote_asset=quote_asset)
+                if lvl:
+                    bids.append(lvl)
+            elif side == "ask":
+                lvl = self._orderbook_level_from_order(row, side="ask", quote_asset=quote_asset)
+                if lvl:
+                    asks.append(lvl)
+
+        dispensers_result: Dict[str, Any] = {"ok": True, "items": [], "errors": []}
+        if quote_asset == "BTC":
+            dispensers_result = self.get_asset_dispensers(base, limit=lim, open_only=open_only)
+            for row in dispensers_result.get("items") or []:
+                if open_only and not row.get("is_open"):
+                    continue
+                lvl = self._orderbook_level_from_dispenser(row, quote_asset="BTC")
+                if lvl:
+                    asks.append(lvl)
+
+        bids = sorted(bids, key=lambda x: float(x.get("price") or 0), reverse=True)[:d]
+        asks = sorted(asks, key=lambda x: float(x.get("price") or 0))[:d]
+
+        base_decimals = self._asset_display_decimals(base)
+        quote_decimals = self._asset_display_decimals(quote_asset)
+        best_bid = bids[0]["price"] if bids else None
+        best_ask = asks[0]["price"] if asks else None
+        spread = (float(best_ask) - float(best_bid)) if best_bid is not None and best_ask is not None else None
+        spread_pct = (spread / float(best_bid) * 100.0) if spread is not None and best_bid not in (None, 0) else None
+
+        return {
+            "ok": True,
+            "venue": self.venue,
+            "symbol": symbol_canon,
+            "symbol_canon": symbol_canon,
+            "baseAsset": base,
+            "base_asset": base,
+            "quoteAsset": quote_asset,
+            "quote_asset": quote_asset,
+            "depth": d,
+            "bids": bids,
+            "asks": asks,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "spread_pct": spread_pct,
+            "priceDecimals": max(0, min(int(quote_decimals or 8), 12)),
+            "sizeDecimals": max(0, min(int(base_decimals or 0), 12)),
+            "sources": {
+                "orders": orders_result.get("source_path"),
+                "dispensers": dispensers_result.get("source_path"),
+            },
+            "errors": {
+                "orders": orders_result.get("errors") or [],
+                "dispensers": dispensers_result.get("errors") or [],
+            },
+            "counts": {
+                "orders": len(orders),
+                "bids": len(bids),
+                "asks": len(asks),
+                "dispensers": len(dispensers_result.get("items") or []),
+            },
+            "open_only": bool(open_only),
+            "read_only": True,
+            "signing": "not_available_in_this_tranche",
+            "compose": "later_unsigned_psbt_or_wallet_flow",
+        }
+
     # ------------------------------------------------------------------
     # Read endpoints
     # ------------------------------------------------------------------

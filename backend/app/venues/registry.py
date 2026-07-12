@@ -235,8 +235,8 @@ def _make_registry() -> Dict[str, VenueSpec]:
             enabled=_counterparty_enabled,
             adapter_factory=counterparty_factory,
             supports_trading=False,   # no direct signing/broadcasting in this tranche
-            supports_balances=False,  # wallet-address balances use /api/wallet_addresses, not venue balances
-            supports_orderbook=False, # protocol DEX/order reads will get a dedicated path
+            supports_balances=False,  # browser-wallet balances use /api/counterparty/address/{address}/balances
+            supports_orderbook=True,  # read-only protocol order/dispenser book via /api/counterparty/orderbook
             supports_markets=False,   # DEX metrics will get a dedicated source adapter later
         ),
 

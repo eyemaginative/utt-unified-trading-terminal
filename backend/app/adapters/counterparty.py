@@ -1779,6 +1779,76 @@ class CounterpartyAdapter:
                     return d
         return None
 
+    @staticmethod
+    def _compose_level_is_dispenser(row: Any) -> bool:
+        if not isinstance(row, dict):
+            return False
+        return bool(
+            "dispenser" in str(row.get("source_type") or "").strip().lower()
+            or isinstance(row.get("raw_dispenser"), dict)
+        )
+
+    @staticmethod
+    def _compose_level_oracle_address(row: Any) -> Optional[str]:
+        if not isinstance(row, dict):
+            return None
+        raw_dispenser = row.get("raw_dispenser") if isinstance(row.get("raw_dispenser"), dict) else {}
+        oracle = row.get("oracle_address") or raw_dispenser.get("oracle_address") or raw_dispenser.get("oracleAddress")
+        oracle_text = str(oracle or "").strip()
+        return oracle_text or None
+
+    def _compose_level_rejection_reasons(
+        self,
+        row: Any,
+        *,
+        side: str,
+        limit_price: Decimal,
+        quantity: Decimal,
+    ) -> List[str]:
+        """Return every reason a dispenser row is unsafe for this compose ticket."""
+        if not isinstance(row, dict):
+            return ["malformed_level"]
+
+        reasons: List[str] = []
+        px = self._compose_level_price_decimal(row)
+        size_dec = self._decimal_or_none(row.get("size"))
+        source = str(row.get("source") or "").strip()
+
+        if px is None or px <= 0 or size_dec is None or size_dec <= 0 or not source:
+            reasons.append("malformed_level")
+            return reasons
+
+        # Counterparty oracle dispensers require oracle-adjusted pricing rules.
+        # Until those semantics are implemented and verified, their raw book
+        # price must never be treated as a conventional fixed BTC price.
+        if self._compose_level_oracle_address(row):
+            reasons.append("oracle_price_unsupported")
+
+        trade_side = str(side or "").strip().lower()
+        if (trade_side == "buy" and px > limit_price) or (trade_side == "sell" and px < limit_price):
+            reasons.append("price_outside_limit")
+
+        if size_dec < quantity:
+            reasons.append("insufficient_level_size")
+
+        return reasons
+
+    def _compose_level_diagnostic_row(self, row: Any, *, index: int, reasons: List[str]) -> Dict[str, Any]:
+        if not isinstance(row, dict):
+            return {"index": index, "reasons": list(reasons or ["malformed_level"])}
+        px = self._compose_level_price_decimal(row)
+        size_dec = self._decimal_or_none(row.get("size"))
+        return {
+            "index": index,
+            "reasons": list(reasons or []),
+            "price": self._decimal_plain(px, max_places=18) if px is not None else None,
+            "size": self._decimal_plain(size_dec, max_places=18) if size_dec is not None else None,
+            "source_type": str(row.get("source_type") or "").strip() or None,
+            "source": str(row.get("source") or "").strip() or None,
+            "tx_hash": str(row.get("tx_hash") or "").strip() or None,
+            "oracle_address": self._compose_level_oracle_address(row),
+        }
+
     def _find_compose_book_level(
         self,
         *,
@@ -1787,52 +1857,104 @@ class CounterpartyAdapter:
         limit_price: Decimal,
         quantity: Decimal,
         depth: int = 100,
-    ) -> Optional[Dict[str, Any]]:
-        """Best-effort local book match for compose preview.
+    ) -> Dict[str, Any]:
+        """Find one safe conventional dispenser and explain every rejection.
 
-        The frontend normally passes the clicked orderbook row as selected_level.
-        Manual API smoke tests and some stale UI states may omit it.  In that
-        case, use the read-only orderbook to select an executable level so
-        BTC dispenser asks can still route to compose/dispense instead of
-        falling back to compose/order.
+        Automatic level selection exists only to recover a missing selected_level
+        for BTC-quoted BUY dispenser previews.  Generic order rows continue to
+        use compose/order and are never silently reclassified as dispensers.
         """
         sym = str(symbol or "").strip().upper()
         trade_side = str(side or "").strip().lower()
+        diagnostics: Dict[str, Any] = {
+            "attempted": True,
+            "symbol": sym or None,
+            "side": trade_side or None,
+            "limit_price": self._decimal_plain(limit_price, max_places=18),
+            "quantity": self._decimal_plain(quantity, max_places=18),
+            "book_side": "asks" if trade_side == "buy" else "bids",
+            "row_count": 0,
+            "dispenser_row_count": 0,
+            "ignored_non_dispenser_count": 0,
+            "eligible_count": 0,
+            "rejected_count": 0,
+            "rejections": [],
+            "selected": None,
+            "reason": None,
+        }
+
         if not sym or trade_side not in {"buy", "sell"}:
-            return None
+            diagnostics["reason"] = "invalid_symbol_or_side"
+            return {"selected_level": None, "diagnostics": diagnostics}
+
+        try:
+            _base_asset, quote_asset, _symbol_canon = self._parse_orderbook_symbol(sym)
+        except Exception as e:
+            diagnostics["reason"] = "symbol_parse_failed"
+            diagnostics["error"] = str(e)[:300]
+            return {"selected_level": None, "diagnostics": diagnostics}
+
+        # Dispensers are executable only as BTC-quoted BUY asks in this tranche.
+        if trade_side != "buy" or quote_asset != "BTC":
+            diagnostics["reason"] = "not_btc_buy_dispenser_shape"
+            return {"selected_level": None, "diagnostics": diagnostics}
+
         try:
             book = self.get_orderbook(symbol=sym, depth=max(1, min(int(depth or 100), 200)), open_only=True)
-        except Exception:
-            return None
+        except Exception as e:
+            diagnostics["reason"] = "orderbook_unavailable"
+            diagnostics["error"] = str(e)[:300]
+            return {"selected_level": None, "diagnostics": diagnostics}
+
         rows = book.get("asks") if trade_side == "buy" else book.get("bids")
         if not isinstance(rows, list) or not rows:
-            return None
+            diagnostics["reason"] = "no_book_rows"
+            return {"selected_level": None, "diagnostics": diagnostics}
 
-        candidates: List[Tuple[int, Decimal, int, Dict[str, Any]]] = []
+        diagnostics["row_count"] = len(rows)
+        candidates: List[Tuple[Decimal, int, Dict[str, Any]]] = []
+        rejected: List[Dict[str, Any]] = []
+
         for idx, row in enumerate(rows):
-            if not isinstance(row, dict):
+            if not self._compose_level_is_dispenser(row):
+                diagnostics["ignored_non_dispenser_count"] += 1
                 continue
+
+            diagnostics["dispenser_row_count"] += 1
+            reasons = self._compose_level_rejection_reasons(
+                row,
+                side=trade_side,
+                limit_price=limit_price,
+                quantity=quantity,
+            )
+            if reasons:
+                rejected.append(self._compose_level_diagnostic_row(row, index=idx, reasons=reasons))
+                continue
+
             px = self._compose_level_price_decimal(row)
-            if px is None or px <= 0:
+            if px is None:
+                rejected.append(self._compose_level_diagnostic_row(row, index=idx, reasons=["malformed_level"]))
                 continue
-            if trade_side == "buy" and px > limit_price:
-                continue
-            if trade_side == "sell" and px < limit_price:
-                continue
-            size_dec = self._decimal_or_none(row.get("size"))
-            size_ok = 1 if (size_dec is not None and size_dec >= quantity) else 0
-            is_dispenser = 1 if "dispenser" in str(row.get("source_type") or "").lower() or isinstance(row.get("raw_dispenser"), dict) else 0
-            # For BUY choose lowest executable ask. For SELL choose highest executable bid.
-            price_rank = px if trade_side == "buy" else -px
-            # Prefer levels large enough for the requested qty, then dispenser rows,
-            # then best executable price, preserving original order as final tie-break.
-            candidates.append((-size_ok, -is_dispenser, price_rank, idx, row))
+
+            # BUY chooses the lowest qualifying conventional dispenser ask.
+            candidates.append((px, idx, row))
+
+        diagnostics["eligible_count"] = len(candidates)
+        diagnostics["rejected_count"] = len(rejected)
+        diagnostics["rejections"] = rejected
+
         if not candidates:
-            return None
-        candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-        chosen = dict(candidates[0][4])
+            diagnostics["reason"] = "no_safe_executable_dispenser"
+            return {"selected_level": None, "diagnostics": diagnostics}
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        selected_price, selected_index, selected_row = candidates[0]
+        chosen = dict(selected_row)
         chosen.setdefault("selection_source", "auto_orderbook_match")
-        return chosen
+        diagnostics["selected"] = self._compose_level_diagnostic_row(chosen, index=selected_index, reasons=[])
+        diagnostics["selected"]["price"] = self._decimal_plain(selected_price, max_places=18)
+        diagnostics["reason"] = "selected_safe_executable_dispenser"
+        return {"selected_level": chosen, "diagnostics": diagnostics}
 
     def _compose_try_candidates(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
         errors: List[Dict[str, Any]] = []
@@ -1892,13 +2014,38 @@ class CounterpartyAdapter:
         btc_sats = self._display_quantity_to_atomic("BTC", quote_qty_dec) if quote_asset == "BTC" else None
         level = self._selected_counterparty_book_row(selected_level)
         selected_level_source = "provided" if level else "none"
+        provided_level_validation: Optional[Dict[str, Any]] = None
+        auto_selection_diagnostics: Dict[str, Any] = {
+            "attempted": False,
+            "reason": "selected_level_provided" if level else "not_started",
+            "rejections": [],
+        }
+
+        # Enforce the same safety rules for a dispenser row supplied by the UI.
+        # A clicked oracle-backed or undersized dispenser must not bypass the
+        # backend auto-selection guard and reach compose/dispense.
+        if level and trade_side == "buy" and quote_asset == "BTC" and self._compose_level_is_dispenser(level):
+            provided_reasons = self._compose_level_rejection_reasons(
+                level,
+                side=trade_side,
+                limit_price=px_dec,
+                quantity=qty_dec,
+            )
+            provided_level_validation = self._compose_level_diagnostic_row(level, index=0, reasons=provided_reasons)
+            provided_level_validation["accepted"] = not bool(provided_reasons)
+            if provided_reasons:
+                level = {}
+                selected_level_source = "none"
+
         if not level:
-            auto_level = self._find_compose_book_level(
+            auto_match = self._find_compose_book_level(
                 symbol=symbol_canon,
                 side=trade_side,
                 limit_price=px_dec,
                 quantity=qty_dec,
             )
+            auto_selection_diagnostics = auto_match.get("diagnostics") if isinstance(auto_match.get("diagnostics"), dict) else auto_selection_diagnostics
+            auto_level = auto_match.get("selected_level") if isinstance(auto_match.get("selected_level"), dict) else None
             if auto_level:
                 level = auto_level
                 selected_level_source = "auto_orderbook_match"
@@ -1914,9 +2061,19 @@ class CounterpartyAdapter:
             "Review source address, assets, quantities, fee behavior, and selected order/dispenser details before enabling wallet signing.",
         ]
 
+        if provided_level_validation and provided_level_validation.get("accepted") is False:
+            rejected_reasons = ", ".join(provided_level_validation.get("reasons") or []) or "unsafe_level"
+            warnings.append(
+                f"The supplied Counterparty dispenser level was rejected for compose execution ({rejected_reasons}); UTT searched for a safe conventional replacement."
+            )
+
         if selected_level_source == "auto_orderbook_match":
             warnings.append(
-                "No selected book level was supplied; UTT auto-selected a current executable Counterparty book level for compose preview."
+                "No eligible supplied book level was available; UTT auto-selected a current full-size, non-oracle Counterparty dispenser for compose preview."
+            )
+        elif auto_selection_diagnostics.get("attempted") and auto_selection_diagnostics.get("reason") == "no_safe_executable_dispenser":
+            warnings.append(
+                "No full-size, non-oracle Counterparty dispenser satisfied this ticket limit; UTT used the safe compose/order preview fallback."
             )
 
         if dispenser_like and level_size_dec is not None and qty_dec > level_size_dec:
@@ -2032,6 +2189,8 @@ class CounterpartyAdapter:
             "get_quantity_atomic": get_quantity_atomic,
             "selected_level": level or None,
             "selected_level_source": selected_level_source,
+            "provided_level_validation": provided_level_validation,
+            "auto_selection_diagnostics": auto_selection_diagnostics,
             "candidate_requests": candidates,
             "attempted_upstream": bool(attempt_upstream),
             "compose_ok": bool(compose_probe.get("ok")),

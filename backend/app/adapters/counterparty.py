@@ -1827,7 +1827,19 @@ class CounterpartyAdapter:
         level = self._selected_counterparty_book_row(selected_level)
         level_source_type = str(level.get("source_type") or "").strip().lower()
         level_source = str(level.get("source") or "").strip()
+        level_tx_hash = str(level.get("tx_hash") or "").strip()
+        level_size_dec = self._decimal_or_none(level.get("size"))
         dispenser_like = trade_side == "buy" and quote_asset == "BTC" and ("dispenser" in level_source_type or bool(level.get("raw_dispenser")))
+
+        warnings = [
+            "Unsigned compose preview only. UTT did not sign or broadcast this transaction.",
+            "Review source address, assets, quantities, fee behavior, and selected order/dispenser details before enabling wallet signing.",
+        ]
+
+        if dispenser_like and level_size_dec is not None and qty_dec > level_size_dec:
+            warnings.append(
+                f"Requested quantity {self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base))} {base} exceeds selected dispenser level size {self._decimal_plain(level_size_dec, max_places=self._asset_display_decimals(base))} {base}. Compose preview may be rejected upstream unless quantity is reduced."
+            )
 
         if trade_side == "buy":
             give_asset = quote_asset
@@ -1849,26 +1861,51 @@ class CounterpartyAdapter:
         candidates: List[Dict[str, Any]] = []
 
         if compose_kind == "dispenser_dispense":
-            destination = level_source
-            if not destination:
+            dispenser_ref = level_source
+            if not dispenser_ref:
                 compose_kind = "order"
             else:
-                dispense_params = {
-                    "destination": destination,
-                    "dispenser": destination,
-                    "asset": base,
-                    "quantity": base_atomic,
-                    "quantity_normalized": self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base)),
-                    "btc_amount": btc_sats,
-                    "satoshirate": level.get("satoshirate"),
+                # Counterparty Core v2 /compose/dispense accepts a narrow parameter set.
+                # The prior preview sent extra human/audit fields (asset, btc_amount,
+                # destination, quantity_normalized, satoshirate), and Core rejected them
+                # as unrecognized.  Keep the upstream request minimal and preserve the
+                # richer audit fields separately under preview_params.
+                #
+                # For a dispenser dispense, quantity is the BTC amount to send to the
+                # dispenser in satoshis.  The received asset quantity remains visible
+                # in preview_params/get_quantity for operator review.
+                compact_dispense_params = {
+                    "dispenser": dispenser_ref,
+                    "quantity": btc_sats,
                 }
-                compact_dispense_params = {k: v for k, v in dispense_params.items() if v not in (None, "")}
-                for path in (
-                    f"/v2/addresses/{escaped_source}/compose/dispense",
-                    f"/v2/addresses/{escaped_source}/compose/dispenser/dispense",
-                    f"/api/addresses/{escaped_source}/compose/dispense",
-                ):
-                    candidates.append({"method": "GET", "path": path, "params": compact_dispense_params})
+                compact_dispense_params = {k: v for k, v in compact_dispense_params.items() if v not in (None, "")}
+                preview_params = {
+                    "dispenser": dispenser_ref,
+                    "dispenser_tx_hash": level_tx_hash or None,
+                    "asset": base,
+                    "asset_quantity": base_atomic,
+                    "asset_quantity_normalized": self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base)),
+                    "btc_amount": btc_sats,
+                    "btc_amount_normalized": self._decimal_plain(quote_qty_dec, max_places=8),
+                    "satoshirate": level.get("satoshirate"),
+                    "selected_level_size": self._decimal_plain(level_size_dec, max_places=self._asset_display_decimals(base)) if level_size_dec is not None else None,
+                }
+                preview_params = {k: v for k, v in preview_params.items() if v not in (None, "")}
+                candidates.append({
+                    "method": "GET",
+                    "path": f"/v2/addresses/{escaped_source}/compose/dispense",
+                    "params": compact_dispense_params,
+                    "preview_params": preview_params,
+                })
+                if level_tx_hash:
+                    tx_hash_params = dict(compact_dispense_params)
+                    tx_hash_params["dispenser"] = level_tx_hash
+                    candidates.append({
+                        "method": "GET",
+                        "path": f"/v2/addresses/{escaped_source}/compose/dispense",
+                        "params": tx_hash_params,
+                        "preview_params": {**preview_params, "dispenser": level_tx_hash, "dispenser_address": dispenser_ref},
+                    })
 
         if compose_kind == "order":
             order_params = {
@@ -1923,10 +1960,7 @@ class CounterpartyAdapter:
             "broadcast": False,
             "signing": "not_performed",
             "broadcasting": "not_performed",
-            "warnings": [
-                "Unsigned compose preview only. UTT did not sign or broadcast this transaction.",
-                "Review source address, assets, quantities, fee behavior, and selected order/dispenser details before enabling wallet signing.",
-            ],
+            "warnings": warnings,
         }
 
     # ------------------------------------------------------------------

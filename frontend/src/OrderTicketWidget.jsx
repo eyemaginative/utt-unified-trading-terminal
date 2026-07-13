@@ -22,6 +22,26 @@ const HYDRATION_ROUTER_BOOK_SIDE_TOLERANCE_BPS = 2;
 
 const LS_OT_COUNTERPARTY_UNISAT_ADDR = "utt_nft_unisat_address_v1";
 const LS_OT_COUNTERPARTY_BTC_BALANCE = "utt_counterparty_unisat_btc_balance_v1";
+const LS_OT_COUNTERPARTY_FEE_TIER = "utt_counterparty_fee_tier_v1";
+
+const COUNTERPARTY_FEE_TIERS = {
+  slow: { label: "Slow", blocks: 18, eta: "~3 hours" },
+  normal: { label: "Normal", blocks: 6, eta: "~1 hour" },
+  fast: { label: "Fast", blocks: 2, eta: "~20 minutes" },
+};
+
+function normalizeCounterpartyFeeTier(value) {
+  const v = String(value || "normal").trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(COUNTERPARTY_FEE_TIERS, v) ? v : "normal";
+}
+
+function readCounterpartyFeeTier() {
+  try {
+    return normalizeCounterpartyFeeTier(localStorage.getItem(LS_OT_COUNTERPARTY_FEE_TIER) || "normal");
+  } catch {
+    return "normal";
+  }
+}
 
 function isCounterpartyVenueKey(value) {
   const v = String(value || "").toLowerCase().trim();
@@ -151,10 +171,15 @@ function counterpartySigningHandoffView(payload) {
   if (!handoff || typeof handoff !== "object") return null;
   const psbtHex = counterpartyPsbtHexOrNull(handoff?.psbt_hex);
   const fundingBlocked = payload?.funding_requirements?.insufficient_funds_detected === true;
+  const feeStatus = String(payload?.funding_requirements?.network_fee_status || "").trim().toLowerCase();
+  const feeReady = feeStatus === "known" || feeStatus === "estimated";
   const alreadySigned = payload?.signed === true || payload?.wallet_signing_result?.signed === true;
+  const baseReason = String(handoff?.status_reason || "").trim();
   return {
     status: String(handoff?.status || "unknown").trim(),
-    reason: String(handoff?.status_reason || "").trim(),
+    reason: !feeReady && handoff?.signable_with_unisat === true
+      ? "Signing is blocked until Counterparty Core returns a transaction-specific Bitcoin fee estimate."
+      : baseReason,
     format: String(handoff?.payload_format || "unknown").trim(),
     sourceAddress: String(handoff?.source_address || payload?.source_address || "").trim(),
     sourcePath: String(handoff?.payload_source_path || "").trim(),
@@ -164,9 +189,12 @@ function counterpartySigningHandoffView(payload) {
       handoff?.signable_with_unisat === true &&
       psbtHex &&
       !fundingBlocked &&
+      feeReady &&
       !alreadySigned
     ),
     fundingBlocked,
+    feeReady,
+    feeStatus,
     alreadySigned,
     broadcastEnabled: handoff?.broadcast_enabled === true,
   };
@@ -212,7 +240,9 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
   const tradeValueSats = counterpartySatoshisOrNull(funding?.trade_value_satoshis);
   const immediatePaymentSats = counterpartySatoshisOrNull(funding?.immediate_payment_satoshis);
   const feeSats = counterpartySatoshisOrNull(funding?.network_fee_satoshis);
-  const feeKnown = String(funding?.network_fee_status || "").toLowerCase() === "known" && feeSats !== null;
+  const feeStatus = String(funding?.network_fee_status || "").toLowerCase();
+  const feeKnown = (feeStatus === "known" || feeStatus === "estimated") && feeSats !== null;
+  const feeEstimated = feeStatus === "estimated" && feeSats !== null;
   const conservativeRequiredSats = counterpartySatoshisOrNull(funding?.conservative_balance_requirement_satoshis);
   const requiredSats = conservativeRequiredSats !== null
     ? conservativeRequiredSats
@@ -260,8 +290,19 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
     immediatePaymentSats,
     immediatePaymentBtc: counterpartyBtcFromSatoshis(immediatePaymentSats),
     feeKnown,
+    feeEstimated,
+    feeStatus,
     feeSats,
     feeBtc: counterpartyBtcFromSatoshis(feeSats),
+    feeTier: normalizeCounterpartyFeeTier(funding?.fee_tier || payload?.fee_policy?.fee_tier || "normal"),
+    feeTierLabel: String(funding?.fee_tier_label || payload?.fee_policy?.label || "").trim(),
+    confirmationTargetBlocks: otCounterpartyFiniteNumberOrNull(
+      funding?.confirmation_target_blocks ?? payload?.fee_policy?.confirmation_target_blocks
+    ),
+    effectiveSatPerVbyte: otCounterpartyFiniteNumberOrNull(funding?.effective_sat_per_vbyte),
+    estimatedVsize: otCounterpartyFiniteNumberOrNull(funding?.estimated_vsize),
+    estimatedAdjustedVsize: otCounterpartyFiniteNumberOrNull(funding?.estimated_adjusted_vsize),
+    feeEstimator: String(funding?.fee_estimator || payload?.fee_policy?.estimator || "").trim(),
     requiredSats,
     requiredBtc: counterpartyBtcFromSatoshis(requiredSats),
     remainingAfterTradeSats,
@@ -2352,11 +2393,15 @@ export default function OrderTicketWidget({
   const [counterpartyBookError, setCounterpartyBookError] = useState(null);
   const [counterpartyBtcBalanceMeta, setCounterpartyBtcBalanceMeta] = useState(null);
   const [counterpartySigningPending, setCounterpartySigningPending] = useState(false);
+  const [counterpartyFeeTier, setCounterpartyFeeTier] = useState(() => readCounterpartyFeeTier());
   const counterpartyBookReqRef = useRef(0);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
   useEffect(() => { setPreferredHydrationRouteMode(preferredHydrationRouteMode); }, [preferredHydrationRouteMode]);
   useEffect(() => { setPreferredPolkadotWalletKey(preferredPolkadotWallet); }, [preferredPolkadotWallet]);
+  useEffect(() => {
+    try { localStorage.setItem(LS_OT_COUNTERPARTY_FEE_TIER, normalizeCounterpartyFeeTier(counterpartyFeeTier)); } catch {}
+  }, [counterpartyFeeTier]);
   useEffect(() => {
     if (!isPolkadotDexVenue) return;
     const bump = () => setPolkadotWalletScanNonce((x) => x + 1);
@@ -5836,7 +5881,15 @@ async function previewCounterpartyCompose() {
   setSubmitOk(null);
   openSubmitResultModal(
     "info",
-    { ok: true, venue: "counterparty", stage: "compose_preview", symbol: otSymbol, side, read_only: true },
+    {
+      ok: true,
+      venue: "counterparty",
+      stage: "compose_preview",
+      symbol: otSymbol,
+      side,
+      fee_tier: normalizeCounterpartyFeeTier(counterpartyFeeTier),
+      read_only: true,
+    },
     "Building Counterparty Compose Preview"
   );
 
@@ -5858,6 +5911,7 @@ async function previewCounterpartyCompose() {
       total_quote: notional === null ? null : String(notional),
       selected_level: selectedLevel,
       attempt_upstream: true,
+      fee_tier: normalizeCounterpartyFeeTier(counterpartyFeeTier),
     };
 
     const base = String(apiBase || "").replace(/\/+$/, "");
@@ -7205,10 +7259,26 @@ async function submitLimitOrder() {
             >
               <span style={{ fontWeight: 800 }}>Counterparty / Bitcoin</span>
               <span style={{ ...safeMuted, fontSize: 11 }}>
-                Read-only preview. Uses UniSat for BTC and /api/counterparty/address balances for XCP / BITCRYSTALS.
+                Compose preview + explicit UniSat PSBT signing. Broadcast remains disabled.
               </span>
               <span style={{ ...safeMuted, fontSize: 11 }}>
                 Book: {counterpartyBookLoading ? "loading…" : counterpartyBookError ? "unavailable" : `${counterpartyBookRows(counterpartyBook, "bids").length} bids / ${counterpartyBookRows(counterpartyBook, "asks").length} asks`}
+              </span>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap" }}>
+                <span style={{ ...safeMuted, fontSize: 11 }}>Bitcoin fee</span>
+                <select
+                  style={{ ...darkSelectStyle, minWidth: 132 }}
+                  value={normalizeCounterpartyFeeTier(counterpartyFeeTier)}
+                  onChange={(e) => setCounterpartyFeeTier(normalizeCounterpartyFeeTier(e.target.value))}
+                  title="Counterparty Core estimates sat/vB for this confirmation target, then calculates the transaction-specific fee from selected UTXOs and adjusted virtual size."
+                >
+                  <option value="slow">Slow · ~18 blocks</option>
+                  <option value="normal">Normal · ~6 blocks</option>
+                  <option value="fast">Fast · ~2 blocks</option>
+                </select>
+              </label>
+              <span style={{ ...safeMuted, fontSize: 10.5 }}>
+                {COUNTERPARTY_FEE_TIERS[normalizeCounterpartyFeeTier(counterpartyFeeTier)]?.eta} target · not guaranteed
               </span>
             </div>
           )}
@@ -7873,13 +7943,44 @@ async function submitLimitOrder() {
                             : "Not applicable for this non-BTC quote"}
                       </div>
 
+                      <div style={{ color: "#a9a9a9" }}>Bitcoin fee policy</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : `${counterpartySubmitFunding.feeTierLabel || COUNTERPARTY_FEE_TIERS[counterpartySubmitFunding.feeTier]?.label || "Normal"} · target ${
+                              counterpartySubmitFunding.confirmationTargetBlocks ?? COUNTERPARTY_FEE_TIERS[counterpartySubmitFunding.feeTier]?.blocks ?? 6
+                            } blocks`}
+                      </div>
+
                       <div style={{ color: "#a9a9a9" }}>Bitcoin network fee</div>
                       <div>
                         {hideTableData
                           ? "••••"
                           : counterpartySubmitFunding.feeKnown
-                            ? `${counterpartyFormatBtc(counterpartySubmitFunding.feeBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.feeSats)})`
-                            : "Unknown — wallet/Core estimate not returned"}
+                            ? `${counterpartySubmitFunding.feeEstimated ? "Estimated " : ""}${counterpartyFormatBtc(counterpartySubmitFunding.feeBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.feeSats)})`
+                            : "Unavailable — compose did not return a verbose fee result"}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Effective fee rate</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitFunding.effectiveSatPerVbyte !== null
+                            ? `${counterpartySubmitFunding.effectiveSatPerVbyte.toLocaleString(undefined, { maximumFractionDigits: 4 })} sat/vB`
+                            : "Unavailable"}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Estimated signed size</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitFunding.estimatedAdjustedVsize !== null
+                            ? `${Math.trunc(counterpartySubmitFunding.estimatedAdjustedVsize).toLocaleString()} adjusted vB${
+                                counterpartySubmitFunding.estimatedVsize !== null
+                                  ? ` · ${Math.trunc(counterpartySubmitFunding.estimatedVsize).toLocaleString()} vB`
+                                  : ""
+                              }`
+                            : "Unavailable"}
                       </div>
 
                       <div style={{ color: "#a9a9a9" }}>Conservative requirement</div>

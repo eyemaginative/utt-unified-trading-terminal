@@ -25,6 +25,23 @@ class CounterpartyAdapter:
 
     venue = "counterparty"
     _MARKET_CONTEXT_CACHE: Dict[str, Dict[str, Any]] = {}
+    _FEE_TIERS: Dict[str, Dict[str, Any]] = {
+        "slow": {
+            "confirmation_target_blocks": 18,
+            "label": "Slow",
+            "target_note": "Target approximately 18 blocks; confirmation time is not guaranteed.",
+        },
+        "normal": {
+            "confirmation_target_blocks": 6,
+            "label": "Normal",
+            "target_note": "Target approximately 6 blocks; confirmation time is not guaranteed.",
+        },
+        "fast": {
+            "confirmation_target_blocks": 2,
+            "label": "Fast",
+            "target_note": "Target approximately 2 blocks; confirmation time is not guaranteed.",
+        },
+    }
 
     def __init__(self, base_url: Optional[str] = None, timeout_s: Optional[float] = None):
         fn = getattr(settings, "counterparty_effective_base_url", None)
@@ -2097,6 +2114,64 @@ class CounterpartyAdapter:
         }
 
     @classmethod
+    def _compose_fee_policy(cls, fee_tier: Any) -> Dict[str, Any]:
+        tier = str(fee_tier or "normal").strip().lower()
+        if tier not in cls._FEE_TIERS:
+            raise ValueError("Counterparty fee_tier must be one of: slow, normal, fast")
+        row = cls._FEE_TIERS[tier]
+        return {
+            "fee_tier": tier,
+            "label": row.get("label") or tier.title(),
+            "confirmation_target_blocks": int(row.get("confirmation_target_blocks") or 6),
+            "target_note": str(row.get("target_note") or "").strip(),
+            "estimator": "counterparty_core_bitcoin_backend",
+            "compose_parameter": "confirmation_target",
+            "fee_rate_unit": "sat/vB",
+            "read_only": True,
+        }
+
+    @classmethod
+    def _compose_size_info(cls, payload: Any) -> Dict[str, Any]:
+        """Extract Counterparty Core's signed-size estimate from a verbose compose result."""
+        found: Optional[Dict[str, Any]] = None
+
+        def walk(value: Any, path: str, depth: int) -> None:
+            nonlocal found
+            if found is not None or depth > 8:
+                return
+            if isinstance(value, dict):
+                size_row = value.get("signed_tx_estimated_size")
+                if isinstance(size_row, dict):
+                    vsize = cls._as_int(size_row.get("vsize"))
+                    adjusted_vsize = cls._as_int(size_row.get("adjusted_vsize"))
+                    sigops_count = cls._as_int(size_row.get("sigops_count"))
+                    if vsize is not None or adjusted_vsize is not None:
+                        found = {
+                            "vsize": vsize,
+                            "adjusted_vsize": adjusted_vsize,
+                            "sigops_count": sigops_count,
+                            "source": f"{path}.signed_tx_estimated_size" if path else "signed_tx_estimated_size",
+                        }
+                        return
+                for raw_key, child in value.items():
+                    walk(child, f"{path}.{raw_key}" if path else str(raw_key), depth + 1)
+                    if found is not None:
+                        return
+            elif isinstance(value, list):
+                for idx, child in enumerate(value[:100]):
+                    walk(child, f"{path}[{idx}]", depth + 1)
+                    if found is not None:
+                        return
+
+        walk(payload, "", 0)
+        return found or {
+            "vsize": None,
+            "adjusted_vsize": None,
+            "sigops_count": None,
+            "source": None,
+        }
+
+    @classmethod
     def _compose_network_fee_info(cls, payload: Any) -> Dict[str, Any]:
         """Extract a Bitcoin network fee only from explicitly named fee fields.
 
@@ -2105,6 +2180,9 @@ class CounterpartyAdapter:
         fee_required/fee_provided are not Bitcoin miner fees.
         """
         satoshi_keys = {
+            # Counterparty Core API v2 returns btc_fee as an integer number of
+            # satoshis in verbose compose results.
+            "btc_fee",
             "btc_fee_satoshis",
             "bitcoin_fee_satoshis",
             "miner_fee_satoshis",
@@ -2119,7 +2197,7 @@ class CounterpartyAdapter:
             "tx_fee_sats",
         }
         btc_keys = {
-            "btc_fee",
+            "btc_fee_normalized",
             "bitcoin_fee",
             "miner_fee_btc",
             "network_fee_btc",
@@ -2214,6 +2292,7 @@ class CounterpartyAdapter:
         immediate_btc_payment_satoshis: Optional[int],
         attempt_upstream: bool,
         compose_probe: Dict[str, Any],
+        fee_policy: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Return normalized read-only funding information for UI presentation."""
         quote_is_btc = str(quote_asset or "").strip().upper() == "BTC"
@@ -2224,10 +2303,18 @@ class CounterpartyAdapter:
             else 0
         )
 
-        fee_info = self._compose_network_fee_info(compose_probe.get("raw") if compose_probe.get("ok") else None)
+        compose_payload = compose_probe.get("raw") if compose_probe.get("ok") else None
+        fee_info = self._compose_network_fee_info(compose_payload)
+        size_info = self._compose_size_info(compose_payload)
         fee_sats = fee_info.get("satoshis")
         fee_known = fee_sats is not None
         fee_sats_int = int(fee_sats) if fee_known else None
+        adjusted_vsize = self._as_int(size_info.get("adjusted_vsize"))
+        virtual_size = self._as_int(size_info.get("vsize"))
+        sigops_count = self._as_int(size_info.get("sigops_count"))
+        effective_sat_per_vbyte = None
+        if fee_sats_int is not None and adjusted_vsize not in (None, 0):
+            effective_sat_per_vbyte = float(Decimal(fee_sats_int) / Decimal(adjusted_vsize))
 
         # For dispenser purchases, the target BTC amount is paid by this
         # transaction. For protocol orders, the BTC amount is a trade
@@ -2247,16 +2334,16 @@ class CounterpartyAdapter:
             status = "insufficient_target_funds"
             status_reason = "Counterparty Core reported that the source address could not fund the target BTC amount."
         elif not attempt_upstream:
-            status = "preview_only_fee_unknown" if not fee_known else "preview_only_fee_known"
-            status_reason = "Upstream compose was not attempted; no authoritative miner-fee result is available."
+            status = "preview_only_fee_unknown" if not fee_known else "preview_only_fee_estimated"
+            status_reason = "Upstream compose was not attempted; no transaction-specific miner-fee estimate is available."
         elif compose_ok and fee_known:
-            status = "compose_ready_fee_known"
-            status_reason = "Unsigned compose succeeded and an explicit Bitcoin network fee was returned."
+            status = "compose_ready_fee_estimated"
+            status_reason = "Counterparty Core composed the unsigned transaction and estimated its miner fee from selected UTXOs and adjusted virtual size."
         elif compose_ok:
             status = "compose_ready_fee_unknown"
-            status_reason = "Unsigned compose succeeded, but Counterparty Core did not return an explicit Bitcoin network fee."
+            status_reason = "Unsigned compose succeeded, but Counterparty Core did not return an explicit Bitcoin network-fee estimate."
         else:
-            status = "compose_failed_fee_unknown" if not fee_known else "compose_failed_fee_known"
+            status = "compose_failed_fee_unknown" if not fee_known else "compose_failed_fee_estimated"
             status_reason = "Unsigned compose did not succeed; review compose_errors for the protocol-level cause."
 
         return {
@@ -2266,7 +2353,7 @@ class CounterpartyAdapter:
             "trade_value_btc": self._decimal_plain(quote_quantity, max_places=8) if quote_is_btc else None,
             "immediate_payment_satoshis": immediate_sats,
             "immediate_payment_btc": self._decimal_plain(Decimal(immediate_sats) / Decimal(100000000), max_places=8),
-            "network_fee_status": "known" if fee_known else "unknown",
+            "network_fee_status": "estimated" if fee_known else "unknown",
             "network_fee_satoshis": fee_sats_int,
             "network_fee_btc": (
                 self._decimal_plain(Decimal(fee_sats_int) / Decimal(100000000), max_places=8)
@@ -2274,6 +2361,20 @@ class CounterpartyAdapter:
                 else None
             ),
             "network_fee_source": fee_info.get("source"),
+            "fee_tier": fee_policy.get("fee_tier"),
+            "fee_tier_label": fee_policy.get("label"),
+            "confirmation_target_blocks": fee_policy.get("confirmation_target_blocks"),
+            "fee_estimator": fee_policy.get("estimator"),
+            "fee_rate_unit": fee_policy.get("fee_rate_unit"),
+            "effective_sat_per_vbyte": (
+                round(float(effective_sat_per_vbyte), 8)
+                if effective_sat_per_vbyte is not None
+                else None
+            ),
+            "estimated_vsize": virtual_size,
+            "estimated_adjusted_vsize": adjusted_vsize,
+            "estimated_sigops_count": sigops_count,
+            "size_estimate_source": size_info.get("source"),
             "known_minimum_required_satoshis": known_minimum_sats,
             "known_minimum_required_btc": self._decimal_plain(Decimal(known_minimum_sats) / Decimal(100000000), max_places=8),
             "estimated_total_required_satoshis": estimated_total_sats,
@@ -2296,9 +2397,9 @@ class CounterpartyAdapter:
             "status": status,
             "status_reason": status_reason,
             "fee_note": (
-                "Bitcoin network fee was explicitly returned by Counterparty Core."
+                "Counterparty Core estimated this fee from the selected UTXOs and adjusted virtual size. The final signed transaction can differ by a few satoshis because DER signature sizes vary."
                 if fee_known
-                else "Bitcoin network fee is unknown until Counterparty Core or the signing wallet provides an explicit estimate."
+                else "No transaction-specific fee is available because compose did not return a verbose transaction result. The selected confirmation target remains visible for review."
             ),
             "read_only": True,
             "wallet_balance_not_mutated": True,
@@ -2314,6 +2415,7 @@ class CounterpartyAdapter:
         limit_price: Any,
         selected_level: Optional[Dict[str, Any]] = None,
         attempt_upstream: bool = True,
+        fee_tier: Any = "normal",
     ) -> Dict[str, Any]:
         """Build a read-only unsigned Counterparty compose preview.
 
@@ -2336,6 +2438,8 @@ class CounterpartyAdapter:
             raise ValueError("quantity must be positive")
         if px_dec is None or px_dec <= 0:
             raise ValueError("limit_price must be positive")
+
+        fee_policy = self._compose_fee_policy(fee_tier)
 
         quote_qty_dec = qty_dec * px_dec
         base_atomic = self._display_quantity_to_atomic(base, qty_dec)
@@ -2388,6 +2492,11 @@ class CounterpartyAdapter:
         warnings = [
             "Unsigned compose preview only. UTT did not sign or broadcast this transaction.",
             "Review source address, assets, quantities, fee behavior, and selected order/dispenser details before enabling wallet signing.",
+            (
+                f"Bitcoin fee tier {fee_policy.get('label')} targets approximately "
+                f"{fee_policy.get('confirmation_target_blocks')} blocks. Counterparty Core calculates the "
+                "transaction-specific fee from selected UTXOs and adjusted virtual size when compose succeeds."
+            ),
         ]
 
         if provided_level_validation and provided_level_validation.get("accepted") is False:
@@ -2428,6 +2537,16 @@ class CounterpartyAdapter:
         compose_kind = "dispenser_dispense" if dispenser_like else "order"
         escaped_source = quote(source, safe="")
         candidates: List[Dict[str, Any]] = []
+        construct_fee_params = {
+            # Counterparty Core v2 uses confirmation_target to obtain a current
+            # sat/vB estimate from its Bitcoin backend, then calculates the
+            # transaction-specific fee from selected UTXOs and adjusted vsize.
+            "confirmation_target": fee_policy.get("confirmation_target_blocks"),
+            # Preview compose must not temporarily reserve/lock the source UTXOs.
+            "disable_utxo_locks": True,
+            # Verbose compose is required for btc_fee, size diagnostics, and PSBT.
+            "verbose": True,
+        }
 
         if compose_kind == "dispenser_dispense":
             dispenser_ref = level_source
@@ -2446,6 +2565,7 @@ class CounterpartyAdapter:
                 compact_dispense_params = {
                     "dispenser": dispenser_ref,
                     "quantity": btc_sats,
+                    **construct_fee_params,
                 }
                 compact_dispense_params = {k: v for k, v in compact_dispense_params.items() if v not in (None, "")}
                 preview_params = {
@@ -2485,6 +2605,7 @@ class CounterpartyAdapter:
                 "expiration": 1000,
                 "fee_required": 0,
                 "fee_provided": 0,
+                **construct_fee_params,
             }
             compact_order_params = {k: v for k, v in order_params.items() if v not in (None, "")}
             for path in (
@@ -2504,6 +2625,7 @@ class CounterpartyAdapter:
             immediate_btc_payment_satoshis=btc_sats if compose_kind == "dispenser_dispense" else 0,
             attempt_upstream=bool(attempt_upstream),
             compose_probe=compose_probe,
+            fee_policy=fee_policy,
         )
         wallet_signing_handoff = self._compose_wallet_signing_handoff(
             compose_probe,
@@ -2529,6 +2651,7 @@ class CounterpartyAdapter:
             "side": trade_side,
             "source_address": source,
             "compose_kind": compose_kind,
+            "fee_policy": fee_policy,
             "quantity": self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base)),
             "limit_price": self._decimal_plain(px_dec, max_places=self._asset_display_decimals(quote_asset)),
             "quote_total": self._decimal_plain(quote_qty_dec, max_places=self._asset_display_decimals(quote_asset)),

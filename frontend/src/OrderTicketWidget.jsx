@@ -139,6 +139,59 @@ function counterpartyFormatSats(value) {
   return `${Math.trunc(sats).toLocaleString()} sats`;
 }
 
+function counterpartyPsbtHexOrNull(value) {
+  const raw = String(value || "").trim().replace(/^0x/i, "");
+  if (!raw || raw.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(raw)) return null;
+  return raw.toLowerCase().startsWith("70736274ff") ? raw.toLowerCase() : null;
+}
+
+function counterpartySigningHandoffView(payload) {
+  if (!payload || typeof payload !== "object" || !isCounterpartyVenueKey(payload?.venue)) return null;
+  const handoff = payload?.wallet_signing_handoff;
+  if (!handoff || typeof handoff !== "object") return null;
+  const psbtHex = counterpartyPsbtHexOrNull(handoff?.psbt_hex);
+  const fundingBlocked = payload?.funding_requirements?.insufficient_funds_detected === true;
+  const alreadySigned = payload?.signed === true || payload?.wallet_signing_result?.signed === true;
+  return {
+    status: String(handoff?.status || "unknown").trim(),
+    reason: String(handoff?.status_reason || "").trim(),
+    format: String(handoff?.payload_format || "unknown").trim(),
+    sourceAddress: String(handoff?.source_address || payload?.source_address || "").trim(),
+    sourcePath: String(handoff?.payload_source_path || "").trim(),
+    psbtHex,
+    canSign: Boolean(
+      payload?.compose_ok === true &&
+      handoff?.signable_with_unisat === true &&
+      psbtHex &&
+      !fundingBlocked &&
+      !alreadySigned
+    ),
+    fundingBlocked,
+    alreadySigned,
+    broadcastEnabled: handoff?.broadcast_enabled === true,
+  };
+}
+
+async function counterpartyUniSatMainnetStatus(provider) {
+  if (!provider) return { ok: false, label: "UniSat unavailable" };
+  try {
+    if (typeof provider.getChain === "function") {
+      const chain = await provider.getChain();
+      const chainEnum = String(chain?.enum || chain?.chain || "").trim().toUpperCase();
+      const network = String(chain?.network || "").trim().toLowerCase();
+      const ok = chainEnum === "BITCOIN_MAINNET" || network === "livenet" || network === "mainnet";
+      return { ok, label: chainEnum || network || "unknown", raw: chain };
+    }
+    if (typeof provider.getNetwork === "function") {
+      const network = String(await provider.getNetwork()).trim().toLowerCase();
+      return { ok: network === "livenet" || network === "mainnet", label: network || "unknown", raw: network };
+    }
+  } catch (e) {
+    return { ok: false, label: e?.message || "network check failed" };
+  }
+  return { ok: false, label: "UniSat network API unavailable" };
+}
+
 function counterpartyFundingSummaryView(payload, opts = {}) {
   if (!payload || typeof payload !== "object") return null;
   if (!isCounterpartyVenueKey(payload?.venue)) return null;
@@ -240,7 +293,7 @@ function counterpartyPreviewRules(symbol, venue = "counterparty") {
     min_qty: 0,
     min_notional: 0,
     errors: [],
-    warnings: ["Counterparty ticket is preview-only; unsigned compose/sign/broadcast is not enabled in this tranche."],
+    warnings: ["Counterparty compose remains review-first. A successful PSBT may be signed explicitly with UniSat; broadcast remains disabled."],
   };
 }
 
@@ -2234,7 +2287,7 @@ export default function OrderTicketWidget({
 
     const counterpartyReadOnly = venueId.includes("counterparty");
     const inlineText = counterpartyReadOnly
-      ? "Counterparty: read-only preview · submit disabled"
+      ? "Counterparty: compose preview · explicit UniSat PSBT signing · broadcast disabled"
       : `${title} · ${inlineParts.join(" · ")}`;
 
     return {
@@ -2298,6 +2351,7 @@ export default function OrderTicketWidget({
   const [counterpartyBookLoading, setCounterpartyBookLoading] = useState(false);
   const [counterpartyBookError, setCounterpartyBookError] = useState(null);
   const [counterpartyBtcBalanceMeta, setCounterpartyBtcBalanceMeta] = useState(null);
+  const [counterpartySigningPending, setCounterpartySigningPending] = useState(false);
   const counterpartyBookReqRef = useRef(0);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
@@ -5824,14 +5878,20 @@ async function previewCounterpartyCompose() {
 
     setSubmitOk(body);
     const fundingInsufficient = body?.funding_requirements?.insufficient_funds_detected === true;
+    const signingReady = body?.wallet_signing_handoff?.signable_with_unisat === true;
+    const rawTxNeedsPsbt = body?.wallet_signing_handoff?.status === "raw_transaction_requires_psbt_conversion";
     openSubmitResultModal(
       fundingInsufficient ? "error" : body?.compose_ok ? "ok" : "info",
       body,
       fundingInsufficient
         ? "Counterparty Compose Preview — Funding Shortfall"
-        : body?.compose_ok
-          ? "Unsigned Counterparty Compose Preview"
-          : "Counterparty Compose Request Preview"
+        : signingReady
+          ? "Counterparty Compose Ready — Review Before UniSat Signing"
+          : rawTxNeedsPsbt
+            ? "Counterparty Compose Preview — PSBT Conversion Required"
+            : body?.compose_ok
+              ? "Unsigned Counterparty Compose Preview"
+              : "Counterparty Compose Request Preview"
     );
   } catch (e) {
     const msg = e?.message || "Failed to build Counterparty compose preview";
@@ -6342,6 +6402,11 @@ async function submitLimitOrder() {
     [submitResultPayload, submitResultKind]
   );
 
+  const counterpartySigningHandoff = useMemo(
+    () => counterpartySigningHandoffView(submitResultPayload),
+    [submitResultPayload]
+  );
+
   const counterpartySubmitFunding = useMemo(() => {
     const availableBtc =
       otCounterpartyFiniteNumberOrNull(counterpartyBtcBalanceMeta?.btc) ??
@@ -6362,7 +6427,7 @@ async function submitLimitOrder() {
       if (side === "buy" && !polkadotEffectiveExactBuyEnabled) return "/api/polkadot_dex/hydration/swap_tx (BUY disabled; SELL enabled)";
       return `/api/polkadot_dex/hydration/swap_tx (${hydrationRouteModeLabel(preferredHydrationRouteMode)}) → SubWallet sign/send`;
     }
-    if (isCounterpartyVenue) return "/api/counterparty/compose/preview (unsigned preview only)";
+    if (isCounterpartyVenue) return "/api/counterparty/compose/preview → UniSat signPsbt (explicit user action; no broadcast)";
     if (!isSolanaDexVenue) return "/api/trade/order";
     if (isSolanaLimitMode) return "/api/solana_dex/jupiter/trigger/create_order";
     const v = String(effectiveVenue || "").toLowerCase().trim();
@@ -6372,6 +6437,87 @@ async function submitLimitOrder() {
     if (routerMode === "metis") return "/api/solana_dex/jupiter/swap_tx";
     return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute → fallback /api/solana_dex/jupiter/swap_tx → fallback /api/solana_dex/raydium/swap_tx";
   }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, isCounterpartyVenue, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotManualRouterFallbackAvailable, polkadotSyntheticPriceOnly, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
+
+  async function signCounterpartyComposeWithUniSat() {
+    const preview = submitResultPayload;
+    const handoff = counterpartySigningHandoffView(preview);
+    if (!handoff?.canSign || !handoff?.psbtHex) {
+      const reason = handoff?.reason || "This Counterparty compose result is not ready for UniSat PSBT signing.";
+      onToast?.({ kind: "warn", msg: reason });
+      return;
+    }
+
+    setCounterpartySigningPending(true);
+    setSubmitError(null);
+    try {
+      const provider = typeof window !== "undefined" ? window.unisat : null;
+      if (!provider || typeof provider.signPsbt !== "function") {
+        throw new Error("UniSat signPsbt is unavailable. Install, unlock, and connect UniSat, then retry.");
+      }
+
+      const connectedAddress = await getCounterpartyAddressWithPrompt({ forcePrompt: true });
+      if (!connectedAddress) throw new Error("UniSat did not return a connected Bitcoin address.");
+      if (handoff.sourceAddress && connectedAddress.toLowerCase() !== handoff.sourceAddress.toLowerCase()) {
+        throw new Error(
+          `UniSat account mismatch. Compose source is ${shortenWalletAddress(handoff.sourceAddress)}, but UniSat exposed ${shortenWalletAddress(connectedAddress)}.`
+        );
+      }
+
+      const networkStatus = await counterpartyUniSatMainnetStatus(provider);
+      if (!networkStatus.ok) {
+        throw new Error(`UniSat must be on Bitcoin Mainnet before signing. Current network: ${networkStatus.label}.`);
+      }
+
+      updateSubmitResultModal(
+        "info",
+        preview,
+        "Waiting for UniSat PSBT Approval"
+      );
+
+      const signedPsbt = counterpartyPsbtHexOrNull(
+        await provider.signPsbt(handoff.psbtHex, { autoFinalized: true })
+      );
+      if (!signedPsbt) throw new Error("UniSat did not return valid signed PSBT hex.");
+
+      const signedPayload = {
+        ...preview,
+        read_only: false,
+        backend_read_only: preview?.read_only === true,
+        unsigned_only: false,
+        signed: true,
+        broadcast: false,
+        signing: "performed_by_unisat",
+        broadcasting: "not_performed",
+        wallet_signing_result: {
+          ok: true,
+          provider: "unisat",
+          wallet_method: "signPsbt",
+          source_address: connectedAddress,
+          network: networkStatus.label,
+          signed_psbt_hex: signedPsbt,
+          signed: true,
+          broadcast: false,
+          broadcast_method_called: null,
+          persisted_to_browser_storage: false,
+        },
+        warnings: [
+          ...(Array.isArray(preview?.warnings) ? preview.warnings : []),
+          "UniSat signed the PSBT after explicit user approval. UTT did not call pushPsbt, pushTx, sendBitcoin, or any backend broadcast endpoint.",
+          "The signed PSBT exists only in this in-memory result modal; closing or refreshing the page discards it unless copied manually.",
+        ],
+      };
+
+      setSubmitOk(signedPayload);
+      openSubmitResultModal("ok", signedPayload, "Counterparty PSBT Signed — Not Broadcast");
+      onToast?.({ kind: "ok", msg: "Counterparty PSBT signed by UniSat. Broadcast was not performed." });
+    } catch (e) {
+      const msg = e?.message || "UniSat PSBT signing failed";
+      setSubmitError(msg);
+      openSubmitResultModal("error", { ...(preview || {}), signing_error: msg }, "Counterparty UniSat Signing Failed");
+    } finally {
+      setCounterpartySigningPending(false);
+    }
+  }
 
   async function copySubmitResultToClipboard() {
     try {
@@ -7545,6 +7691,25 @@ async function submitLimitOrder() {
                 </div>
 
                 <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  {counterpartySigningHandoff?.canSign && (
+                    <button
+                      type="button"
+                      onClick={signCounterpartyComposeWithUniSat}
+                      style={{
+                        ...safeButton,
+                        padding: "7px 10px",
+                        opacity: counterpartySigningPending ? 0.7 : 1,
+                        border: "1px solid #6d5a1f",
+                        background: "#19160d",
+                        color: "#f1d98a",
+                      }}
+                      title="Ask UniSat to sign this PSBT. CP-SIGN.1 never broadcasts."
+                      disabled={counterpartySigningPending}
+                    >
+                      {counterpartySigningPending ? "Waiting for UniSat…" : "Sign with UniSat — No Broadcast"}
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     onClick={() => {
@@ -7577,6 +7742,55 @@ async function submitLimitOrder() {
                   flex: 1,
                 }}
               >
+                {counterpartySigningHandoff && (
+                  <div
+                    style={{
+                      marginBottom: 10,
+                      borderRadius: 12,
+                      border: `1px solid ${
+                        counterpartySigningHandoff.alreadySigned
+                          ? "#1f6f3a"
+                          : counterpartySigningHandoff.canSign
+                            ? "#6d5a1f"
+                            : "#4a4a4a"
+                      }`,
+                      background:
+                        counterpartySigningHandoff.alreadySigned
+                          ? "#0f1a0f"
+                          : counterpartySigningHandoff.canSign
+                            ? "#19160d"
+                            : "#111111",
+                      padding: 10,
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+                      <div style={{ fontSize: 12, fontWeight: 900 }}>Counterparty UniSat signing handoff</div>
+                      <div style={{ fontSize: 11, fontWeight: 900 }}>
+                        {counterpartySigningHandoff.alreadySigned
+                          ? "SIGNED · NOT BROADCAST"
+                          : counterpartySigningHandoff.canSign
+                            ? "READY FOR USER APPROVAL"
+                            : "SIGNING BLOCKED"}
+                      </div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "minmax(145px, 0.8fr) minmax(220px, 1.2fr)", gap: "6px 12px", fontSize: 11 }}>
+                      <div style={{ color: "#a9a9a9" }}>Payload format</div>
+                      <div>{hideTableData ? "••••" : counterpartySigningHandoff.format || "unknown"}</div>
+                      <div style={{ color: "#a9a9a9" }}>Source address</div>
+                      <div>{hideTableData ? "••••" : counterpartySigningHandoff.sourceAddress || "unknown"}</div>
+                      <div style={{ color: "#a9a9a9" }}>Wallet method</div>
+                      <div>{counterpartySigningHandoff.psbtHex ? "UniSat signPsbt" : "Unavailable"}</div>
+                      <div style={{ color: "#a9a9a9" }}>Broadcast</div>
+                      <div>Disabled in CP-SIGN.1</div>
+                    </div>
+                    {!hideTableData && counterpartySigningHandoff.reason && (
+                      <div style={{ marginTop: 8, fontSize: 10.5, color: "#bdbdbd", lineHeight: 1.3 }}>
+                        {counterpartySigningHandoff.reason}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {counterpartySubmitFunding && (
                   <div
                     style={{

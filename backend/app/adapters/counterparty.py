@@ -1703,8 +1703,8 @@ class CounterpartyAdapter:
             },
             "open_only": bool(open_only),
             "read_only": True,
-            "signing": "not_available_in_this_tranche",
-            "compose": "later_unsigned_psbt_or_wallet_flow",
+            "signing": "explicit_unisat_psbt_after_successful_compose",
+            "compose": "unsigned_preview_with_wallet_signing_handoff",
         }
 
     # ------------------------------------------------------------------
@@ -1974,6 +1974,127 @@ class CounterpartyAdapter:
             except Exception as e:
                 errors.append({"candidate": candidate, "error": str(e)[:1000]})
         return {"ok": False, "errors": errors}
+
+    @staticmethod
+    def _compose_hex_text(value: Any) -> Optional[str]:
+        s = str(value or "").strip()
+        if s.lower().startswith("0x"):
+            s = s[2:]
+        if not s or len(s) % 2 != 0 or not re.fullmatch(r"[0-9a-fA-F]+", s):
+            return None
+        return s.lower()
+
+    @classmethod
+    def _compose_wallet_signing_handoff(
+        cls,
+        compose_probe: Dict[str, Any],
+        *,
+        source_address: str,
+        compose_kind: str,
+    ) -> Dict[str, Any]:
+        """Normalize an explicit browser-wallet signing handoff.
+
+        CP-SIGN.1 permits only a PSBT returned by Counterparty Core to reach
+        UniSat signPsbt. A raw unsigned transaction is retained for audit but is
+        not passed to pushTx because pushTx broadcasts; raw-to-PSBT conversion is
+        a separate tranche.
+        """
+        compose_ok = bool(compose_probe.get("ok"))
+        raw = compose_probe.get("raw") if compose_ok else None
+
+        psbt_keys = {
+            "psbt",
+            "psbt_hex",
+            "psbthex",
+            "unsigned_psbt",
+            "unsigned_psbt_hex",
+            "transaction_psbt",
+            "transaction_psbt_hex",
+        }
+        raw_tx_keys = {
+            "rawtransaction",
+            "raw_transaction",
+            "rawtx",
+            "raw_tx",
+            "unsigned_tx",
+            "unsigned_transaction",
+            "tx_hex",
+            "transaction_hex",
+        }
+
+        found_psbt: Optional[Dict[str, Any]] = None
+        found_raw_tx: Optional[Dict[str, Any]] = None
+
+        def walk(value: Any, path: str, depth: int) -> None:
+            nonlocal found_psbt, found_raw_tx
+            if depth > 10 or (found_psbt is not None and found_raw_tx is not None):
+                return
+            if isinstance(value, dict):
+                for raw_key, child in value.items():
+                    key = str(raw_key or "").strip().lower()
+                    child_path = f"{path}.{raw_key}" if path else str(raw_key)
+                    if found_psbt is None and key in psbt_keys:
+                        hex_text = cls._compose_hex_text(child)
+                        if hex_text and hex_text.startswith("70736274ff"):
+                            found_psbt = {"hex": hex_text, "path": child_path}
+                    if found_raw_tx is None and key in raw_tx_keys:
+                        hex_text = cls._compose_hex_text(child)
+                        if hex_text and not hex_text.startswith("70736274ff"):
+                            found_raw_tx = {"hex": hex_text, "path": child_path}
+                    walk(child, child_path, depth + 1)
+            elif isinstance(value, list):
+                for idx, child in enumerate(value[:100]):
+                    walk(child, f"{path}[{idx}]", depth + 1)
+
+        if compose_ok:
+            walk(raw, "compose_result", 0)
+
+        if not compose_ok:
+            status = "compose_unavailable"
+            reason = "Counterparty compose did not return a successful unsigned transaction payload."
+            payload_format = "none"
+        elif found_psbt is not None:
+            status = "ready_for_unisat_signing"
+            reason = "Counterparty Core returned a PSBT that can be handed to UniSat signPsbt after explicit user review."
+            payload_format = "psbt_hex"
+        elif found_raw_tx is not None:
+            status = "raw_transaction_requires_psbt_conversion"
+            reason = "Counterparty Core returned raw transaction hex, but UniSat signPsbt requires PSBT hex. Broadcasting remains disabled."
+            payload_format = "raw_tx_hex"
+        else:
+            status = "unsupported_compose_payload"
+            reason = "Counterparty compose succeeded, but no recognized PSBT or raw transaction field was found."
+            payload_format = "unknown"
+
+        return {
+            "status": status,
+            "status_reason": reason,
+            "provider": "unisat",
+            "browser_object": "window.unisat",
+            "source_address": str(source_address or "").strip(),
+            "compose_kind": str(compose_kind or "").strip(),
+            "payload_format": payload_format,
+            "psbt_hex": found_psbt.get("hex") if found_psbt else None,
+            "raw_tx_hex": found_raw_tx.get("hex") if found_raw_tx else None,
+            "payload_source_path": (
+                found_psbt.get("path")
+                if found_psbt
+                else found_raw_tx.get("path")
+                if found_raw_tx
+                else None
+            ),
+            "wallet_method": "signPsbt" if found_psbt else None,
+            "signable_with_unisat": bool(found_psbt),
+            "requires_explicit_user_action": bool(found_psbt),
+            "auto_finalize_psbt": True if found_psbt else None,
+            "signed": False,
+            "broadcast": False,
+            "broadcast_enabled": False,
+            "broadcast_method": None,
+            "later_broadcast_method": "pushPsbt" if found_psbt else "pushTx" if found_raw_tx else None,
+            "backend_read_only": True,
+            "wallet_payload_not_persisted": True,
+        }
 
     @classmethod
     def _compose_network_fee_info(cls, payload: Any) -> Dict[str, Any]:
@@ -2384,6 +2505,19 @@ class CounterpartyAdapter:
             attempt_upstream=bool(attempt_upstream),
             compose_probe=compose_probe,
         )
+        wallet_signing_handoff = self._compose_wallet_signing_handoff(
+            compose_probe,
+            source_address=source,
+            compose_kind=compose_kind,
+        )
+        if wallet_signing_handoff.get("signable_with_unisat"):
+            warnings.append(
+                "A UniSat PSBT signing handoff is available after review. Signing requires explicit user action and UTT will not broadcast in CP-SIGN.1."
+            )
+        elif wallet_signing_handoff.get("status") == "raw_transaction_requires_psbt_conversion":
+            warnings.append(
+                "Counterparty returned raw unsigned transaction hex rather than PSBT hex. UTT will not call UniSat pushTx or broadcast it; PSBT conversion remains required."
+            )
 
         return {
             "ok": True,
@@ -2415,6 +2549,7 @@ class CounterpartyAdapter:
             "compose_candidate": compose_probe.get("candidate") if compose_probe.get("ok") else None,
             "compose_errors": compose_probe.get("errors") or [],
             "funding_requirements": funding_requirements,
+            "wallet_signing_handoff": wallet_signing_handoff,
             "read_only": True,
             "unsigned_only": True,
             "signed": False,
@@ -2465,8 +2600,9 @@ class CounterpartyAdapter:
             "provider": "unisat",
             "browser_object": "window.unisat",
             "read_methods": ["requestAccounts", "getAccounts", "getChain", "getNetwork", "getPublicKey", "getBalance", "getInscriptions"],
-            "write_methods_later": ["signMessage", "signPsbt", "signPsbts", "pushPsbt", "pushTx", "sendBitcoin"],
-            "utt_policy": "read-only backend now; browser wallet signing/PSBT compose later",
+            "sign_methods_enabled": ["signPsbt"],
+            "broadcast_methods_disabled": ["pushPsbt", "pushTx", "sendBitcoin"],
+            "utt_policy": "CP-SIGN.1 allows explicit browser UniSat signPsbt only when Counterparty Core returns PSBT hex; no backend signing and no broadcast.",
         }
 
     def get_asset(self, asset: str) -> Dict[str, Any]:

@@ -157,6 +157,18 @@ function counterpartyBookRowPrice(row) {
   return otCounterpartyFiniteNumberOrNull(row?.price ?? row?.displayPrice ?? row?.limitPrice ?? row?.rate);
 }
 
+function counterpartyBookRowPriceText(row) {
+  const raw = row?.price ?? row?.displayPrice ?? row?.limitPrice ?? row?.rate;
+  if (raw === null || raw === undefined || raw === "") return "";
+  const expanded = String(expandExponential(String(raw))).trim().replace(/^\+/, "");
+  if (!/^\d+(?:\.\d+)?$/.test(expanded)) return "";
+  const normalized = expanded.includes(".")
+    ? expanded.replace(/0+$/, "").replace(/\.$/, "")
+    : expanded;
+  const n = Number(normalized);
+  return Number.isFinite(n) && n > 0 ? normalized : "";
+}
+
 function counterpartyPickBookRowForTicket(payload, side, limitPrice, executionMode = "dispenser", quantity = null) {
   const mode = normalizeCounterpartyExecutionMode(executionMode);
   if (mode === "limit_order") return null;
@@ -3715,9 +3727,12 @@ export default function OrderTicketWidget({
       const mode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
       const liquidityType = counterpartyBookRowLiquidityType(row);
       const px = counterpartyBookRowPrice(row);
-      if (px !== null && px > 0) {
+      const pxText = counterpartyBookRowPriceText(row);
+      if (px !== null && px > 0 && pxText) {
         limitSourceRef.current = "counterparty_orderbook";
-        setLimitPrice(px.toFixed(8));
+        // Keep the executable row price exact. The compact OrderBook may show
+        // eight decimals, but dispenser prices can require more precision.
+        setLimitPrice(pxText);
       }
 
       if (mode === "limit_order") {
@@ -4962,6 +4977,17 @@ export default function OrderTicketWidget({
     ? counterpartyDispenserLot.exactPaymentBtc
     : null;
 
+  const counterpartySelectedDispenserPrice = useMemo(() => {
+    if (!isCounterpartyDispenserMode || !counterpartyEffectiveDispenserLevel) return null;
+    return counterpartyBookRowPrice(counterpartyEffectiveDispenserLevel);
+  }, [isCounterpartyDispenserMode, counterpartyEffectiveDispenserLevel]);
+
+  const counterpartyDispenserPriceWithinLimit = useMemo(() => {
+    if (!isCounterpartyDispenserMode) return true;
+    if (counterpartySelectedDispenserPrice === null || pxNum === null) return true;
+    return counterpartySelectedDispenserPrice <= pxNum + 1e-18;
+  }, [isCounterpartyDispenserMode, counterpartySelectedDispenserPrice, pxNum]);
+
   useEffect(() => {
     if (!autoCalc) return;
 
@@ -5133,6 +5159,15 @@ export default function OrderTicketWidget({
             lines.push(
               `Dispenser lots: ${counterpartyDispenserLot.lotCount} × ${counterpartyDispenserLot.lotSizeText} ${parts.base} at ${counterpartyDispenserLot.satoshiratePerLot.toLocaleString()} sats per lot = ${counterpartyDispenserLot.exactPaymentSats.toLocaleString()} sats exact payment.`
             );
+          }
+
+          if (counterpartyEffectiveDispenserLevel && !counterpartyDispenserPriceWithinLimit) {
+            const selectedPriceText = counterpartyBookRowPriceText(counterpartyEffectiveDispenserLevel) || "unknown";
+            const limitText = String(expandExponential(String(limitPrice || ""))).trim() || "unknown";
+            lines.push(
+              `Selected dispenser exact price ${selectedPriceText} BTC exceeds the ticket limit ${limitText} BTC. Use the exact clicked price or raise the limit; UTT will not round the dispenser price down.`
+            );
+            fails.push("counterparty_dispenser_price_outside_limit");
           }
         }
       } else if (counterpartyExpirationBlocks === null) {
@@ -5454,6 +5489,8 @@ export default function OrderTicketWidget({
     counterpartyBookError,
     counterpartyEffectiveDispenserLevel,
     counterpartyDispenserLot,
+    counterpartyDispenserPriceWithinLimit,
+    limitPrice,
     balErr,
     balNotice,
     buySpendQuote,
@@ -5507,9 +5544,10 @@ export default function OrderTicketWidget({
   const mode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
   if (mode === "dispenser" && side !== "buy") return false;
   if (mode === "dispenser" && counterpartyDispenserLot?.valid !== true) return false;
+  if (mode === "dispenser" && counterpartyDispenserPriceWithinLimit !== true) return false;
   if (mode === "limit_order" && counterpartyExpirationBlocks === null) return false;
   return qtyNum !== null && pxNum !== null;
-  }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum, counterpartyExecutionMode, counterpartyExpirationBlocks, counterpartyDispenserLot]);
+  }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum, counterpartyExecutionMode, counterpartyExpirationBlocks, counterpartyDispenserLot, counterpartyDispenserPriceWithinLimit]);
 
   const primaryActionDisabled = submitting || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
 

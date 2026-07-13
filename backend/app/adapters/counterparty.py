@@ -3147,12 +3147,24 @@ class CounterpartyAdapter:
             fee_policy=fee_policy,
         )
         if execution_mode_norm == "dispenser" and not (selected_lot_context and selected_lot_context.get("valid")):
-            funding_requirements["status"] = "dispenser_lot_invalid"
-            funding_requirements["status_reason"] = (
-                "UTT could not validate complete dispenser lots and an exact lot_count × satoshirate payment. "
-                "No payment was derived from the rounded OrderBook price and signing remains blocked."
-            )
-            funding_requirements["funding_scope"] = "dispenser_lot_validation"
+            rejection_reasons = list((provided_level_validation or {}).get("reasons") or [])
+            supplied_lot_valid = bool(supplied_lot_context and supplied_lot_context.get("valid"))
+            if explicit_rejected_level_fail_closed and supplied_lot_valid:
+                funding_requirements["status"] = "selected_dispenser_rejected"
+                funding_requirements["status_reason"] = (
+                    "The selected dispenser had valid complete-lot and exact satoshirate payment data, "
+                    "but it failed the ticket execution constraints before compose. UTT did not replace "
+                    "the selected dispenser, compose a transaction, sign, or broadcast."
+                )
+                funding_requirements["funding_scope"] = "dispenser_selection_validation"
+                funding_requirements["selection_rejection_reasons"] = rejection_reasons
+            else:
+                funding_requirements["status"] = "dispenser_lot_invalid"
+                funding_requirements["status_reason"] = (
+                    "UTT could not validate complete dispenser lots and an exact lot_count × satoshirate payment. "
+                    "No payment was derived from the rounded OrderBook price and signing remains blocked."
+                )
+                funding_requirements["funding_scope"] = "dispenser_lot_validation"
         wallet_signing_handoff = self._compose_wallet_signing_handoff(
             compose_probe,
             source_address=source,

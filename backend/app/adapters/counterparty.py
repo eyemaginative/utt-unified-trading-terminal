@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -2002,19 +2004,60 @@ class CounterpartyAdapter:
         return s.lower()
 
     @classmethod
+    def _compose_psbt_payload(cls, value: Any) -> Optional[Dict[str, Any]]:
+        """Normalize a Counterparty PSBT supplied as hex or standard base64.
+
+        Counterparty Core verbose compose responses currently expose `psbt` as
+        base64 on some deployments, while UniSat signPsbt requires PSBT hex.
+        Decode only values whose bytes begin with the PSBT magic prefix
+        `psbt\xff`; arbitrary base64 is never forwarded to the wallet.
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+
+        hex_text = cls._compose_hex_text(raw)
+        if hex_text and hex_text.startswith("70736274ff"):
+            return {
+                "hex": hex_text,
+                "source_encoding": "hex",
+                "original": raw,
+            }
+
+        compact = re.sub(r"\s+", "", raw)
+        if not compact:
+            return None
+        compact += "=" * ((4 - len(compact) % 4) % 4)
+        try:
+            decoded = base64.b64decode(compact, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+        if not decoded.startswith(b"psbt\xff"):
+            return None
+        return {
+            "hex": decoded.hex(),
+            "source_encoding": "base64",
+            "original": raw,
+        }
+
+    @classmethod
     def _compose_wallet_signing_handoff(
         cls,
         compose_probe: Dict[str, Any],
         *,
         source_address: str,
         compose_kind: str,
+        funding_requirements: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Normalize an explicit browser-wallet signing handoff.
 
-        CP-SIGN.1 permits only a PSBT returned by Counterparty Core to reach
-        UniSat signPsbt. A raw unsigned transaction is retained for audit but is
-        not passed to pushTx because pushTx broadcasts; raw-to-PSBT conversion is
-        a separate tranche.
+        CP-SIGN.1 permits only a validated PSBT returned by Counterparty Core to
+        reach UniSat signPsbt. Counterparty may return that PSBT as hex or
+        base64; base64 is normalized to hex after PSBT-magic validation.
+
+        A PSBT can be present but remain blocked from signing when CP-FEE.1C
+        determines that the transaction-specific miner fee is missing, zero,
+        malformed, or otherwise not ready.
         """
         compose_ok = bool(compose_probe.get("ok"))
         raw = compose_probe.get("raw") if compose_ok else None
@@ -2051,9 +2094,9 @@ class CounterpartyAdapter:
                     key = str(raw_key or "").strip().lower()
                     child_path = f"{path}.{raw_key}" if path else str(raw_key)
                     if found_psbt is None and key in psbt_keys:
-                        hex_text = cls._compose_hex_text(child)
-                        if hex_text and hex_text.startswith("70736274ff"):
-                            found_psbt = {"hex": hex_text, "path": child_path}
+                        normalized = cls._compose_psbt_payload(child)
+                        if normalized:
+                            found_psbt = {**normalized, "path": child_path}
                     if found_raw_tx is None and key in raw_tx_keys:
                         hex_text = cls._compose_hex_text(child)
                         if hex_text and not hex_text.startswith("70736274ff"):
@@ -2066,17 +2109,55 @@ class CounterpartyAdapter:
         if compose_ok:
             walk(raw, "compose_result", 0)
 
+        funding = funding_requirements if isinstance(funding_requirements, dict) else None
+        fee_status = str((funding or {}).get("network_fee_status") or "").strip().lower()
+        fee_sats = cls._as_int((funding or {}).get("network_fee_satoshis"))
+        adjusted_vsize = cls._as_int((funding or {}).get("estimated_adjusted_vsize"))
+        fee_rate = cls._as_float((funding or {}).get("effective_sat_per_vbyte"))
+        funding_insufficient = bool((funding or {}).get("insufficient_funds_detected"))
+        fee_ready = True
+        fee_block_reason = None
+        if funding is not None:
+            fee_ready = bool(
+                fee_status in {"known", "estimated"}
+                and fee_sats is not None
+                and fee_sats > 0
+                and adjusted_vsize is not None
+                and adjusted_vsize > 0
+                and fee_rate is not None
+                and fee_rate > 0
+                and not funding_insufficient
+            )
+            if funding_insufficient:
+                fee_block_reason = "Counterparty Core reported insufficient BTC funding for this compose."
+            elif fee_status == "invalid_zero_fee" or fee_sats == 0:
+                fee_block_reason = "Counterparty Core returned a zero-satoshi miner fee. UTT preserved the PSBT for audit but blocks signing."
+            elif not fee_ready:
+                fee_block_reason = "Signing is blocked until a positive transaction-specific miner fee, adjusted vsize, and effective sat/vB estimate are available."
+
+        psbt_available = found_psbt is not None
+        signable = bool(psbt_available and fee_ready)
+
         if not compose_ok:
             status = "compose_unavailable"
             reason = "Counterparty compose did not return a successful unsigned transaction payload."
             payload_format = "none"
-        elif found_psbt is not None:
+        elif found_psbt is not None and signable:
             status = "ready_for_unisat_signing"
-            reason = "Counterparty Core returned a PSBT that can be handed to UniSat signPsbt after explicit user review."
+            reason = "Counterparty Core returned a validated PSBT and a positive transaction-specific fee estimate. UniSat signing still requires explicit user approval."
+            payload_format = "psbt_hex"
+        elif found_psbt is not None:
+            if funding_insufficient:
+                status = "psbt_available_funding_insufficient"
+            elif fee_status == "invalid_zero_fee" or fee_sats == 0:
+                status = "psbt_available_fee_invalid_zero"
+            else:
+                status = "psbt_available_fee_not_ready"
+            reason = fee_block_reason or "Counterparty Core returned a PSBT, but signing prerequisites are not satisfied."
             payload_format = "psbt_hex"
         elif found_raw_tx is not None:
             status = "raw_transaction_requires_psbt_conversion"
-            reason = "Counterparty Core returned raw transaction hex, but UniSat signPsbt requires PSBT hex. Broadcasting remains disabled."
+            reason = "Counterparty Core returned raw transaction hex without a recognized PSBT. UTT will not call UniSat pushTx or broadcast it."
             payload_format = "raw_tx_hex"
         else:
             status = "unsupported_compose_payload"
@@ -2091,7 +2172,14 @@ class CounterpartyAdapter:
             "source_address": str(source_address or "").strip(),
             "compose_kind": str(compose_kind or "").strip(),
             "payload_format": payload_format,
+            "payload_source_encoding": found_psbt.get("source_encoding") if found_psbt else None,
+            "psbt_available": bool(found_psbt),
             "psbt_hex": found_psbt.get("hex") if found_psbt else None,
+            "psbt_base64": (
+                found_psbt.get("original")
+                if found_psbt and found_psbt.get("source_encoding") == "base64"
+                else None
+            ),
             "raw_tx_hex": found_raw_tx.get("hex") if found_raw_tx else None,
             "payload_source_path": (
                 found_psbt.get("path")
@@ -2101,8 +2189,10 @@ class CounterpartyAdapter:
                 else None
             ),
             "wallet_method": "signPsbt" if found_psbt else None,
-            "signable_with_unisat": bool(found_psbt),
-            "requires_explicit_user_action": bool(found_psbt),
+            "signable_with_unisat": signable,
+            "fee_ready_for_signing": bool(fee_ready) if found_psbt else False,
+            "fee_status": fee_status or None,
+            "requires_explicit_user_action": signable,
             "auto_finalize_psbt": True if found_psbt else None,
             "signed": False,
             "broadcast": False,
@@ -2112,6 +2202,7 @@ class CounterpartyAdapter:
             "backend_read_only": True,
             "wallet_payload_not_persisted": True,
         }
+
 
     @classmethod
     def _compose_fee_policy(cls, fee_tier: Any) -> Dict[str, Any]:
@@ -2173,15 +2264,15 @@ class CounterpartyAdapter:
 
     @classmethod
     def _compose_network_fee_info(cls, payload: Any) -> Dict[str, Any]:
-        """Extract a Bitcoin network fee only from explicitly named fee fields.
+        """Extract and validate an explicitly named Bitcoin miner-fee field.
 
-        Counterparty compose responses are not consistent across deployments.
-        Avoid generic `fee` keys because protocol order fields such as
-        fee_required/fee_provided are not Bitcoin miner fees.
+        Generic `fee` fields remain excluded because Counterparty order
+        fee_required/fee_provided values are protocol fields, not miner fees.
+
+        A reported zero is preserved for audit but is not accepted as a usable
+        network-fee estimate for signing.
         """
         satoshi_keys = {
-            # Counterparty Core API v2 returns btc_fee as an integer number of
-            # satoshis in verbose compose results.
             "btc_fee",
             "btc_fee_satoshis",
             "bitcoin_fee_satoshis",
@@ -2206,6 +2297,17 @@ class CounterpartyAdapter:
 
         found: Optional[Dict[str, Any]] = None
 
+        def record(satoshis: int, source: str, unit: str) -> Dict[str, Any]:
+            sats = int(satoshis)
+            return {
+                "satoshis": sats,
+                "source": source,
+                "unit": unit,
+                "valid": sats > 0,
+                "status": "estimated" if sats > 0 else "invalid_zero_fee",
+                "invalid_reason": None if sats > 0 else "counterparty_core_returned_zero_fee",
+            }
+
         def walk(value: Any, path: str, depth: int) -> None:
             nonlocal found
             if found is not None or depth > 8:
@@ -2217,13 +2319,13 @@ class CounterpartyAdapter:
                     if key in satoshi_keys:
                         amount = cls._as_int(child)
                         if amount is not None and amount >= 0:
-                            found = {"satoshis": int(amount), "source": child_path, "unit": "satoshis"}
+                            found = record(int(amount), child_path, "satoshis")
                             return
                     if key in btc_keys:
                         amount_btc = cls._decimal_or_none(child)
                         if amount_btc is not None and amount_btc >= 0:
                             sats = int((amount_btc * Decimal(100000000)).to_integral_value(rounding=ROUND_FLOOR))
-                            found = {"satoshis": sats, "source": child_path, "unit": "btc"}
+                            found = record(sats, child_path, "btc")
                             return
                     walk(child, child_path, depth + 1)
                     if found is not None:
@@ -2235,7 +2337,15 @@ class CounterpartyAdapter:
                         return
 
         walk(payload, "", 0)
-        return found or {"satoshis": None, "source": None, "unit": None}
+        return found or {
+            "satoshis": None,
+            "source": None,
+            "unit": None,
+            "valid": False,
+            "status": "unknown",
+            "invalid_reason": None,
+        }
+
 
     @classmethod
     def _compose_insufficient_funds_info(cls, errors: Any) -> Dict[str, Any]:
@@ -2306,26 +2416,43 @@ class CounterpartyAdapter:
         compose_payload = compose_probe.get("raw") if compose_probe.get("ok") else None
         fee_info = self._compose_network_fee_info(compose_payload)
         size_info = self._compose_size_info(compose_payload)
-        fee_sats = fee_info.get("satoshis")
-        fee_known = fee_sats is not None
-        fee_sats_int = int(fee_sats) if fee_known else None
+        fee_sats_raw = fee_info.get("satoshis")
+        fee_sats_int = int(fee_sats_raw) if fee_sats_raw is not None else None
+        fee_positive = fee_sats_int is not None and fee_sats_int > 0
+        fee_invalid_zero = fee_sats_int == 0
         adjusted_vsize = self._as_int(size_info.get("adjusted_vsize"))
         virtual_size = self._as_int(size_info.get("vsize"))
         sigops_count = self._as_int(size_info.get("sigops_count"))
         effective_sat_per_vbyte = None
-        if fee_sats_int is not None and adjusted_vsize not in (None, 0):
+        if fee_positive and adjusted_vsize is not None and adjusted_vsize > 0:
             effective_sat_per_vbyte = float(Decimal(fee_sats_int) / Decimal(adjusted_vsize))
+
+        fee_estimate_ready = bool(
+            fee_positive
+            and adjusted_vsize is not None
+            and adjusted_vsize > 0
+            and effective_sat_per_vbyte is not None
+            and effective_sat_per_vbyte > 0
+        )
+        if fee_invalid_zero:
+            network_fee_status = "invalid_zero_fee"
+        elif fee_estimate_ready:
+            network_fee_status = "estimated"
+        elif fee_positive:
+            network_fee_status = "incomplete_estimate"
+        else:
+            network_fee_status = "unknown"
 
         # For dispenser purchases, the target BTC amount is paid by this
         # transaction. For protocol orders, the BTC amount is a trade
         # commitment and the compose transaction's miner fee remains separate.
         funding_scope = "dispenser_immediate_payment" if compose_kind == "dispenser_dispense" else "order_trade_commitment"
         conservative_balance_requirement_sats = trade_value_sats if quote_is_btc else 0
-        if conservative_balance_requirement_sats is not None and fee_sats_int is not None:
-            conservative_balance_requirement_sats = int(conservative_balance_requirement_sats) + fee_sats_int
+        if conservative_balance_requirement_sats is not None and fee_positive:
+            conservative_balance_requirement_sats = int(conservative_balance_requirement_sats) + int(fee_sats_int)
 
-        known_minimum_sats = immediate_sats + (fee_sats_int or 0)
-        estimated_total_sats = known_minimum_sats if fee_known else None
+        known_minimum_sats = immediate_sats + (int(fee_sats_int) if fee_positive else 0)
+        estimated_total_sats = known_minimum_sats if fee_estimate_ready else None
 
         insuff = self._compose_insufficient_funds_info(compose_probe.get("errors") or [])
         compose_ok = bool(compose_probe.get("ok"))
@@ -2334,17 +2461,44 @@ class CounterpartyAdapter:
             status = "insufficient_target_funds"
             status_reason = "Counterparty Core reported that the source address could not fund the target BTC amount."
         elif not attempt_upstream:
-            status = "preview_only_fee_unknown" if not fee_known else "preview_only_fee_estimated"
+            status = "preview_only_fee_unknown"
             status_reason = "Upstream compose was not attempted; no transaction-specific miner-fee estimate is available."
-        elif compose_ok and fee_known:
+        elif compose_ok and fee_invalid_zero:
+            status = "compose_ready_fee_invalid_zero"
+            status_reason = "Counterparty Core composed the unsigned transaction but returned btc_fee=0. UTT preserves the value for audit and blocks signing."
+        elif compose_ok and fee_estimate_ready:
             status = "compose_ready_fee_estimated"
-            status_reason = "Counterparty Core composed the unsigned transaction and estimated its miner fee from selected UTXOs and adjusted virtual size."
+            status_reason = "Counterparty Core composed the unsigned transaction and returned a positive miner fee with adjusted virtual-size diagnostics."
+        elif compose_ok and fee_positive:
+            status = "compose_ready_fee_incomplete"
+            status_reason = "Counterparty Core returned a positive fee, but the adjusted-vsize/rate diagnostics required for signing validation are incomplete."
         elif compose_ok:
             status = "compose_ready_fee_unknown"
             status_reason = "Unsigned compose succeeded, but Counterparty Core did not return an explicit Bitcoin network-fee estimate."
         else:
-            status = "compose_failed_fee_unknown" if not fee_known else "compose_failed_fee_estimated"
+            status = "compose_failed_fee_unknown"
             status_reason = "Unsigned compose did not succeed; review compose_errors for the protocol-level cause."
+
+        if fee_invalid_zero:
+            fee_note = (
+                "Counterparty Core returned a zero-satoshi miner fee for a non-empty transaction. "
+                "UTT preserves that upstream value for audit but does not treat it as a valid estimate or permit signing."
+            )
+        elif fee_estimate_ready:
+            fee_note = (
+                "Counterparty Core estimated this fee from the selected UTXOs and adjusted virtual size. "
+                "The final signed transaction can differ by a few satoshis because DER signature sizes vary."
+            )
+        elif fee_positive:
+            fee_note = (
+                "A positive fee was returned, but adjusted virtual-size diagnostics are incomplete. "
+                "UTT blocks signing until the effective sat/vB can be validated."
+            )
+        else:
+            fee_note = (
+                "No transaction-specific fee is available because compose did not return a usable verbose fee result. "
+                "The selected confirmation target remains visible for review."
+            )
 
         return {
             "asset": "BTC",
@@ -2353,7 +2507,9 @@ class CounterpartyAdapter:
             "trade_value_btc": self._decimal_plain(quote_quantity, max_places=8) if quote_is_btc else None,
             "immediate_payment_satoshis": immediate_sats,
             "immediate_payment_btc": self._decimal_plain(Decimal(immediate_sats) / Decimal(100000000), max_places=8),
-            "network_fee_status": "estimated" if fee_known else "unknown",
+            "network_fee_status": network_fee_status,
+            "network_fee_valid": fee_estimate_ready,
+            "network_fee_invalid_reason": fee_info.get("invalid_reason"),
             "network_fee_satoshis": fee_sats_int,
             "network_fee_btc": (
                 self._decimal_plain(Decimal(fee_sats_int) / Decimal(100000000), max_places=8)
@@ -2375,6 +2531,7 @@ class CounterpartyAdapter:
             "estimated_adjusted_vsize": adjusted_vsize,
             "estimated_sigops_count": sigops_count,
             "size_estimate_source": size_info.get("source"),
+            "fee_ready_for_signing": fee_estimate_ready and not bool(insuff.get("detected")),
             "known_minimum_required_satoshis": known_minimum_sats,
             "known_minimum_required_btc": self._decimal_plain(Decimal(known_minimum_sats) / Decimal(100000000), max_places=8),
             "estimated_total_required_satoshis": estimated_total_sats,
@@ -2396,14 +2553,11 @@ class CounterpartyAdapter:
             "shortfall_target_satoshis": insuff.get("shortfall_target_satoshis"),
             "status": status,
             "status_reason": status_reason,
-            "fee_note": (
-                "Counterparty Core estimated this fee from the selected UTXOs and adjusted virtual size. The final signed transaction can differ by a few satoshis because DER signature sizes vary."
-                if fee_known
-                else "No transaction-specific fee is available because compose did not return a verbose transaction result. The selected confirmation target remains visible for review."
-            ),
+            "fee_note": fee_note,
             "read_only": True,
             "wallet_balance_not_mutated": True,
         }
+
 
     def preview_compose(
         self,
@@ -2631,14 +2785,19 @@ class CounterpartyAdapter:
             compose_probe,
             source_address=source,
             compose_kind=compose_kind,
+            funding_requirements=funding_requirements,
         )
         if wallet_signing_handoff.get("signable_with_unisat"):
             warnings.append(
-                "A UniSat PSBT signing handoff is available after review. Signing requires explicit user action and UTT will not broadcast in CP-SIGN.1."
+                "A validated UniSat PSBT signing handoff is available after review. Signing requires explicit user action and UTT will not broadcast in CP-SIGN.1."
+            )
+        elif wallet_signing_handoff.get("psbt_available"):
+            warnings.append(
+                "Counterparty returned a PSBT, but UTT blocked signing because the positive miner-fee, adjusted-vsize, or funding checks are not ready."
             )
         elif wallet_signing_handoff.get("status") == "raw_transaction_requires_psbt_conversion":
             warnings.append(
-                "Counterparty returned raw unsigned transaction hex rather than PSBT hex. UTT will not call UniSat pushTx or broadcast it; PSBT conversion remains required."
+                "Counterparty returned raw unsigned transaction hex without a recognized PSBT. UTT will not call UniSat pushTx or broadcast it."
             )
 
         return {

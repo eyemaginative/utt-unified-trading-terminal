@@ -169,18 +169,37 @@ function counterpartySigningHandoffView(payload) {
   if (!payload || typeof payload !== "object" || !isCounterpartyVenueKey(payload?.venue)) return null;
   const handoff = payload?.wallet_signing_handoff;
   if (!handoff || typeof handoff !== "object") return null;
+  const funding = payload?.funding_requirements && typeof payload.funding_requirements === "object"
+    ? payload.funding_requirements
+    : {};
   const psbtHex = counterpartyPsbtHexOrNull(handoff?.psbt_hex);
-  const fundingBlocked = payload?.funding_requirements?.insufficient_funds_detected === true;
-  const feeStatus = String(payload?.funding_requirements?.network_fee_status || "").trim().toLowerCase();
-  const feeReady = feeStatus === "known" || feeStatus === "estimated";
+  const fundingBlocked = funding?.insufficient_funds_detected === true;
+  const feeStatus = String(funding?.network_fee_status || "").trim().toLowerCase();
+  const feeSats = counterpartySatoshisOrNull(funding?.network_fee_satoshis);
+  const adjustedVsize = otCounterpartyFiniteNumberOrNull(funding?.estimated_adjusted_vsize);
+  const effectiveSatPerVbyte = otCounterpartyFiniteNumberOrNull(funding?.effective_sat_per_vbyte);
+  const feeReady = Boolean(
+    (feeStatus === "known" || feeStatus === "estimated") &&
+    feeSats !== null &&
+    feeSats > 0 &&
+    adjustedVsize !== null &&
+    adjustedVsize > 0 &&
+    effectiveSatPerVbyte !== null &&
+    effectiveSatPerVbyte > 0
+  );
+  const feeInvalidZero = feeStatus === "invalid_zero_fee" || feeSats === 0;
   const alreadySigned = payload?.signed === true || payload?.wallet_signing_result?.signed === true;
   const baseReason = String(handoff?.status_reason || "").trim();
+  const reason = feeInvalidZero
+    ? "Signing is blocked because Counterparty Core returned a zero-satoshi miner fee for this non-empty transaction."
+    : !feeReady && psbtHex
+      ? "A PSBT is available, but signing is blocked until a positive miner fee, adjusted vsize, and effective sat/vB are validated."
+      : baseReason;
   return {
     status: String(handoff?.status || "unknown").trim(),
-    reason: !feeReady && handoff?.signable_with_unisat === true
-      ? "Signing is blocked until Counterparty Core returns a transaction-specific Bitcoin fee estimate."
-      : baseReason,
+    reason,
     format: String(handoff?.payload_format || "unknown").trim(),
+    sourceEncoding: String(handoff?.payload_source_encoding || "").trim(),
     sourceAddress: String(handoff?.source_address || payload?.source_address || "").trim(),
     sourcePath: String(handoff?.payload_source_path || "").trim(),
     psbtHex,
@@ -194,11 +213,16 @@ function counterpartySigningHandoffView(payload) {
     ),
     fundingBlocked,
     feeReady,
+    feeInvalidZero,
     feeStatus,
+    feeSats,
+    adjustedVsize,
+    effectiveSatPerVbyte,
     alreadySigned,
     broadcastEnabled: handoff?.broadcast_enabled === true,
   };
 }
+
 
 async function counterpartyUniSatMainnetStatus(provider) {
   if (!provider) return { ok: false, label: "UniSat unavailable" };
@@ -241,8 +265,21 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
   const immediatePaymentSats = counterpartySatoshisOrNull(funding?.immediate_payment_satoshis);
   const feeSats = counterpartySatoshisOrNull(funding?.network_fee_satoshis);
   const feeStatus = String(funding?.network_fee_status || "").toLowerCase();
-  const feeKnown = (feeStatus === "known" || feeStatus === "estimated") && feeSats !== null;
-  const feeEstimated = feeStatus === "estimated" && feeSats !== null;
+  const effectiveSatPerVbyte = otCounterpartyFiniteNumberOrNull(funding?.effective_sat_per_vbyte);
+  const estimatedVsize = otCounterpartyFiniteNumberOrNull(funding?.estimated_vsize);
+  const estimatedAdjustedVsize = otCounterpartyFiniteNumberOrNull(funding?.estimated_adjusted_vsize);
+  const feePositive = feeSats !== null && feeSats > 0;
+  const feeInvalidZero = feeStatus === "invalid_zero_fee" || feeSats === 0;
+  const feeKnown = Boolean(
+    (feeStatus === "known" || feeStatus === "estimated") &&
+    feePositive &&
+    estimatedAdjustedVsize !== null &&
+    estimatedAdjustedVsize > 0 &&
+    effectiveSatPerVbyte !== null &&
+    effectiveSatPerVbyte > 0
+  );
+  const feeEstimated = feeStatus === "estimated" && feeKnown;
+  const feeIncomplete = feeStatus === "incomplete_estimate" || (feePositive && !feeKnown);
   const conservativeRequiredSats = counterpartySatoshisOrNull(funding?.conservative_balance_requirement_satoshis);
   const requiredSats = conservativeRequiredSats !== null
     ? conservativeRequiredSats
@@ -255,6 +292,12 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
   let tone = "warn";
   if (backendInsufficient) {
     status = "INSUFFICIENT";
+    tone = "error";
+  } else if (feeInvalidZero) {
+    status = "FEE INVALID · SIGNING BLOCKED";
+    tone = "error";
+  } else if (feeIncomplete) {
+    status = "FEE ESTIMATE INCOMPLETE";
     tone = "error";
   } else if (availableSats !== null && requiredSats !== null && availableSats < requiredSats) {
     status = "INSUFFICIENT";
@@ -291,6 +334,8 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
     immediatePaymentBtc: counterpartyBtcFromSatoshis(immediatePaymentSats),
     feeKnown,
     feeEstimated,
+    feeInvalidZero,
+    feeIncomplete,
     feeStatus,
     feeSats,
     feeBtc: counterpartyBtcFromSatoshis(feeSats),
@@ -299,9 +344,9 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
     confirmationTargetBlocks: otCounterpartyFiniteNumberOrNull(
       funding?.confirmation_target_blocks ?? payload?.fee_policy?.confirmation_target_blocks
     ),
-    effectiveSatPerVbyte: otCounterpartyFiniteNumberOrNull(funding?.effective_sat_per_vbyte),
-    estimatedVsize: otCounterpartyFiniteNumberOrNull(funding?.estimated_vsize),
-    estimatedAdjustedVsize: otCounterpartyFiniteNumberOrNull(funding?.estimated_adjusted_vsize),
+    effectiveSatPerVbyte,
+    estimatedVsize,
+    estimatedAdjustedVsize,
     feeEstimator: String(funding?.fee_estimator || payload?.fee_policy?.estimator || "").trim(),
     requiredSats,
     requiredBtc: counterpartyBtcFromSatoshis(requiredSats),
@@ -7846,6 +7891,8 @@ async function submitLimitOrder() {
                     <div style={{ display: "grid", gridTemplateColumns: "minmax(145px, 0.8fr) minmax(220px, 1.2fr)", gap: "6px 12px", fontSize: 11 }}>
                       <div style={{ color: "#a9a9a9" }}>Payload format</div>
                       <div>{hideTableData ? "••••" : counterpartySigningHandoff.format || "unknown"}</div>
+                      <div style={{ color: "#a9a9a9" }}>PSBT source encoding</div>
+                      <div>{hideTableData ? "••••" : counterpartySigningHandoff.sourceEncoding || "unknown"}</div>
                       <div style={{ color: "#a9a9a9" }}>Source address</div>
                       <div>{hideTableData ? "••••" : counterpartySigningHandoff.sourceAddress || "unknown"}</div>
                       <div style={{ color: "#a9a9a9" }}>Wallet method</div>
@@ -7956,18 +8003,24 @@ async function submitLimitOrder() {
                       <div>
                         {hideTableData
                           ? "••••"
-                          : counterpartySubmitFunding.feeKnown
-                            ? `${counterpartySubmitFunding.feeEstimated ? "Estimated " : ""}${counterpartyFormatBtc(counterpartySubmitFunding.feeBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.feeSats)})`
-                            : "Unavailable — compose did not return a verbose fee result"}
+                          : counterpartySubmitFunding.feeInvalidZero
+                            ? "Invalid 0 sats — signing blocked"
+                            : counterpartySubmitFunding.feeIncomplete
+                              ? `${counterpartyFormatSats(counterpartySubmitFunding.feeSats)} reported, but size/rate validation is incomplete`
+                              : counterpartySubmitFunding.feeKnown
+                                ? `${counterpartySubmitFunding.feeEstimated ? "Estimated " : ""}${counterpartyFormatBtc(counterpartySubmitFunding.feeBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.feeSats)})`
+                                : "Unavailable — compose did not return a usable verbose fee result"}
                       </div>
 
                       <div style={{ color: "#a9a9a9" }}>Effective fee rate</div>
                       <div>
                         {hideTableData
                           ? "••••"
-                          : counterpartySubmitFunding.effectiveSatPerVbyte !== null
-                            ? `${counterpartySubmitFunding.effectiveSatPerVbyte.toLocaleString(undefined, { maximumFractionDigits: 4 })} sat/vB`
-                            : "Unavailable"}
+                          : counterpartySubmitFunding.feeInvalidZero
+                            ? "Invalid 0 sat/vB — signing blocked"
+                            : counterpartySubmitFunding.effectiveSatPerVbyte !== null
+                              ? `${counterpartySubmitFunding.effectiveSatPerVbyte.toLocaleString(undefined, { maximumFractionDigits: 4 })} sat/vB`
+                              : "Unavailable"}
                       </div>
 
                       <div style={{ color: "#a9a9a9" }}>Estimated signed size</div>

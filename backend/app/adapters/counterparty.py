@@ -45,6 +45,12 @@ class CounterpartyAdapter:
         },
     }
 
+    _EXECUTION_MODES = {"auto", "dispenser", "limit_order"}
+    _ORDER_EXPIRATION_DEFAULT_BLOCKS = 500
+    _ORDER_EXPIRATION_LEGACY_AUTO_BLOCKS = 1000
+    _ORDER_EXPIRATION_MIN_BLOCKS = 1
+    _ORDER_EXPIRATION_MAX_BLOCKS = 8064
+
     def __init__(self, base_url: Optional[str] = None, timeout_s: Optional[float] = None):
         fn = getattr(settings, "counterparty_effective_base_url", None)
         resolved = base_url or (fn() if callable(fn) else None) or os.getenv("COUNTERPARTY_API_BASE_URL") or "https://api.counterparty.io:4000"
@@ -1605,6 +1611,8 @@ class CounterpartyAdapter:
             "side": side,
             "quote_asset": quote_asset,
             "source_type": "counterparty_order",
+            "liquidity_type": "limit_order",
+            "liquidity_label": "LIMIT",
             "source": row.get("source"),
             "tx_hash": row.get("tx_hash"),
             "status": row.get("status"),
@@ -1622,12 +1630,21 @@ class CounterpartyAdapter:
                 break
         if price is None or price <= 0 or size is None or size <= 0:
             return None
+        unit_size = None
+        for key in ("give_quantity", "unit_size", "dispense_quantity"):
+            n = cls._as_float(row.get(key))
+            if n is not None and n > 0:
+                unit_size = float(n)
+                break
         return {
             "price": float(price),
             "size": float(size),
+            "unit_size": unit_size,
             "side": "ask",
             "quote_asset": quote_asset,
             "source_type": "counterparty_dispenser",
+            "liquidity_type": "dispenser",
+            "liquidity_label": "DISP",
             "source": row.get("source"),
             "tx_hash": row.get("tx_hash"),
             "status": row.get("status"),
@@ -1678,6 +1695,17 @@ class CounterpartyAdapter:
                 if lvl:
                     asks.append(lvl)
 
+        liquidity_counts = {
+            "bid_limit_orders": sum(1 for row in bids if row.get("source_type") == "counterparty_order"),
+            "ask_limit_orders": sum(1 for row in asks if row.get("source_type") == "counterparty_order"),
+            "ask_dispensers": sum(1 for row in asks if row.get("source_type") == "counterparty_dispenser"),
+            "unknown": sum(
+                1
+                for row in [*bids, *asks]
+                if row.get("source_type") not in {"counterparty_order", "counterparty_dispenser"}
+            ),
+        }
+
         bids = sorted(bids, key=lambda x: float(x.get("price") or 0), reverse=True)[:d]
         asks = sorted(asks, key=lambda x: float(x.get("price") or 0))[:d]
 
@@ -1719,6 +1747,12 @@ class CounterpartyAdapter:
                 "bids": len(bids),
                 "asks": len(asks),
                 "dispensers": len(dispensers_result.get("items") or []),
+                **liquidity_counts,
+            },
+            "liquidity_counts": liquidity_counts,
+            "liquidity_types": {
+                "counterparty_order": "limit_order",
+                "counterparty_dispenser": "dispenser",
             },
             "open_only": bool(open_only),
             "read_only": True,
@@ -2205,6 +2239,43 @@ class CounterpartyAdapter:
 
 
     @classmethod
+    def _normalize_compose_execution_mode(cls, execution_mode: Any) -> str:
+        mode = str(execution_mode or "auto").strip().lower().replace("-", "_")
+        aliases = {
+            "dispense": "dispenser",
+            "swap": "dispenser",
+            "purchase": "dispenser",
+            "market": "dispenser",
+            "limit": "limit_order",
+            "order": "limit_order",
+            "protocol_order": "limit_order",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in cls._EXECUTION_MODES:
+            raise ValueError("Counterparty execution_mode must be one of: auto, dispenser, limit_order")
+        return mode
+
+    @classmethod
+    def _normalize_order_expiration_blocks(
+        cls,
+        expiration_blocks: Any,
+        *,
+        default_blocks: Optional[int] = None,
+    ) -> int:
+        if expiration_blocks in (None, ""):
+            return int(default_blocks or cls._ORDER_EXPIRATION_DEFAULT_BLOCKS)
+        try:
+            value = int(str(expiration_blocks).replace(",", "").strip())
+        except Exception as e:
+            raise ValueError("Counterparty expiration_blocks must be an integer number of Bitcoin blocks") from e
+        if value < cls._ORDER_EXPIRATION_MIN_BLOCKS or value > cls._ORDER_EXPIRATION_MAX_BLOCKS:
+            raise ValueError(
+                f"Counterparty expiration_blocks must be between "
+                f"{cls._ORDER_EXPIRATION_MIN_BLOCKS} and {cls._ORDER_EXPIRATION_MAX_BLOCKS}"
+            )
+        return value
+
+    @classmethod
     def _compose_fee_policy(cls, fee_tier: Any) -> Dict[str, Any]:
         tier = str(fee_tier or "normal").strip().lower()
         if tier not in cls._FEE_TIERS:
@@ -2570,6 +2641,8 @@ class CounterpartyAdapter:
         selected_level: Optional[Dict[str, Any]] = None,
         attempt_upstream: bool = True,
         fee_tier: Any = "normal",
+        execution_mode: Any = "auto",
+        expiration_blocks: Any = None,
     ) -> Dict[str, Any]:
         """Build a read-only unsigned Counterparty compose preview.
 
@@ -2594,19 +2667,58 @@ class CounterpartyAdapter:
             raise ValueError("limit_price must be positive")
 
         fee_policy = self._compose_fee_policy(fee_tier)
+        execution_mode_norm = self._normalize_compose_execution_mode(execution_mode)
+        expiration_default = (
+            self._ORDER_EXPIRATION_LEGACY_AUTO_BLOCKS
+            if execution_mode_norm == "auto"
+            else self._ORDER_EXPIRATION_DEFAULT_BLOCKS
+        )
+        expiration_blocks_norm = self._normalize_order_expiration_blocks(
+            expiration_blocks,
+            default_blocks=expiration_default,
+        )
+
+        if execution_mode_norm == "dispenser":
+            if trade_side != "buy":
+                raise ValueError("Counterparty dispenser mode is buy-only; use limit_order mode for sells")
+            if quote_asset != "BTC":
+                raise ValueError("Counterparty dispenser mode currently requires a BTC-quoted pair")
 
         quote_qty_dec = qty_dec * px_dec
         base_atomic = self._display_quantity_to_atomic(base, qty_dec)
         quote_atomic = self._display_quantity_to_atomic(quote_asset, quote_qty_dec)
         btc_sats = self._display_quantity_to_atomic("BTC", quote_qty_dec) if quote_asset == "BTC" else None
-        level = self._selected_counterparty_book_row(selected_level)
-        selected_level_source = "provided" if level else "none"
+        supplied_level = self._selected_counterparty_book_row(selected_level)
+        level = {} if execution_mode_norm == "limit_order" else supplied_level
+        selected_level_source = (
+            "ignored_limit_order_mode"
+            if execution_mode_norm == "limit_order" and supplied_level
+            else "provided"
+            if level
+            else "none"
+        )
         provided_level_validation: Optional[Dict[str, Any]] = None
         auto_selection_diagnostics: Dict[str, Any] = {
             "attempted": False,
-            "reason": "selected_level_provided" if level else "not_started",
+            "reason": (
+                "limit_order_mode_no_dispenser_lookup"
+                if execution_mode_norm == "limit_order"
+                else "selected_level_provided"
+                if level
+                else "not_started"
+            ),
             "rejections": [],
         }
+
+        if execution_mode_norm == "dispenser" and level and not self._compose_level_is_dispenser(level):
+            provided_level_validation = self._compose_level_diagnostic_row(
+                level,
+                index=0,
+                reasons=["wrong_liquidity_type"],
+            )
+            provided_level_validation["accepted"] = False
+            level = {}
+            selected_level_source = "none"
 
         # Enforce the same safety rules for a dispenser row supplied by the UI.
         # A clicked oracle-backed or undersized dispenser must not bypass the
@@ -2624,7 +2736,7 @@ class CounterpartyAdapter:
                 level = {}
                 selected_level_source = "none"
 
-        if not level:
+        if execution_mode_norm != "limit_order" and not level:
             auto_match = self._find_compose_book_level(
                 symbol=symbol_canon,
                 side=trade_side,
@@ -2652,6 +2764,18 @@ class CounterpartyAdapter:
                 "transaction-specific fee from selected UTXOs and adjusted virtual size when compose succeeds."
             ),
         ]
+        if execution_mode_norm == "dispenser":
+            warnings.append(
+                "Execution mode is Dispenser Purchase. UTT may compose only dispense and must fail closed if no eligible dispenser is available."
+            )
+        elif execution_mode_norm == "limit_order":
+            warnings.append(
+                f"Execution mode is Limit Order. UTT skipped dispenser execution and will compose a protocol order expiring after {expiration_blocks_norm} blocks."
+            )
+        else:
+            warnings.append(
+                "Execution mode is legacy Auto for backward compatibility; interactive Order Ticket requests should use dispenser or limit_order explicitly."
+            )
 
         if provided_level_validation and provided_level_validation.get("accepted") is False:
             rejected_reasons = ", ".join(provided_level_validation.get("reasons") or []) or "unsafe_level"
@@ -2663,10 +2787,19 @@ class CounterpartyAdapter:
             warnings.append(
                 "No eligible supplied book level was available; UTT auto-selected a current full-size, non-oracle Counterparty dispenser for compose preview."
             )
-        elif auto_selection_diagnostics.get("attempted") and auto_selection_diagnostics.get("reason") == "no_safe_executable_dispenser":
-            warnings.append(
-                "No full-size, non-oracle Counterparty dispenser satisfied this ticket limit; UTT used the safe compose/order preview fallback."
-            )
+        elif auto_selection_diagnostics.get("attempted") and auto_selection_diagnostics.get("reason") in {
+            "no_safe_executable_dispenser",
+            "no_book_rows",
+            "orderbook_unavailable",
+        }:
+            if execution_mode_norm == "auto":
+                warnings.append(
+                    "No full-size, non-oracle Counterparty dispenser satisfied this ticket limit; legacy Auto mode used the safe compose/order preview fallback."
+                )
+            else:
+                warnings.append(
+                    "No eligible Counterparty dispenser satisfied this ticket. Dispenser Purchase mode failed closed and did not create a protocol order."
+                )
 
         if dispenser_like and level_size_dec is not None and qty_dec > level_size_dec:
             warnings.append(
@@ -2688,7 +2821,13 @@ class CounterpartyAdapter:
             get_quantity_display = quote_qty_dec
             get_quantity_atomic = quote_atomic
 
-        compose_kind = "dispenser_dispense" if dispenser_like else "order"
+        if execution_mode_norm == "dispenser":
+            compose_kind = "dispenser_dispense"
+        elif execution_mode_norm == "limit_order":
+            compose_kind = "order"
+        else:
+            compose_kind = "dispenser_dispense" if dispenser_like else "order"
+        mode_fallback_used = execution_mode_norm == "auto" and compose_kind == "order" and not dispenser_like
         escaped_source = quote(source, safe="")
         candidates: List[Dict[str, Any]] = []
         construct_fee_params = {
@@ -2705,7 +2844,13 @@ class CounterpartyAdapter:
         if compose_kind == "dispenser_dispense":
             dispenser_ref = level_source
             if not dispenser_ref:
-                compose_kind = "order"
+                if execution_mode_norm == "auto":
+                    compose_kind = "order"
+                    mode_fallback_used = True
+                else:
+                    warnings.append(
+                        "Dispenser Purchase mode failed closed because no eligible full-size, non-oracle BTC dispenser matched the ticket. UTT did not fall back to compose/order."
+                    )
             else:
                 # Counterparty Core v2 /compose/dispense accepts a narrow parameter set.
                 # The prior preview sent extra human/audit fields (asset, btc_amount,
@@ -2756,7 +2901,7 @@ class CounterpartyAdapter:
                 "give_quantity": give_quantity_atomic,
                 "get_asset": get_asset,
                 "get_quantity": get_quantity_atomic,
-                "expiration": 1000,
+                "expiration": expiration_blocks_norm,
                 "fee_required": 0,
                 "fee_provided": 0,
                 **construct_fee_params,
@@ -2770,7 +2915,22 @@ class CounterpartyAdapter:
 
         compose_probe = {"ok": False, "skipped": True, "reason": "attempt_upstream=false"}
         if attempt_upstream:
-            compose_probe = self._compose_try_candidates(candidates)
+            if candidates:
+                compose_probe = self._compose_try_candidates(candidates)
+            elif execution_mode_norm == "dispenser":
+                compose_probe = {
+                    "ok": False,
+                    "skipped": True,
+                    "reason": "dispenser_unavailable",
+                    "errors": [],
+                }
+            else:
+                compose_probe = {
+                    "ok": False,
+                    "skipped": True,
+                    "reason": "no_compose_candidates",
+                    "errors": [],
+                }
 
         funding_requirements = self._compose_funding_requirements(
             compose_kind=compose_kind,
@@ -2809,6 +2969,9 @@ class CounterpartyAdapter:
             "quote_asset": quote_asset,
             "side": trade_side,
             "source_address": source,
+            "execution_mode": execution_mode_norm,
+            "mode_fallback_used": bool(mode_fallback_used),
+            "expiration_blocks": expiration_blocks_norm if compose_kind == "order" else None,
             "compose_kind": compose_kind,
             "fee_policy": fee_policy,
             "quantity": self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base)),

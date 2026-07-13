@@ -19,6 +19,8 @@ class CounterpartyComposePreviewRequest(BaseModel):
     selected_level: Optional[Dict[str, Any]] = None
     attempt_upstream: bool = True
     fee_tier: str = "normal"
+    execution_mode: str = "auto"
+    expiration_blocks: int | str | None = None
 
 
 def _adapter() -> CounterpartyAdapter:
@@ -74,6 +76,8 @@ def counterparty_compose_preview(req: CounterpartyComposePreviewRequest = Body(.
             selected_level=req.selected_level,
             attempt_upstream=bool(req.attempt_upstream),
             fee_tier=req.fee_tier,
+            execution_mode=req.execution_mode,
+            expiration_blocks=req.expiration_blocks,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

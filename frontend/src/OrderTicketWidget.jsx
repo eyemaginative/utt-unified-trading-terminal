@@ -23,6 +23,11 @@ const HYDRATION_ROUTER_BOOK_SIDE_TOLERANCE_BPS = 2;
 const LS_OT_COUNTERPARTY_UNISAT_ADDR = "utt_nft_unisat_address_v1";
 const LS_OT_COUNTERPARTY_BTC_BALANCE = "utt_counterparty_unisat_btc_balance_v1";
 const LS_OT_COUNTERPARTY_FEE_TIER = "utt_counterparty_fee_tier_v1";
+const LS_OT_COUNTERPARTY_EXECUTION_MODE = "utt_counterparty_execution_mode_v1";
+const LS_OT_COUNTERPARTY_EXPIRATION_PRESET = "utt_counterparty_expiration_preset_v1";
+const LS_OT_COUNTERPARTY_EXPIRATION_CUSTOM = "utt_counterparty_expiration_custom_v1";
+const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
+const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
 
 const COUNTERPARTY_FEE_TIERS = {
   slow: { label: "Slow", blocks: 18, eta: "~3 hours" },
@@ -41,6 +46,58 @@ function readCounterpartyFeeTier() {
   } catch {
     return "normal";
   }
+}
+
+function normalizeCounterpartyExecutionMode(value) {
+  const v = String(value || "dispenser").trim().toLowerCase().replace(/-/g, "_");
+  if (v === "limit" || v === "order" || v === "protocol_order") return "limit_order";
+  if (v === "dispense" || v === "swap" || v === "purchase") return "dispenser";
+  return v === "limit_order" ? "limit_order" : "dispenser";
+}
+
+function readCounterpartyExecutionMode() {
+  try {
+    return normalizeCounterpartyExecutionMode(localStorage.getItem(LS_OT_COUNTERPARTY_EXECUTION_MODE) || "dispenser");
+  } catch {
+    return "dispenser";
+  }
+}
+
+const COUNTERPARTY_EXPIRATION_PRESETS = {
+  short: { label: "Short", blocks: 100 },
+  normal: { label: "Normal", blocks: 500 },
+  long: { label: "Long", blocks: 1000 },
+  custom: { label: "Custom", blocks: null },
+};
+
+function normalizeCounterpartyExpirationPreset(value) {
+  const v = String(value || "normal").trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(COUNTERPARTY_EXPIRATION_PRESETS, v) ? v : "normal";
+}
+
+function readCounterpartyExpirationPreset() {
+  try {
+    return normalizeCounterpartyExpirationPreset(localStorage.getItem(LS_OT_COUNTERPARTY_EXPIRATION_PRESET) || "normal");
+  } catch {
+    return "normal";
+  }
+}
+
+function readCounterpartyExpirationCustom() {
+  try {
+    return String(localStorage.getItem(LS_OT_COUNTERPARTY_EXPIRATION_CUSTOM) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function counterpartyBookRowLiquidityType(row) {
+  const explicit = String(row?.liquidity_type || "").trim().toLowerCase();
+  if (explicit === "dispenser" || explicit === "limit_order") return explicit;
+  const sourceType = String(row?.source_type || "").trim().toLowerCase();
+  if (sourceType === "counterparty_dispenser" || sourceType.includes("dispenser") || row?.raw_dispenser) return "dispenser";
+  if (sourceType === "counterparty_order" || sourceType.includes("order") || row?.raw_order) return "limit_order";
+  return "unknown";
 }
 
 function isCounterpartyVenueKey(value) {
@@ -100,8 +157,11 @@ function counterpartyBookRowPrice(row) {
   return otCounterpartyFiniteNumberOrNull(row?.price ?? row?.displayPrice ?? row?.limitPrice ?? row?.rate);
 }
 
-function counterpartyPickBookRowForTicket(payload, side, limitPrice) {
-  const rows = counterpartyBookRows(payload, String(side || "").toLowerCase() === "buy" ? "asks" : "bids");
+function counterpartyPickBookRowForTicket(payload, side, limitPrice, executionMode = "dispenser") {
+  const mode = normalizeCounterpartyExecutionMode(executionMode);
+  if (mode === "limit_order") return null;
+  const rows = counterpartyBookRows(payload, String(side || "").toLowerCase() === "buy" ? "asks" : "bids")
+    .filter((row) => counterpartyBookRowLiquidityType(row) === "dispenser");
   if (!rows.length) return null;
   const wanted = otCounterpartyFiniteNumberOrNull(expandExponential(limitPrice));
   if (wanted !== null) {
@@ -124,7 +184,7 @@ function counterpartyPickBookRowForTicket(payload, side, limitPrice) {
 function counterpartySafeBookLevelForPreview(row) {
   if (!row || typeof row !== "object") return null;
   const out = {};
-  for (const key of ["price", "size", "side", "quote_asset", "source_type", "source", "tx_hash", "status", "satoshirate"]) {
+  for (const key of ["price", "size", "unit_size", "side", "quote_asset", "source_type", "liquidity_type", "liquidity_label", "source", "tx_hash", "status", "satoshirate"]) {
     if (row[key] !== undefined && row[key] !== null && row[key] !== "") out[key] = row[key];
   }
   if (row.raw_dispenser && typeof row.raw_dispenser === "object") {
@@ -2439,6 +2499,12 @@ export default function OrderTicketWidget({
   const [counterpartyBtcBalanceMeta, setCounterpartyBtcBalanceMeta] = useState(null);
   const [counterpartySigningPending, setCounterpartySigningPending] = useState(false);
   const [counterpartyFeeTier, setCounterpartyFeeTier] = useState(() => readCounterpartyFeeTier());
+  const [counterpartyExecutionMode, setCounterpartyExecutionMode] = useState(() => readCounterpartyExecutionMode());
+  const [counterpartyExpirationPreset, setCounterpartyExpirationPreset] = useState(() => readCounterpartyExpirationPreset());
+  const [counterpartyExpirationCustom, setCounterpartyExpirationCustom] = useState(() => readCounterpartyExpirationCustom());
+  const [counterpartySelectedLevel, setCounterpartySelectedLevel] = useState(null);
+  const isCounterpartyDispenserMode = isCounterpartyVenue && normalizeCounterpartyExecutionMode(counterpartyExecutionMode) === "dispenser";
+  const isCounterpartyLimitOrderMode = isCounterpartyVenue && normalizeCounterpartyExecutionMode(counterpartyExecutionMode) === "limit_order";
   const counterpartyBookReqRef = useRef(0);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
@@ -2447,6 +2513,21 @@ export default function OrderTicketWidget({
   useEffect(() => {
     try { localStorage.setItem(LS_OT_COUNTERPARTY_FEE_TIER, normalizeCounterpartyFeeTier(counterpartyFeeTier)); } catch {}
   }, [counterpartyFeeTier]);
+  useEffect(() => {
+    const mode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
+    try { localStorage.setItem(LS_OT_COUNTERPARTY_EXECUTION_MODE, mode); } catch {}
+    try {
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent(COUNTERPARTY_EXECUTION_MODE_EVENT, { detail: { mode } }));
+      }
+    } catch {}
+  }, [counterpartyExecutionMode]);
+  useEffect(() => {
+    try { localStorage.setItem(LS_OT_COUNTERPARTY_EXPIRATION_PRESET, normalizeCounterpartyExpirationPreset(counterpartyExpirationPreset)); } catch {}
+  }, [counterpartyExpirationPreset]);
+  useEffect(() => {
+    try { localStorage.setItem(LS_OT_COUNTERPARTY_EXPIRATION_CUSTOM, String(counterpartyExpirationCustom || "").trim()); } catch {}
+  }, [counterpartyExpirationCustom]);
   useEffect(() => {
     if (!isPolkadotDexVenue) return;
     const bump = () => setPolkadotWalletScanNonce((x) => x + 1);
@@ -3443,6 +3524,58 @@ export default function OrderTicketWidget({
       clearTimeout(t);
     };
   }, [isCounterpartyVenue, apiBase, otSymbol]);
+
+  useEffect(() => {
+    if (!isCounterpartyVenue) return;
+    if (side === "sell" && normalizeCounterpartyExecutionMode(counterpartyExecutionMode) === "dispenser") {
+      setCounterpartyExecutionMode("limit_order");
+      setCounterpartySelectedLevel(null);
+    }
+  }, [isCounterpartyVenue, side, counterpartyExecutionMode]);
+
+  useEffect(() => {
+    setCounterpartySelectedLevel(null);
+  }, [otSymbol, counterpartyExecutionMode, side]);
+
+  useEffect(() => {
+    if (!isCounterpartyVenue || typeof window === "undefined") return undefined;
+    const onBookPick = (event) => {
+      const detail = event?.detail && typeof event.detail === "object" ? event.detail : {};
+      const pickedSymbol = normalizeCounterpartySymbol(detail?.symbol || "");
+      const ticketSymbol = normalizeCounterpartySymbol(otSymbol || "");
+      if (pickedSymbol && ticketSymbol && pickedSymbol !== ticketSymbol) return;
+      const row = detail?.row && typeof detail.row === "object" ? detail.row : null;
+      if (!row) return;
+
+      const mode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
+      const liquidityType = counterpartyBookRowLiquidityType(row);
+      const px = counterpartyBookRowPrice(row);
+      if (px !== null && px > 0) {
+        limitSourceRef.current = "counterparty_orderbook";
+        setLimitPrice(px.toFixed(8));
+      }
+
+      if (mode === "limit_order") {
+        setCounterpartySelectedLevel(null);
+        return;
+      }
+
+      if (liquidityType !== "dispenser") {
+        setCounterpartySelectedLevel(null);
+        onToast?.({ kind: "warn", msg: "This row is a Counterparty protocol limit order. Switch to Limit Order mode to use its price as order context." });
+        return;
+      }
+
+      const safeLevel = counterpartySafeBookLevelForPreview(row);
+      setCounterpartySelectedLevel(safeLevel);
+      if (detail?.pick === "unit" || detail?.pick === "size") {
+        const unit = otCounterpartyFiniteNumberOrNull(row?.unit_size ?? row?.raw_dispenser?.give_quantity);
+        if (unit !== null && unit > 0) setQty(String(unit));
+      }
+    };
+    window.addEventListener(COUNTERPARTY_ORDERBOOK_PICK_EVENT, onBookPick);
+    return () => window.removeEventListener(COUNTERPARTY_ORDERBOOK_PICK_EVENT, onBookPick);
+  }, [isCounterpartyVenue, counterpartyExecutionMode, otSymbol, setLimitPrice, setQty, onToast]);
 
   // ─────────────────────────────────────────────────────────────
   // Helpers: formatting + increment math
@@ -4626,6 +4759,22 @@ export default function OrderTicketWidget({
     return "Never";
   }, [isSolanaLimitMode, solanaExpiryPreset, solanaExpiryCustom]);
 
+  const counterpartyExpirationBlocks = useMemo(() => {
+    const preset = normalizeCounterpartyExpirationPreset(counterpartyExpirationPreset);
+    if (preset !== "custom") return COUNTERPARTY_EXPIRATION_PRESETS[preset]?.blocks ?? 500;
+    const n = Number(String(counterpartyExpirationCustom || "").replace(/,/g, "").trim());
+    if (!Number.isInteger(n) || n < 1 || n > 8064) return null;
+    return n;
+  }, [counterpartyExpirationPreset, counterpartyExpirationCustom]);
+
+  const counterpartyExpirationLabel = useMemo(() => {
+    if (!isCounterpartyLimitOrderMode) return "—";
+    const preset = normalizeCounterpartyExpirationPreset(counterpartyExpirationPreset);
+    const blocks = counterpartyExpirationBlocks;
+    if (blocks === null) return "Invalid custom expiration";
+    return `${COUNTERPARTY_EXPIRATION_PRESETS[preset]?.label || "Custom"} · ${blocks} blocks`;
+  }, [isCounterpartyLimitOrderMode, counterpartyExpirationPreset, counterpartyExpirationBlocks]);
+
   useEffect(() => {
     if (!autoCalc) return;
 
@@ -4736,11 +4885,17 @@ export default function OrderTicketWidget({
     if (isCounterpartyVenue) {
       const parts = counterpartyPairParts(otSymbol);
       const canonSymbol = parts.symbol || normalizeCounterpartySymbol(otSymbol);
+      const mode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
       const bids = counterpartyBookRows(counterpartyBook, "bids");
       const asks = counterpartyBookRows(counterpartyBook, "asks");
-      const executableSideRows = side === "buy" ? asks : bids;
+      const dispenserAsks = asks.filter((row) => counterpartyBookRowLiquidityType(row) === "dispenser");
 
-      lines.push("Counterparty ticket is preview-only. Compose, UniSat signing, and broadcast are intentionally disabled in this tranche.");
+      lines.push("Counterparty builds an unsigned compose preview. UniSat signing requires explicit approval; broadcast remains disabled.");
+      lines.push(
+        mode === "dispenser"
+          ? "Mode: Dispenser Purchase. UTT will fail closed if no eligible dispenser is available and will not fall back to a protocol order."
+          : `Mode: Limit Order. UTT will compose a new protocol order expiring after ${counterpartyExpirationBlocks ?? "an invalid number of"} blocks and will not execute a dispenser.`
+      );
       if (counterpartyBookLoading) lines.push("Counterparty book preview loading…");
       if (counterpartyBookError) lines.push(hideTableData ? "Counterparty book preview unavailable." : `Counterparty book preview unavailable: ${counterpartyBookError}`);
 
@@ -4752,6 +4907,30 @@ export default function OrderTicketWidget({
         fails.push("counterparty_quote_unsupported");
       }
 
+      if (mode === "dispenser") {
+        if (side !== "buy") {
+          lines.push("Dispenser Purchase is buy-only. Use Limit Order mode to sell.");
+          fails.push("counterparty_dispenser_buy_only");
+        }
+        if (parts.quote && parts.quote !== "BTC") {
+          lines.push("Dispenser Purchase currently requires a BTC-quoted pair.");
+          fails.push("counterparty_dispenser_btc_quote_required");
+        }
+        if (
+          parts.base &&
+          parts.quote === "BTC" &&
+          !counterpartyBookLoading &&
+          !counterpartyBookError &&
+          dispenserAsks.length === 0
+        ) {
+          lines.push(`No active Counterparty dispenser asks found for ${canonSymbol}. Dispenser mode will fail closed.`);
+          fails.push("counterparty_dispenser_unavailable");
+        }
+      } else if (counterpartyExpirationBlocks === null) {
+        lines.push("Limit-order expiration must be a whole number from 1 through 8064 blocks.");
+        fails.push("counterparty_expiration_invalid");
+      }
+
       if (qtyNum === null) {
         lines.push("Qty missing/invalid.");
         fails.push("qty_missing");
@@ -4759,12 +4938,6 @@ export default function OrderTicketWidget({
       if (pxNum === null) {
         lines.push("Limit price missing/invalid.");
         fails.push("px_missing");
-      }
-
-      if (parts.base && parts.quote && !counterpartyBookLoading && !counterpartyBookError && executableSideRows.length === 0) {
-        const label = side === "buy" ? "ask" : "bid";
-        lines.push(`No active Counterparty ${label} levels found for ${canonSymbol}. Preview only; no executable quote source yet.`);
-        fails.push("counterparty_book_empty");
       }
 
       if (side === "buy" && buySpendQuote !== null && buySpendCapacityQuote !== null && buySpendQuote > buySpendCapacityQuote + 1e-12) {
@@ -4789,10 +4962,10 @@ export default function OrderTicketWidget({
       if (balNotice) lines.push(hideTableData ? "Counterparty wallet notice." : balNotice);
 
       return {
-        status: fails.length ? "warn" : "warn",
-        title: fails.length ? "Counterparty preview: needs attention" : "Counterparty preview: read-only",
+        status: fails.length ? "fail" : "warn",
+        title: fails.length ? "Counterparty preview: blocked" : "Counterparty preview: review required",
         lines,
-        block: true,
+        block: fails.length > 0,
         message: lines.join(" "),
       };
     }
@@ -5061,6 +5234,8 @@ export default function OrderTicketWidget({
     polkadotLiquidityWarning,
     hydrationManualRouterPriceGuard,
     isCounterpartyVenue,
+    counterpartyExecutionMode,
+    counterpartyExpirationBlocks,
     counterpartyBook,
     counterpartyBookLoading,
     counterpartyBookError,
@@ -5114,8 +5289,11 @@ export default function OrderTicketWidget({
   if (!isCounterpartyVenue) return false;
   if (!String(otSymbol || "").trim()) return false;
   if (!(side === "buy" || side === "sell")) return false;
+  const mode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
+  if (mode === "dispenser" && side !== "buy") return false;
+  if (mode === "limit_order" && counterpartyExpirationBlocks === null) return false;
   return qtyNum !== null && pxNum !== null;
-  }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum]);
+  }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum, counterpartyExecutionMode, counterpartyExpirationBlocks]);
 
   const primaryActionDisabled = submitting || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
 
@@ -5933,6 +6111,8 @@ async function previewCounterpartyCompose() {
       symbol: otSymbol,
       side,
       fee_tier: normalizeCounterpartyFeeTier(counterpartyFeeTier),
+      execution_mode: normalizeCounterpartyExecutionMode(counterpartyExecutionMode),
+      expiration_blocks: isCounterpartyLimitOrderMode ? counterpartyExpirationBlocks : null,
       read_only: true,
     },
     "Building Counterparty Compose Preview"
@@ -5943,9 +6123,14 @@ async function previewCounterpartyCompose() {
     const sourceAddress = await getCounterpartyAddressWithPrompt({ forcePrompt: true });
     if (!sourceAddress) throw new Error("Connect or unlock UniSat to choose the Counterparty source address.");
 
-    const selectedLevel = counterpartySafeBookLevelForPreview(
-      counterpartyPickBookRowForTicket(counterpartyBook, side, limitPrice)
-    );
+    const executionMode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
+    const pickedLevel = executionMode === "dispenser"
+      ? (
+          counterpartySelectedLevel ||
+          counterpartyPickBookRowForTicket(counterpartyBook, side, limitPrice, executionMode)
+        )
+      : null;
+    const selectedLevel = counterpartySafeBookLevelForPreview(pickedLevel);
 
     const payload = {
       source_address: sourceAddress,
@@ -5957,6 +6142,8 @@ async function previewCounterpartyCompose() {
       selected_level: selectedLevel,
       attempt_upstream: true,
       fee_tier: normalizeCounterpartyFeeTier(counterpartyFeeTier),
+      execution_mode: executionMode,
+      expiration_blocks: executionMode === "limit_order" ? counterpartyExpirationBlocks : null,
     };
 
     const base = String(apiBase || "").replace(/\/+$/, "");
@@ -6526,7 +6713,10 @@ async function submitLimitOrder() {
       if (side === "buy" && !polkadotEffectiveExactBuyEnabled) return "/api/polkadot_dex/hydration/swap_tx (BUY disabled; SELL enabled)";
       return `/api/polkadot_dex/hydration/swap_tx (${hydrationRouteModeLabel(preferredHydrationRouteMode)}) → SubWallet sign/send`;
     }
-    if (isCounterpartyVenue) return "/api/counterparty/compose/preview → UniSat signPsbt (explicit user action; no broadcast)";
+    if (isCounterpartyVenue) {
+      const modeLabel = isCounterpartyLimitOrderMode ? "limit order" : "dispenser purchase";
+      return `/api/counterparty/compose/preview (${modeLabel}) → UniSat signPsbt (explicit user action; no broadcast)`;
+    }
     if (!isSolanaDexVenue) return "/api/trade/order";
     if (isSolanaLimitMode) return "/api/solana_dex/jupiter/trigger/create_order";
     const v = String(effectiveVenue || "").toLowerCase().trim();
@@ -6535,7 +6725,7 @@ async function submitLimitOrder() {
     if (routerMode === "ultra") return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute";
     if (routerMode === "metis") return "/api/solana_dex/jupiter/swap_tx";
     return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute → fallback /api/solana_dex/jupiter/swap_tx → fallback /api/solana_dex/raydium/swap_tx";
-  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, isCounterpartyVenue, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotManualRouterFallbackAvailable, polkadotSyntheticPriceOnly, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
+  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, isCounterpartyVenue, isCounterpartyLimitOrderMode, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotManualRouterFallbackAvailable, polkadotSyntheticPriceOnly, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
 
   async function signCounterpartyComposeWithUniSat() {
     const preview = submitResultPayload;
@@ -6651,7 +6841,9 @@ async function submitLimitOrder() {
       { k: "Venue", v: hideVenueNames ? "••••" : v },
       { k: "Symbol", v: hideTableData ? "••••" : sym },
       { k: "Side", v: side.toUpperCase() },
-      { k: "Type", v: isCounterpartyVenue ? "PREVIEW" : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "LIMIT" : "SWAP") : isPolkadotDexVenue ? "SWAP" : "LIMIT" },
+      { k: "Type", v: isCounterpartyVenue ? (isCounterpartyLimitOrderMode ? "LIMIT ORDER" : "DISPENSER PURCHASE") : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "LIMIT" : "SWAP") : isPolkadotDexVenue ? "SWAP" : "LIMIT" },
+      ...(isCounterpartyVenue ? [{ k: "Execution Mode", v: isCounterpartyLimitOrderMode ? "Limit Order" : "Dispenser Purchase" }] : []),
+      ...(isCounterpartyLimitOrderMode ? [{ k: "Expiration", v: hideTableData ? "••••" : counterpartyExpirationLabel }] : []),
       ...(isPolkadotDexVenue ? [{ k: "Route", v: polkadotManualRouterFallbackAvailable ? "Manual Router fallback" : hydrationRouteModeLabel(preferredHydrationRouteMode) }] : []),
       { k: "Qty", v: hideTableData ? "••••" : qStr },
       { k: "Limit", v: hideTableData ? "••••" : pxStr },
@@ -6659,9 +6851,11 @@ async function submitLimitOrder() {
       ...(autoCalc ? [{ k: `Requested Total (${totalLabel})`, v: hideTableData ? "••••" : reqTotStr }] : []),
       ...(isSolanaLimitMode
         ? [{ k: "Expiry", v: hideTableData ? "••••" : solanaExpiryLabel }]
-        : [{ k: "TIF", v: String(tif || "gtc").toUpperCase() }]),
-      ...(!isSolanaLimitMode ? [{ k: "Post-only", v: postOnly ? "YES" : "NO" }] : []),
-      ...(!isSolanaLimitMode && clientOid ? [{ k: "Client OID", v: hideTableData ? "••••" : String(clientOid) }] : []),
+        : isCounterpartyVenue
+          ? []
+          : [{ k: "TIF", v: String(tif || "gtc").toUpperCase() }]),
+      ...(!isSolanaLimitMode && !isCounterpartyVenue ? [{ k: "Post-only", v: postOnly ? "YES" : "NO" }] : []),
+      ...(!isSolanaLimitMode && !isCounterpartyVenue && clientOid ? [{ k: "Client OID", v: hideTableData ? "••••" : String(clientOid) }] : []),
     ];
   }, [
     venueLabel,
@@ -6683,6 +6877,8 @@ async function submitLimitOrder() {
     isSolanaJupiterVenue,
     isPolkadotDexVenue,
     isCounterpartyVenue,
+    isCounterpartyLimitOrderMode,
+    counterpartyExpirationLabel,
     preferredHydrationRouteMode,
     isSolanaLimitMode,
     solanaOrderMode,
@@ -6807,6 +7003,43 @@ async function submitLimitOrder() {
                 title="Use Jupiter Trigger limit orders"
               >
                 Limit
+              </button>
+            </div>
+          )}
+
+          {isCounterpartyVenue && (
+            <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                style={{
+                  ...sideBtnBase,
+                  ...(isCounterpartyDispenserMode ? sideBtnActive : null),
+                  boxShadow: isCounterpartyDispenserMode ? "0 0 0 1px #2f6f8f inset" : undefined,
+                  opacity: side === "sell" ? 0.5 : 1,
+                }}
+                onClick={() => {
+                  if (side === "sell") {
+                    onToast?.({ kind: "warn", msg: "Counterparty dispenser purchases are buy-only. Switch to Buy or use Limit Order mode." });
+                    return;
+                  }
+                  setCounterpartyExecutionMode("dispenser");
+                }}
+                type="button"
+                title="Buy immediately from an eligible BTC-quoted Counterparty dispenser. This mode fails closed and never falls back to a protocol order."
+                disabled={side === "sell"}
+              >
+                Dispenser Purchase
+              </button>
+              <button
+                style={{
+                  ...sideBtnBase,
+                  ...(isCounterpartyLimitOrderMode ? sideBtnActive : null),
+                  boxShadow: isCounterpartyLimitOrderMode ? "0 0 0 1px #8f6a2f inset" : undefined,
+                }}
+                onClick={() => setCounterpartyExecutionMode("limit_order")}
+                type="button"
+                title="Compose a new Counterparty protocol limit order. Existing book rows provide price context only."
+              >
+                Limit Order
               </button>
             </div>
           )}
@@ -7307,8 +7540,44 @@ async function submitLimitOrder() {
                 Compose preview + explicit UniSat PSBT signing. Broadcast remains disabled.
               </span>
               <span style={{ ...safeMuted, fontSize: 11 }}>
+                Mode: <b>{isCounterpartyDispenserMode ? "Dispenser Purchase" : "Limit Order"}</b>
+              </span>
+              <span style={{ ...safeMuted, fontSize: 11 }}>
                 Book: {counterpartyBookLoading ? "loading…" : counterpartyBookError ? "unavailable" : `${counterpartyBookRows(counterpartyBook, "bids").length} bids / ${counterpartyBookRows(counterpartyBook, "asks").length} asks`}
               </span>
+              {isCounterpartyLimitOrderMode && (
+                <>
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap" }}>
+                    <span style={{ ...safeMuted, fontSize: 11 }}>Expiration</span>
+                    <select
+                      style={{ ...darkSelectStyle, minWidth: 126 }}
+                      value={normalizeCounterpartyExpirationPreset(counterpartyExpirationPreset)}
+                      onChange={(e) => setCounterpartyExpirationPreset(normalizeCounterpartyExpirationPreset(e.target.value))}
+                      title="Counterparty protocol-order expiration in Bitcoin blocks."
+                    >
+                      <option value="short">Short · 100 blocks</option>
+                      <option value="normal">Normal · 500 blocks</option>
+                      <option value="long">Long · 1000 blocks</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                  </label>
+                  {normalizeCounterpartyExpirationPreset(counterpartyExpirationPreset) === "custom" && (
+                    <label style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap" }}>
+                      <span style={{ ...safeMuted, fontSize: 11 }}>Blocks</span>
+                      <input
+                        style={{ ...safeInput, width: 90 }}
+                        type="number"
+                        min="1"
+                        max="8064"
+                        step="1"
+                        value={counterpartyExpirationCustom}
+                        onChange={(e) => setCounterpartyExpirationCustom(e.target.value)}
+                        title="Whole number from 1 through 8064 blocks."
+                      />
+                    </label>
+                  )}
+                </>
+              )}
               <label style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap" }}>
                 <span style={{ ...safeMuted, fontSize: 11 }}>Bitcoin fee</span>
                 <select
@@ -7533,7 +7802,7 @@ async function submitLimitOrder() {
                 </div>
               )}
             </>
-          ) : (
+          ) : isCounterpartyVenue ? null : (
             <>
               <div style={safePill}>
                 <span>TIF</span>
@@ -7563,8 +7832,9 @@ async function submitLimitOrder() {
         </div>
 
         <div style={{ marginTop: 6, ...safeMuted, fontSize: 12, lineHeight: 1.15 }}>
-          Type: <b>{isCounterpartyVenue ? "Preview" : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
+          Type: <b>{isCounterpartyVenue ? (isCounterpartyLimitOrderMode ? "Limit Order" : "Dispenser Purchase") : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
           {isSolanaLimitMode ? <> • Expiry: <b>{hideTableData ? "••••" : solanaExpiryLabel}</b></> : null}
+          {isCounterpartyLimitOrderMode ? <> • Expiration: <b>{hideTableData ? "••••" : counterpartyExpirationLabel}</b></> : null}
           {" "}• Est. Total ({totalLabel}): <b>{notional === null ? "—" : fmtNum ? fmtNum(notional) : String(notional)}</b>
         </div>
 
@@ -7581,8 +7851,12 @@ async function submitLimitOrder() {
             title={
               isCounterpartyVenue
                 ? canCounterpartyComposePreview
-                  ? "Preview unsigned Counterparty compose payload. No signing or broadcast."
-                  : "Fill Counterparty symbol, qty, and limit price"
+                  ? isCounterpartyLimitOrderMode
+                    ? "Preview unsigned Counterparty limit order. UniSat signing is explicit; broadcast remains disabled."
+                    : "Preview unsigned Counterparty dispenser purchase. UniSat signing is explicit; broadcast remains disabled."
+                  : isCounterpartyLimitOrderMode
+                    ? "Fill Counterparty symbol, qty, limit price, and valid expiration"
+                    : "Fill Counterparty symbol, qty, and limit price"
                 : !canSubmitBase
                   ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isDexSwapVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
                   : preTrade?.block
@@ -7593,7 +7867,9 @@ async function submitLimitOrder() {
             {submitting
               ? "Submitting…"
               : isCounterpartyVenue
-                ? "Preview Unsigned Compose"
+                ? isCounterpartyLimitOrderMode
+                  ? "Preview Limit Order"
+                  : "Preview Dispenser Purchase"
                 : isSolanaLimitMode
                 ? side === "buy" ? "Place Buy Limit" : "Place Sell Limit"
                 : isDexSwapVenue

@@ -8,10 +8,195 @@ const LS_OB_AUTO = "utt_ob_auto_v1";
 const LS_OB_SEC = "utt_ob_sec_v1";
 const LS_OB_SOL_ROUTER = "utt_ob_sol_router_v1";
 const LS_OB_HYDRATION_ROUTE = "utt_ob_hydration_route_mode_v1";
+const LS_OB_COUNTERPARTY_LIQUIDITY_FILTER = "utt_ob_counterparty_liquidity_filter_v1";
+const LS_OT_COUNTERPARTY_EXECUTION_MODE = "utt_counterparty_execution_mode_v1";
+const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
+const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
+const MARKET_METRICS_BROWSER_CACHE_KEY = "utt.market_metrics.summary.v10";
+const MARKET_METRICS_BROWSER_CACHE_EVENT = "utt:market-metrics-summary-v10";
+const ORDERBOOK_QUOTE_USD_STALE_MS = 15 * 60 * 1000;
+
+const USD_VALUE_QUOTES = new Set([
+  "USD", "USDT", "USDC", "DAI", "FDUSD", "PYUSD", "GUSD", "TUSD",
+  "USDP", "USD1", "HOLLAR", "BUSD", "USDD", "USDE", "RLUSD",
+]);
 
 function safeNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function normalizeOrderBookAsset(value) {
+  const a = String(value || "").trim().toUpperCase();
+  if (a === "XBT") return "BTC";
+  if (a === "BCY" || a === "BITCRYSTAL") return "BITCRYSTALS";
+  if (a === "WETH") return "ETH";
+  if (a === "WSOL") return "SOL";
+  return a;
+}
+
+function orderBookPairParts(symbol) {
+  const raw = String(symbol || "").trim().toUpperCase().replace(/[\\/_]/g, "-");
+  const parts = raw.split("-").map((x) => x.trim()).filter(Boolean);
+  if (parts.length !== 2) return { base: "", quote: "", symbol: raw };
+  const base = normalizeOrderBookAsset(parts[0]);
+  const quote = normalizeOrderBookAsset(parts[1]);
+  return { base, quote, symbol: base && quote ? `${base}-${quote}` : raw };
+}
+
+function isUsdValueQuote(asset) {
+  return USD_VALUE_QUOTES.has(normalizeOrderBookAsset(asset));
+}
+
+function metricRowAsset(row) {
+  const raw = String(row?.asset || row?.symbol || row?.pair || "").trim().toUpperCase();
+  if (!raw) return "";
+  const parts = raw.replace(/[\\/_]/g, "-").split("-").filter(Boolean);
+  return normalizeOrderBookAsset(parts[0] || raw);
+}
+
+function metricRowIsUsdValue(row) {
+  if (!row || typeof row !== "object") return false;
+  if (row?.is_usd_quote === true || row?.is_stablecoin === true || row?.stablecoin === true) return true;
+  const peg = String(row?.peg_currency || row?.peg || row?.stablecoin_peg || "").trim().toUpperCase();
+  return peg === "USD";
+}
+
+function metricRowQuoteUsdContext(row, snapshot, quoteAsset) {
+  if (!row || typeof row !== "object") return null;
+  const quote = normalizeOrderBookAsset(quoteAsset);
+  if (metricRowIsUsdValue(row)) {
+    return {
+      status: "native_usd",
+      quoteAsset: quote,
+      priceUsd: 1,
+      source: String(row?.price_source || row?.market_data_source || "token_registry").trim(),
+      updatedAt: row?.market_data_updated_at || row?.price_updated_at || row?.updated_at || snapshot?.lastUpdated || null,
+      stale: false,
+    };
+  }
+  const priceUsd = safeNum(row?.price_usd ?? row?.usd_price ?? row?.priceUsd);
+  if (priceUsd === null || priceUsd <= 0) return null;
+  const updatedAt = row?.market_data_updated_at || row?.price_updated_at || row?.updated_at || snapshot?.lastUpdated || null;
+  const updatedMs = updatedAt ? Date.parse(updatedAt) : NaN;
+  const stale = Number.isFinite(updatedMs) ? Date.now() - updatedMs > ORDERBOOK_QUOTE_USD_STALE_MS : false;
+  return {
+    status: "available",
+    quoteAsset: normalizeOrderBookAsset(quoteAsset),
+    priceUsd,
+    source: String(
+      row?.price_source ||
+      row?.market_data_source ||
+      row?.source ||
+      row?.price_source_id ||
+      "market_metrics"
+    ).trim(),
+    updatedAt,
+    stale,
+  };
+}
+
+function readSharedQuoteUsdContext(quoteAsset) {
+  const quote = normalizeOrderBookAsset(quoteAsset);
+  if (!quote) return null;
+  if (isUsdValueQuote(quote)) {
+    return { status: "native_usd", quoteAsset: quote, priceUsd: 1, source: "USD-valued quote", updatedAt: null, stale: false };
+  }
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(MARKET_METRICS_BROWSER_CACHE_KEY);
+    if (!raw) return null;
+    const snapshot = JSON.parse(raw);
+    const rows = Array.isArray(snapshot?.rows) ? snapshot.rows : [];
+    const row = rows.find((item) => metricRowAsset(item) === quote);
+    return metricRowQuoteUsdContext(row, snapshot, quote);
+  } catch {
+    return null;
+  }
+}
+
+function formatOrderBookUsd(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return "USD —";
+  const abs = Math.abs(n);
+  if (abs > 0 && abs < 0.00000001) return "<$0.00000001";
+  if (abs >= 1000) return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  if (abs >= 1) return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`;
+  if (abs >= 0.01) return `$${n.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 })}`;
+  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 8 })}`;
+}
+
+function normalizeCounterpartyLiquidityFilter(value) {
+  const v = String(value || "all").trim().toLowerCase().replace(/-/g, "_");
+  if (v === "dispenser" || v === "dispensers" || v === "disp") return "dispensers";
+  if (v === "limit" || v === "limits" || v === "orders" || v === "limit_order") return "limit_orders";
+  return "all";
+}
+
+function readCounterpartyLiquidityFilter() {
+  try {
+    return normalizeCounterpartyLiquidityFilter(localStorage.getItem(LS_OB_COUNTERPARTY_LIQUIDITY_FILTER) || "all");
+  } catch {
+    return "all";
+  }
+}
+
+function counterpartyLiquidityFilterLabel(value) {
+  const filter = normalizeCounterpartyLiquidityFilter(value);
+  if (filter === "dispensers") return "Dispensers";
+  if (filter === "limit_orders") return "Limit Orders";
+  return "All Liquidity";
+}
+
+function normalizeCounterpartyExecutionMode(value) {
+  const v = String(value || "dispenser").trim().toLowerCase().replace(/-/g, "_");
+  if (v === "limit" || v === "order" || v === "protocol_order") return "limit_order";
+  return v === "limit_order" ? "limit_order" : "dispenser";
+}
+
+function readCounterpartyExecutionMode() {
+  try {
+    return normalizeCounterpartyExecutionMode(localStorage.getItem(LS_OT_COUNTERPARTY_EXECUTION_MODE) || "dispenser");
+  } catch {
+    return "dispenser";
+  }
+}
+
+function counterpartyLiquidityType(row) {
+  const explicit = String(row?.liquidity_type || "").trim().toLowerCase();
+  if (explicit === "dispenser" || explicit === "limit_order") return explicit;
+  const sourceType = String(row?.source_type || "").trim().toLowerCase();
+  if (sourceType === "counterparty_dispenser" || row?.raw_dispenser) return "dispenser";
+  if (sourceType === "counterparty_order" || row?.raw_order) return "limit_order";
+  return "unknown";
+}
+
+function counterpartyLiquidityLabel(row) {
+  const type = counterpartyLiquidityType(row);
+  if (type === "dispenser") return "DISP";
+  if (type === "limit_order") return "LIMIT";
+  return "UNKNOWN";
+}
+
+function counterpartyRowMatchesFilter(row, filter) {
+  const f = normalizeCounterpartyLiquidityFilter(filter);
+  if (f === "all") return true;
+  const type = counterpartyLiquidityType(row);
+  return f === "dispensers" ? type === "dispenser" : type === "limit_order";
+}
+
+function counterpartyUnitSize(row) {
+  const candidates = [
+    row?.unit_size,
+    row?.raw_dispenser?.give_quantity,
+    row?.raw_dispenser?.dispense_quantity,
+    row?.raw_dispenser?.unit_size,
+  ];
+  for (const value of candidates) {
+    const n = safeNum(value);
+    if (n !== null && n > 0) return n;
+  }
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -369,6 +554,11 @@ export default function OrderBookWidget({
   const [obAsks, setObAsks] = useState([]);
   const [obLoading, setObLoading] = useState(false);
   const [obError, setObError] = useState(null);
+  const [orderBookMeta, setOrderBookMeta] = useState(null);
+  const [quoteUsdContext, setQuoteUsdContext] = useState(null);
+  const [counterpartyLiquidityFilter, setCounterpartyLiquidityFilter] = useState(() => readCounterpartyLiquidityFilter());
+  const [counterpartyExecutionMode, setCounterpartyExecutionMode] = useState(() => readCounterpartyExecutionMode());
+  const quoteUsdReqRef = useRef(0);
 
   // NEW: local draft so typing doesn't spam the backend
   const [symbolDraft, setSymbolDraft] = useState(String(obSymbol || ""));
@@ -500,6 +690,32 @@ export default function OrderBookWidget({
     }
   }, [obHydrationRouteMode]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_OB_COUNTERPARTY_LIQUIDITY_FILTER, normalizeCounterpartyLiquidityFilter(counterpartyLiquidityFilter));
+    } catch {
+      // ignore
+    }
+  }, [counterpartyLiquidityFilter]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const onMode = (event) => {
+      setCounterpartyExecutionMode(normalizeCounterpartyExecutionMode(event?.detail?.mode));
+    };
+    const onStorage = (event) => {
+      if (event?.key === LS_OT_COUNTERPARTY_EXECUTION_MODE) {
+        setCounterpartyExecutionMode(readCounterpartyExecutionMode());
+      }
+    };
+    window.addEventListener(COUNTERPARTY_EXECUTION_MODE_EVENT, onMode);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(COUNTERPARTY_EXECUTION_MODE_EVENT, onMode);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
+
   // Keep draft in sync when parent sets obSymbol (e.g. from clicks elsewhere)
   useEffect(() => {
     setSymbolDraft(String(obSymbol || ""));
@@ -511,6 +727,8 @@ export default function OrderBookWidget({
     setHydrationLiquidityWarning(null);
     setHydrationPriceStatus(null);
     setHydrationPriceStatusError(null);
+    setOrderBookMeta(null);
+    setQuoteUsdContext(null);
   }, [obSymbol]);
 
   const isSolJupVenue = useMemo(() => {
@@ -530,6 +748,8 @@ export default function OrderBookWidget({
     setHydrationLiquidityWarning(null);
     setHydrationPriceStatus(null);
     setHydrationPriceStatusError(null);
+    setOrderBookMeta(null);
+    setQuoteUsdContext(null);
 
     // Prevent DEX-specific decimals from leaking into regular CEX venues.
     if (!isSolJupVenue && !isPolkadotDexVenue && !isCounterpartyVenue) setSizeDecimals(null);
@@ -559,6 +779,98 @@ export default function OrderBookWidget({
     cooldownPowRef.current = 0;
     setObActiveRouter(null);
   }, [isCounterpartyVenue, obSymbol]);
+
+
+  useEffect(() => {
+    const parts = orderBookPairParts(obSymbol);
+    const quote = normalizeOrderBookAsset(parts.quote);
+    const reqId = ++quoteUsdReqRef.current;
+    let cancelled = false;
+
+    if (!quote) {
+      setQuoteUsdContext(null);
+      return undefined;
+    }
+    if (isUsdValueQuote(quote)) {
+      setQuoteUsdContext({
+        status: "native_usd",
+        quoteAsset: quote,
+        priceUsd: 1,
+        source: "USD-valued quote",
+        updatedAt: null,
+        stale: false,
+      });
+      return undefined;
+    }
+
+    const applyShared = () => {
+      if (cancelled || quoteUsdReqRef.current !== reqId) return null;
+      const shared = readSharedQuoteUsdContext(quote);
+      if (shared) setQuoteUsdContext(shared);
+      return shared;
+    };
+
+    const shared = applyShared();
+    const onSharedSnapshot = () => applyShared();
+    const onStorage = (event) => {
+      if (event?.key === MARKET_METRICS_BROWSER_CACHE_KEY) applyShared();
+    };
+
+    if (typeof window !== "undefined") {
+      window.addEventListener(MARKET_METRICS_BROWSER_CACHE_EVENT, onSharedSnapshot);
+      window.addEventListener("storage", onStorage);
+    }
+
+    const shouldRefresh = !shared || shared.stale === true;
+    const timer = shouldRefresh && apiBase
+      ? window.setTimeout(async () => {
+          try {
+            const base = String(apiBase || "").replace(/\/+$/, "");
+            const url = new URL(`${base}/api/market_metrics/summary`);
+            url.searchParams.set("assets", quote);
+            url.searchParams.set("limit", "25");
+            url.searchParams.set("ttl_s", "300");
+            const response = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const payload = await response.json();
+            const rows = Array.isArray(payload?.items) ? payload.items : [];
+            const row = rows.find((item) => metricRowAsset(item) === quote);
+            const next = metricRowQuoteUsdContext(row, { lastUpdated: payload?.updated_at || null }, quote);
+            if (cancelled || quoteUsdReqRef.current !== reqId) return;
+            if (next) setQuoteUsdContext(next);
+            else if (!shared) {
+              setQuoteUsdContext({
+                status: "unavailable",
+                quoteAsset: quote,
+                priceUsd: null,
+                source: "",
+                updatedAt: null,
+                stale: false,
+              });
+            }
+          } catch {
+            if (cancelled || quoteUsdReqRef.current !== reqId || shared) return;
+            setQuoteUsdContext({
+              status: "unavailable",
+              quoteAsset: quote,
+              priceUsd: null,
+              source: "",
+              updatedAt: null,
+              stale: false,
+            });
+          }
+        }, 250)
+      : null;
+
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+      if (typeof window !== "undefined") {
+        window.removeEventListener(MARKET_METRICS_BROWSER_CACHE_EVENT, onSharedSnapshot);
+        window.removeEventListener("storage", onStorage);
+      }
+    };
+  }, [apiBase, effectiveVenue, obSymbol]);
 
 
   useEffect(() => {
@@ -760,7 +1072,9 @@ function clampBox(next) {
       } else {
         const px = Number(x?.price);
         const sz = Number(x?.size ?? x?.qty ?? x?.amount);
-        if (Number.isFinite(px) && Number.isFinite(sz)) out.push({ price: px, size: sz });
+        if (Number.isFinite(px) && Number.isFinite(sz)) {
+          out.push({ ...x, price: px, size: sz });
+        }
       }
     }
     return out;
@@ -768,6 +1082,28 @@ function clampBox(next) {
 
   const asksSorted = useMemo(() => [...(obAsks || [])].sort((a, b) => b.price - a.price), [obAsks]);
   const bidsSorted = useMemo(() => [...(obBids || [])].sort((a, b) => Number(b.price) - Number(a.price)), [obBids]);
+
+  const counterpartyLiquidityCounts = useMemo(() => {
+    const counts = {
+      bidLimitOrders: 0,
+      askLimitOrders: 0,
+      askDispensers: 0,
+      unknown: 0,
+    };
+    for (const row of obBids || []) {
+      const type = counterpartyLiquidityType(row);
+      if (type === "limit_order") counts.bidLimitOrders += 1;
+      else if (type === "dispenser") counts.askDispensers += 1;
+      else counts.unknown += 1;
+    }
+    for (const row of obAsks || []) {
+      const type = counterpartyLiquidityType(row);
+      if (type === "limit_order") counts.askLimitOrders += 1;
+      else if (type === "dispenser") counts.askDispensers += 1;
+      else counts.unknown += 1;
+    }
+    return counts;
+  }, [obAsks, obBids]);
 
   // ─────────────────────────────────────────────────────────────
   // Rules fetch (any venue; used for BTC-quoted pairs that need >8 decimals)
@@ -852,6 +1188,36 @@ function clampBox(next) {
     return fmtNum(np);
   }
 
+  function orderBookQuoteAsset() {
+    const fromMeta = normalizeOrderBookAsset(orderBookMeta?.quoteAsset);
+    if (fromMeta) return fromMeta;
+    return orderBookPairParts(obSymbol).quote;
+  }
+
+  function orderBookPriceUsd(p) {
+    const quote = orderBookQuoteAsset();
+    if (!quote || isUsdValueQuote(quote)) return null;
+    const px = Number(p);
+    const quoteUsd = Number(quoteUsdContext?.priceUsd);
+    if (!Number.isFinite(px) || px < 0 || !Number.isFinite(quoteUsd) || quoteUsd <= 0) return null;
+    return px * quoteUsd;
+  }
+
+  function orderBookPriceTitle(p) {
+    const quote = orderBookQuoteAsset();
+    const usd = orderBookPriceUsd(p);
+    const lines = [`Native execution price: ${fmtPriceCell(p)} ${quote || ""}`.trim()];
+    if (usd !== null) {
+      lines.push(`Derived USD value: ${formatOrderBookUsd(usd)} per ${orderBookPairParts(obSymbol).base || "base unit"}`);
+      if (quoteUsdContext?.source) lines.push(`Source: ${quoteUsdContext.source}`);
+      if (quoteUsdContext?.updatedAt) lines.push(`Updated: ${quoteUsdContext.updatedAt}`);
+      if (quoteUsdContext?.stale) lines.push("Status: stale");
+      lines.push("Informational only; the native quote price is used for execution.");
+    } else if (quote && !isUsdValueQuote(quote)) {
+      lines.push("USD conversion unavailable; native price remains authoritative.");
+    }
+    return lines.join("\n");
+  }
 
   function fmtSizeCell(sz) {
     const v = Number(sz);
@@ -1078,6 +1444,14 @@ function clampBox(next) {
         if (Number.isFinite(sd)) setSizeDecimals(sd);
       }
 
+      setOrderBookMeta({
+        venue: usedVenue,
+        symbol: data?.symbol || data?.resolvedSymbol || sym,
+        baseAsset: data?.base_asset || data?.baseAsset || orderBookPairParts(sym).base,
+        quoteAsset: data?.quote_asset || data?.quoteAsset || orderBookPairParts(sym).quote,
+        liquidityCounts: data?.liquidity_counts || data?.counts || null,
+        sources: data?.sources || null,
+      });
       setObAsks(normalizeSide(data?.asks || []));
       setObBids(normalizeSide(data?.bids || []));
 
@@ -1095,6 +1469,7 @@ function clampBox(next) {
 
       setObAsks([]);
       setObBids([]);
+      setOrderBookMeta(null);
       setHydrationLiquidityWarning(null);
 
       setObActiveRouter(null);
@@ -1225,31 +1600,61 @@ function clampBox(next) {
     window.addEventListener("mouseup", onUp);
   }
 
-  function handlePickPrice(px) {
+  function dispatchCounterpartyBookPick(row, pick) {
+    if (!isCounterpartyVenue || typeof window === "undefined" || !row || typeof row !== "object") return;
+    try {
+      window.dispatchEvent(new CustomEvent(COUNTERPARTY_ORDERBOOK_PICK_EVENT, {
+        detail: {
+          symbol: orderBookMeta?.symbol || obSymbol,
+          row,
+          pick: String(pick || "price"),
+          liquidity_type: counterpartyLiquidityType(row),
+          execution_mode: counterpartyExecutionMode,
+        },
+      }));
+    } catch {
+      // Event bridge is best-effort; regular App.jsx callbacks still receive price/qty.
+    }
+  }
+
+  function handlePickPrice(px, row = null) {
     // Normalize clicked price when rules are known; otherwise pass through.
     const outPx = normPriceByRules(px);
-    if (typeof onPickPrice !== "function") return;
-
     const n = Number(outPx);
     if (!Number.isFinite(n)) return;
 
     // Preserve decimals for venues where order rules may be unknown.
     // Some ticket implementations format clicked prices using "known" decimals
     // (which may default to 0), causing whole-number rounding.
-    const d = Number.isFinite(Number(priceDecimals)) ? clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_CLICK_CAP) : null;
+    const counterpartyDefaultDecimals = isCounterpartyVenue ? 8 : null;
+    const d = Number.isFinite(Number(priceDecimals))
+      ? clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_CLICK_CAP)
+      : counterpartyDefaultDecimals;
     const pxStr = d !== null ? n.toFixed(clamp(d, 0, 18)) : String(outPx);
 
-    // Back-compat: keep numeric first arg; pass string + context as optional extras.
-    onPickPrice(n, pxStr, { priceDecimals: d, priceIncrement });
+    // Back-compat: regular venues keep numeric first arg. Counterparty sends the
+    // fixed-decimal string first so App.jsx implementations that only consume
+    // the first arg do not turn tiny BTC prices into scientific notation/0.
+    if (typeof onPickPrice === "function") {
+      onPickPrice(isCounterpartyVenue ? pxStr : n, pxStr, { priceDecimals: d, priceIncrement });
+    }
+    dispatchCounterpartyBookPick(row, "price");
   }
 
-  function handlePickQty(q) {
+  function handlePickQty(q, row = null, pick = "size") {
     if (typeof onPickQty === "function" && Number.isFinite(Number(q))) onPickQty(Number(q));
+    dispatchCounterpartyBookPick(row, pick);
   }
 
   const depthN = Math.max(1, Math.min(200, Number(obDepth) || 25));
-  const asksView = asksSorted.slice(0, depthN);
-  const bidsView = bidsSorted.slice(0, depthN);
+  const asksFiltered = isCounterpartyVenue
+    ? asksSorted.filter((row) => counterpartyRowMatchesFilter(row, counterpartyLiquidityFilter))
+    : asksSorted;
+  const bidsFiltered = isCounterpartyVenue
+    ? bidsSorted.filter((row) => counterpartyRowMatchesFilter(row, counterpartyLiquidityFilter))
+    : bidsSorted;
+  const asksView = asksFiltered.slice(0, depthN);
+  const bidsView = bidsFiltered.slice(0, depthN);
   const hasLiveBookRows = asksView.length > 0 || bidsView.length > 0;
   const liveBookWrapMinHeight = hasLiveBookRows ? 96 : 44;
 
@@ -1479,6 +1884,86 @@ function clampBox(next) {
     ? { border: "1px solid rgba(46,204,113,0.20)", background: "rgba(46,204,113,0.06)", color: "#c9f7d7" }
     : { border: "1px solid rgba(241,196,15,0.20)", background: "rgba(241,196,15,0.06)", color: "#f7e8b0" };
 
+  const displayedQuoteAsset = orderBookQuoteAsset();
+  const displayedBaseAsset = normalizeOrderBookAsset(orderBookMeta?.baseAsset) || orderBookPairParts(obSymbol).base;
+  const showDerivedUsd = Boolean(
+    displayedQuoteAsset &&
+    !isUsdValueQuote(displayedQuoteAsset) &&
+    quoteUsdContext?.status !== "native_usd"
+  );
+  const counterpartyColumnCount = isCounterpartyVenue ? 4 : 2;
+
+  function renderOrderBookPrice(row) {
+    const usd = orderBookPriceUsd(row?.price);
+    const usdText = usd !== null
+      ? `${formatOrderBookUsd(usd)}${quoteUsdContext?.stale ? "*" : ""}`
+      : "USD —";
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: 4,
+          lineHeight: 1,
+          minWidth: 0,
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+        }}
+      >
+        <span style={{ flex: "0 0 auto" }}>
+          {fmtPriceCell(row?.price)}
+          {displayedQuoteAsset ? <span style={{ opacity: 0.72, marginLeft: 4 }}>{displayedQuoteAsset}</span> : null}
+        </span>
+        {showDerivedUsd ? (
+          <span
+            style={{
+              flex: "1 1 auto",
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              fontSize: 10,
+              opacity: quoteUsdContext?.stale ? 0.62 : 0.78,
+            }}
+          >
+            ({usdText})
+          </span>
+        ) : null}
+      </div>
+    );
+  }
+
+  function counterpartyRowTitle(row) {
+    const type = counterpartyLiquidityType(row);
+    const unit = counterpartyUnitSize(row);
+    const lines = [
+      `Type: ${type === "dispenser" ? "Counterparty dispenser" : type === "limit_order" ? "Counterparty protocol limit order" : "Unknown Counterparty liquidity"}`,
+      `Price: ${fmtPriceCell(row?.price)} ${displayedQuoteAsset || ""}`.trim(),
+      `Remaining: ${fmtSizeCell(row?.size)} ${displayedBaseAsset || ""}`.trim(),
+    ];
+    if (unit !== null) lines.push(`Dispense unit: ${fmtSizeCell(unit)} ${displayedBaseAsset || ""}`.trim());
+    if (row?.source) lines.push(`Source: ${row.source}`);
+    if (row?.status) lines.push(`Status: ${row.status}`);
+    if (type === "unknown") lines.push("Unknown rows are display-only and are not executable as dispenser selections.");
+    else if (type === "dispenser") lines.push("Execution: immediate dispenser purchase when Order Ticket is in Dispenser Purchase mode.");
+    else lines.push("Execution: protocol limit-order context; clicking copies price for a new limit order.");
+    return lines.join("\n");
+  }
+
+  function counterpartyTypeBadge(row) {
+    const type = counterpartyLiquidityType(row);
+    const label = counterpartyLiquidityLabel(row);
+    const style = type === "dispenser"
+      ? { border: "1px solid rgba(64,196,255,0.40)", background: "rgba(64,196,255,0.10)", color: "#bcecff" }
+      : type === "limit_order"
+        ? { border: "1px solid rgba(178,132,255,0.40)", background: "rgba(178,132,255,0.10)", color: "#ddc8ff" }
+        : { border: "1px solid rgba(241,196,15,0.35)", background: "rgba(241,196,15,0.08)", color: "#f7e8b0" };
+    return (
+      <span style={{ ...style, display: "inline-flex", padding: "2px 6px", borderRadius: 999, fontSize: 9, fontWeight: 900 }}>
+        {label}
+      </span>
+    );
+  }
+
   function commitSymbolAndRefresh(force = false) {
     const next = String(symbolDraft || "").trim();
     if (!next) return;
@@ -1514,7 +1999,20 @@ function clampBox(next) {
           title={inlineMode ? "" : locked ? "Locked" : "Drag to move (snug gutter, no margins)"}
         >
           <h3 style={{ ...styles.widgetTitle, fontSize: 16, lineHeight: "18px" }}>Order Book</h3>
-          <span style={{ ...styles.widgetSub, fontSize: 11 }}>
+          <span
+            style={{
+              ...styles.widgetSub,
+              fontSize: 11,
+              flex: "1 1 auto",
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={isCounterpartyVenue
+              ? `Venue used: ${venueLabel || "—"} • Source: orders / dispensers • Asks: ${counterpartyLiquidityCounts.askDispensers} DISP / ${counterpartyLiquidityCounts.askLimitOrders} LIMIT • Bids: ${counterpartyLiquidityCounts.bidLimitOrders} LIMIT`
+              : undefined}
+          >
             Venue used: <b>{venueLabel || "—"}</b>
             {isSolJupVenue ? (
               <>
@@ -1545,6 +2043,8 @@ function clampBox(next) {
             ) : isCounterpartyVenue ? (
               <>
                 {" "}• Source: <b>orders / dispensers</b>
+                {" "}• Asks: <b>{counterpartyLiquidityCounts.askDispensers} DISP / {counterpartyLiquidityCounts.askLimitOrders} LIMIT</b>
+                {" "}• Bids: <b>{counterpartyLiquidityCounts.bidLimitOrders} LIMIT</b>
               </>
             ) : null}
           </span>
@@ -1583,11 +2083,30 @@ function clampBox(next) {
         </div>
 
         <div style={{ ...rowStyle, marginTop: 6, gap: 8, flexWrap: "nowrap", minWidth: 0, overflow: "hidden" }}>
-          <span style={{ ...styles.muted, fontSize: 11, flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span
+            style={{ ...styles.muted, fontSize: 11, flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            title={isCounterpartyVenue
+              ? `Counterparty liquidity filter: ${counterpartyLiquidityFilterLabel(counterpartyLiquidityFilter)}. DISP = immediate dispenser liquidity. LIMIT = open protocol order. Ticket mode: ${counterpartyExecutionMode === "limit_order" ? "Limit Order" : "Dispenser Purchase"}.`
+              : undefined}
+          >
             Depth <b>{obDepth}</b> • Auto <b>{obAutoRefresh ? `${obAutoSeconds}s` : "off"}</b>
             {isSolJupVenue ? <> • Router <b>{String(obSolanaRouterMode || "auto")}</b></> : null}
             {isPolkadotDexVenue ? <> • Route <b>{hydrationRouteModeLabel(obHydrationRouteMode)}</b></> : null}
-            {isCounterpartyVenue ? <> • Read-only <b>Counterparty</b></> : null}
+            {isCounterpartyVenue ? (
+              <>
+                {" "}• Filter <b>{counterpartyLiquidityFilterLabel(counterpartyLiquidityFilter)}</b>
+                {" "}• Mode <b>{counterpartyExecutionMode === "limit_order" ? "Limit Order" : "Dispenser Purchase"}</b>
+              </>
+            ) : null}
+            {showDerivedUsd ? (
+              <>
+                {" "}• {displayedQuoteAsset}/USD <b>{
+                  Number.isFinite(Number(quoteUsdContext?.priceUsd)) && Number(quoteUsdContext?.priceUsd) > 0
+                    ? `${formatOrderBookUsd(quoteUsdContext.priceUsd)}${quoteUsdContext?.stale ? " stale" : ""}`
+                    : "unavailable"
+                }</b>
+              </>
+            ) : null}
           </span>
           {isPolkadotDexVenue ? (
             <span
@@ -1610,7 +2129,6 @@ function clampBox(next) {
             </span>
           ) : null}
         </div>
-
 
         {obSettingsOpen ? (
           <div style={settingsBackdropStyle} onMouseDown={(e) => { if (e.target === e.currentTarget) setObSettingsOpen(false); }}>
@@ -1657,6 +2175,34 @@ function clampBox(next) {
                   </span>
                 </label>
 
+                {isCounterpartyVenue ? (
+                  <>
+                    <label style={settingsFieldStyle}>
+                      <span>Liquidity</span>
+                      <select
+                        style={{ ...darkSelectStyle, width: "100%" }}
+                        value={counterpartyLiquidityFilter}
+                        onChange={(e) => setCounterpartyLiquidityFilter(normalizeCounterpartyLiquidityFilter(e.target.value))}
+                        title="Filter the combined Counterparty book by execution mechanism"
+                      >
+                        <option value="all" style={darkOptionStyle}>All Liquidity</option>
+                        <option value="dispensers" style={darkOptionStyle}>Dispensers</option>
+                        <option value="limit_orders" style={darkOptionStyle}>Limit Orders</option>
+                      </select>
+                    </label>
+                    <div
+                      style={{
+                        fontSize: 10,
+                        lineHeight: 1.3,
+                        color: "rgba(255,255,255,0.62)",
+                        padding: "0 2px",
+                      }}
+                    >
+                      <b>DISP</b> immediate dispenser liquidity • <b>LIMIT</b> open protocol order
+                    </div>
+                  </>
+                ) : null}
+
                 {isSolJupVenue ? (
                   <label style={settingsFieldStyle}>
                     <span>Router</span>
@@ -1702,38 +2248,81 @@ function clampBox(next) {
         <div style={obBodyWrapStyle}>
           <div style={obDepthStackStyle}>
             <div style={obDepthPaneStyle}>
-              <div style={asksTitleStyle}>Asks</div>
+              <div style={asksTitleStyle}>
+                Asks
+                {isCounterpartyVenue ? (
+                  <span style={{ opacity: 0.72, marginLeft: 6 }}>
+                    {asksView.filter((row) => counterpartyLiquidityType(row) === "dispenser").length} DISP • {asksView.filter((row) => counterpartyLiquidityType(row) === "limit_order").length} LIMIT
+                  </span>
+                ) : null}
+              </div>
               <div ref={asksWrapRef} style={asksWrapStyle}>
                 <table style={styles.obInnerTable}>
                   <thead>
                     <tr>
-                      <th style={asksTh}>Price</th>
-                      <th style={asksTh}>Size</th>
+                      <th style={asksTh}>Price{displayedQuoteAsset ? ` (${displayedQuoteAsset})` : ""}</th>
+                      <th style={asksTh}>{isCounterpartyVenue ? "Remaining" : "Size"}</th>
+                      {isCounterpartyVenue ? <th style={asksTh}>Unit</th> : null}
+                      {isCounterpartyVenue ? <th style={asksTh}>Type</th> : null}
                     </tr>
                   </thead>
                   <tbody>
-                    {asksView.map((x, idx) => (
-                      <tr key={`a-${idx}`}>
-                        <td
-                          style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
-                          title="Click to set ticket Limit price"
-                          onClick={() => handlePickPrice(x.price)}
-                        >
-                          {fmtPriceCell(x.price)}
-                        </td>
-                        <td
-                          style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
-                          title="Click to set ticket Qty"
-                          onClick={() => handlePickQty(x.size)}
-                        >
-                          {fmtSizeCell(x.size)}
-                        </td>
-                      </tr>
-                    ))}
+                    {asksView.map((x, idx) => {
+                      const liquidityType = counterpartyLiquidityType(x);
+                      const unitSize = counterpartyUnitSize(x);
+                      const rowTitle = isCounterpartyVenue ? counterpartyRowTitle(x) : "";
+                      const remainingClickable = !isCounterpartyVenue || liquidityType === "limit_order";
+                      return (
+                        <tr key={`a-${idx}-${x?.tx_hash || x?.source || ""}`} title={rowTitle || undefined}>
+                          <td
+                            style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
+                            title={orderBookPriceTitle(x.price)}
+                            onClick={() => handlePickPrice(x.price, x)}
+                          >
+                            {renderOrderBookPrice(x)}
+                          </td>
+                          <td
+                            style={{
+                              ...asksTd(),
+                              cursor: remainingClickable ? "pointer" : "default",
+                              userSelect: "none",
+                            }}
+                            title={remainingClickable ? "Click to set ticket Qty" : "Remaining dispenser inventory; use Unit for purchase quantity"}
+                            onClick={() => {
+                              if (remainingClickable) handlePickQty(x.size, x, "size");
+                            }}
+                          >
+                            {fmtSizeCell(x.size)}
+                          </td>
+                          {isCounterpartyVenue ? (
+                            <td
+                              style={{
+                                ...asksTd(),
+                                cursor: liquidityType === "dispenser" && unitSize !== null ? "pointer" : "default",
+                                userSelect: "none",
+                              }}
+                              title={liquidityType === "dispenser" && unitSize !== null ? "Click to set dispenser unit Qty" : "Not applicable"}
+                              onClick={() => {
+                                if (liquidityType === "dispenser" && unitSize !== null) handlePickQty(unitSize, x, "unit");
+                              }}
+                            >
+                              {unitSize !== null ? fmtSizeCell(unitSize) : "—"}
+                            </td>
+                          ) : null}
+                          {isCounterpartyVenue ? <td style={asksTd()}>{counterpartyTypeBadge(x)}</td> : null}
+                        </tr>
+                      );
+                    })}
                     {asksView.length === 0 && (
                       <tr>
-                        <td style={tdCompact} colSpan={2}>
-                          <span style={styles.muted}>No asks loaded.</span>
+                        <td style={tdCompact} colSpan={counterpartyColumnCount}>
+                          <span style={styles.muted}>
+                            {isCounterpartyVenue && counterpartyLiquidityFilter === "dispensers"
+                              ? "No dispenser asks loaded."
+                              : isCounterpartyVenue && counterpartyLiquidityFilter === "limit_orders"
+                                ? "No protocol limit-order asks loaded."
+                                : "No asks loaded."}
+                          </span>
                         </td>
                       </tr>
                     )}
@@ -1742,39 +2331,60 @@ function clampBox(next) {
               </div>
             </div>
 
+
             <div style={obDepthPaneStyle}>
-              <div style={bidsTitleStyle}>Bids</div>
+              <div style={bidsTitleStyle}>
+                Bids
+                {isCounterpartyVenue ? (
+                  <span style={{ opacity: 0.72, marginLeft: 6 }}>
+                    {bidsView.filter((row) => counterpartyLiquidityType(row) === "limit_order").length} LIMIT
+                  </span>
+                ) : null}
+              </div>
               <div ref={bidsWrapRef} style={bidsWrapStyle}>
                 <table style={styles.obInnerTable}>
                   <thead>
                     <tr>
-                      <th style={bidsTh}>Price</th>
-                      <th style={bidsTh}>Size</th>
+                      <th style={bidsTh}>Price{displayedQuoteAsset ? ` (${displayedQuoteAsset})` : ""}</th>
+                      <th style={bidsTh}>{isCounterpartyVenue ? "Remaining" : "Size"}</th>
+                      {isCounterpartyVenue ? <th style={bidsTh}>Unit</th> : null}
+                      {isCounterpartyVenue ? <th style={bidsTh}>Type</th> : null}
                     </tr>
                   </thead>
                   <tbody>
-                    {bidsView.map((x, idx) => (
-                      <tr key={`b-${idx}`}>
-                        <td
-                          style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
-                          title="Click to set ticket Limit price"
-                          onClick={() => handlePickPrice(x.price)}
-                        >
-                          {fmtPriceCell(x.price)}
-                        </td>
-                        <td
-                          style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
-                          title="Click to set ticket Qty"
-                          onClick={() => handlePickQty(x.size)}
-                        >
-                          {fmtSizeCell(x.size)}
-                        </td>
-                      </tr>
-                    ))}
+                    {bidsView.map((x, idx) => {
+                      const rowTitle = isCounterpartyVenue ? counterpartyRowTitle(x) : "";
+                      return (
+                        <tr key={`b-${idx}-${x?.tx_hash || x?.source || ""}`} title={rowTitle || undefined}>
+                          <td
+                            style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
+                            title={orderBookPriceTitle(x.price)}
+                            onClick={() => handlePickPrice(x.price, x)}
+                          >
+                            {renderOrderBookPrice(x)}
+                          </td>
+                          <td
+                            style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
+                            title="Click to set ticket Qty"
+                            onClick={() => handlePickQty(x.size, x, "size")}
+                          >
+                            {fmtSizeCell(x.size)}
+                          </td>
+                          {isCounterpartyVenue ? <td style={bidsTd()}>—</td> : null}
+                          {isCounterpartyVenue ? <td style={bidsTd()}>{counterpartyTypeBadge(x)}</td> : null}
+                        </tr>
+                      );
+                    })}
                     {bidsView.length === 0 && (
                       <tr>
-                        <td style={tdCompact} colSpan={2}>
-                          <span style={styles.muted}>No bids loaded.</span>
+                        <td style={tdCompact} colSpan={counterpartyColumnCount}>
+                          <span style={styles.muted}>
+                            {isCounterpartyVenue && counterpartyLiquidityFilter === "dispensers"
+                              ? "Dispensers do not create bids."
+                              : isCounterpartyVenue && counterpartyLiquidityFilter === "limit_orders"
+                                ? "No protocol limit-order bids loaded."
+                                : "No bids loaded."}
+                          </span>
                         </td>
                       </tr>
                     )}
@@ -1783,6 +2393,7 @@ function clampBox(next) {
               </div>
             </div>
           </div>
+
 
           <div style={{ height: BOTTOM_SPACER, flex: "0 0 auto" }} />
         </div>

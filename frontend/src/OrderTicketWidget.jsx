@@ -157,11 +157,14 @@ function counterpartyBookRowPrice(row) {
   return otCounterpartyFiniteNumberOrNull(row?.price ?? row?.displayPrice ?? row?.limitPrice ?? row?.rate);
 }
 
-function counterpartyPickBookRowForTicket(payload, side, limitPrice, executionMode = "dispenser") {
+function counterpartyPickBookRowForTicket(payload, side, limitPrice, executionMode = "dispenser", quantity = null) {
   const mode = normalizeCounterpartyExecutionMode(executionMode);
   if (mode === "limit_order") return null;
-  const rows = counterpartyBookRows(payload, String(side || "").toLowerCase() === "buy" ? "asks" : "bids")
+  const dispenserRows = counterpartyBookRows(payload, String(side || "").toLowerCase() === "buy" ? "asks" : "bids")
     .filter((row) => counterpartyBookRowLiquidityType(row) === "dispenser");
+  const rows = quantity === null || quantity === undefined || String(quantity).trim() === ""
+    ? dispenserRows
+    : dispenserRows.filter((row) => counterpartyDispenserLotView(row, quantity, 8).valid);
   if (!rows.length) return null;
   const wanted = otCounterpartyFiniteNumberOrNull(expandExponential(limitPrice));
   if (wanted !== null) {
@@ -184,7 +187,7 @@ function counterpartyPickBookRowForTicket(payload, side, limitPrice, executionMo
 function counterpartySafeBookLevelForPreview(row) {
   if (!row || typeof row !== "object") return null;
   const out = {};
-  for (const key of ["price", "size", "unit_size", "side", "quote_asset", "source_type", "liquidity_type", "liquidity_label", "source", "tx_hash", "status", "satoshirate"]) {
+  for (const key of ["price", "size", "unit_size", "lot_size", "lots_available", "side", "quote_asset", "source_type", "liquidity_type", "liquidity_label", "source", "tx_hash", "status", "satoshirate", "lot_satoshirate"]) {
     if (row[key] !== undefined && row[key] !== null && row[key] !== "") out[key] = row[key];
   }
   if (row.raw_dispenser && typeof row.raw_dispenser === "object") {
@@ -194,6 +197,161 @@ function counterpartySafeBookLevelForPreview(row) {
     out.raw_order = row.raw_order;
   }
   return Object.keys(out).length ? out : null;
+}
+
+function counterpartyDispenserLotSize(row) {
+  if (!row || typeof row !== "object") return null;
+  for (const value of [
+    row?.lot_size,
+    row?.unit_size,
+    row?.raw_dispenser?.give_quantity,
+    row?.raw_dispenser?.giveQuantity,
+    row?.raw_dispenser?.give_quantity_normalized,
+    row?.raw_dispenser?.dispense_quantity,
+    row?.raw_dispenser?.unit_size,
+  ]) {
+    const n = otCounterpartyFiniteNumberOrNull(value);
+    if (n !== null && n > 0) return value;
+  }
+  return null;
+}
+
+function counterpartyDispenserSatoshirate(row) {
+  if (!row || typeof row !== "object") return null;
+  for (const value of [
+    row?.satoshirate,
+    row?.lot_satoshirate,
+    row?.raw_dispenser?.satoshirate,
+    row?.raw_dispenser?.satoshi_rate,
+    row?.raw_dispenser?.satoshiRate,
+  ]) {
+    const n = otCounterpartyFiniteNumberOrNull(value);
+    if (n !== null && n > 0 && Number.isInteger(n)) return n;
+  }
+  return null;
+}
+
+function counterpartyDecimalToAtomic(value, decimals = 8) {
+  try {
+    const places = Math.max(0, Math.min(18, Math.trunc(Number(decimals) || 0)));
+    const expanded = expandExponential(String(value ?? "").trim());
+    const match = /^\+?(\d+)(?:\.(\d+))?$/.exec(String(expanded || "").trim());
+    if (!match) return null;
+    const whole = match[1] || "0";
+    const fractionRaw = match[2] || "";
+    if (fractionRaw.length > places && /[1-9]/.test(fractionRaw.slice(places))) return null;
+    const fraction = fractionRaw.slice(0, places).padEnd(places, "0");
+    const scale = 10n ** BigInt(places);
+    return BigInt(whole) * scale + BigInt(fraction || "0");
+  } catch {
+    return null;
+  }
+}
+
+function counterpartyAtomicToDisplay(value, decimals = 8) {
+  try {
+    const atomic = typeof value === "bigint" ? value : BigInt(value);
+    const places = Math.max(0, Math.min(18, Math.trunc(Number(decimals) || 0)));
+    if (places === 0) return atomic.toString();
+    const scale = 10n ** BigInt(places);
+    const whole = atomic / scale;
+    const fraction = (atomic % scale).toString().padStart(places, "0").replace(/0+$/, "");
+    return fraction ? `${whole}.${fraction}` : whole.toString();
+  } catch {
+    return "";
+  }
+}
+
+function counterpartyDispenserLotView(row, quantity, assetDecimals = 8) {
+  if (!row || typeof row !== "object" || counterpartyBookRowLiquidityType(row) !== "dispenser") {
+    return {
+      status: "unavailable",
+      valid: false,
+      reasons: ["dispenser_not_selected"],
+      lotSize: null,
+      lotSizeText: "",
+      lotCount: null,
+      satoshiratePerLot: null,
+      exactPaymentSats: null,
+      exactPaymentBtc: null,
+      lotsAvailable: null,
+    };
+  }
+
+  const lotValue = counterpartyDispenserLotSize(row);
+  const satoshirate = counterpartyDispenserSatoshirate(row);
+  const lotAtomic = counterpartyDecimalToAtomic(lotValue, assetDecimals);
+  const qtyAtomic = counterpartyDecimalToAtomic(quantity, assetDecimals);
+  const remainingAtomic = counterpartyDecimalToAtomic(row?.size, assetDecimals);
+  const reasons = [];
+
+  if (lotAtomic === null || lotAtomic <= 0n) reasons.push("missing_dispenser_lot_size");
+  if (satoshirate === null || satoshirate <= 0) reasons.push("missing_dispenser_satoshirate");
+  if (qtyAtomic === null || qtyAtomic <= 0n) reasons.push("invalid_requested_quantity");
+
+  let lotCountBig = null;
+  let exactPaymentBig = null;
+  if (!reasons.length && lotAtomic !== null && qtyAtomic !== null) {
+    if (qtyAtomic % lotAtomic !== 0n) {
+      reasons.push("quantity_not_whole_lots");
+    } else {
+      lotCountBig = qtyAtomic / lotAtomic;
+      exactPaymentBig = lotCountBig * BigInt(satoshirate);
+    }
+  }
+
+  let lotsAvailableBig = null;
+  if (remainingAtomic !== null && lotAtomic !== null && lotAtomic > 0n) {
+    lotsAvailableBig = remainingAtomic / lotAtomic;
+    if (lotCountBig !== null && lotCountBig > lotsAvailableBig) reasons.push("insufficient_complete_lots");
+  }
+
+  const safeNumber = (v) => {
+    if (v === null) return null;
+    const n = Number(v);
+    return Number.isSafeInteger(n) ? n : null;
+  };
+  const exactPaymentSats = safeNumber(exactPaymentBig);
+  const lotCount = safeNumber(lotCountBig);
+  const lotsAvailable = safeNumber(lotsAvailableBig);
+  const lotSizeText = lotAtomic !== null ? counterpartyAtomicToDisplay(lotAtomic, assetDecimals) : "";
+
+  return {
+    status: reasons.length
+      ? reasons.includes("quantity_not_whole_lots")
+        ? "quantity_not_whole_lots"
+        : "invalid_dispenser_lot"
+      : "ready",
+    valid: reasons.length === 0 && lotCount !== null && exactPaymentSats !== null,
+    reasons,
+    lotSize: lotSizeText ? Number(lotSizeText) : null,
+    lotSizeText,
+    lotCount,
+    satoshiratePerLot: satoshirate,
+    exactPaymentSats,
+    exactPaymentBtc: exactPaymentSats !== null ? exactPaymentSats / 100_000_000 : null,
+    lotsAvailable,
+  };
+}
+
+function counterpartyDispenserLotResultView(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const raw = payload?.dispenser_lot;
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    status: String(raw?.status || "unavailable"),
+    valid: raw?.valid === true,
+    asset: String(raw?.asset || payload?.base_asset || "").trim(),
+    requestedQuantity: String(raw?.requested_quantity || payload?.quantity || "").trim(),
+    lotSize: String(raw?.lot_size || "").trim(),
+    lotCount: counterpartySatoshisOrNull(raw?.lot_count),
+    satoshiratePerLot: counterpartySatoshisOrNull(raw?.satoshirate_per_lot),
+    exactPaymentSats: counterpartySatoshisOrNull(raw?.exact_payment_satoshis),
+    exactPaymentBtc: otCounterpartyFiniteNumberOrNull(raw?.exact_payment_btc),
+    lotsAvailable: counterpartySatoshisOrNull(raw?.lots_available),
+    paymentSource: String(raw?.payment_source || "").trim(),
+    reasons: Array.isArray(raw?.reasons) ? raw.reasons.map(String) : [],
+  };
 }
 
 function counterpartySatoshisOrNull(value) {
@@ -248,13 +406,17 @@ function counterpartySigningHandoffView(payload) {
     effectiveSatPerVbyte > 0
   );
   const feeInvalidZero = feeStatus === "invalid_zero_fee" || feeSats === 0;
+  const dispenserLot = counterpartyDispenserLotResultView(payload);
+  const dispenserLotReady = String(payload?.compose_kind || "") !== "dispenser_dispense" || dispenserLot?.valid === true;
   const alreadySigned = payload?.signed === true || payload?.wallet_signing_result?.signed === true;
   const baseReason = String(handoff?.status_reason || "").trim();
-  const reason = feeInvalidZero
-    ? "Signing is blocked because Counterparty Core returned a zero-satoshi miner fee for this non-empty transaction."
-    : !feeReady && psbtHex
-      ? "A PSBT is available, but signing is blocked until a positive miner fee, adjusted vsize, and effective sat/vB are validated."
-      : baseReason;
+  const reason = !dispenserLotReady
+    ? "Signing is blocked because the dispenser quantity is not validated as complete lots with an exact satoshirate payment."
+    : feeInvalidZero
+      ? "Signing is blocked because Counterparty Core returned a zero-satoshi miner fee for this non-empty transaction."
+      : !feeReady && psbtHex
+        ? "A PSBT is available, but signing is blocked until a positive miner fee, adjusted vsize, and effective sat/vB are validated."
+        : baseReason;
   return {
     status: String(handoff?.status || "unknown").trim(),
     reason,
@@ -269,11 +431,14 @@ function counterpartySigningHandoffView(payload) {
       psbtHex &&
       !fundingBlocked &&
       feeReady &&
+      dispenserLotReady &&
       !alreadySigned
     ),
     fundingBlocked,
     feeReady,
     feeInvalidZero,
+    dispenserLot,
+    dispenserLotReady,
     feeStatus,
     feeSats,
     adjustedVsize,
@@ -3568,9 +3733,11 @@ export default function OrderTicketWidget({
 
       const safeLevel = counterpartySafeBookLevelForPreview(row);
       setCounterpartySelectedLevel(safeLevel);
-      if (detail?.pick === "unit" || detail?.pick === "size") {
-        const unit = otCounterpartyFiniteNumberOrNull(row?.unit_size ?? row?.raw_dispenser?.give_quantity);
-        if (unit !== null && unit > 0) setQty(String(unit));
+      if (detail?.pick === "lot" || detail?.pick === "unit" || detail?.pick === "size") {
+        const lot = otCounterpartyFiniteNumberOrNull(
+          row?.lot_size ?? row?.unit_size ?? row?.raw_dispenser?.give_quantity
+        );
+        if (lot !== null && lot > 0) setQty(String(lot));
       }
     };
     window.addEventListener(COUNTERPARTY_ORDERBOOK_PICK_EVENT, onBookPick);
@@ -4775,6 +4942,26 @@ export default function OrderTicketWidget({
     return `${COUNTERPARTY_EXPIRATION_PRESETS[preset]?.label || "Custom"} · ${blocks} blocks`;
   }, [isCounterpartyLimitOrderMode, counterpartyExpirationPreset, counterpartyExpirationBlocks]);
 
+  const counterpartyEffectiveDispenserLevel = useMemo(() => {
+    if (!isCounterpartyDispenserMode) return null;
+    return (
+      counterpartySelectedLevel ||
+      counterpartyPickBookRowForTicket(counterpartyBook, side, limitPrice, "dispenser", qty)
+    );
+  }, [isCounterpartyDispenserMode, counterpartySelectedLevel, counterpartyBook, side, limitPrice, qty]);
+
+  const counterpartyDispenserLot = useMemo(() => {
+    if (!isCounterpartyDispenserMode) return null;
+    const decimals = Number.isFinite(Number(rules?.qty_decimals))
+      ? Math.max(0, Math.min(18, Math.trunc(Number(rules.qty_decimals))))
+      : 8;
+    return counterpartyDispenserLotView(counterpartyEffectiveDispenserLevel, qty, decimals);
+  }, [isCounterpartyDispenserMode, counterpartyEffectiveDispenserLevel, qty, rules?.qty_decimals]);
+
+  const counterpartyExactDispenserTotalBtc = counterpartyDispenserLot?.valid
+    ? counterpartyDispenserLot.exactPaymentBtc
+    : null;
+
   useEffect(() => {
     if (!autoCalc) return;
 
@@ -4926,6 +5113,28 @@ export default function OrderTicketWidget({
           lines.push(`No active Counterparty dispenser asks found for ${canonSymbol}. Dispenser mode will fail closed.`);
           fails.push("counterparty_dispenser_unavailable");
         }
+
+        if (!counterpartyBookLoading && !counterpartyBookError && dispenserAsks.length > 0) {
+          if (!counterpartyEffectiveDispenserLevel) {
+            lines.push("Select an executable DISP row. UTT will not infer a payment from a rounded displayed price.");
+            fails.push("counterparty_dispenser_not_selected");
+          } else if (!counterpartyDispenserLot?.valid) {
+            const lotText = counterpartyDispenserLot?.lotSizeText || "unknown";
+            if (counterpartyDispenserLot?.reasons?.includes("quantity_not_whole_lots")) {
+              lines.push(
+                `This dispenser sells ${lotText} ${parts.base} per lot. Enter ${lotText}, ${lotText && Number(lotText) > 0 ? Number(lotText) * 2 : "another whole multiple"}, or another exact whole multiple. UTT will not silently round the quantity.`
+              );
+              fails.push("counterparty_dispenser_quantity_not_whole_lots");
+            } else {
+              lines.push("The selected dispenser is missing a valid lot size or satoshirate. UTT cannot calculate an exact payment and blocks compose/signing.");
+              fails.push("counterparty_dispenser_lot_invalid");
+            }
+          } else {
+            lines.push(
+              `Dispenser lots: ${counterpartyDispenserLot.lotCount} × ${counterpartyDispenserLot.lotSizeText} ${parts.base} at ${counterpartyDispenserLot.satoshiratePerLot.toLocaleString()} sats per lot = ${counterpartyDispenserLot.exactPaymentSats.toLocaleString()} sats exact payment.`
+            );
+          }
+        }
       } else if (counterpartyExpirationBlocks === null) {
         lines.push("Limit-order expiration must be a whole number from 1 through 8064 blocks.");
         fails.push("counterparty_expiration_invalid");
@@ -4940,11 +5149,15 @@ export default function OrderTicketWidget({
         fails.push("px_missing");
       }
 
-      if (side === "buy" && buySpendQuote !== null && buySpendCapacityQuote !== null && buySpendQuote > buySpendCapacityQuote + 1e-12) {
+      const counterpartySpendQuote =
+        mode === "dispenser" && counterpartyDispenserLot?.valid
+          ? counterpartyDispenserLot.exactPaymentBtc
+          : buySpendQuote;
+      if (side === "buy" && counterpartySpendQuote !== null && buySpendCapacityQuote !== null && counterpartySpendQuote > buySpendCapacityQuote + 1e-12) {
         lines.push(
           hideTableData
             ? "Insufficient available balance for this Counterparty buy preview."
-            : `Insufficient ${parts.quote || quoteAsset} available: need ${buySpendQuote.toLocaleString(undefined, { maximumFractionDigits: 12 })}, have ${buySpendCapacityQuote.toLocaleString(undefined, { maximumFractionDigits: 12 })}.`
+            : `Insufficient ${parts.quote || quoteAsset} available: need ${counterpartySpendQuote.toLocaleString(undefined, { maximumFractionDigits: 12 })}, have ${buySpendCapacityQuote.toLocaleString(undefined, { maximumFractionDigits: 12 })}.`
         );
         fails.push("counterparty_quote_balance");
       }
@@ -5239,6 +5452,8 @@ export default function OrderTicketWidget({
     counterpartyBook,
     counterpartyBookLoading,
     counterpartyBookError,
+    counterpartyEffectiveDispenserLevel,
+    counterpartyDispenserLot,
     balErr,
     balNotice,
     buySpendQuote,
@@ -5291,9 +5506,10 @@ export default function OrderTicketWidget({
   if (!(side === "buy" || side === "sell")) return false;
   const mode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
   if (mode === "dispenser" && side !== "buy") return false;
+  if (mode === "dispenser" && counterpartyDispenserLot?.valid !== true) return false;
   if (mode === "limit_order" && counterpartyExpirationBlocks === null) return false;
   return qtyNum !== null && pxNum !== null;
-  }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum, counterpartyExecutionMode, counterpartyExpirationBlocks]);
+  }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum, counterpartyExecutionMode, counterpartyExpirationBlocks, counterpartyDispenserLot]);
 
   const primaryActionDisabled = submitting || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
 
@@ -6113,6 +6329,16 @@ async function previewCounterpartyCompose() {
       fee_tier: normalizeCounterpartyFeeTier(counterpartyFeeTier),
       execution_mode: normalizeCounterpartyExecutionMode(counterpartyExecutionMode),
       expiration_blocks: isCounterpartyLimitOrderMode ? counterpartyExpirationBlocks : null,
+      dispenser_lot: isCounterpartyDispenserMode && counterpartyDispenserLot
+        ? {
+            status: counterpartyDispenserLot.status,
+            valid: counterpartyDispenserLot.valid,
+            lot_size: counterpartyDispenserLot.lotSizeText,
+            lot_count: counterpartyDispenserLot.lotCount,
+            satoshirate_per_lot: counterpartyDispenserLot.satoshiratePerLot,
+            exact_payment_satoshis: counterpartyDispenserLot.exactPaymentSats,
+          }
+        : null,
       read_only: true,
     },
     "Building Counterparty Compose Preview"
@@ -6124,13 +6350,17 @@ async function previewCounterpartyCompose() {
     if (!sourceAddress) throw new Error("Connect or unlock UniSat to choose the Counterparty source address.");
 
     const executionMode = normalizeCounterpartyExecutionMode(counterpartyExecutionMode);
-    const pickedLevel = executionMode === "dispenser"
-      ? (
-          counterpartySelectedLevel ||
-          counterpartyPickBookRowForTicket(counterpartyBook, side, limitPrice, executionMode)
-        )
-      : null;
+    const pickedLevel = executionMode === "dispenser" ? counterpartyEffectiveDispenserLevel : null;
     const selectedLevel = counterpartySafeBookLevelForPreview(pickedLevel);
+    const lotView = executionMode === "dispenser"
+      ? counterpartyDispenserLotView(pickedLevel, qty, Number(rules?.qty_decimals ?? 8))
+      : null;
+    if (executionMode === "dispenser" && !lotView?.valid) {
+      const lotText = lotView?.lotSizeText || "the selected lot size";
+      throw new Error(
+        `Counterparty dispenser quantity must be an exact whole multiple of ${lotText}. UTT did not round the quantity or calculate payment from the displayed price.`
+      );
+    }
 
     const payload = {
       source_address: sourceAddress,
@@ -6138,7 +6368,11 @@ async function previewCounterpartyCompose() {
       side,
       quantity: String(qty),
       limit_price: String(expandExponential(limitPrice)),
-      total_quote: notional === null ? null : String(notional),
+      total_quote: executionMode === "dispenser" && lotView?.valid
+        ? String(lotView.exactPaymentBtc)
+        : notional === null
+          ? null
+          : String(notional),
       selected_level: selectedLevel,
       attempt_upstream: true,
       fee_tier: normalizeCounterpartyFeeTier(counterpartyFeeTier),
@@ -6690,6 +6924,11 @@ async function submitLimitOrder() {
 
   const counterpartySigningHandoff = useMemo(
     () => counterpartySigningHandoffView(submitResultPayload),
+    [submitResultPayload]
+  );
+
+  const counterpartySubmitDispenserLot = useMemo(
+    () => counterpartyDispenserLotResultView(submitResultPayload),
     [submitResultPayload]
   );
 
@@ -7545,6 +7784,14 @@ async function submitLimitOrder() {
               <span style={{ ...safeMuted, fontSize: 11 }}>
                 Book: {counterpartyBookLoading ? "loading…" : counterpartyBookError ? "unavailable" : `${counterpartyBookRows(counterpartyBook, "bids").length} bids / ${counterpartyBookRows(counterpartyBook, "asks").length} asks`}
               </span>
+              {isCounterpartyDispenserMode && counterpartyDispenserLot?.valid && (
+                <span
+                  style={{ ...safeMuted, fontSize: 11 }}
+                  title="Exact dispenser payment is whole lots multiplied by the dispenser satoshirate. The rounded OrderBook price is informational only."
+                >
+                  Lot: <b>{counterpartyDispenserLot.lotSizeText}</b> · Lots: <b>{counterpartyDispenserLot.lotCount}</b> · Payment: <b>{counterpartyDispenserLot.exactPaymentSats.toLocaleString()} sats</b>
+                </span>
+              )}
               {isCounterpartyLimitOrderMode && (
                 <>
                   <label style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap" }}>
@@ -7835,7 +8082,19 @@ async function submitLimitOrder() {
           Type: <b>{isCounterpartyVenue ? (isCounterpartyLimitOrderMode ? "Limit Order" : "Dispenser Purchase") : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
           {isSolanaLimitMode ? <> • Expiry: <b>{hideTableData ? "••••" : solanaExpiryLabel}</b></> : null}
           {isCounterpartyLimitOrderMode ? <> • Expiration: <b>{hideTableData ? "••••" : counterpartyExpirationLabel}</b></> : null}
-          {" "}• Est. Total ({totalLabel}): <b>{notional === null ? "—" : fmtNum ? fmtNum(notional) : String(notional)}</b>
+          {" "}• {isCounterpartyDispenserMode ? "Exact Payment" : "Est. Total"} ({totalLabel}): <b>{
+            isCounterpartyDispenserMode
+              ? counterpartyExactDispenserTotalBtc === null
+                ? "—"
+                : fmtNum
+                  ? fmtNum(counterpartyExactDispenserTotalBtc)
+                  : String(counterpartyExactDispenserTotalBtc)
+              : notional === null
+                ? "—"
+                : fmtNum
+                  ? fmtNum(notional)
+                  : String(notional)
+          }</b>
         </div>
 
         <div style={{ marginTop: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -7856,7 +8115,7 @@ async function submitLimitOrder() {
                     : "Preview unsigned Counterparty dispenser purchase. UniSat signing is explicit; broadcast remains disabled."
                   : isCounterpartyLimitOrderMode
                     ? "Fill Counterparty symbol, qty, limit price, and valid expiration"
-                    : "Fill Counterparty symbol, qty, and limit price"
+                    : "Select a DISP row and enter a Qty that is an exact whole multiple of its Lot"
                 : !canSubmitBase
                   ? (isSolanaLimitMode ? "Fill symbol, qty, and limit price" : isDexSwapVenue ? "Fill symbol and order amount" : "Fill symbol, qty, and limit price")
                   : preTrade?.block
@@ -8265,6 +8524,44 @@ async function submitLimitOrder() {
                             ? `${counterpartyFormatBtc(counterpartySubmitFunding.tradeValueBtc)} (${counterpartyFormatSats(counterpartySubmitFunding.tradeValueSats)})`
                             : "Not applicable for this non-BTC quote"}
                       </div>
+
+                      {counterpartySubmitDispenserLot && (
+                        <>
+                          <div style={{ color: "#a9a9a9" }}>Dispenser lot size</div>
+                          <div>
+                            {hideTableData
+                              ? "••••"
+                              : `${counterpartySubmitDispenserLot.lotSize || "unknown"} ${counterpartySubmitDispenserLot.asset || ""}`.trim()}
+                          </div>
+
+                          <div style={{ color: "#a9a9a9" }}>Whole lots</div>
+                          <div>
+                            {hideTableData
+                              ? "••••"
+                              : counterpartySubmitDispenserLot.valid
+                                ? `${counterpartySubmitDispenserLot.lotCount?.toLocaleString() || "unknown"} lot(s) · ${counterpartySubmitDispenserLot.lotsAvailable?.toLocaleString() || "unknown"} available`
+                                : `Invalid · ${(counterpartySubmitDispenserLot.reasons || []).join(", ") || counterpartySubmitDispenserLot.status}`}
+                          </div>
+
+                          <div style={{ color: "#a9a9a9" }}>Satoshis per lot</div>
+                          <div>
+                            {hideTableData
+                              ? "••••"
+                              : counterpartySubmitDispenserLot.satoshiratePerLot !== null
+                                ? `${counterpartySubmitDispenserLot.satoshiratePerLot.toLocaleString()} sats`
+                                : "Unavailable"}
+                          </div>
+
+                          <div style={{ color: "#a9a9a9" }}>Exact dispenser payment</div>
+                          <div>
+                            {hideTableData
+                              ? "••••"
+                              : counterpartySubmitDispenserLot.exactPaymentSats !== null
+                                ? `${counterpartyFormatBtc(counterpartySubmitDispenserLot.exactPaymentBtc)} (${counterpartyFormatSats(counterpartySubmitDispenserLot.exactPaymentSats)})`
+                                : "Unavailable — signing blocked"}
+                          </div>
+                        </>
+                      )}
 
                       <div style={{ color: "#a9a9a9" }}>Bitcoin fee policy</div>
                       <div>

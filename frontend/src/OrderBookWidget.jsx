@@ -185,8 +185,9 @@ function counterpartyRowMatchesFilter(row, filter) {
   return f === "dispensers" ? type === "dispenser" : type === "limit_order";
 }
 
-function counterpartyUnitSize(row) {
+function counterpartyLotSize(row) {
   const candidates = [
+    row?.lot_size,
     row?.unit_size,
     row?.raw_dispenser?.give_quantity,
     row?.raw_dispenser?.dispense_quantity,
@@ -1934,17 +1935,17 @@ function clampBox(next) {
 
   function counterpartyRowTitle(row) {
     const type = counterpartyLiquidityType(row);
-    const unit = counterpartyUnitSize(row);
+    const unit = counterpartyLotSize(row);
     const lines = [
       `Type: ${type === "dispenser" ? "Counterparty dispenser" : type === "limit_order" ? "Counterparty protocol limit order" : "Unknown Counterparty liquidity"}`,
       `Price: ${fmtPriceCell(row?.price)} ${displayedQuoteAsset || ""}`.trim(),
       `Remaining: ${fmtSizeCell(row?.size)} ${displayedBaseAsset || ""}`.trim(),
     ];
-    if (unit !== null) lines.push(`Dispense unit: ${fmtSizeCell(unit)} ${displayedBaseAsset || ""}`.trim());
+    if (unit !== null) lines.push(`Lot size: ${fmtSizeCell(unit)} ${displayedBaseAsset || ""}`.trim());
     if (row?.source) lines.push(`Source: ${row.source}`);
     if (row?.status) lines.push(`Status: ${row.status}`);
     if (type === "unknown") lines.push("Unknown rows are display-only and are not executable as dispenser selections.");
-    else if (type === "dispenser") lines.push("Execution: immediate dispenser purchase when Order Ticket is in Dispenser Purchase mode.");
+    else if (type === "dispenser") lines.push("Execution: immediate purchase in complete lots. Exact payment is lot count × satoshirate; the rounded displayed price is informational only.");
     else lines.push("Execution: protocol limit-order context; clicking copies price for a new limit order.");
     return lines.join("\n");
   }
@@ -2262,14 +2263,14 @@ function clampBox(next) {
                     <tr>
                       <th style={asksTh}>Price{displayedQuoteAsset ? ` (${displayedQuoteAsset})` : ""}</th>
                       <th style={asksTh}>{isCounterpartyVenue ? "Remaining" : "Size"}</th>
-                      {isCounterpartyVenue ? <th style={asksTh}>Unit</th> : null}
+                      {isCounterpartyVenue ? <th style={asksTh} title="Asset quantity dispensed per satoshirate payment increment. Purchases must use complete lots.">Lot</th> : null}
                       {isCounterpartyVenue ? <th style={asksTh}>Type</th> : null}
                     </tr>
                   </thead>
                   <tbody>
                     {asksView.map((x, idx) => {
                       const liquidityType = counterpartyLiquidityType(x);
-                      const unitSize = counterpartyUnitSize(x);
+                      const lotSize = counterpartyLotSize(x);
                       const rowTitle = isCounterpartyVenue ? counterpartyRowTitle(x) : "";
                       const remainingClickable = !isCounterpartyVenue || liquidityType === "limit_order";
                       return (
@@ -2287,7 +2288,7 @@ function clampBox(next) {
                               cursor: remainingClickable ? "pointer" : "default",
                               userSelect: "none",
                             }}
-                            title={remainingClickable ? "Click to set ticket Qty" : "Remaining dispenser inventory; use Unit for purchase quantity"}
+                            title={remainingClickable ? "Click to set ticket Qty" : "Remaining dispenser inventory; use Lot for purchase quantity"}
                             onClick={() => {
                               if (remainingClickable) handlePickQty(x.size, x, "size");
                             }}
@@ -2298,15 +2299,15 @@ function clampBox(next) {
                             <td
                               style={{
                                 ...asksTd(),
-                                cursor: liquidityType === "dispenser" && unitSize !== null ? "pointer" : "default",
+                                cursor: liquidityType === "dispenser" && lotSize !== null ? "pointer" : "default",
                                 userSelect: "none",
                               }}
-                              title={liquidityType === "dispenser" && unitSize !== null ? "Click to set dispenser unit Qty" : "Not applicable"}
+                              title={liquidityType === "dispenser" && lotSize !== null ? "Click to set one complete dispenser lot as Qty" : "Not applicable to protocol limit orders"}
                               onClick={() => {
-                                if (liquidityType === "dispenser" && unitSize !== null) handlePickQty(unitSize, x, "unit");
+                                if (liquidityType === "dispenser" && lotSize !== null) handlePickQty(lotSize, x, "lot");
                               }}
                             >
-                              {unitSize !== null ? fmtSizeCell(unitSize) : "—"}
+                              {lotSize !== null ? fmtSizeCell(lotSize) : "—"}
                             </td>
                           ) : null}
                           {isCounterpartyVenue ? <td style={asksTd()}>{counterpartyTypeBadge(x)}</td> : null}
@@ -2347,7 +2348,7 @@ function clampBox(next) {
                     <tr>
                       <th style={bidsTh}>Price{displayedQuoteAsset ? ` (${displayedQuoteAsset})` : ""}</th>
                       <th style={bidsTh}>{isCounterpartyVenue ? "Remaining" : "Size"}</th>
-                      {isCounterpartyVenue ? <th style={bidsTh}>Unit</th> : null}
+                      {isCounterpartyVenue ? <th style={bidsTh} title="Dispenser lot size; not applicable to protocol limit orders.">Lot</th> : null}
                       {isCounterpartyVenue ? <th style={bidsTh}>Type</th> : null}
                     </tr>
                   </thead>

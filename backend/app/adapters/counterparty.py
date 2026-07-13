@@ -1640,6 +1640,7 @@ class CounterpartyAdapter:
             "price": float(price),
             "size": float(size),
             "unit_size": unit_size,
+            "lot_size": unit_size,
             "side": "ask",
             "quote_asset": quote_asset,
             "source_type": "counterparty_dispenser",
@@ -1649,6 +1650,12 @@ class CounterpartyAdapter:
             "tx_hash": row.get("tx_hash"),
             "status": row.get("status"),
             "satoshirate": row.get("satoshirate"),
+            "lot_satoshirate": row.get("satoshirate"),
+            "lots_available": (
+                int(Decimal(str(size)) / Decimal(str(unit_size)))
+                if unit_size is not None and unit_size > 0
+                else None
+            ),
             "raw_dispenser": row,
         }
 
@@ -1841,6 +1848,131 @@ class CounterpartyAdapter:
             or isinstance(row.get("raw_dispenser"), dict)
         )
 
+    @classmethod
+    def _compose_dispenser_lot_size_decimal(cls, row: Any) -> Optional[Decimal]:
+        if not isinstance(row, dict):
+            return None
+        raw_dispenser = row.get("raw_dispenser") if isinstance(row.get("raw_dispenser"), dict) else {}
+        for value in (
+            row.get("lot_size"),
+            row.get("unit_size"),
+            raw_dispenser.get("give_quantity"),
+            raw_dispenser.get("giveQuantity"),
+            raw_dispenser.get("give_quantity_normalized"),
+            raw_dispenser.get("giveQuantityNormalized"),
+            raw_dispenser.get("dispense_quantity"),
+            raw_dispenser.get("unit_size"),
+        ):
+            d = cls._decimal_or_none(value)
+            if d is not None and d > 0:
+                return d
+        return None
+
+    @classmethod
+    def _compose_dispenser_satoshirate_int(cls, row: Any) -> Optional[int]:
+        if not isinstance(row, dict):
+            return None
+        raw_dispenser = row.get("raw_dispenser") if isinstance(row.get("raw_dispenser"), dict) else {}
+        for value in (
+            row.get("satoshirate"),
+            row.get("satoshi_rate"),
+            row.get("lot_satoshirate"),
+            raw_dispenser.get("satoshirate"),
+            raw_dispenser.get("satoshi_rate"),
+            raw_dispenser.get("satoshiRate"),
+        ):
+            d = cls._decimal_or_none(value)
+            if d is None or d <= 0:
+                continue
+            whole = d.to_integral_value()
+            if d == whole:
+                return int(whole)
+        return None
+
+    @classmethod
+    def _compose_dispenser_lot_context(cls, row: Any, quantity: Any) -> Dict[str, Any]:
+        """Return exact whole-lot and satoshirate payment diagnostics.
+
+        Counterparty dispensers dispense only complete `give_quantity` lots.
+        The Bitcoin payment is therefore `lot_count * satoshirate`; it must
+        never be reconstructed from a rounded per-asset display price.
+        """
+        qty = cls._decimal_or_none(quantity)
+        lot_size = cls._compose_dispenser_lot_size_decimal(row)
+        satoshirate = cls._compose_dispenser_satoshirate_int(row)
+        remaining = cls._decimal_or_none(row.get("size")) if isinstance(row, dict) else None
+        reasons: List[str] = []
+
+        if lot_size is None or lot_size <= 0:
+            reasons.append("missing_dispenser_lot_size")
+        if satoshirate is None or satoshirate <= 0:
+            reasons.append("missing_dispenser_satoshirate")
+        if qty is None or qty <= 0:
+            reasons.append("invalid_requested_quantity")
+
+        lot_count: Optional[int] = None
+        exact_payment_satoshis: Optional[int] = None
+        if not reasons and lot_size is not None and qty is not None and satoshirate is not None:
+            quotient = qty / lot_size
+            whole = quotient.to_integral_value()
+            if quotient != whole or whole <= 0:
+                reasons.append("quantity_not_whole_lots")
+            else:
+                lot_count = int(whole)
+                exact_payment_satoshis = int(lot_count * satoshirate)
+
+        lots_available: Optional[int] = None
+        if remaining is not None and remaining >= 0 and lot_size is not None and lot_size > 0:
+            lots_available = int((remaining / lot_size).to_integral_value(rounding=ROUND_FLOOR))
+            if lot_count is not None and lot_count > lots_available:
+                reasons.append("insufficient_complete_lots")
+
+        status = "ready" if not reasons else (
+            "quantity_not_whole_lots"
+            if "quantity_not_whole_lots" in reasons
+            else "invalid_dispenser_lot"
+        )
+        return {
+            "status": status,
+            "valid": not bool(reasons),
+            "reasons": reasons,
+            "requested_quantity": qty,
+            "lot_size": lot_size,
+            "lot_count": lot_count,
+            "satoshirate": satoshirate,
+            "exact_payment_satoshis": exact_payment_satoshis,
+            "remaining": remaining,
+            "lots_available": lots_available,
+        }
+
+    @classmethod
+    def _compose_dispenser_lot_payload(cls, context: Optional[Dict[str, Any]], *, asset: str) -> Dict[str, Any]:
+        ctx = context if isinstance(context, dict) else {}
+        lot_size = ctx.get("lot_size")
+        requested = ctx.get("requested_quantity")
+        remaining = ctx.get("remaining")
+        payment_sats = cls._as_int(ctx.get("exact_payment_satoshis"))
+        return {
+            "status": str(ctx.get("status") or "unavailable"),
+            "valid": bool(ctx.get("valid")),
+            "whole_lots_required": True,
+            "asset": str(asset or "").strip().upper() or None,
+            "requested_quantity": cls._decimal_plain(requested, max_places=18) if isinstance(requested, Decimal) else None,
+            "lot_size": cls._decimal_plain(lot_size, max_places=18) if isinstance(lot_size, Decimal) else None,
+            "lot_count": cls._as_int(ctx.get("lot_count")),
+            "satoshirate_per_lot": cls._as_int(ctx.get("satoshirate")),
+            "exact_payment_satoshis": payment_sats,
+            "exact_payment_btc": (
+                cls._decimal_plain(Decimal(payment_sats) / Decimal(100000000), max_places=8)
+                if payment_sats is not None
+                else None
+            ),
+            "remaining_quantity": cls._decimal_plain(remaining, max_places=18) if isinstance(remaining, Decimal) else None,
+            "lots_available": cls._as_int(ctx.get("lots_available")),
+            "payment_source": "lot_count_x_satoshirate" if payment_sats is not None else None,
+            "reasons": list(ctx.get("reasons") or []),
+        }
+
     @staticmethod
     def _compose_level_oracle_address(row: Any) -> Optional[str]:
         if not isinstance(row, dict):
@@ -1884,6 +2016,12 @@ class CounterpartyAdapter:
         if size_dec < quantity:
             reasons.append("insufficient_level_size")
 
+        if self._compose_level_is_dispenser(row):
+            lot_context = self._compose_dispenser_lot_context(row, quantity)
+            for reason in lot_context.get("reasons") or []:
+                if reason not in reasons:
+                    reasons.append(reason)
+
         return reasons
 
     def _compose_level_diagnostic_row(self, row: Any, *, index: int, reasons: List[str]) -> Dict[str, Any]:
@@ -1891,11 +2029,19 @@ class CounterpartyAdapter:
             return {"index": index, "reasons": list(reasons or ["malformed_level"])}
         px = self._compose_level_price_decimal(row)
         size_dec = self._decimal_or_none(row.get("size"))
+        lot_size = self._compose_dispenser_lot_size_decimal(row) if self._compose_level_is_dispenser(row) else None
+        satoshirate = self._compose_dispenser_satoshirate_int(row) if self._compose_level_is_dispenser(row) else None
+        lots_available = None
+        if size_dec is not None and lot_size is not None and lot_size > 0:
+            lots_available = int((size_dec / lot_size).to_integral_value(rounding=ROUND_FLOOR))
         return {
             "index": index,
             "reasons": list(reasons or []),
             "price": self._decimal_plain(px, max_places=18) if px is not None else None,
             "size": self._decimal_plain(size_dec, max_places=18) if size_dec is not None else None,
+            "lot_size": self._decimal_plain(lot_size, max_places=18) if lot_size is not None else None,
+            "satoshirate_per_lot": satoshirate,
+            "lots_available": lots_available,
             "source_type": str(row.get("source_type") or "").strip() or None,
             "source": str(row.get("source") or "").strip() or None,
             "tx_hash": str(row.get("tx_hash") or "").strip() or None,
@@ -2469,7 +2615,7 @@ class CounterpartyAdapter:
         *,
         compose_kind: str,
         quote_asset: str,
-        quote_quantity: Decimal,
+        quote_quantity: Optional[Decimal],
         immediate_btc_payment_satoshis: Optional[int],
         attempt_upstream: bool,
         compose_probe: Dict[str, Any],
@@ -2575,7 +2721,7 @@ class CounterpartyAdapter:
             "asset": "BTC",
             "funding_scope": funding_scope,
             "trade_value_satoshis": int(trade_value_sats) if trade_value_sats is not None else None,
-            "trade_value_btc": self._decimal_plain(quote_quantity, max_places=8) if quote_is_btc else None,
+            "trade_value_btc": self._decimal_plain(quote_quantity, max_places=8) if quote_is_btc and quote_quantity is not None else None,
             "immediate_payment_satoshis": immediate_sats,
             "immediate_payment_btc": self._decimal_plain(Decimal(immediate_sats) / Decimal(100000000), max_places=8),
             "network_fee_status": network_fee_status,
@@ -2689,6 +2835,13 @@ class CounterpartyAdapter:
         quote_atomic = self._display_quantity_to_atomic(quote_asset, quote_qty_dec)
         btc_sats = self._display_quantity_to_atomic("BTC", quote_qty_dec) if quote_asset == "BTC" else None
         supplied_level = self._selected_counterparty_book_row(selected_level)
+        supplied_level_present = bool(supplied_level)
+        supplied_level_rejected = False
+        supplied_lot_context = (
+            self._compose_dispenser_lot_context(supplied_level, qty_dec)
+            if supplied_level_present and self._compose_level_is_dispenser(supplied_level)
+            else None
+        )
         level = {} if execution_mode_norm == "limit_order" else supplied_level
         selected_level_source = (
             "ignored_limit_order_mode"
@@ -2717,6 +2870,7 @@ class CounterpartyAdapter:
                 reasons=["wrong_liquidity_type"],
             )
             provided_level_validation["accepted"] = False
+            supplied_level_rejected = True
             level = {}
             selected_level_source = "none"
 
@@ -2733,10 +2887,16 @@ class CounterpartyAdapter:
             provided_level_validation = self._compose_level_diagnostic_row(level, index=0, reasons=provided_reasons)
             provided_level_validation["accepted"] = not bool(provided_reasons)
             if provided_reasons:
+                supplied_level_rejected = True
                 level = {}
                 selected_level_source = "none"
 
-        if execution_mode_norm != "limit_order" and not level:
+        explicit_rejected_level_fail_closed = bool(
+            execution_mode_norm == "dispenser"
+            and supplied_level_present
+            and supplied_level_rejected
+        )
+        if execution_mode_norm != "limit_order" and not level and not explicit_rejected_level_fail_closed:
             auto_match = self._find_compose_book_level(
                 symbol=symbol_canon,
                 side=trade_side,
@@ -2748,12 +2908,33 @@ class CounterpartyAdapter:
             if auto_level:
                 level = auto_level
                 selected_level_source = "auto_orderbook_match"
+        elif explicit_rejected_level_fail_closed:
+            auto_selection_diagnostics = {
+                "attempted": False,
+                "reason": "provided_level_rejected_fail_closed",
+                "rejections": [provided_level_validation] if provided_level_validation else [],
+            }
 
         level_source_type = str(level.get("source_type") or "").strip().lower()
         level_source = str(level.get("source") or "").strip()
         level_tx_hash = str(level.get("tx_hash") or "").strip()
         level_size_dec = self._decimal_or_none(level.get("size"))
         dispenser_like = trade_side == "buy" and quote_asset == "BTC" and ("dispenser" in level_source_type or bool(level.get("raw_dispenser")))
+        selected_lot_context = self._compose_dispenser_lot_context(level, qty_dec) if dispenser_like else None
+        dispenser_lot_context = selected_lot_context or supplied_lot_context
+        if selected_lot_context and selected_lot_context.get("valid"):
+            exact_payment_sats = self._as_int(selected_lot_context.get("exact_payment_satoshis"))
+            if exact_payment_sats is not None:
+                btc_sats = int(exact_payment_sats)
+                quote_atomic = int(exact_payment_sats)
+                quote_qty_dec = Decimal(exact_payment_sats) / Decimal(100000000)
+        elif execution_mode_norm == "dispenser":
+            # Fail closed without preserving a misleading linear payment derived
+            # from the rounded OrderBook unit price. Until a complete lot and
+            # satoshirate are validated, the exact BTC payment is unknown.
+            btc_sats = None
+            quote_atomic = None
+            quote_qty_dec = None
 
         warnings = [
             "Unsigned compose preview only. UTT did not sign or broadcast this transaction.",
@@ -2779,9 +2960,14 @@ class CounterpartyAdapter:
 
         if provided_level_validation and provided_level_validation.get("accepted") is False:
             rejected_reasons = ", ".join(provided_level_validation.get("reasons") or []) or "unsafe_level"
-            warnings.append(
-                f"The supplied Counterparty dispenser level was rejected for compose execution ({rejected_reasons}); UTT searched for a safe conventional replacement."
-            )
+            if execution_mode_norm == "dispenser" and supplied_level_present:
+                warnings.append(
+                    f"The supplied Counterparty dispenser level was rejected for compose execution ({rejected_reasons}). Explicit Dispenser Purchase mode failed closed and UTT did not replace the selected dispenser."
+                )
+            else:
+                warnings.append(
+                    f"The supplied Counterparty dispenser level was rejected for compose execution ({rejected_reasons}); UTT searched for a safe conventional replacement."
+                )
 
         if selected_level_source == "auto_orderbook_match":
             warnings.append(
@@ -2804,6 +2990,17 @@ class CounterpartyAdapter:
         if dispenser_like and level_size_dec is not None and qty_dec > level_size_dec:
             warnings.append(
                 f"Requested quantity {self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base))} {base} exceeds selected dispenser level size {self._decimal_plain(level_size_dec, max_places=self._asset_display_decimals(base))} {base}. Compose preview may be rejected upstream unless quantity is reduced."
+            )
+
+        if dispenser_lot_context and not dispenser_lot_context.get("valid"):
+            lot_size = dispenser_lot_context.get("lot_size")
+            lot_text = self._decimal_plain(lot_size, max_places=self._asset_display_decimals(base)) if isinstance(lot_size, Decimal) else "unknown"
+            warnings.append(
+                f"Dispenser lot validation failed. This dispenser sells {lot_text} {base} per lot; the requested quantity must be an exact whole multiple. UTT did not round the quantity or derive payment from the displayed unit price."
+            )
+        elif selected_lot_context and selected_lot_context.get("valid"):
+            warnings.append(
+                f"Exact dispenser payment uses {selected_lot_context.get('lot_count')} whole lot(s) × {selected_lot_context.get('satoshirate')} sats per lot. The rounded OrderBook price was not used to build the payment."
             )
 
         if trade_side == "buy":
@@ -2875,7 +3072,15 @@ class CounterpartyAdapter:
                     "asset_quantity_normalized": self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base)),
                     "btc_amount": btc_sats,
                     "btc_amount_normalized": self._decimal_plain(quote_qty_dec, max_places=8),
-                    "satoshirate": level.get("satoshirate"),
+                    "satoshirate": selected_lot_context.get("satoshirate") if selected_lot_context else level.get("satoshirate"),
+                    "lot_size": (
+                        self._decimal_plain(selected_lot_context.get("lot_size"), max_places=self._asset_display_decimals(base))
+                        if selected_lot_context and isinstance(selected_lot_context.get("lot_size"), Decimal)
+                        else None
+                    ),
+                    "lot_count": selected_lot_context.get("lot_count") if selected_lot_context else None,
+                    "exact_payment_satoshis": selected_lot_context.get("exact_payment_satoshis") if selected_lot_context else None,
+                    "payment_source": "lot_count_x_satoshirate" if selected_lot_context and selected_lot_context.get("valid") else None,
                     "selected_level_size": self._decimal_plain(level_size_dec, max_places=self._asset_display_decimals(base)) if level_size_dec is not None else None,
                 }
                 preview_params = {k: v for k, v in preview_params.items() if v not in (None, "")}
@@ -2941,6 +3146,13 @@ class CounterpartyAdapter:
             compose_probe=compose_probe,
             fee_policy=fee_policy,
         )
+        if execution_mode_norm == "dispenser" and not (selected_lot_context and selected_lot_context.get("valid")):
+            funding_requirements["status"] = "dispenser_lot_invalid"
+            funding_requirements["status_reason"] = (
+                "UTT could not validate complete dispenser lots and an exact lot_count × satoshirate payment. "
+                "No payment was derived from the rounded OrderBook price and signing remains blocked."
+            )
+            funding_requirements["funding_scope"] = "dispenser_lot_validation"
         wallet_signing_handoff = self._compose_wallet_signing_handoff(
             compose_probe,
             source_address=source,
@@ -2986,6 +3198,11 @@ class CounterpartyAdapter:
             "selected_level": level or None,
             "selected_level_source": selected_level_source,
             "provided_level_validation": provided_level_validation,
+            "dispenser_lot": (
+                self._compose_dispenser_lot_payload(dispenser_lot_context, asset=base)
+                if execution_mode_norm == "dispenser" or compose_kind == "dispenser_dispense"
+                else None
+            ),
             "auto_selection_diagnostics": auto_selection_diagnostics,
             "candidate_requests": candidates,
             "attempted_upstream": bool(attempt_upstream),

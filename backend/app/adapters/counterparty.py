@@ -3107,6 +3107,10 @@ class CounterpartyAdapter:
         for candidate in candidates or []:
             params = dict(candidate.get("params") or {})
             params.pop("confirmation_target", None)
+            # Counterparty Core treats deprecated fee_provided as max_fee.
+            # A legacy fee_provided=0 therefore caps the miner fee at zero and
+            # defeats an otherwise valid explicit sat_per_vbyte retry.
+            params.pop("fee_provided", None)
             params["sat_per_vbyte"] = int(sat_per_vbyte)
             retry_candidate = {
                 **candidate,
@@ -3814,7 +3818,9 @@ class CounterpartyAdapter:
                 "get_quantity": get_quantity_atomic,
                 "expiration": expiration_blocks_norm,
                 "fee_required": 0,
-                "fee_provided": 0,
+                # Do not send deprecated fee_provided=0. Counterparty Core maps
+                # it to max_fee=0, which forces btc_fee=0 even when a positive
+                # confirmation_target or sat_per_vbyte is supplied.
                 **construct_fee_params,
             }
             compact_order_params = {k: v for k, v in order_params.items() if v not in (None, "")}

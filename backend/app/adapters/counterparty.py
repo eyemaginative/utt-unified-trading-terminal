@@ -57,12 +57,11 @@ class CounterpartyRateLimitError(RuntimeError):
 
 
 class CounterpartyAdapter:
-    """Read-only Counterparty / Bitcoin metaprotocol adapter.
+    """Counterparty / Bitcoin metaprotocol adapter.
 
-    This adapter deliberately does not sign, compose, or broadcast transactions.
-    Wallet operations should remain browser/wallet-mediated (UniSat now; other
-    Bitcoin wallets later) until an explicit unsigned transaction compose tranche
-    is added.
+    The adapter normalizes read-only market data and unsigned compose previews.
+    It never signs or broadcasts transactions. Wallet signing and any operator-
+    enabled broadcast remain explicit browser-mediated UniSat actions.
     """
 
     venue = "counterparty"
@@ -3242,6 +3241,16 @@ class CounterpartyAdapter:
             reason = "Counterparty compose succeeded, but no recognized PSBT or raw transaction field was found."
             payload_format = "unknown"
 
+        live_broadcast_gate_enabled = bool(
+            self._env_bool("COUNTERPARTY_LIVE_BROADCAST_ENABLED", False)
+        )
+        live_broadcast_enabled = bool(
+            live_broadcast_gate_enabled
+            and signable
+            and found_psbt is not None
+            and payload_format == "psbt_hex"
+        )
+
         return {
             "status": status,
             "status_reason": reason,
@@ -3288,8 +3297,16 @@ class CounterpartyAdapter:
             "auto_finalize_psbt": True if found_psbt else None,
             "signed": False,
             "broadcast": False,
-            "broadcast_enabled": False,
-            "broadcast_method": None,
+            "broadcast_enabled": live_broadcast_enabled,
+            "broadcast_method": "pushPsbt" if live_broadcast_enabled else None,
+            "broadcast_gate_enabled": live_broadcast_gate_enabled,
+            "broadcast_gate_env": "COUNTERPARTY_LIVE_BROADCAST_ENABLED",
+            "broadcast_policy": (
+                "separate_explicit_irreversible_user_confirmation"
+                if live_broadcast_enabled
+                else "disabled_by_operator_gate"
+            ),
+            "automatic_broadcast": False,
             "later_broadcast_method": "pushPsbt" if found_psbt else "pushTx" if found_raw_tx else None,
             "backend_read_only": True,
             "wallet_payload_not_persisted": True,
@@ -4355,9 +4372,14 @@ class CounterpartyAdapter:
             funding_requirements=funding_requirements,
         )
         if wallet_signing_handoff.get("signable_with_unisat"):
-            warnings.append(
-                "A validated UniSat PSBT signing handoff is available after review. Signing requires explicit user action and UTT will not broadcast in CP-SIGN.1."
-            )
+            if wallet_signing_handoff.get("broadcast_enabled"):
+                warnings.append(
+                    "A validated UniSat PSBT signing handoff is available after review. Signing and broadcast are separate explicit user actions; UTT never broadcasts automatically."
+                )
+            else:
+                warnings.append(
+                    "A validated UniSat PSBT signing handoff is available after review. Signing requires explicit user action; live broadcast remains disabled by COUNTERPARTY_LIVE_BROADCAST_ENABLED."
+                )
         elif wallet_signing_handoff.get("psbt_available"):
             warnings.append(
                 "Counterparty returned a PSBT, but UTT blocked signing because validated input UTXO metadata, the positive miner-fee diagnostics, or funding checks are not ready."
@@ -4460,6 +4482,11 @@ class CounterpartyAdapter:
             "wallet_provider": provider_fn() if callable(provider_fn) else "unisat",
             "read_only": True,
             "signing": "external_wallet_required",
+            "live_broadcast_enabled": bool(
+                self._env_bool("COUNTERPARTY_LIVE_BROADCAST_ENABLED", False)
+            ),
+            "live_broadcast_method": "unisat_pushPsbt",
+            "automatic_broadcast": False,
             "probe": probe,
         }
 
@@ -4472,14 +4499,29 @@ class CounterpartyAdapter:
                 "error": "unsupported_wallet_provider",
                 "supported": ["unisat"],
             }
+        live_broadcast_enabled = bool(
+            self._env_bool("COUNTERPARTY_LIVE_BROADCAST_ENABLED", False)
+        )
         return {
             "ok": True,
             "provider": "unisat",
             "browser_object": "window.unisat",
             "read_methods": ["requestAccounts", "getAccounts", "getChain", "getNetwork", "getPublicKey", "getBalance", "getInscriptions"],
             "sign_methods_enabled": ["signPsbt"],
-            "broadcast_methods_disabled": ["pushPsbt", "pushTx", "sendBitcoin"],
-            "utt_policy": "CP-SIGN.1 allows explicit browser UniSat signPsbt only when Counterparty Core returns PSBT hex; no backend signing and no broadcast.",
+            "broadcast_methods_enabled": ["pushPsbt"] if live_broadcast_enabled else [],
+            "broadcast_methods_disabled": (
+                ["pushTx", "sendBitcoin"]
+                if live_broadcast_enabled
+                else ["pushPsbt", "pushTx", "sendBitcoin"]
+            ),
+            "live_broadcast_enabled": live_broadcast_enabled,
+            "live_broadcast_gate_env": "COUNTERPARTY_LIVE_BROADCAST_ENABLED",
+            "automatic_broadcast": False,
+            "utt_policy": (
+                "CP-LIVE.1 permits a separately confirmed browser UniSat pushPsbt only after explicit signPsbt approval; no backend signing or broadcast."
+                if live_broadcast_enabled
+                else "Counterparty UniSat signPsbt is explicit and live broadcast remains disabled by COUNTERPARTY_LIVE_BROADCAST_ENABLED."
+            ),
         }
 
     def get_asset(self, asset: str) -> Dict[str, Any]:

@@ -501,6 +501,92 @@ function counterpartyPsbtHexOrNull(value) {
   return raw.toLowerCase().startsWith("70736274ff") ? raw.toLowerCase() : null;
 }
 
+function counterpartyTxidOrNull(value) {
+  const candidates = value && typeof value === "object"
+    ? [value?.txid, value?.txId, value?.hash, value?.result, value?.transaction_id, value?.transactionId]
+    : [value];
+  for (const candidate of candidates) {
+    const raw = String(candidate || "").trim().replace(/^0x/i, "");
+    if (/^[0-9a-f]{64}$/i.test(raw)) return raw.toLowerCase();
+  }
+  return null;
+}
+
+function counterpartyBroadcastHandoffView(payload) {
+  if (!payload || typeof payload !== "object" || !isCounterpartyVenueKey(payload?.venue)) return null;
+  const handoff = payload?.wallet_signing_handoff && typeof payload.wallet_signing_handoff === "object"
+    ? payload.wallet_signing_handoff
+    : {};
+  const signingResult = payload?.wallet_signing_result && typeof payload.wallet_signing_result === "object"
+    ? payload.wallet_signing_result
+    : {};
+  const signedPsbtHex = counterpartyPsbtHexOrNull(signingResult?.signed_psbt_hex);
+  const txid = counterpartyTxidOrNull(
+    payload?.broadcast_txid ??
+    payload?.txid ??
+    signingResult?.broadcast_txid ??
+    signingResult?.txid
+  );
+  const signed = payload?.signed === true && signingResult?.signed === true;
+  const broadcastEnabled = handoff?.broadcast_enabled === true;
+  const alreadyBroadcast = payload?.broadcast === true || signingResult?.broadcast === true || !!txid;
+  const sourceAddress = String(
+    signingResult?.source_address ||
+    handoff?.source_address ||
+    payload?.source_address ||
+    ""
+  ).trim();
+
+  let reason = "";
+  if (!signed) reason = "A signed UniSat PSBT is required before broadcast.";
+  else if (!signedPsbtHex) reason = "The signed PSBT is unavailable or malformed.";
+  else if (!broadcastEnabled) reason = "Live broadcast is disabled by COUNTERPARTY_LIVE_BROADCAST_ENABLED.";
+  else if (alreadyBroadcast) reason = "This signed transaction has already been broadcast.";
+
+  return {
+    signed,
+    signedPsbtHex,
+    sourceAddress,
+    broadcastEnabled,
+    alreadyBroadcast,
+    txid,
+    broadcastAt: String(payload?.broadcast_at || signingResult?.broadcast_at || "").trim(),
+    broadcastMethod: String(
+      payload?.broadcast_method ||
+      signingResult?.broadcast_method_called ||
+      handoff?.broadcast_method ||
+      ""
+    ).trim(),
+    canBroadcast: Boolean(
+      signed &&
+      signedPsbtHex &&
+      broadcastEnabled &&
+      !alreadyBroadcast
+    ),
+    reason,
+  };
+}
+
+function counterpartyResultPayloadForDisplay(payload) {
+  const sensitiveKeys = new Set(["signed_psbt_hex", "signedPsbtHex"]);
+  const walk = (value, key = "", depth = 0) => {
+    if (sensitiveKeys.has(key)) {
+      return "[REDACTED: signed PSBT retained in memory for explicit broadcast only]";
+    }
+    if (depth > 24) return "[TRUNCATED]";
+    if (Array.isArray(value)) return value.map((item) => walk(item, "", depth + 1));
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [childKey, childValue] of Object.entries(value)) {
+        out[childKey] = walk(childValue, childKey, depth + 1);
+      }
+      return out;
+    }
+    return value;
+  };
+  return walk(payload);
+}
+
 function counterpartySigningHandoffView(payload) {
   if (!payload || typeof payload !== "object" || !isCounterpartyVenueKey(payload?.venue)) return null;
   const handoff = payload?.wallet_signing_handoff;
@@ -590,6 +676,9 @@ function counterpartySubmitResultTitle(payload, kind, requestedTitle = "") {
     return explicit || (kind === "error" ? "Order Submit Failed" : "Order Submit Result");
   }
 
+  if (kind === "error" && payload?.broadcast_error) {
+    return "Counterparty Broadcast Failed — Signed Transaction Retained";
+  }
   if (payload?.signed === true && payload?.broadcast !== true) {
     return "Counterparty Transaction Signed — Not Broadcast";
   }
@@ -866,7 +955,7 @@ function counterpartyPreviewRules(symbol, venue = "counterparty") {
     min_qty: 0,
     min_notional: 0,
     errors: [],
-    warnings: ["Counterparty compose remains review-first. A successful PSBT may be signed explicitly with UniSat; broadcast remains disabled."],
+    warnings: ["Counterparty compose remains review-first. Signing and any operator-enabled broadcast require separate explicit user actions; broadcast is never automatic."],
   };
 }
 
@@ -2860,7 +2949,7 @@ export default function OrderTicketWidget({
 
     const counterpartyReadOnly = venueId.includes("counterparty");
     const inlineText = counterpartyReadOnly
-      ? "Counterparty: compose preview · explicit UniSat PSBT signing · broadcast disabled"
+      ? "Counterparty: compose preview · explicit UniSat PSBT signing · separately gated broadcast"
       : `${title} · ${inlineParts.join(" · ")}`;
 
     return {
@@ -2925,6 +3014,8 @@ export default function OrderTicketWidget({
   const [counterpartyBookError, setCounterpartyBookError] = useState(null);
   const [counterpartyBtcBalanceMeta, setCounterpartyBtcBalanceMeta] = useState(null);
   const [counterpartySigningPending, setCounterpartySigningPending] = useState(false);
+  const [counterpartyBroadcastPending, setCounterpartyBroadcastPending] = useState(false);
+  const [counterpartyBroadcastConfirmArmed, setCounterpartyBroadcastConfirmArmed] = useState(false);
   const [counterpartyFeeTier, setCounterpartyFeeTier] = useState(() => readCounterpartyFeeTier());
   const [counterpartyExecutionMode, setCounterpartyExecutionMode] = useState(() => readCounterpartyExecutionMode());
   const [counterpartyExpirationPreset, setCounterpartyExpirationPreset] = useState(() => readCounterpartyExpirationPreset());
@@ -5384,7 +5475,7 @@ export default function OrderTicketWidget({
       const asks = counterpartyBookRows(counterpartyBook, "asks");
       const dispenserAsks = asks.filter((row) => counterpartyBookRowLiquidityType(row) === "dispenser");
 
-      lines.push("Counterparty builds an unsigned compose preview. UniSat signing requires explicit approval; broadcast remains disabled.");
+      lines.push("Counterparty builds an unsigned compose preview. UniSat signing and any enabled broadcast require separate explicit approvals; broadcast is never automatic.");
       lines.push(
         mode === "dispenser"
           ? "Mode: Dispenser Purchase. UTT will fail closed if no eligible dispenser is available and will not fall back to a protocol order."
@@ -5881,7 +5972,7 @@ export default function OrderTicketWidget({
     } else {
       try {
         if (typeof payload === "string") setSubmitResultText(payload);
-        else setSubmitResultText(JSON.stringify(payload, null, 2));
+        else setSubmitResultText(JSON.stringify(counterpartyResultPayloadForDisplay(payload), null, 2));
       } catch {
         setSubmitResultText(String(payload ?? ""));
       }
@@ -7247,6 +7338,19 @@ async function submitLimitOrder() {
     [submitResultPayload]
   );
 
+  const counterpartyBroadcastHandoff = useMemo(
+    () => counterpartyBroadcastHandoffView(submitResultPayload),
+    [submitResultPayload]
+  );
+
+  useEffect(() => {
+    setCounterpartyBroadcastConfirmArmed(false);
+  }, [
+    submitResultPayload?.wallet_signing_result?.signed_psbt_hex,
+    submitResultPayload?.broadcast,
+    submitResultPayload?.broadcast_txid,
+  ]);
+
   const counterpartySubmitDispenserLot = useMemo(
     () => counterpartyDispenserLotResultView(submitResultPayload),
     [submitResultPayload]
@@ -7279,7 +7383,7 @@ async function submitLimitOrder() {
     }
     if (isCounterpartyVenue) {
       const modeLabel = isCounterpartyLimitOrderMode ? "limit order" : "dispenser purchase";
-      return `/api/counterparty/compose/preview (${modeLabel}) → UniSat signPsbt (explicit user action; no broadcast)`;
+      return `/api/counterparty/compose/preview (${modeLabel}) → UniSat signPsbt → separately confirmed pushPsbt when operator-enabled`;
     }
     if (!isSolanaDexVenue) return "/api/trade/order";
     if (isSolanaLimitMode) return "/api/solana_dex/jupiter/trigger/create_order";
@@ -7340,7 +7444,9 @@ async function submitLimitOrder() {
         signed: true,
         broadcast: false,
         signing: "performed_by_unisat",
-        broadcasting: "not_performed",
+        broadcasting: handoff.broadcastEnabled
+          ? "awaiting_separate_user_confirmation"
+          : "disabled_by_operator_gate",
         wallet_signing_result: {
           ok: true,
           provider: "unisat",
@@ -7350,25 +7456,170 @@ async function submitLimitOrder() {
           signed_psbt_hex: signedPsbt,
           signed: true,
           broadcast: false,
+          broadcast_available: handoff.broadcastEnabled === true,
           broadcast_method_called: null,
           persisted_to_browser_storage: false,
         },
         warnings: [
           ...(Array.isArray(preview?.warnings) ? preview.warnings : []),
-          "UniSat signed the PSBT after explicit user approval. UTT did not call pushPsbt, pushTx, sendBitcoin, or any backend broadcast endpoint.",
-          "The signed PSBT exists only in this in-memory result modal; closing or refreshing the page discards it unless copied manually.",
+          handoff.broadcastEnabled
+            ? "UniSat signed the PSBT after explicit user approval. UTT did not broadcast automatically; a second irreversible confirmation is required before pushPsbt."
+            : "UniSat signed the PSBT after explicit user approval. Live broadcast remains disabled by COUNTERPARTY_LIVE_BROADCAST_ENABLED.",
+          "The signed PSBT exists only in memory and is redacted from the modal Copy output.",
         ],
       };
 
       setSubmitOk(signedPayload);
+      setCounterpartyBroadcastConfirmArmed(false);
       openSubmitResultModal("ok", signedPayload, "Counterparty PSBT Signed — Not Broadcast");
-      onToast?.({ kind: "ok", msg: "Counterparty PSBT signed by UniSat. Broadcast was not performed." });
+      onToast?.({
+        kind: "ok",
+        msg: handoff.broadcastEnabled
+          ? "Counterparty PSBT signed by UniSat. A separate broadcast confirmation is now available."
+          : "Counterparty PSBT signed by UniSat. Live broadcast remains disabled.",
+      });
     } catch (e) {
       const msg = e?.message || "UniSat PSBT signing failed";
       setSubmitError(msg);
       openSubmitResultModal("error", { ...(preview || {}), signing_error: msg }, "Counterparty UniSat Signing Failed");
     } finally {
       setCounterpartySigningPending(false);
+    }
+  }
+
+  async function broadcastCounterpartySignedPsbtWithUniSat() {
+    const signedPayload = submitResultPayload;
+    const handoff = counterpartyBroadcastHandoffView(signedPayload);
+    if (!handoff?.canBroadcast || !handoff?.signedPsbtHex) {
+      const reason = handoff?.reason || "This signed Counterparty transaction is not ready for broadcast.";
+      onToast?.({ kind: "warn", msg: reason });
+      return;
+    }
+
+    if (!counterpartyBroadcastConfirmArmed) {
+      setCounterpartyBroadcastConfirmArmed(true);
+      onToast?.({
+        kind: "warn",
+        msg: "Broadcast is irreversible. Review the signed transaction, then click Confirm Broadcast — Irreversible.",
+      });
+      return;
+    }
+
+    setCounterpartyBroadcastPending(true);
+    setCounterpartyBroadcastConfirmArmed(false);
+    setSubmitError(null);
+    try {
+      const provider = typeof window !== "undefined" ? window.unisat : null;
+      if (!provider || typeof provider.pushPsbt !== "function") {
+        throw new Error("UniSat pushPsbt is unavailable. Update, unlock, and connect UniSat, then retry.");
+      }
+
+      const connectedAddress = await getCounterpartyAddressWithPrompt({ forcePrompt: true });
+      if (!connectedAddress) throw new Error("UniSat did not return a connected Bitcoin address.");
+      if (handoff.sourceAddress && connectedAddress.toLowerCase() !== handoff.sourceAddress.toLowerCase()) {
+        throw new Error(
+          `UniSat account mismatch. Signed transaction source is ${shortenWalletAddress(handoff.sourceAddress)}, but UniSat exposed ${shortenWalletAddress(connectedAddress)}.`
+        );
+      }
+
+      const networkStatus = await counterpartyUniSatMainnetStatus(provider);
+      if (!networkStatus.ok) {
+        throw new Error(`UniSat must be on Bitcoin Mainnet before broadcast. Current network: ${networkStatus.label}.`);
+      }
+
+      updateSubmitResultModal(
+        "info",
+        {
+          ...signedPayload,
+          broadcast_attempted: true,
+          broadcast_status: "pending",
+          broadcasting: "waiting_for_unisat_pushPsbt",
+        },
+        "Broadcasting Counterparty Transaction"
+      );
+
+      const txid = counterpartyTxidOrNull(
+        await provider.pushPsbt(handoff.signedPsbtHex)
+      );
+      if (!txid) {
+        throw new Error("UniSat pushPsbt did not return a valid 64-character Bitcoin transaction ID.");
+      }
+
+      const broadcastAt = new Date().toISOString();
+      const priorWarnings = Array.isArray(signedPayload?.warnings)
+        ? signedPayload.warnings.filter((warning) => {
+            const textValue = String(warning || "").toLowerCase();
+            return !textValue.includes("did not broadcast automatically")
+              && !textValue.includes("live broadcast remains disabled")
+              && !textValue.includes("signed psbt exists only in memory");
+          })
+        : [];
+      const broadcastPayload = {
+        ...signedPayload,
+        submitted: true,
+        signed: true,
+        broadcast: true,
+        broadcast_attempted: true,
+        broadcast_status: "submitted",
+        broadcasting: "performed_by_unisat_pushPsbt",
+        broadcast_method: "pushPsbt",
+        broadcast_txid: txid,
+        broadcast_at: broadcastAt,
+        broadcast_error: null,
+        wallet_signing_result: {
+          ...(signedPayload?.wallet_signing_result || {}),
+          ok: true,
+          provider: "unisat",
+          source_address: connectedAddress,
+          network: networkStatus.label,
+          signed: true,
+          broadcast: true,
+          broadcast_method_called: "pushPsbt",
+          broadcast_txid: txid,
+          broadcast_at: broadcastAt,
+          persisted_to_browser_storage: false,
+        },
+        warnings: [
+          ...priorWarnings,
+          "UniSat broadcast the previously signed PSBT only after a separate irreversible user confirmation.",
+          "UTT did not call pushTx, sendBitcoin, or any backend broadcast endpoint.",
+        ],
+      };
+
+      setSubmitOk(broadcastPayload);
+      openSubmitResultModal("ok", broadcastPayload, "Counterparty Transaction Broadcast");
+      onToast?.({ kind: "ok", msg: `Counterparty transaction broadcast: ${txid}` });
+    } catch (e) {
+      const msg = e?.message || "UniSat PSBT broadcast failed";
+      const failedPayload = {
+        ...(signedPayload || {}),
+        signed: true,
+        broadcast: false,
+        broadcast_attempted: true,
+        broadcast_status: "failed_or_unknown",
+        broadcasting: "not_confirmed",
+        broadcast_error: msg,
+        wallet_signing_result: {
+          ...(signedPayload?.wallet_signing_result || {}),
+          signed: true,
+          broadcast: false,
+          broadcast_method_called: "pushPsbt",
+          broadcast_error: msg,
+        },
+      };
+      setSubmitOk(failedPayload);
+      setSubmitError(msg);
+      openSubmitResultModal(
+        "error",
+        failedPayload,
+        "Counterparty Broadcast Failed — Signed Transaction Retained"
+      );
+      onToast?.({
+        kind: "warn",
+        msg: "Broadcast was not confirmed. UTT will not retry automatically; verify wallet/network state before trying again.",
+      });
+    } finally {
+      setCounterpartyBroadcastPending(false);
     }
   }
 
@@ -8101,7 +8352,7 @@ async function submitLimitOrder() {
             >
               <span style={{ fontWeight: 800 }}>Counterparty / Bitcoin</span>
               <span style={{ ...safeMuted, fontSize: 11 }}>
-                Compose preview + explicit UniSat PSBT signing. Broadcast remains disabled.
+                Compose preview + explicit UniSat PSBT signing. Broadcast is separately gated and never automatic.
               </span>
               <span style={{ ...safeMuted, fontSize: 11 }}>
                 Mode: <b>{isCounterpartyDispenserMode ? "Dispenser Purchase" : "Limit Order"}</b>
@@ -8437,8 +8688,8 @@ async function submitLimitOrder() {
               isCounterpartyVenue
                 ? canCounterpartyComposePreview
                   ? isCounterpartyLimitOrderMode
-                    ? "Preview unsigned Counterparty limit order. UniSat signing is explicit; broadcast remains disabled."
-                    : "Preview unsigned Counterparty dispenser purchase. UniSat signing is explicit; broadcast remains disabled."
+                    ? "Preview unsigned Counterparty limit order. Signing and any enabled broadcast are separate explicit actions."
+                    : "Preview unsigned Counterparty dispenser purchase. Signing and any enabled broadcast are separate explicit actions."
                   : isCounterpartyLimitOrderMode
                     ? "Fill Counterparty symbol, qty, limit price, and valid expiration"
                     : "Select a DISP row and enter a Qty that is an exact whole multiple of its Lot"
@@ -8683,10 +8934,41 @@ async function submitLimitOrder() {
                         background: "#19160d",
                         color: "#f1d98a",
                       }}
-                      title="Ask UniSat to sign this PSBT. CP-SIGN.1 never broadcasts."
-                      disabled={counterpartySigningPending}
+                      title="Ask UniSat to sign this PSBT. Signing never broadcasts; broadcast is a separate operator-gated action."
+                      disabled={counterpartySigningPending || counterpartyBroadcastPending}
                     >
                       {counterpartySigningPending ? "Waiting for UniSat…" : "Sign with UniSat — No Broadcast"}
+                    </button>
+                  )}
+
+                  {counterpartyBroadcastHandoff?.canBroadcast && (
+                    <button
+                      type="button"
+                      onClick={broadcastCounterpartySignedPsbtWithUniSat}
+                      style={{
+                        ...safeButton,
+                        padding: "7px 10px",
+                        opacity: counterpartyBroadcastPending ? 0.7 : 1,
+                        border: counterpartyBroadcastConfirmArmed
+                          ? "1px solid #d14b4b"
+                          : "1px solid #7a2b2b",
+                        background: counterpartyBroadcastConfirmArmed
+                          ? "#3b1111"
+                          : "#241010",
+                        color: "#ffd2d2",
+                      }}
+                      title={
+                        counterpartyBroadcastConfirmArmed
+                          ? "Final irreversible confirmation. This will submit the signed Bitcoin transaction to the network."
+                          : "Arm a separate irreversible UniSat pushPsbt broadcast confirmation."
+                      }
+                      disabled={counterpartyBroadcastPending || counterpartySigningPending}
+                    >
+                      {counterpartyBroadcastPending
+                        ? "Broadcasting…"
+                        : counterpartyBroadcastConfirmArmed
+                          ? "Confirm Broadcast — Irreversible"
+                          : "Broadcast Signed Transaction"}
                     </button>
                   )}
 
@@ -8746,11 +9028,15 @@ async function submitLimitOrder() {
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
                       <div style={{ fontSize: 12, fontWeight: 900 }}>Counterparty UniSat signing handoff</div>
                       <div style={{ fontSize: 11, fontWeight: 900 }}>
-                        {counterpartySigningHandoff.alreadySigned
-                          ? "SIGNED · NOT BROADCAST"
-                          : counterpartySigningHandoff.canSign
-                            ? "READY FOR USER APPROVAL"
-                            : "SIGNING BLOCKED"}
+                        {counterpartyBroadcastHandoff?.alreadyBroadcast
+                          ? "BROADCAST"
+                          : counterpartySigningHandoff.alreadySigned
+                            ? counterpartySigningHandoff.broadcastEnabled
+                              ? "SIGNED · BROADCAST AVAILABLE"
+                              : "SIGNED · NOT BROADCAST"
+                            : counterpartySigningHandoff.canSign
+                              ? "READY FOR USER APPROVAL"
+                              : "SIGNING BLOCKED"}
                       </div>
                     </div>
                     <div style={{ display: "grid", gridTemplateColumns: "minmax(145px, 0.8fr) minmax(220px, 1.2fr)", gap: "6px 12px", fontSize: 11 }}>
@@ -8771,13 +9057,67 @@ async function submitLimitOrder() {
                       <div style={{ color: "#a9a9a9" }}>Wallet method</div>
                       <div>{counterpartySigningHandoff.psbtHex ? "UniSat signPsbt" : "Unavailable"}</div>
                       <div style={{ color: "#a9a9a9" }}>Broadcast</div>
-                      <div>Disabled in CP-SIGN.1</div>
+                      <div>
+                        {counterpartyBroadcastHandoff?.alreadyBroadcast
+                          ? "Submitted by UniSat pushPsbt"
+                          : counterpartySigningHandoff.alreadySigned && counterpartySigningHandoff.broadcastEnabled
+                            ? "Available after separate irreversible confirmation"
+                            : counterpartySigningHandoff.broadcastEnabled
+                              ? "Operator-enabled after signing"
+                              : "Disabled by COUNTERPARTY_LIVE_BROADCAST_ENABLED"}
+                      </div>
                     </div>
                     {!hideTableData && counterpartySigningHandoff.reason && (
                       <div style={{ marginTop: 8, fontSize: 10.5, color: "#bdbdbd", lineHeight: 1.3 }}>
                         {counterpartySigningHandoff.reason}
                       </div>
                     )}
+                  </div>
+                )}
+
+                {counterpartyBroadcastConfirmArmed && counterpartyBroadcastHandoff?.canBroadcast && (
+                  <div
+                    style={{
+                      marginBottom: 10,
+                      borderRadius: 12,
+                      border: "1px solid #d14b4b",
+                      background: "#2a0f0f",
+                      padding: 10,
+                      color: "#ffd2d2",
+                      fontSize: 11,
+                      lineHeight: 1.35,
+                    }}
+                  >
+                    <div style={{ fontWeight: 900, marginBottom: 5 }}>
+                      Final broadcast confirmation armed
+                    </div>
+                    Broadcasting is irreversible. Confirm only after reviewing the signed transaction.
+                    UTT will call UniSat pushPsbt once and will not retry automatically.
+                  </div>
+                )}
+
+                {counterpartyBroadcastHandoff?.alreadyBroadcast && (
+                  <div
+                    style={{
+                      marginBottom: 10,
+                      borderRadius: 12,
+                      border: "1px solid #1f6f3a",
+                      background: "#0f1a0f",
+                      padding: 10,
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+                      <div style={{ fontSize: 12, fontWeight: 900 }}>Counterparty broadcast result</div>
+                      <div style={{ fontSize: 11, fontWeight: 900, color: "#b8f5c8" }}>SUBMITTED</div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "minmax(145px, 0.8fr) minmax(220px, 1.2fr)", gap: "6px 12px", fontSize: 11 }}>
+                      <div style={{ color: "#a9a9a9" }}>Transaction ID</div>
+                      <div style={{ wordBreak: "break-all" }}>{hideTableData ? "••••" : counterpartyBroadcastHandoff.txid || "unknown"}</div>
+                      <div style={{ color: "#a9a9a9" }}>Wallet method</div>
+                      <div>{counterpartyBroadcastHandoff.broadcastMethod || "pushPsbt"}</div>
+                      <div style={{ color: "#a9a9a9" }}>Broadcast time</div>
+                      <div>{counterpartyBroadcastHandoff.broadcastAt || "unknown"}</div>
+                    </div>
                   </div>
                 )}
 

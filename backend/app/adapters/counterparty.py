@@ -7,7 +7,9 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
@@ -15,6 +17,43 @@ from urllib.parse import quote, urljoin, urlparse
 import httpx
 
 from ..config import settings
+
+
+class CounterpartyRateLimitError(RuntimeError):
+    """Machine-readable upstream HTTP 429 response.
+
+    The adapter never sleeps or retries inside a request.  It preserves the
+    upstream Retry-After instruction so the OrderBook caller can enter a
+    bounded cooldown without issuing more requests.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        retry_after_raw: Optional[str] = None,
+        retry_after_s: Optional[int] = None,
+        retry_at: Optional[str] = None,
+        body_preview: str = "",
+    ) -> None:
+        self.path = str(path or "")
+        self.status_code = 429
+        self.retry_after_raw = str(retry_after_raw or "").strip() or None
+        self.retry_after_s = int(retry_after_s) if retry_after_s is not None else None
+        self.retry_at = str(retry_at or "").strip() or None
+        self.body_preview = str(body_preview or "")[:800]
+        wait_text = f" retry_after_s={self.retry_after_s}" if self.retry_after_s is not None else ""
+        super().__init__(f"HTTP 429 from Counterparty API path={self.path!r}{wait_text} body={self.body_preview}")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "status_code": 429,
+            "path": self.path,
+            "retry_after_raw": self.retry_after_raw,
+            "retry_after_s": self.retry_after_s,
+            "retry_at": self.retry_at,
+            "error": str(self)[:500],
+        }
 
 
 class CounterpartyAdapter:
@@ -28,6 +67,7 @@ class CounterpartyAdapter:
 
     venue = "counterparty"
     _MARKET_CONTEXT_CACHE: Dict[str, Dict[str, Any]] = {}
+    _ORDERBOOK_SNAPSHOT_CACHE: Dict[str, Dict[str, Any]] = {}
     _FEE_TIERS: Dict[str, Dict[str, Any]] = {
         "slow": {
             "confirmation_target_blocks": 18,
@@ -82,12 +122,47 @@ class CounterpartyAdapter:
             p = "/" + p
         return f"{self.base_url}{p}"
 
+    @staticmethod
+    def _retry_after_details(raw_value: Any) -> Tuple[Optional[int], Optional[str]]:
+        """Normalize Retry-After seconds or HTTP-date without sleeping."""
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return None, None
+        now = time.time()
+        try:
+            seconds = max(0, int(Decimal(raw).to_integral_value(rounding=ROUND_CEILING)))
+            retry_ts = now + seconds
+            retry_at = datetime.fromtimestamp(retry_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            return seconds, retry_at
+        except Exception:
+            pass
+        try:
+            dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            retry_ts = dt.timestamp()
+            seconds = max(0, int(Decimal(str(retry_ts - now)).to_integral_value(rounding=ROUND_CEILING)))
+            retry_at = datetime.fromtimestamp(retry_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            return seconds, retry_at
+        except Exception:
+            return None, None
+
     def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not self.base_url.startswith(("https://", "http://")):
             raise ValueError("COUNTERPARTY_API_BASE_URL must start with http:// or https://")
         with httpx.Client(timeout=self.timeout_s, headers={"accept": "application/json"}) as client:
             r = client.get(self._url(path), params=params or {})
         body_preview = (r.text or "")[:800]
+        if r.status_code == 429:
+            retry_raw = str(r.headers.get("retry-after") or "").strip() or None
+            retry_after_s, retry_at = self._retry_after_details(retry_raw)
+            raise CounterpartyRateLimitError(
+                path=path,
+                retry_after_raw=retry_raw,
+                retry_after_s=retry_after_s,
+                retry_at=retry_at,
+                body_preview=body_preview,
+            )
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code} from Counterparty API path={path!r} body={body_preview}")
         try:
@@ -102,6 +177,17 @@ class CounterpartyAdapter:
             try:
                 data = self._get_json(path, params=params)
                 return {"ok": True, "path": path, "params": params or {}, "raw": data}
+            except CounterpartyRateLimitError as e:
+                detail = {"path": path, "params": params or {}, **e.as_dict()}
+                errors.append(detail)
+                # A 429 is normally service-wide. Stop trying alternate endpoint
+                # shapes so one UI refresh cannot multiply the rate-limit load.
+                return {
+                    "ok": False,
+                    "errors": errors,
+                    "rate_limited": True,
+                    "rate_limit": e.as_dict(),
+                }
             except Exception as e:
                 errors.append({"path": path, "params": params or {}, "error": str(e)[:500]})
         return {"ok": False, "errors": errors}
@@ -1667,6 +1753,140 @@ class CounterpartyAdapter:
             "raw_dispenser": row,
         }
 
+    @staticmethod
+    def _orderbook_snapshot_max_age_s() -> int:
+        try:
+            return max(60, min(int(os.getenv("COUNTERPARTY_ORDERBOOK_LAST_GOOD_MAX_AGE_S") or "3600"), 86400))
+        except Exception:
+            return 3600
+
+    @classmethod
+    def _orderbook_snapshot_key(cls, symbol_canon: str, depth: int, open_only: bool) -> str:
+        return f"{str(symbol_canon or '').strip().upper()}|depth:{int(depth)}|open:{1 if open_only else 0}"
+
+    @classmethod
+    def _orderbook_snapshot_get(cls, key: str) -> Optional[Dict[str, Any]]:
+        row = cls._ORDERBOOK_SNAPSHOT_CACHE.get(str(key or ""))
+        if not isinstance(row, dict):
+            return None
+        ts = float(row.get("ts") or 0)
+        data = row.get("data")
+        if not ts or not isinstance(data, dict):
+            return None
+        age_s = max(0, int(time.time() - ts))
+        if age_s > cls._orderbook_snapshot_max_age_s():
+            try:
+                cls._ORDERBOOK_SNAPSHOT_CACHE.pop(str(key or ""), None)
+            except Exception:
+                pass
+            return None
+        return {"data": data, "ts": ts, "age_s": age_s}
+
+    @classmethod
+    def _orderbook_snapshot_put(cls, key: str, data: Dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        try:
+            if len(cls._ORDERBOOK_SNAPSHOT_CACHE) > 100:
+                oldest = sorted(
+                    cls._ORDERBOOK_SNAPSHOT_CACHE.items(),
+                    key=lambda kv: float((kv[1] or {}).get("ts") or 0),
+                )[:20]
+                for cache_key, _row in oldest:
+                    cls._ORDERBOOK_SNAPSHOT_CACHE.pop(cache_key, None)
+            cls._ORDERBOOK_SNAPSHOT_CACHE[str(key or "")] = {"ts": time.time(), "data": data}
+        except Exception:
+            pass
+
+    @staticmethod
+    def _rate_limit_meta(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(result, dict) or result.get("rate_limited") is not True:
+            return None
+        meta = result.get("rate_limit") if isinstance(result.get("rate_limit"), dict) else {}
+        retry_after_s = CounterpartyAdapter._as_int(meta.get("retry_after_s"))
+        if retry_after_s is None:
+            try:
+                retry_after_s = max(1, min(int(os.getenv("COUNTERPARTY_RATE_LIMIT_DEFAULT_RETRY_S") or "30"), 900))
+            except Exception:
+                retry_after_s = 30
+        retry_at = str(meta.get("retry_at") or "").strip() or datetime.fromtimestamp(
+            time.time() + retry_after_s, tz=timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        return {
+            "active": True,
+            "status_code": 429,
+            "retry_after_raw": meta.get("retry_after_raw"),
+            "retry_after_s": retry_after_s,
+            "retry_at": retry_at,
+            "path": meta.get("path"),
+            "source": "counterparty_upstream",
+        }
+
+    def _orderbook_rate_limited_response(
+        self,
+        *,
+        cache_key: str,
+        symbol_canon: str,
+        base: str,
+        quote_asset: str,
+        depth: int,
+        open_only: bool,
+        rate_limit: Dict[str, Any],
+        orders_errors: Optional[List[Dict[str, Any]]] = None,
+        dispensers_errors: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        cached = self._orderbook_snapshot_get(cache_key)
+        if cached is not None:
+            data = dict(cached.get("data") or {})
+            cached_at = datetime.fromtimestamp(float(cached.get("ts") or time.time()), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            return {
+                **data,
+                "ok": True,
+                "rate_limited": True,
+                "rate_limit": rate_limit,
+                "stale": True,
+                "stale_reason": "counterparty_upstream_rate_limited",
+                "snapshot_source": "last_good_memory_cache",
+                "snapshot_cached_at": cached_at,
+                "snapshot_age_s": int(cached.get("age_s") or 0),
+                "errors": {
+                    "orders": orders_errors or [],
+                    "dispensers": dispensers_errors or [],
+                },
+                "warnings": [
+                    "Counterparty upstream returned HTTP 429. UTT retained the last successful read-only OrderBook snapshot and will not refresh again until the advertised cooldown expires."
+                ],
+            }
+
+        return {
+            "ok": False,
+            "venue": self.venue,
+            "symbol": symbol_canon,
+            "symbol_canon": symbol_canon,
+            "baseAsset": base,
+            "base_asset": base,
+            "quoteAsset": quote_asset,
+            "quote_asset": quote_asset,
+            "depth": depth,
+            "bids": [],
+            "asks": [],
+            "rate_limited": True,
+            "rate_limit": rate_limit,
+            "stale": False,
+            "stale_reason": "no_last_good_snapshot_available",
+            "snapshot_source": "none",
+            "snapshot_cached_at": None,
+            "snapshot_age_s": None,
+            "errors": {
+                "orders": orders_errors or [],
+                "dispensers": dispensers_errors or [],
+            },
+            "open_only": bool(open_only),
+            "read_only": True,
+            "signing": "explicit_unisat_psbt_after_successful_compose",
+            "compose": "unsigned_preview_with_wallet_signing_handoff",
+        }
+
     def get_orderbook(self, symbol: str, depth: int = 25, open_only: bool = True) -> Dict[str, Any]:
         """Build a read-only Counterparty order/dispenser book for BASE-QUOTE.
 
@@ -1679,7 +1899,20 @@ class CounterpartyAdapter:
         d = max(1, min(int(depth or 25), 200))
         lim = max(25, min(max(d * 4, 50), 500))
 
+        cache_key = self._orderbook_snapshot_key(symbol_canon, d, bool(open_only))
         orders_result = self.get_asset_orders(base, limit=lim, open_only=open_only)
+        orders_rate_limit = self._rate_limit_meta(orders_result)
+        if orders_rate_limit is not None:
+            return self._orderbook_rate_limited_response(
+                cache_key=cache_key,
+                symbol_canon=symbol_canon,
+                base=base,
+                quote_asset=quote_asset,
+                depth=d,
+                open_only=bool(open_only),
+                rate_limit=orders_rate_limit,
+                orders_errors=orders_result.get("errors") or [],
+            )
         orders = orders_result.get("items") or []
 
         bids: List[Dict[str, Any]] = []
@@ -1703,6 +1936,19 @@ class CounterpartyAdapter:
         dispensers_result: Dict[str, Any] = {"ok": True, "items": [], "errors": []}
         if quote_asset == "BTC":
             dispensers_result = self.get_asset_dispensers(base, limit=lim, open_only=open_only)
+            dispensers_rate_limit = self._rate_limit_meta(dispensers_result)
+            if dispensers_rate_limit is not None:
+                return self._orderbook_rate_limited_response(
+                    cache_key=cache_key,
+                    symbol_canon=symbol_canon,
+                    base=base,
+                    quote_asset=quote_asset,
+                    depth=d,
+                    open_only=bool(open_only),
+                    rate_limit=dispensers_rate_limit,
+                    orders_errors=orders_result.get("errors") or [],
+                    dispensers_errors=dispensers_result.get("errors") or [],
+                )
             for row in dispensers_result.get("items") or []:
                 if open_only and not row.get("is_open"):
                     continue
@@ -1731,7 +1977,7 @@ class CounterpartyAdapter:
         spread = (float(best_ask) - float(best_bid)) if best_bid is not None and best_ask is not None else None
         spread_pct = (spread / float(best_bid) * 100.0) if spread is not None and best_bid not in (None, 0) else None
 
-        return {
+        response = {
             "ok": True,
             "venue": self.venue,
             "symbol": symbol_canon,
@@ -1773,7 +2019,21 @@ class CounterpartyAdapter:
             "read_only": True,
             "signing": "explicit_unisat_psbt_after_successful_compose",
             "compose": "unsigned_preview_with_wallet_signing_handoff",
+            "rate_limited": False,
+            "rate_limit": {"active": False},
+            "stale": False,
+            "stale_reason": None,
+            "snapshot_source": "live",
+            "snapshot_cached_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "snapshot_age_s": 0,
         }
+
+        required_sources_ok = bool(orders_result.get("ok")) and (
+            quote_asset != "BTC" or bool(dispensers_result.get("ok"))
+        )
+        if required_sources_ok:
+            self._orderbook_snapshot_put(cache_key, response)
+        return response
 
     # ------------------------------------------------------------------
     # Unsigned compose preview helpers
@@ -4428,6 +4688,8 @@ class CounterpartyAdapter:
             "items": items,
             "source_path": result.get("path"),
             "errors": result.get("errors") or [],
+            "rate_limited": result.get("rate_limited") is True,
+            "rate_limit": result.get("rate_limit") if isinstance(result.get("rate_limit"), dict) else None,
             "raw": result.get("raw"),
             "open_only": bool(open_only),
             "read_only": True,
@@ -4467,6 +4729,8 @@ class CounterpartyAdapter:
             "items": items,
             "source_path": result.get("path"),
             "errors": result.get("errors") or [],
+            "rate_limited": result.get("rate_limited") is True,
+            "rate_limit": result.get("rate_limit") if isinstance(result.get("rate_limit"), dict) else None,
             "raw": result.get("raw"),
             "open_only": bool(open_only),
             "read_only": True,

@@ -15,6 +15,9 @@ const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
 const MARKET_METRICS_BROWSER_CACHE_KEY = "utt.market_metrics.summary.v10";
 const MARKET_METRICS_BROWSER_CACHE_EVENT = "utt:market-metrics-summary-v10";
 const ORDERBOOK_QUOTE_USD_STALE_MS = 15 * 60 * 1000;
+const COUNTERPARTY_RATE_LIMIT_BASE_BACKOFF_MS = 15 * 1000;
+const COUNTERPARTY_RATE_LIMIT_MAX_BACKOFF_MS = 5 * 60 * 1000;
+const COUNTERPARTY_RATE_LIMIT_JITTER_RATIO = 0.20;
 
 const USD_VALUE_QUOTES = new Set([
   "USD", "USDT", "USDC", "DAI", "FDUSD", "PYUSD", "GUSD", "TUSD",
@@ -24,6 +27,36 @@ const USD_VALUE_QUOTES = new Set([
 function safeNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function counterpartyRetryAfterMs(rawValue, nowMs = Date.now()) {
+  const raw = String(rawValue ?? "").trim();
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  const retryAt = Date.parse(raw);
+  if (Number.isFinite(retryAt)) return Math.max(0, retryAt - nowMs);
+  return null;
+}
+
+function counterpartyRetryAtMs(value) {
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) return n;
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function counterpartyCooldownText(ms) {
+  const remaining = Math.max(0, Number(ms) || 0);
+  const seconds = Math.ceil(remaining / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const extra = seconds % 60;
+  return extra ? `${minutes}m ${extra}s` : `${minutes}m`;
+}
+
+function counterpartyOrderbookSnapshotKey(venue, symbol, depth) {
+  return `${String(venue || "counterparty").trim().toLowerCase()}|${String(symbol || "").trim().toUpperCase()}|${Number(depth) || 25}`;
 }
 
 function normalizeOrderBookAsset(value) {
@@ -622,6 +655,9 @@ export default function OrderBookWidget({
   // NEW: 429 backoff/cooldown
   const cooldownUntilRef = useRef(0);
   const cooldownPowRef = useRef(0);
+  const [counterpartyResilience, setCounterpartyResilience] = useState(null);
+  const [cooldownClock, setCooldownClock] = useState(() => Date.now());
+  const counterpartyLastGoodRef = useRef(new Map());
 
   const [inlineMode, setInlineMode] = useState(true);
 
@@ -720,17 +756,37 @@ export default function OrderBookWidget({
   // Keep draft in sync when parent sets obSymbol (e.g. from clicks elsewhere)
   useEffect(() => {
     setSymbolDraft(String(obSymbol || ""));
-    // Reset gating when symbol changes externally
+    // Reset pair gating when symbol changes externally. Preserve an active
+    // Counterparty service-wide cooldown so symbol changes cannot bypass 429.
     pairNotFoundRef.current = false;
-    cooldownUntilRef.current = 0;
-    cooldownPowRef.current = 0;
+    const preserveCounterpartyCooldown = isCounterpartyVenueKey(effectiveVenue) && Date.now() < (cooldownUntilRef.current || 0);
+    if (preserveCounterpartyCooldown) {
+      const canon = counterpartyPairParts(obSymbol).symbol || String(obSymbol || "").trim();
+      const key = counterpartyOrderbookSnapshotKey(effectiveVenue, canon, obDepth);
+      const cached = counterpartyLastGoodRef.current.get(key) || null;
+      if (cached) {
+        setObAsks(cached.asks || []);
+        setObBids(cached.bids || []);
+        setOrderBookMeta({ ...(cached.meta || {}), stale: true, snapshotSource: cached.snapshotSource || "frontend_last_good" });
+        setCounterpartyResilience((prev) => prev ? { ...prev, stale: true } : prev);
+      } else {
+        setObAsks([]);
+        setObBids([]);
+        setOrderBookMeta(null);
+        setCounterpartyResilience((prev) => prev ? { ...prev, stale: false } : prev);
+      }
+    } else {
+      cooldownUntilRef.current = 0;
+      cooldownPowRef.current = 0;
+      setCounterpartyResilience(null);
+      setOrderBookMeta(null);
+    }
     setHydrationStatus(null);
     setHydrationLiquidityWarning(null);
     setHydrationPriceStatus(null);
     setHydrationPriceStatusError(null);
-    setOrderBookMeta(null);
     setQuoteUsdContext(null);
-  }, [obSymbol]);
+  }, [obSymbol, obDepth, effectiveVenue]);
 
   const isSolJupVenue = useMemo(() => {
     return String(effectiveVenue || "").toLowerCase().trim() === "solana_jupiter";
@@ -744,6 +800,8 @@ export default function OrderBookWidget({
     pairNotFoundRef.current = false;
     cooldownUntilRef.current = 0;
     cooldownPowRef.current = 0;
+    setCounterpartyResilience(null);
+    setCooldownClock(Date.now());
     setObActiveRouter(null);
     setHydrationStatus(null);
     setHydrationLiquidityWarning(null);
@@ -776,10 +834,22 @@ export default function OrderBookWidget({
   useEffect(() => {
     if (!isCounterpartyVenue) return;
     pairNotFoundRef.current = false;
-    cooldownUntilRef.current = 0;
-    cooldownPowRef.current = 0;
     setObActiveRouter(null);
   }, [isCounterpartyVenue, obSymbol]);
+
+  useEffect(() => {
+    if (!counterpartyResilience?.active) return undefined;
+    const tick = () => {
+      const now = Date.now();
+      setCooldownClock(now);
+      if (now >= Number(counterpartyResilience?.retryAtMs || 0)) {
+        setCounterpartyResilience((prev) => prev ? { ...prev, active: false } : prev);
+      }
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [counterpartyResilience?.active, counterpartyResilience?.retryAtMs]);
 
 
   useEffect(() => {
@@ -1231,6 +1301,39 @@ function clampBox(next) {
     return fmtNum(v);
   }
 
+  function enterCounterpartyCooldown(details = {}) {
+    const now = Date.now();
+    const pow = clamp(Number(cooldownPowRef.current) || 0, 0, 6);
+    const localBaseMs = Math.min(
+      COUNTERPARTY_RATE_LIMIT_MAX_BACKOFF_MS,
+      COUNTERPARTY_RATE_LIMIT_BASE_BACKOFF_MS * Math.pow(2, pow)
+    );
+    const jitterMs = Math.floor(localBaseMs * COUNTERPARTY_RATE_LIMIT_JITTER_RATIO * Math.random());
+    let retryAtMs = now + localBaseMs + jitterMs;
+
+    const advertisedDelayMs = Number(details?.retryAfterMs);
+    if (Number.isFinite(advertisedDelayMs) && advertisedDelayMs >= 0) {
+      retryAtMs = Math.max(retryAtMs, now + advertisedDelayMs);
+    }
+    const advertisedRetryAtMs = counterpartyRetryAtMs(details?.retryAtMs);
+    if (advertisedRetryAtMs !== null) retryAtMs = Math.max(retryAtMs, advertisedRetryAtMs);
+
+    cooldownPowRef.current = clamp(pow + 1, 0, 6);
+    cooldownUntilRef.current = retryAtMs;
+    setCooldownClock(now);
+    setCounterpartyResilience({
+      active: true,
+      stale: details?.stale === true,
+      retryAtMs,
+      retryAfterMs: Math.max(0, retryAtMs - now),
+      source: String(details?.source || "counterparty_upstream").trim(),
+      reason: String(details?.reason || "HTTP 429 Too Many Requests").trim(),
+      snapshotAgeS: Number.isFinite(Number(details?.snapshotAgeS)) ? Number(details.snapshotAgeS) : null,
+      snapshotSource: String(details?.snapshotSource || "").trim(),
+    });
+    return retryAtMs;
+  }
+
   async function fetchOrderBook(opts = {}) {
     const v = String(opts.venueOverride ?? effectiveVenue ?? "").toLowerCase().trim();
     const sym = String(opts.symbolOverride ?? obSymbol ?? "").trim();
@@ -1238,12 +1341,19 @@ function clampBox(next) {
 
     if (!v || !sym) return;
 
+    const counterpartyRequest = isCounterpartyVenueKey(v);
+    const counterpartyRequestSymbol = counterpartyPairParts(sym).symbol || sym;
+    const counterpartyCacheKey = counterpartyOrderbookSnapshotKey(v, counterpartyRequestSymbol, depth);
+
     // gating: known-bad pair
     if (!opts.force && pairNotFoundRef.current) return;
 
-    // gating: cooldown (e.g., 429)
+    // Counterparty 429 is service-wide: force/manual refresh must not bypass it.
     const now = Date.now();
-    if (!opts.force && now < (cooldownUntilRef.current || 0)) return;
+    if (now < (cooldownUntilRef.current || 0) && (counterpartyRequest || !opts.force)) {
+      setCooldownClock(now);
+      return;
+    }
 
     if (inFlightRef.current) return;
     inFlightRef.current = true;
@@ -1288,7 +1398,7 @@ function clampBox(next) {
         String(depth)
       )}&route_mode=${encodeURIComponent(hydrationRouteMode)}${forceQ}&_ts=${Date.now()}`;
       const counterpartyParts = counterpartyPairParts(sym);
-      const counterpartySymbol = counterpartyParts.symbol || sym;
+      const counterpartySymbol = counterpartyRequestSymbol;
       const counterpartyOrderbookUrl = `${apiBase}/api/counterparty/orderbook?symbol=${encodeURIComponent(counterpartySymbol)}&depth=${encodeURIComponent(
         String(depth)
       )}&open_only=true${forceQ}&_ts=${Date.now()}`;
@@ -1339,6 +1449,23 @@ function clampBox(next) {
         );
       };
 
+      const throwRateLimit = async (response) => {
+        const txt = await response.text().catch(() => "");
+        if (counterpartyRequest) {
+          const retryAfterRaw = response.headers?.get?.("retry-after") || "";
+          const retryAfterMs = counterpartyRetryAfterMs(retryAfterRaw);
+          const err = new Error(txt || "HTTP 429 Too Many Requests");
+          err.counterpartyRateLimited = true;
+          err.retryAfterMs = retryAfterMs;
+          err.counterpartyRateLimitSource = "counterparty_http_response";
+          throw err;
+        }
+        cooldownPowRef.current = clamp((cooldownPowRef.current || 0) + 1, 0, 6);
+        const backoffMs = Math.min(300000, 15000 * Math.pow(2, cooldownPowRef.current));
+        cooldownUntilRef.current = Date.now() + backoffMs;
+        throw new Error(txt || "HTTP 429 Too Many Requests");
+      };
+
       if (isPolkadotHydration) {
         requestTimeoutId = window.setTimeout(() => {
           requestTimedOut = true;
@@ -1359,14 +1486,7 @@ function clampBox(next) {
           : (isSolRay ? "raydium" : v || null);
 
       // handle 429 explicitly (cooldown)
-      if (r.status === 429) {
-        cooldownPowRef.current = clamp((cooldownPowRef.current || 0) + 1, 0, 6);
-        const backoffMs = Math.min(300000, 15000 * Math.pow(2, cooldownPowRef.current)); // 15s, 30s, 60s... up to 5m
-        cooldownUntilRef.current = Date.now() + backoffMs;
-
-        const txt = await r.text().catch(() => "");
-        throw new Error(txt || `HTTP 429 Too Many Requests`);
-      }
+      if (r.status === 429) await throwRateLimit(r);
 
       if (!r.ok && isSolJup) {
         const txt = await r.text().catch(() => "");
@@ -1387,24 +1507,69 @@ function clampBox(next) {
         }
       }
 
-      if (r.status === 429) {
-        cooldownPowRef.current = clamp((cooldownPowRef.current || 0) + 1, 0, 6);
-        const backoffMs = Math.min(300000, 15000 * Math.pow(2, cooldownPowRef.current));
-        cooldownUntilRef.current = Date.now() + backoffMs;
-        const txt = await r.text().catch(() => "");
-        throw new Error(txt || `HTTP 429 Too Many Requests`);
-      }
+      if (r.status === 429) await throwRateLimit(r);
 
       if (!r.ok) {
         const txt = await r.text().catch(() => "");
         throw new Error(txt || `HTTP ${r.status}`);
       }
 
-      // success: clear cooldown
+      const data = await r.json();
+
+      if (counterpartyRequest && (data?.rate_limited === true || data?.rate_limit?.active === true)) {
+        const retryAfterMs = Number.isFinite(Number(data?.rate_limit?.retry_after_s))
+          ? Math.max(0, Number(data.rate_limit.retry_after_s) * 1000)
+          : counterpartyRetryAfterMs(data?.rate_limit?.retry_after_raw);
+        const retryAtMs = counterpartyRetryAtMs(data?.rate_limit?.retry_at);
+        const backendHasSnapshot = data?.stale === true && Array.isArray(data?.asks) && Array.isArray(data?.bids);
+        const localSnapshot = counterpartyLastGoodRef.current.get(counterpartyCacheKey) || null;
+        const staleSnapshot = backendHasSnapshot
+          ? {
+              asks: normalizeSide(data?.asks || []),
+              bids: normalizeSide(data?.bids || []),
+              meta: {
+                venue: v,
+                symbol: data?.symbol || counterpartyRequestSymbol,
+                baseAsset: data?.base_asset || data?.baseAsset || counterpartyParts.base,
+                quoteAsset: data?.quote_asset || data?.quoteAsset || counterpartyParts.quote,
+                liquidityCounts: data?.liquidity_counts || data?.counts || null,
+                sources: data?.sources || null,
+                stale: true,
+                snapshotAgeS: Number.isFinite(Number(data?.snapshot_age_s)) ? Number(data.snapshot_age_s) : null,
+                snapshotSource: String(data?.snapshot_source || "last_good_memory_cache"),
+              },
+            }
+          : localSnapshot;
+
+        enterCounterpartyCooldown({
+          retryAfterMs,
+          retryAtMs,
+          stale: !!staleSnapshot,
+          source: data?.rate_limit?.source || "counterparty_upstream",
+          reason: data?.stale_reason || "Counterparty upstream returned HTTP 429.",
+          snapshotAgeS: backendHasSnapshot ? data?.snapshot_age_s : localSnapshot?.snapshotAgeS,
+          snapshotSource: backendHasSnapshot ? data?.snapshot_source : localSnapshot?.snapshotSource,
+        });
+
+        if (staleSnapshot) {
+          setObAsks(staleSnapshot.asks || []);
+          setObBids(staleSnapshot.bids || []);
+          setOrderBookMeta({ ...(staleSnapshot.meta || {}), stale: true });
+          setObActiveRouter("counterparty");
+          setObError(null);
+          snapToCenterAnchors();
+        } else {
+          setObError("Counterparty API cooldown active. No last successful snapshot is available for this pair yet.");
+        }
+        return;
+      }
+
+      // Live success: clear cooldown and reset the exponential sequence.
       cooldownPowRef.current = 0;
       cooldownUntilRef.current = 0;
+      setCounterpartyResilience(null);
+      setCooldownClock(Date.now());
 
-      const data = await r.json();
       setHydrationLiquidityWarning(isPolkadotHydration ? buildHydrationLowLiquidityWarning(data) : null);
       const responseRouter = String(data?.router || "").toLowerCase().trim();
       if (usedRouter === "ultra") {
@@ -1445,16 +1610,38 @@ function clampBox(next) {
         if (Number.isFinite(sd)) setSizeDecimals(sd);
       }
 
-      setOrderBookMeta({
+      const nextAsks = normalizeSide(data?.asks || []);
+      const nextBids = normalizeSide(data?.bids || []);
+      const nextMeta = {
         venue: usedVenue,
         symbol: data?.symbol || data?.resolvedSymbol || sym,
         baseAsset: data?.base_asset || data?.baseAsset || orderBookPairParts(sym).base,
         quoteAsset: data?.quote_asset || data?.quoteAsset || orderBookPairParts(sym).quote,
         liquidityCounts: data?.liquidity_counts || data?.counts || null,
         sources: data?.sources || null,
-      });
-      setObAsks(normalizeSide(data?.asks || []));
-      setObBids(normalizeSide(data?.bids || []));
+        stale: false,
+        snapshotAgeS: 0,
+        snapshotSource: "live",
+      };
+      setOrderBookMeta(nextMeta);
+      setObAsks(nextAsks);
+      setObBids(nextBids);
+
+      if (counterpartyRequest) {
+        const cache = counterpartyLastGoodRef.current;
+        if (cache.size >= 20 && !cache.has(counterpartyCacheKey)) {
+          const oldestKey = cache.keys().next().value;
+          if (oldestKey) cache.delete(oldestKey);
+        }
+        cache.set(counterpartyCacheKey, {
+          asks: nextAsks,
+          bids: nextBids,
+          meta: nextMeta,
+          ts: Date.now(),
+          snapshotAgeS: 0,
+          snapshotSource: "frontend_last_good",
+        });
+      }
 
       snapToCenterAnchors();
     } catch (e) {
@@ -1465,6 +1652,30 @@ function clampBox(next) {
       }
       const msg = String(e?.message || "");
       if (msg.toLowerCase().includes("aborted") && !requestTimedOut) {
+        return;
+      }
+
+      const counterpartyRateLimited = counterpartyRequest && (e?.counterpartyRateLimited === true || msg.toLowerCase().includes("429"));
+      if (counterpartyRateLimited) {
+        const cached = counterpartyLastGoodRef.current.get(counterpartyCacheKey) || null;
+        if (!counterpartyResilience?.active) {
+          enterCounterpartyCooldown({
+            retryAfterMs: e?.retryAfterMs,
+            stale: !!cached,
+            source: e?.counterpartyRateLimitSource || "counterparty_fetch_error",
+            reason: e?.message || "HTTP 429 Too Many Requests",
+            snapshotSource: cached?.snapshotSource,
+          });
+        }
+        if (cached) {
+          setObAsks(cached.asks || []);
+          setObBids(cached.bids || []);
+          setOrderBookMeta({ ...(cached.meta || {}), stale: true, snapshotSource: cached.snapshotSource || "frontend_last_good" });
+          setObActiveRouter("counterparty");
+          setObError(null);
+        } else {
+          setObError("Counterparty API cooldown active. No last successful snapshot is available for this pair yet.");
+        }
         return;
       }
 
@@ -1969,10 +2180,18 @@ function clampBox(next) {
     const next = String(symbolDraft || "").trim();
     if (!next) return;
 
-    // reset gating; user is explicitly trying
+    const now = Date.now();
+    if (isCounterpartyVenue && now < (cooldownUntilRef.current || 0)) {
+      setCooldownClock(now);
+      return;
+    }
+
+    // Reset pair gating; Counterparty cooldown power resets only after success.
     pairNotFoundRef.current = false;
-    cooldownUntilRef.current = 0;
-    cooldownPowRef.current = 0;
+    if (!isCounterpartyVenue) {
+      cooldownUntilRef.current = 0;
+      cooldownPowRef.current = 0;
+    }
 
     if (next !== String(obSymbol || "")) {
       setObSymbol(next);
@@ -1984,6 +2203,12 @@ function clampBox(next) {
       void fetchOrderRules(next);
     }
   }
+
+  const counterpartyCooldownRemainingMs = isCounterpartyVenue
+    ? Math.max(0, Number(cooldownUntilRef.current || 0) - Number(cooldownClock || Date.now()))
+    : 0;
+  const counterpartyCooldownActive = isCounterpartyVenue && counterpartyCooldownRemainingMs > 0;
+  const counterpartyCooldownLabel = counterpartyCooldownText(counterpartyCooldownRemainingMs);
 
   return (
     <div style={fixedWrapperStyle}>
@@ -2075,11 +2300,12 @@ function clampBox(next) {
           </button>
 
           <button
-            style={{ ...btnCompact(), ...(obLoading ? styles.buttonDisabled : {}) }}
-            disabled={obLoading}
+            style={{ ...btnCompact(), ...((obLoading || counterpartyCooldownActive) ? styles.buttonDisabled : {}) }}
+            disabled={obLoading || counterpartyCooldownActive}
+            title={counterpartyCooldownActive ? `Counterparty cooldown active. Refresh available in ${counterpartyCooldownLabel}.` : "Refresh OrderBook"}
             onClick={() => commitSymbolAndRefresh(true)}
           >
-            {obLoading ? "Loading…" : "Refresh"}
+            {obLoading ? "Loading…" : counterpartyCooldownActive ? `Retry ${counterpartyCooldownLabel}` : "Refresh"}
           </button>
         </div>
 
@@ -2097,6 +2323,9 @@ function clampBox(next) {
               <>
                 {" "}• Filter <b>{counterpartyLiquidityFilterLabel(counterpartyLiquidityFilter)}</b>
                 {" "}• Mode <b>{counterpartyExecutionMode === "limit_order" ? "Limit Order" : "Dispenser Purchase"}</b>
+                {counterpartyResilience?.stale || orderBookMeta?.stale ? <> • Book <b>STALE</b></> : null}
+                {counterpartyCooldownActive ? <> • Retry <b>{counterpartyCooldownLabel}</b></> : null}
+                {!counterpartyCooldownActive && (counterpartyResilience?.stale || orderBookMeta?.stale) ? <> • <b>Refresh available</b></> : null}
               </>
             ) : null}
             {showDerivedUsd ? (

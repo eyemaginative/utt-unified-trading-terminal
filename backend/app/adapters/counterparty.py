@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
@@ -2220,9 +2221,439 @@ class CounterpartyAdapter:
             "original": raw,
         }
 
+    @staticmethod
+    def _compose_compact_size_read(data: bytes, offset: int) -> Tuple[int, int]:
+        if offset < 0 or offset >= len(data):
+            raise ValueError("compact-size offset is outside the payload")
+        prefix = data[offset]
+        offset += 1
+        if prefix < 0xFD:
+            return prefix, offset
+        size = 2 if prefix == 0xFD else 4 if prefix == 0xFE else 8
+        if offset + size > len(data):
+            raise ValueError("truncated compact-size integer")
+        value = int.from_bytes(data[offset : offset + size], "little")
+        minimum = 0xFD if size == 2 else 0x10000 if size == 4 else 0x100000000
+        if value < minimum:
+            raise ValueError("non-canonical compact-size integer")
+        return value, offset + size
+
+    @staticmethod
+    def _compose_compact_size_encode(value: int) -> bytes:
+        n = int(value)
+        if n < 0:
+            raise ValueError("compact-size value must be non-negative")
+        if n < 0xFD:
+            return bytes([n])
+        if n <= 0xFFFF:
+            return b"\xfd" + n.to_bytes(2, "little")
+        if n <= 0xFFFFFFFF:
+            return b"\xfe" + n.to_bytes(4, "little")
+        if n <= 0xFFFFFFFFFFFFFFFF:
+            return b"\xff" + n.to_bytes(8, "little")
+        raise ValueError("compact-size value is too large")
+
     @classmethod
-    def _compose_wallet_signing_handoff(
+    def _compose_psbt_read_map(
         cls,
+        data: bytes,
+        offset: int,
+    ) -> Tuple[List[Tuple[bytes, bytes]], int]:
+        pairs: List[Tuple[bytes, bytes]] = []
+        seen: set[bytes] = set()
+        while True:
+            key_len, offset = cls._compose_compact_size_read(data, offset)
+            if key_len == 0:
+                return pairs, offset
+            if offset + key_len > len(data):
+                raise ValueError("truncated PSBT key")
+            key = data[offset : offset + key_len]
+            offset += key_len
+            if key in seen:
+                raise ValueError("duplicate PSBT key")
+            seen.add(key)
+            value_len, offset = cls._compose_compact_size_read(data, offset)
+            if offset + value_len > len(data):
+                raise ValueError("truncated PSBT value")
+            value = data[offset : offset + value_len]
+            offset += value_len
+            pairs.append((key, value))
+
+    @classmethod
+    def _compose_psbt_write_map(cls, pairs: List[Tuple[bytes, bytes]]) -> bytes:
+        out = bytearray()
+        seen: set[bytes] = set()
+        for key, value in pairs:
+            key_bytes = bytes(key)
+            value_bytes = bytes(value)
+            if not key_bytes:
+                raise ValueError("PSBT map key cannot be empty")
+            if key_bytes in seen:
+                raise ValueError("duplicate PSBT key while serializing")
+            seen.add(key_bytes)
+            out.extend(cls._compose_compact_size_encode(len(key_bytes)))
+            out.extend(key_bytes)
+            out.extend(cls._compose_compact_size_encode(len(value_bytes)))
+            out.extend(value_bytes)
+        out.append(0)
+        return bytes(out)
+
+    @classmethod
+    def _compose_bitcoin_transaction_info(cls, raw_tx: bytes) -> Dict[str, Any]:
+        """Parse enough Bitcoin transaction structure for PSBT prevout validation.
+
+        The returned txid is independently calculated from the non-witness
+        serialization. No signing, mutation, or broadcast is performed.
+        """
+        raw = bytes(raw_tx)
+        if len(raw) < 10:
+            raise ValueError("Bitcoin transaction is too short")
+
+        version = raw[:4]
+        offset = 4
+        has_witness = False
+        if offset + 2 <= len(raw) and raw[offset] == 0 and raw[offset + 1] != 0:
+            has_witness = True
+            offset += 2
+
+        vin_count_start = offset
+        input_count, offset = cls._compose_compact_size_read(raw, offset)
+        vin_count_bytes = raw[vin_count_start:offset]
+        if input_count <= 0:
+            raise ValueError("Bitcoin transaction has no inputs")
+
+        inputs_start = offset
+        inputs: List[Dict[str, Any]] = []
+        for index in range(input_count):
+            if offset + 36 > len(raw):
+                raise ValueError("truncated Bitcoin transaction input")
+            prev_hash_le = raw[offset : offset + 32]
+            offset += 32
+            prev_vout = int.from_bytes(raw[offset : offset + 4], "little")
+            offset += 4
+            script_len, offset = cls._compose_compact_size_read(raw, offset)
+            if offset + script_len + 4 > len(raw):
+                raise ValueError("truncated Bitcoin transaction input script")
+            script_sig = raw[offset : offset + script_len]
+            offset += script_len
+            sequence = int.from_bytes(raw[offset : offset + 4], "little")
+            offset += 4
+            inputs.append(
+                {
+                    "index": index,
+                    "txid": prev_hash_le[::-1].hex(),
+                    "vout": prev_vout,
+                    "script_sig_hex": script_sig.hex(),
+                    "sequence": sequence,
+                }
+            )
+        inputs_bytes = raw[inputs_start:offset]
+
+        vout_count_start = offset
+        output_count, offset = cls._compose_compact_size_read(raw, offset)
+        vout_count_bytes = raw[vout_count_start:offset]
+        outputs_start = offset
+        outputs: List[Dict[str, Any]] = []
+        for index in range(output_count):
+            if offset + 8 > len(raw):
+                raise ValueError("truncated Bitcoin transaction output value")
+            value_satoshis = int.from_bytes(raw[offset : offset + 8], "little")
+            offset += 8
+            script_len, offset = cls._compose_compact_size_read(raw, offset)
+            if offset + script_len > len(raw):
+                raise ValueError("truncated Bitcoin transaction output script")
+            script_pub_key = raw[offset : offset + script_len]
+            offset += script_len
+            outputs.append(
+                {
+                    "index": index,
+                    "value_satoshis": value_satoshis,
+                    "script_pub_key_hex": script_pub_key.hex(),
+                }
+            )
+        outputs_bytes = raw[outputs_start:offset]
+
+        if has_witness:
+            for _ in range(input_count):
+                item_count, offset = cls._compose_compact_size_read(raw, offset)
+                for _ in range(item_count):
+                    item_len, offset = cls._compose_compact_size_read(raw, offset)
+                    if offset + item_len > len(raw):
+                        raise ValueError("truncated Bitcoin transaction witness")
+                    offset += item_len
+
+        if offset + 4 != len(raw):
+            raise ValueError("Bitcoin transaction has trailing or truncated bytes")
+        lock_time = raw[offset : offset + 4]
+        stripped = version + vin_count_bytes + inputs_bytes + vout_count_bytes + outputs_bytes + lock_time
+        txid = hashlib.sha256(hashlib.sha256(stripped).digest()).digest()[::-1].hex()
+        return {
+            "txid": txid,
+            "has_witness": has_witness,
+            "input_count": input_count,
+            "output_count": output_count,
+            "inputs": inputs,
+            "outputs": outputs,
+            "stripped_hex": stripped.hex(),
+        }
+
+    @classmethod
+    def _compose_psbt_parse(cls, psbt_hex: str) -> Dict[str, Any]:
+        normalized = cls._compose_hex_text(psbt_hex)
+        if not normalized or not normalized.startswith("70736274ff"):
+            raise ValueError("payload is not PSBT hex")
+        data = bytes.fromhex(normalized)
+        if not data.startswith(b"psbt\xff"):
+            raise ValueError("missing PSBT magic")
+
+        offset = 5
+        global_map, offset = cls._compose_psbt_read_map(data, offset)
+        unsigned_candidates = [value for key, value in global_map if key == b"\x00"]
+        if len(unsigned_candidates) != 1:
+            raise ValueError("PSBT must contain exactly one global unsigned transaction")
+        unsigned_tx = unsigned_candidates[0]
+        unsigned_info = cls._compose_bitcoin_transaction_info(unsigned_tx)
+        if unsigned_info.get("has_witness"):
+            raise ValueError("PSBT global unsigned transaction must not contain witness data")
+        if any(str(row.get("script_sig_hex") or "") for row in unsigned_info.get("inputs") or []):
+            raise ValueError("PSBT global unsigned transaction contains a non-empty scriptSig")
+
+        input_maps: List[List[Tuple[bytes, bytes]]] = []
+        for _ in range(int(unsigned_info.get("input_count") or 0)):
+            pairs, offset = cls._compose_psbt_read_map(data, offset)
+            input_maps.append(pairs)
+
+        output_maps: List[List[Tuple[bytes, bytes]]] = []
+        for _ in range(int(unsigned_info.get("output_count") or 0)):
+            pairs, offset = cls._compose_psbt_read_map(data, offset)
+            output_maps.append(pairs)
+
+        if offset != len(data):
+            raise ValueError("PSBT has trailing bytes after its maps")
+        return {
+            "global_map": global_map,
+            "input_maps": input_maps,
+            "output_maps": output_maps,
+            "unsigned_tx": unsigned_tx,
+            "unsigned_info": unsigned_info,
+        }
+
+    @classmethod
+    def _compose_psbt_serialize(cls, parsed: Dict[str, Any]) -> str:
+        out = bytearray(b"psbt\xff")
+        out.extend(cls._compose_psbt_write_map(list(parsed.get("global_map") or [])))
+        for pairs in parsed.get("input_maps") or []:
+            out.extend(cls._compose_psbt_write_map(list(pairs or [])))
+        for pairs in parsed.get("output_maps") or []:
+            out.extend(cls._compose_psbt_write_map(list(pairs or [])))
+        return bytes(out).hex()
+
+    @classmethod
+    def _compose_result_object(cls, payload: Any) -> Dict[str, Any]:
+        current = payload
+        for _ in range(8):
+            if not isinstance(current, dict):
+                return {}
+            result = current.get("result")
+            if isinstance(result, dict):
+                current = result
+                continue
+            return current
+        return current if isinstance(current, dict) else {}
+
+    def _compose_parent_transaction(self, txid: str) -> Dict[str, Any]:
+        txid_norm = str(txid or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", txid_norm):
+            raise ValueError("invalid parent transaction id")
+        path = f"/v2/bitcoin/transactions/{txid_norm}"
+        payload = self._get_json(path, params={"result_format": "json"})
+        row = self._compose_result_object(payload)
+        raw_hex = self._compose_hex_text(
+            row.get("hex")
+            or row.get("rawtransaction")
+            or row.get("raw_transaction")
+            or row.get("rawtx")
+        )
+        if not raw_hex:
+            # Counterparty Core also exposes the same route with
+            # result_format=hex. Keep this as a read-only compatibility fallback.
+            scalar_payload = self._get_json(path, params={"result_format": "hex"})
+            scalar = scalar_payload.get("result") if isinstance(scalar_payload, dict) else None
+            if scalar in (None, "") and isinstance(scalar_payload, dict):
+                scalar = scalar_payload.get("data")
+            raw_hex = self._compose_hex_text(scalar)
+        if not raw_hex:
+            raise ValueError("Counterparty Core did not return parent transaction hex")
+        if len(raw_hex) > 4 * 1024 * 1024:
+            raise ValueError("parent transaction exceeds the PSBT enrichment size limit")
+
+        raw_bytes = bytes.fromhex(raw_hex)
+        tx_info = self._compose_bitcoin_transaction_info(raw_bytes)
+        reported_txid = str(row.get("txid") or row.get("hash") or "").strip().lower()
+        if reported_txid and reported_txid != txid_norm:
+            raise ValueError("Counterparty Core parent transaction id does not match the requested outpoint")
+        if str(tx_info.get("txid") or "").lower() != txid_norm:
+            raise ValueError("parent transaction hex does not hash to the requested outpoint")
+        return {
+            "path": path,
+            "raw_hex": raw_hex,
+            "raw_bytes": raw_bytes,
+            "tx_info": tx_info,
+        }
+
+    def _compose_enrich_psbt_input_utxos(
+        self,
+        psbt_hex: str,
+        compose_payload: Any,
+    ) -> Dict[str, Any]:
+        """Attach and validate full parent transactions for every PSBT input.
+
+        Counterparty Core may return a syntactically valid PSBT whose input maps
+        are empty. UniSat/bitcoinjs cannot sign those inputs. UTT retrieves each
+        parent transaction from the same Counterparty Core Bitcoin backend,
+        verifies txid/vout/value/script against the verbose compose result, and
+        adds PSBT_IN_NON_WITNESS_UTXO. This remains read-only and never signs or
+        broadcasts.
+        """
+        try:
+            parsed = self._compose_psbt_parse(psbt_hex)
+        except Exception as e:
+            return {
+                "ok": False,
+                "status": "psbt_parse_failed",
+                "reason": str(e),
+                "psbt_hex": psbt_hex,
+                "input_count": 0,
+                "ready_input_count": 0,
+                "enriched_input_count": 0,
+                "source": "counterparty_core_bitcoin_backend",
+                "inputs": [],
+            }
+
+        compose_result = self._compose_result_object(compose_payload)
+        input_values = compose_result.get("inputs_values") if isinstance(compose_result.get("inputs_values"), list) else []
+        lock_scripts = compose_result.get("lock_scripts") if isinstance(compose_result.get("lock_scripts"), list) else []
+        input_maps = parsed.get("input_maps") or []
+        unsigned_inputs = (parsed.get("unsigned_info") or {}).get("inputs") or []
+        details: List[Dict[str, Any]] = []
+        enriched_count = 0
+
+        if len(input_values) < len(input_maps) or len(lock_scripts) < len(input_maps):
+            return {
+                "ok": False,
+                "status": "compose_input_diagnostics_missing",
+                "reason": "Counterparty Core verbose compose did not include inputs_values and lock_scripts for every PSBT input.",
+                "psbt_hex": psbt_hex,
+                "input_count": len(input_maps),
+                "ready_input_count": 0,
+                "enriched_input_count": 0,
+                "source": "counterparty_core_bitcoin_backend",
+                "inputs": [],
+            }
+
+        try:
+            for index, pairs in enumerate(input_maps):
+                outpoint = unsigned_inputs[index]
+                txid = str(outpoint.get("txid") or "").lower()
+                vout = int(outpoint.get("vout"))
+                expected_value = self._as_int(input_values[index])
+                expected_script = self._compose_hex_text(lock_scripts[index])
+                if expected_value is None or expected_value < 0:
+                    raise ValueError(f"PSBT input {index} has no valid compose input value")
+                if not expected_script:
+                    raise ValueError(f"PSBT input {index} has no valid compose lock script")
+
+                existing_non_witness = next(
+                    (value for key, value in pairs if key and key[0] == 0x00),
+                    None,
+                )
+                parent_source = "psbt_input_map" if existing_non_witness is not None else "counterparty_core_bitcoin_backend"
+                if existing_non_witness is not None:
+                    parent_raw = bytes(existing_non_witness)
+                    parent_info = self._compose_bitcoin_transaction_info(parent_raw)
+                    parent_path = None
+                else:
+                    parent = self._compose_parent_transaction(txid)
+                    parent_raw = parent["raw_bytes"]
+                    parent_info = parent["tx_info"]
+                    parent_path = parent["path"]
+
+                if str(parent_info.get("txid") or "").lower() != txid:
+                    raise ValueError(f"PSBT input {index} parent transaction hash mismatch")
+                outputs = parent_info.get("outputs") or []
+                if vout < 0 or vout >= len(outputs):
+                    raise ValueError(f"PSBT input {index} parent vout is out of range")
+                prevout = outputs[vout]
+                actual_value = self._as_int(prevout.get("value_satoshis"))
+                actual_script = self._compose_hex_text(prevout.get("script_pub_key_hex"))
+                if actual_value != expected_value:
+                    raise ValueError(
+                        f"PSBT input {index} prevout value mismatch: expected {expected_value} sats, got {actual_value}"
+                    )
+                if actual_script != expected_script:
+                    raise ValueError(f"PSBT input {index} prevout script does not match Counterparty compose diagnostics")
+
+                if existing_non_witness is None:
+                    pairs.append((b"\x00", parent_raw))
+                    enriched_count += 1
+
+                details.append(
+                    {
+                        "index": index,
+                        "txid": txid,
+                        "vout": vout,
+                        "value_satoshis": actual_value,
+                        "script_pub_key_hex": actual_script,
+                        "parent_transaction_source": parent_source,
+                        "parent_transaction_path": parent_path,
+                        "non_witness_utxo_present": True,
+                        "txid_verified": True,
+                        "value_verified": True,
+                        "script_verified": True,
+                    }
+                )
+
+            enriched_hex = self._compose_psbt_serialize(parsed)
+            reparsed = self._compose_psbt_parse(enriched_hex)
+            ready_count = sum(
+                1
+                for pairs in reparsed.get("input_maps") or []
+                if any(key and key[0] == 0x00 for key, _ in pairs)
+            )
+            ready = ready_count == len(input_maps) and ready_count > 0
+            return {
+                "ok": ready,
+                "status": "ready" if ready else "psbt_input_utxo_incomplete",
+                "reason": (
+                    "Every PSBT input contains a validated full parent transaction."
+                    if ready
+                    else "One or more PSBT inputs still lack a validated full parent transaction."
+                ),
+                "psbt_hex": enriched_hex,
+                "psbt_base64": base64.b64encode(bytes.fromhex(enriched_hex)).decode("ascii"),
+                "input_count": len(input_maps),
+                "ready_input_count": ready_count,
+                "enriched_input_count": enriched_count,
+                "source": "counterparty_core_bitcoin_backend",
+                "requirement": "PSBT_IN_NON_WITNESS_UTXO",
+                "inputs": details,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "status": "psbt_input_utxo_enrichment_failed",
+                "reason": str(e),
+                "psbt_hex": psbt_hex,
+                "input_count": len(input_maps),
+                "ready_input_count": len(details),
+                "enriched_input_count": enriched_count,
+                "source": "counterparty_core_bitcoin_backend",
+                "requirement": "PSBT_IN_NON_WITNESS_UTXO",
+                "inputs": details,
+            }
+
+    def _compose_wallet_signing_handoff(
+        self,
         compose_probe: Dict[str, Any],
         *,
         source_address: str,
@@ -2274,11 +2705,11 @@ class CounterpartyAdapter:
                     key = str(raw_key or "").strip().lower()
                     child_path = f"{path}.{raw_key}" if path else str(raw_key)
                     if found_psbt is None and key in psbt_keys:
-                        normalized = cls._compose_psbt_payload(child)
+                        normalized = self._compose_psbt_payload(child)
                         if normalized:
                             found_psbt = {**normalized, "path": child_path}
                     if found_raw_tx is None and key in raw_tx_keys:
-                        hex_text = cls._compose_hex_text(child)
+                        hex_text = self._compose_hex_text(child)
                         if hex_text and not hex_text.startswith("70736274ff"):
                             found_raw_tx = {"hex": hex_text, "path": child_path}
                     walk(child, child_path, depth + 1)
@@ -2291,9 +2722,9 @@ class CounterpartyAdapter:
 
         funding = funding_requirements if isinstance(funding_requirements, dict) else None
         fee_status = str((funding or {}).get("network_fee_status") or "").strip().lower()
-        fee_sats = cls._as_int((funding or {}).get("network_fee_satoshis"))
-        adjusted_vsize = cls._as_int((funding or {}).get("estimated_adjusted_vsize"))
-        fee_rate = cls._as_float((funding or {}).get("effective_sat_per_vbyte"))
+        fee_sats = self._as_int((funding or {}).get("network_fee_satoshis"))
+        adjusted_vsize = self._as_int((funding or {}).get("estimated_adjusted_vsize"))
+        fee_rate = self._as_float((funding or {}).get("effective_sat_per_vbyte"))
         funding_insufficient = bool((funding or {}).get("insufficient_funds_detected"))
         fee_ready = True
         fee_block_reason = None
@@ -2316,7 +2747,26 @@ class CounterpartyAdapter:
                 fee_block_reason = "Signing is blocked until a positive transaction-specific miner fee, adjusted vsize, and effective sat/vB estimate are available."
 
         psbt_available = found_psbt is not None
-        signable = bool(psbt_available and fee_ready)
+        psbt_input_utxo = {
+            "ok": False,
+            "status": "psbt_unavailable",
+            "reason": "No PSBT was returned by Counterparty Core.",
+            "psbt_hex": found_psbt.get("hex") if found_psbt else None,
+            "input_count": 0,
+            "ready_input_count": 0,
+            "enriched_input_count": 0,
+            "source": "counterparty_core_bitcoin_backend",
+            "requirement": "PSBT_IN_NON_WITNESS_UTXO",
+            "inputs": [],
+        }
+        if found_psbt is not None:
+            psbt_input_utxo = self._compose_enrich_psbt_input_utxos(found_psbt.get("hex"), raw)
+            if psbt_input_utxo.get("ok") and psbt_input_utxo.get("psbt_hex"):
+                found_psbt["hex"] = psbt_input_utxo.get("psbt_hex")
+                found_psbt["normalized_base64"] = psbt_input_utxo.get("psbt_base64")
+
+        psbt_input_utxo_ready = bool(psbt_input_utxo.get("ok"))
+        signable = bool(psbt_available and fee_ready and psbt_input_utxo_ready)
 
         if not compose_ok:
             status = "compose_unavailable"
@@ -2327,13 +2777,21 @@ class CounterpartyAdapter:
             reason = "Counterparty Core returned a validated PSBT and a positive transaction-specific fee estimate. UniSat signing still requires explicit user approval."
             payload_format = "psbt_hex"
         elif found_psbt is not None:
-            if funding_insufficient:
+            if not psbt_input_utxo_ready:
+                status = "psbt_missing_input_utxo"
+                reason = (
+                    "Counterparty Core returned a PSBT without complete input UTXO metadata, and UTT could not "
+                    f"validate/enrich it: {psbt_input_utxo.get('reason') or 'unknown input metadata error'}"
+                )
+            elif funding_insufficient:
                 status = "psbt_available_funding_insufficient"
+                reason = fee_block_reason or "Counterparty Core reported insufficient BTC funding."
             elif fee_status == "invalid_zero_fee" or fee_sats == 0:
                 status = "psbt_available_fee_invalid_zero"
+                reason = fee_block_reason or "Counterparty Core returned an invalid zero-satoshi fee."
             else:
                 status = "psbt_available_fee_not_ready"
-            reason = fee_block_reason or "Counterparty Core returned a PSBT, but signing prerequisites are not satisfied."
+                reason = fee_block_reason or "Counterparty Core returned a PSBT, but signing prerequisites are not satisfied."
             payload_format = "psbt_hex"
         elif found_raw_tx is not None:
             status = "raw_transaction_requires_psbt_conversion"
@@ -2356,8 +2814,13 @@ class CounterpartyAdapter:
             "psbt_available": bool(found_psbt),
             "psbt_hex": found_psbt.get("hex") if found_psbt else None,
             "psbt_base64": (
-                found_psbt.get("original")
-                if found_psbt and found_psbt.get("source_encoding") == "base64"
+                found_psbt.get("normalized_base64")
+                or (
+                    found_psbt.get("original")
+                    if found_psbt and found_psbt.get("source_encoding") == "base64"
+                    else None
+                )
+                if found_psbt
                 else None
             ),
             "raw_tx_hex": found_raw_tx.get("hex") if found_raw_tx else None,
@@ -2370,6 +2833,15 @@ class CounterpartyAdapter:
             ),
             "wallet_method": "signPsbt" if found_psbt else None,
             "signable_with_unisat": signable,
+            "psbt_input_utxo_ready": psbt_input_utxo_ready if found_psbt else False,
+            "psbt_input_utxo_status": psbt_input_utxo.get("status") if found_psbt else None,
+            "psbt_input_utxo_reason": psbt_input_utxo.get("reason") if found_psbt else None,
+            "psbt_input_count": psbt_input_utxo.get("input_count") if found_psbt else 0,
+            "psbt_input_utxo_ready_count": psbt_input_utxo.get("ready_input_count") if found_psbt else 0,
+            "psbt_input_utxo_enriched_count": psbt_input_utxo.get("enriched_input_count") if found_psbt else 0,
+            "psbt_input_utxo_source": psbt_input_utxo.get("source") if found_psbt else None,
+            "psbt_input_utxo_requirement": psbt_input_utxo.get("requirement") if found_psbt else None,
+            "psbt_input_utxo_details": psbt_input_utxo.get("inputs") if found_psbt else [],
             "fee_ready_for_signing": bool(fee_ready) if found_psbt else False,
             "fee_status": fee_status or None,
             "requires_explicit_user_action": signable,
@@ -3177,7 +3649,7 @@ class CounterpartyAdapter:
             )
         elif wallet_signing_handoff.get("psbt_available"):
             warnings.append(
-                "Counterparty returned a PSBT, but UTT blocked signing because the positive miner-fee, adjusted-vsize, or funding checks are not ready."
+                "Counterparty returned a PSBT, but UTT blocked signing because validated input UTXO metadata, the positive miner-fee diagnostics, or funding checks are not ready."
             )
         elif wallet_signing_handoff.get("status") == "raw_transaction_requires_psbt_conversion":
             warnings.append(

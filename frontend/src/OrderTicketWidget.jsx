@@ -418,13 +418,22 @@ function counterpartySigningHandoffView(payload) {
     effectiveSatPerVbyte > 0
   );
   const feeInvalidZero = feeStatus === "invalid_zero_fee" || feeSats === 0;
+  const psbtInputUtxoReady = handoff?.psbt_input_utxo_ready === true;
+  const psbtInputCount = counterpartySatoshisOrNull(handoff?.psbt_input_count) ?? 0;
+  const psbtInputUtxoReadyCount = counterpartySatoshisOrNull(handoff?.psbt_input_utxo_ready_count) ?? 0;
+  const psbtInputUtxoEnrichedCount = counterpartySatoshisOrNull(handoff?.psbt_input_utxo_enriched_count) ?? 0;
+  const psbtInputUtxoStatus = String(handoff?.psbt_input_utxo_status || "unknown").trim();
+  const psbtInputUtxoReason = String(handoff?.psbt_input_utxo_reason || "").trim();
+  const psbtInputUtxoSource = String(handoff?.psbt_input_utxo_source || "").trim();
   const dispenserLot = counterpartyDispenserLotResultView(payload);
   const dispenserLotReady = String(payload?.compose_kind || "") !== "dispenser_dispense" || dispenserLot?.valid === true;
   const alreadySigned = payload?.signed === true || payload?.wallet_signing_result?.signed === true;
   const baseReason = String(handoff?.status_reason || "").trim();
   const reason = !dispenserLotReady
     ? "Signing is blocked because the dispenser quantity is not validated as complete lots with an exact satoshirate payment."
-    : feeInvalidZero
+    : psbtHex && !psbtInputUtxoReady
+      ? psbtInputUtxoReason || "Signing is blocked because one or more PSBT inputs lack validated UTXO metadata."
+      : feeInvalidZero
       ? "Signing is blocked because Counterparty Core returned a zero-satoshi miner fee for this non-empty transaction."
       : !feeReady && psbtHex
         ? "A PSBT is available, but signing is blocked until a positive miner fee, adjusted vsize, and effective sat/vB are validated."
@@ -441,6 +450,7 @@ function counterpartySigningHandoffView(payload) {
       payload?.compose_ok === true &&
       handoff?.signable_with_unisat === true &&
       psbtHex &&
+      psbtInputUtxoReady &&
       !fundingBlocked &&
       feeReady &&
       dispenserLotReady &&
@@ -449,6 +459,13 @@ function counterpartySigningHandoffView(payload) {
     fundingBlocked,
     feeReady,
     feeInvalidZero,
+    psbtInputUtxoReady,
+    psbtInputCount,
+    psbtInputUtxoReadyCount,
+    psbtInputUtxoEnrichedCount,
+    psbtInputUtxoStatus,
+    psbtInputUtxoReason,
+    psbtInputUtxoSource,
     dispenserLot,
     dispenserLotReady,
     feeStatus,
@@ -8468,6 +8485,14 @@ async function submitLimitOrder() {
                       <div>{hideTableData ? "••••" : counterpartySigningHandoff.sourceEncoding || "unknown"}</div>
                       <div style={{ color: "#a9a9a9" }}>Source address</div>
                       <div>{hideTableData ? "••••" : counterpartySigningHandoff.sourceAddress || "unknown"}</div>
+                      <div style={{ color: "#a9a9a9" }}>PSBT input metadata</div>
+                      <div>
+                        {counterpartySigningHandoff.psbtInputUtxoReady
+                          ? `Ready · ${counterpartySigningHandoff.psbtInputUtxoReadyCount}/${counterpartySigningHandoff.psbtInputCount} input(s)${counterpartySigningHandoff.psbtInputUtxoEnrichedCount ? ` · ${counterpartySigningHandoff.psbtInputUtxoEnrichedCount} enriched` : ""}`
+                          : `Blocked · ${counterpartySigningHandoff.psbtInputUtxoStatus || "missing"}`}
+                      </div>
+                      <div style={{ color: "#a9a9a9" }}>Parent transaction source</div>
+                      <div>{counterpartySigningHandoff.psbtInputUtxoSource || "Unavailable"}</div>
                       <div style={{ color: "#a9a9a9" }}>Wallet method</div>
                       <div>{counterpartySigningHandoff.psbtHex ? "UniSat signPsbt" : "Unavailable"}</div>
                       <div style={{ color: "#a9a9a9" }}>Broadcast</div>

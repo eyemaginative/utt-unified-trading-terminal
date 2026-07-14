@@ -152,6 +152,86 @@ function counterpartyBookRowCount(payload) {
   return counterpartyBookRows(payload, "bids").length + counterpartyBookRows(payload, "asks").length;
 }
 
+function counterpartyBookApplicationError(body, status) {
+  const payload = body && typeof body === "object" ? body : null;
+  const statusCode = Number(status);
+  const asText = (value) => {
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (value && typeof value === "object") {
+      try { return JSON.stringify(value); } catch {}
+    }
+    return "";
+  };
+
+  const direct = asText(payload?.detail) || asText(payload?.error);
+  if (direct) return direct;
+
+  const rateLimit = payload?.rate_limit && typeof payload.rate_limit === "object"
+    ? payload.rate_limit
+    : {};
+  if (payload?.rate_limited === true || rateLimit?.active === true) {
+    const retryAfter = otCounterpartyFiniteNumberOrNull(rateLimit?.retry_after_s);
+    return retryAfter !== null && retryAfter >= 0
+      ? `Counterparty orderbook is rate-limited; retry in ${Math.ceil(retryAfter)}s.`
+      : "Counterparty orderbook is temporarily rate-limited.";
+  }
+
+  const sourceErrors = payload?.errors && typeof payload.errors === "object"
+    ? [
+        ...(Array.isArray(payload.errors.orders) ? payload.errors.orders : []),
+        ...(Array.isArray(payload.errors.dispensers) ? payload.errors.dispensers : []),
+      ]
+    : [];
+  for (const item of sourceErrors) {
+    const message = asText(item?.error) || asText(item?.message) || asText(item?.detail);
+    if (message) return message;
+  }
+
+  if (!payload) {
+    return Number.isFinite(statusCode) && statusCode >= 400
+      ? `HTTP ${statusCode}`
+      : "Counterparty orderbook returned an unreadable JSON response.";
+  }
+  if (Number.isFinite(statusCode) && statusCode >= 400) return `HTTP ${statusCode}`;
+  return "Counterparty orderbook response reported unavailable.";
+}
+
+function counterpartyBookRowIdentity(row) {
+  if (!row || typeof row !== "object") return "";
+  return [
+    String(row?.tx_hash || row?.txid || "").trim(),
+    String(row?.source || "").trim(),
+    counterpartyBookRowLiquidityType(row),
+    counterpartyBookRowPriceText(row),
+    String(row?.size ?? row?.remaining ?? "").trim(),
+  ].join("|");
+}
+
+function counterpartyBookWithSelectedRow(payload, row, symbol) {
+  if (!row || typeof row !== "object") return payload;
+  const current = payload && typeof payload === "object" ? payload : {};
+  const bids = counterpartyBookRows(current, "bids").slice();
+  const asks = counterpartyBookRows(current, "asks").slice();
+  const rowSide = String(row?.side || "").trim().toLowerCase();
+  const target = rowSide === "bid" ? bids : asks;
+  const identity = counterpartyBookRowIdentity(row);
+  const alreadyPresent = target.some((candidate) => {
+    const candidateIdentity = counterpartyBookRowIdentity(candidate);
+    return identity && candidateIdentity === identity;
+  });
+  if (!alreadyPresent) target.unshift(row);
+
+  return {
+    ...current,
+    ok: true,
+    venue: current?.venue || "counterparty",
+    symbol: current?.symbol || String(symbol || "").trim().toUpperCase(),
+    bids,
+    asks,
+    ticket_selected_row_snapshot: true,
+  };
+}
+
 
 function counterpartyExactDecimalText(value) {
   if (value === null || value === undefined || value === "") return "";
@@ -2853,6 +2933,7 @@ export default function OrderTicketWidget({
   const isCounterpartyDispenserMode = isCounterpartyVenue && normalizeCounterpartyExecutionMode(counterpartyExecutionMode) === "dispenser";
   const isCounterpartyLimitOrderMode = isCounterpartyVenue && normalizeCounterpartyExecutionMode(counterpartyExecutionMode) === "limit_order";
   const counterpartyBookReqRef = useRef(0);
+  const counterpartySelectedLevelRef = useRef(null);
   useEffect(() => { setPreferredSolanaWalletKey(preferredSolanaWallet); }, [preferredSolanaWallet]);
   useEffect(() => { setPreferredSolanaRouterMode(preferredSolanaRouterMode); }, [preferredSolanaRouterMode]);
   useEffect(() => { setPreferredHydrationRouteMode(preferredHydrationRouteMode); }, [preferredHydrationRouteMode]);
@@ -3800,6 +3881,7 @@ export default function OrderTicketWidget({
 
   useEffect(() => {
     if (!isCounterpartyVenue) {
+      counterpartySelectedLevelRef.current = null;
       setCounterpartyBook(null);
       setCounterpartyBookError(null);
       setCounterpartyBookLoading(false);
@@ -3810,6 +3892,7 @@ export default function OrderTicketWidget({
     const sym = normalizeCounterpartySymbol(otSymbol);
     const candidateSymbols = Array.from(new Set([rawSym, sym].map((x) => String(x || "").trim()).filter((x) => x && x.includes("-"))));
     if (!apiBase || candidateSymbols.length === 0) {
+      counterpartySelectedLevelRef.current = null;
       setCounterpartyBook(null);
       setCounterpartyBookError(null);
       setCounterpartyBookLoading(false);
@@ -3837,9 +3920,14 @@ export default function OrderTicketWidget({
             url.searchParams.set("_ts", String(Date.now()));
             const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
             const body = await r.json().catch(() => null);
-            if (!r.ok || body?.ok === false) {
-              const msg = body?.detail || body?.error || `HTTP ${r.status}`;
-              throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+            if (!r.ok) {
+              throw new Error(counterpartyBookApplicationError(body, r.status));
+            }
+            if (!body || typeof body !== "object") {
+              throw new Error(counterpartyBookApplicationError(body, r.status));
+            }
+            if (body?.ok === false) {
+              throw new Error(counterpartyBookApplicationError(body, r.status));
             }
 
             const rowCount = counterpartyBookRowCount(body);
@@ -3855,11 +3943,26 @@ export default function OrderTicketWidget({
 
         if (!bestBody && lastError) throw lastError;
         if (cancelled || counterpartyBookReqRef.current !== reqId) return;
-        setCounterpartyBook(bestBody ? { ...bestBody, ticket_candidate_symbols: candidateSymbols, ticket_best_row_count: Math.max(bestCount, 0) } : null);
+        const selectedLevel = counterpartySelectedLevelRef.current;
+        const nextBook = bestBody
+          ? { ...bestBody, ticket_candidate_symbols: candidateSymbols, ticket_best_row_count: Math.max(bestCount, 0) }
+          : null;
+        setCounterpartyBook(
+          selectedLevel && counterpartyBookRowCount(nextBook) === 0
+            ? counterpartyBookWithSelectedRow(nextBook, selectedLevel, normalizeCounterpartySymbol(otSymbol))
+            : nextBook
+        );
+        setCounterpartyBookError(null);
       } catch (e) {
         if (cancelled || counterpartyBookReqRef.current !== reqId) return;
-        setCounterpartyBook(null);
-        setCounterpartyBookError(e?.message || "Failed loading Counterparty orderbook preview.");
+        const selectedLevel = counterpartySelectedLevelRef.current;
+        if (selectedLevel) {
+          setCounterpartyBook((prev) => counterpartyBookWithSelectedRow(prev, selectedLevel, normalizeCounterpartySymbol(otSymbol)));
+          setCounterpartyBookError(null);
+        } else {
+          setCounterpartyBook(null);
+          setCounterpartyBookError(e?.message || "Failed loading Counterparty orderbook preview.");
+        }
       } finally {
         if (cancelled || counterpartyBookReqRef.current !== reqId) return;
         setCounterpartyBookLoading(false);
@@ -3876,11 +3979,13 @@ export default function OrderTicketWidget({
     if (!isCounterpartyVenue) return;
     if (side === "sell" && normalizeCounterpartyExecutionMode(counterpartyExecutionMode) === "dispenser") {
       setCounterpartyExecutionMode("limit_order");
+      counterpartySelectedLevelRef.current = null;
       setCounterpartySelectedLevel(null);
     }
   }, [isCounterpartyVenue, side, counterpartyExecutionMode]);
 
   useEffect(() => {
+    counterpartySelectedLevelRef.current = null;
     setCounterpartySelectedLevel(null);
   }, [otSymbol, counterpartyExecutionMode, side]);
 
@@ -3905,18 +4010,24 @@ export default function OrderTicketWidget({
         setLimitPrice(pxText);
       }
 
+      setCounterpartyBook((prev) => counterpartyBookWithSelectedRow(prev, row, ticketSymbol || pickedSymbol));
+      setCounterpartyBookError(null);
+
       if (mode === "limit_order") {
+        counterpartySelectedLevelRef.current = null;
         setCounterpartySelectedLevel(null);
         return;
       }
 
       if (liquidityType !== "dispenser") {
+        counterpartySelectedLevelRef.current = null;
         setCounterpartySelectedLevel(null);
         onToast?.({ kind: "warn", msg: "This row is a Counterparty protocol limit order. Switch to Limit Order mode to use its price as order context." });
         return;
       }
 
       const safeLevel = counterpartySafeBookLevelForPreview(row);
+      counterpartySelectedLevelRef.current = safeLevel;
       setCounterpartySelectedLevel(safeLevel);
       if (detail?.pick === "lot" || detail?.pick === "unit" || detail?.pick === "size") {
         const lot = otCounterpartyFiniteNumberOrNull(

@@ -1501,13 +1501,21 @@ class CounterpartyAdapter:
             base_remaining = get_remaining
             quote_remaining = give_remaining
 
-        explicit_price = self._as_float(self._first_present(row, ("price", "unit_price", "unitPrice", "rate")))
-        price = explicit_price
-        if price is None and base_quantity not in (None, 0) and quote_quantity is not None:
+        explicit_price_raw = self._first_present(row, ("price", "unit_price", "unitPrice", "rate"))
+        explicit_price_dec = self._decimal_or_none(explicit_price_raw)
+        price_dec = explicit_price_dec if explicit_price_dec is not None and explicit_price_dec > 0 else None
+        price_source = "upstream_explicit_price" if price_dec is not None else None
+        if price_dec is None and base_quantity not in (None, 0) and quote_quantity is not None:
             try:
-                price = float(quote_quantity) / float(base_quantity)
+                base_quantity_dec = Decimal(str(base_quantity))
+                quote_quantity_dec = Decimal(str(quote_quantity))
+                if base_quantity_dec > 0:
+                    price_dec = quote_quantity_dec / base_quantity_dec
+                    price_source = "quote_quantity_divided_by_base_quantity"
             except Exception:
-                price = None
+                price_dec = None
+        price = float(price_dec) if price_dec is not None else None
+        price_exact = self._decimal_plain(price_dec, max_places=18) if price_dec is not None else None
 
         status = self._status_text(row)
         tx_hash = str(self._first_present(row, ("tx_hash", "txHash", "txid", "order_hash", "hash")) or "").strip()
@@ -1518,6 +1526,9 @@ class CounterpartyAdapter:
             "side": side,
             "quote_asset": quote_asset or None,
             "price": price,
+            "price_exact": price_exact,
+            "price_source": price_source,
+            "price_precision_decimals": self._decimal_places_from_text(price_exact),
             "base_quantity": base_quantity,
             "quote_quantity": quote_quantity,
             "base_remaining": base_remaining,
@@ -1563,13 +1574,23 @@ class CounterpartyAdapter:
             divisible_hint=give_divisible_hint,
         )
         satoshirate = self._as_int(self._first_present(row, ("satoshirate", "satoshi_rate", "satoshiRate", "rate", "price_sats")))
-        price_btc = float(satoshirate) / 100000000.0 if satoshirate is not None else None
-        price_btc_per_unit = None
-        if price_btc is not None and give_quantity not in (None, 0):
+        price_btc_dec = Decimal(satoshirate) / Decimal(100000000) if satoshirate is not None else None
+        price_btc = float(price_btc_dec) if price_btc_dec is not None else None
+        price_btc_per_unit_dec = None
+        if price_btc_dec is not None and give_quantity not in (None, 0):
             try:
-                price_btc_per_unit = float(price_btc) / float(give_quantity)
+                give_quantity_dec = Decimal(str(give_quantity))
+                if give_quantity_dec > 0:
+                    price_btc_per_unit_dec = price_btc_dec / give_quantity_dec
             except Exception:
-                price_btc_per_unit = None
+                price_btc_per_unit_dec = None
+        price_btc_per_unit = float(price_btc_per_unit_dec) if price_btc_per_unit_dec is not None else None
+        price_btc_exact = self._decimal_plain(price_btc_dec, max_places=18) if price_btc_dec is not None else None
+        price_btc_per_unit_exact = (
+            self._decimal_plain(price_btc_per_unit_dec, max_places=18)
+            if price_btc_per_unit_dec is not None
+            else None
+        )
 
         status = self._status_text(row)
         tx_hash = str(self._first_present(row, ("tx_hash", "txHash", "txid", "dispenser_tx_hash", "hash")) or "").strip()
@@ -1583,7 +1604,19 @@ class CounterpartyAdapter:
             "give_remaining": give_remaining,
             "satoshirate": satoshirate,
             "price_btc": price_btc,
+            "price_btc_exact": price_btc_exact,
             "price_btc_per_unit": price_btc_per_unit,
+            "price_btc_per_unit_exact": price_btc_per_unit_exact,
+            "price_source": (
+                "dispenser_satoshirate_per_lot_divided_by_lot_size"
+                if price_btc_per_unit_exact is not None
+                else "dispenser_satoshirate_per_lot"
+                if price_btc_exact is not None
+                else None
+            ),
+            "price_precision_decimals": self._decimal_places_from_text(
+                price_btc_per_unit_exact or price_btc_exact
+            ),
             "quote_asset": "BTC" if satoshirate is not None else None,
             "status": status,
             "is_open": self._is_open_status(status),
@@ -1695,12 +1728,19 @@ class CounterpartyAdapter:
 
     @classmethod
     def _orderbook_level_from_order(cls, row: Dict[str, Any], *, side: str, quote_asset: str) -> Optional[Dict[str, Any]]:
-        price = cls._as_float(row.get("price"))
+        price_exact = str(row.get("price_exact") or "").strip() or None
+        price_dec = cls._decimal_or_none(price_exact if price_exact is not None else row.get("price"))
+        price = float(price_dec) if price_dec is not None else None
         size = cls._orderbook_level_size(row)
         if price is None or price <= 0 or size is None or size <= 0:
             return None
+        if price_exact is None:
+            price_exact = cls._decimal_plain(price_dec, max_places=18)
         return {
             "price": float(price),
+            "price_exact": price_exact,
+            "price_source": str(row.get("price_source") or "protocol_order_ratio").strip(),
+            "price_precision_decimals": cls._decimal_places_from_text(price_exact),
             "size": float(size),
             "side": side,
             "quote_asset": quote_asset,
@@ -1715,7 +1755,17 @@ class CounterpartyAdapter:
 
     @classmethod
     def _orderbook_level_from_dispenser(cls, row: Dict[str, Any], *, quote_asset: str = "BTC") -> Optional[Dict[str, Any]]:
-        price = cls._as_float(row.get("price_btc_per_unit")) or cls._as_float(row.get("price_btc"))
+        price_exact = str(
+            row.get("price_btc_per_unit_exact")
+            or row.get("price_btc_exact")
+            or ""
+        ).strip() or None
+        price_dec = cls._decimal_or_none(
+            price_exact
+            if price_exact is not None
+            else row.get("price_btc_per_unit") or row.get("price_btc")
+        )
+        price = float(price_dec) if price_dec is not None else None
         size = None
         for key in ("give_remaining", "escrow_quantity", "give_quantity", "size"):
             n = cls._as_float(row.get(key))
@@ -1730,8 +1780,16 @@ class CounterpartyAdapter:
             if n is not None and n > 0:
                 unit_size = float(n)
                 break
+        if price_exact is None:
+            price_exact = cls._decimal_plain(price_dec, max_places=18)
         return {
             "price": float(price),
+            "price_exact": price_exact,
+            "price_source": str(
+                row.get("price_source")
+                or "dispenser_satoshirate_per_lot_divided_by_lot_size"
+            ).strip(),
+            "price_precision_decimals": cls._decimal_places_from_text(price_exact),
             "size": float(size),
             "unit_size": unit_size,
             "lot_size": unit_size,
@@ -1994,6 +2052,7 @@ class CounterpartyAdapter:
             "spread": spread,
             "spread_pct": spread_pct,
             "priceDecimals": max(0, min(int(quote_decimals or 8), 12)),
+            "priceAuditDecimals": 18,
             "sizeDecimals": max(0, min(int(base_decimals or 0), 12)),
             "sources": {
                 "orders": orders_result.get("source_path"),
@@ -2081,6 +2140,20 @@ class CounterpartyAdapter:
             except Exception:
                 return str(value)
 
+    @staticmethod
+    def _decimal_places_from_text(value: Any) -> Optional[int]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if "e" in raw.lower():
+            try:
+                raw = format(Decimal(raw), "f")
+            except Exception:
+                return None
+        if "." not in raw:
+            return 0
+        return max(0, len(raw.rstrip("0").split(".", 1)[1]))
+
     def _display_quantity_to_atomic(self, asset: Any, quantity: Any) -> Optional[int]:
         d = self._decimal_or_none(quantity)
         if d is None or d < 0:
@@ -2100,7 +2173,18 @@ class CounterpartyAdapter:
     def _compose_level_price_decimal(row: Dict[str, Any]) -> Optional[Decimal]:
         if not isinstance(row, dict):
             return None
-        for key in ("price", "displayPrice", "display_price", "limitPrice", "limit_price", "rate"):
+        for key in (
+            "price_exact",
+            "priceExact",
+            "price_btc_per_unit_exact",
+            "priceBtcPerUnitExact",
+            "price",
+            "displayPrice",
+            "display_price",
+            "limitPrice",
+            "limit_price",
+            "rate",
+        ):
             if row.get(key) not in (None, ""):
                 d = CounterpartyAdapter._decimal_or_none(row.get(key))
                 if d is not None and d > 0:
@@ -2239,6 +2323,95 @@ class CounterpartyAdapter:
             "lots_available": cls._as_int(ctx.get("lots_available")),
             "payment_source": "lot_count_x_satoshirate" if payment_sats is not None else None,
             "reasons": list(ctx.get("reasons") or []),
+        }
+
+    @classmethod
+    def _compose_price_audit_payload(
+        cls,
+        *,
+        requested_limit_price: Decimal,
+        requested_quote_total: Decimal,
+        quote_asset: str,
+        compose_kind: str,
+        selected_level: Optional[Dict[str, Any]],
+        dispenser_lot_context: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Expose exact decimal price provenance without changing compose math."""
+        level = selected_level if isinstance(selected_level, dict) else {}
+        requested_limit_exact = cls._decimal_plain(requested_limit_price, max_places=18)
+        requested_quote_total_exact = cls._decimal_plain(requested_quote_total, max_places=18)
+        selected_price_dec = cls._compose_level_price_decimal(level)
+        selected_price_exact = (
+            cls._decimal_plain(selected_price_dec, max_places=18)
+            if selected_price_dec is not None
+            else None
+        )
+        selected_price_source = str(level.get("price_source") or "").strip() or None
+
+        execution_price_dec = requested_limit_price
+        execution_price_source = "ticket_limit_price"
+        execution_quote_total_dec = requested_quote_total
+        dispenser_lot_size = None
+        dispenser_satoshirate = None
+        dispenser_payment_sats = None
+
+        if str(compose_kind or "") == "dispenser_dispense":
+            ctx = dispenser_lot_context if isinstance(dispenser_lot_context, dict) else {}
+            dispenser_lot_size = ctx.get("lot_size") if isinstance(ctx.get("lot_size"), Decimal) else None
+            dispenser_satoshirate = cls._as_int(ctx.get("satoshirate"))
+            dispenser_payment_sats = cls._as_int(ctx.get("exact_payment_satoshis"))
+            if dispenser_lot_size is not None and dispenser_lot_size > 0 and dispenser_satoshirate is not None:
+                execution_price_dec = (
+                    Decimal(dispenser_satoshirate)
+                    / Decimal(100000000)
+                    / dispenser_lot_size
+                )
+                execution_price_source = "dispenser_satoshirate_per_lot_divided_by_lot_size"
+            elif selected_price_dec is not None:
+                execution_price_dec = selected_price_dec
+                execution_price_source = selected_price_source or "selected_dispenser_level"
+            if dispenser_payment_sats is not None:
+                execution_quote_total_dec = Decimal(dispenser_payment_sats) / Decimal(100000000)
+
+        execution_price_exact = cls._decimal_plain(execution_price_dec, max_places=18)
+        execution_quote_total_exact = cls._decimal_plain(execution_quote_total_dec, max_places=18)
+        legacy_limit_display = cls._decimal_plain(requested_limit_price, max_places=8)
+        legacy_execution_display = cls._decimal_plain(execution_price_dec, max_places=8)
+        legacy_rounding_visible = bool(
+            (requested_limit_exact and legacy_limit_display and requested_limit_exact != legacy_limit_display)
+            or (execution_price_exact and legacy_execution_display and execution_price_exact != legacy_execution_display)
+        )
+
+        return {
+            "status": "exact_decimal_audit_available",
+            "quote_asset": str(quote_asset or "").strip().upper() or None,
+            "requested_limit_price_exact": requested_limit_exact,
+            "requested_limit_price_precision_decimals": cls._decimal_places_from_text(requested_limit_exact),
+            "selected_level_price_exact": selected_price_exact,
+            "selected_level_price_precision_decimals": cls._decimal_places_from_text(selected_price_exact),
+            "selected_level_price_source": selected_price_source,
+            "execution_price_exact": execution_price_exact,
+            "execution_price_precision_decimals": cls._decimal_places_from_text(execution_price_exact),
+            "execution_price_source": execution_price_source,
+            "requested_quote_total_exact": requested_quote_total_exact,
+            "execution_quote_total_exact": execution_quote_total_exact,
+            "execution_quote_total_satoshis": (
+                int((execution_quote_total_dec * Decimal(100000000)).to_integral_value(rounding=ROUND_FLOOR))
+                if str(quote_asset or "").strip().upper() == "BTC"
+                else None
+            ),
+            "dispenser_lot_size_exact": (
+                cls._decimal_plain(dispenser_lot_size, max_places=18)
+                if dispenser_lot_size is not None
+                else None
+            ),
+            "dispenser_satoshirate_per_lot": dispenser_satoshirate,
+            "dispenser_exact_payment_satoshis": dispenser_payment_sats,
+            "legacy_limit_price_display": legacy_limit_display,
+            "legacy_execution_price_display": legacy_execution_display,
+            "legacy_display_rounding_visible": legacy_rounding_visible,
+            "precision_preserved": True,
+            "read_only": True,
         }
 
     @staticmethod
@@ -4194,6 +4367,19 @@ class CounterpartyAdapter:
                 "Counterparty returned raw unsigned transaction hex without a recognized PSBT. UTT will not call UniSat pushTx or broadcast it."
             )
 
+        price_audit = self._compose_price_audit_payload(
+            requested_limit_price=px_dec,
+            requested_quote_total=quote_qty_dec,
+            quote_asset=quote_asset,
+            compose_kind=compose_kind,
+            selected_level=level or None,
+            dispenser_lot_context=dispenser_lot_context,
+        )
+        if price_audit.get("legacy_display_rounding_visible"):
+            warnings.append(
+                "Exact Counterparty audit-price fields preserve precision beyond the legacy eight-decimal display field. Compose calculations and dispenser payments remain unchanged."
+            )
+
         return {
             "ok": True,
             "venue": self.venue,
@@ -4210,7 +4396,12 @@ class CounterpartyAdapter:
             "fee_policy": fee_policy,
             "quantity": self._decimal_plain(qty_dec, max_places=self._asset_display_decimals(base)),
             "limit_price": self._decimal_plain(px_dec, max_places=self._asset_display_decimals(quote_asset)),
+            "limit_price_exact": price_audit.get("requested_limit_price_exact"),
             "quote_total": self._decimal_plain(quote_qty_dec, max_places=self._asset_display_decimals(quote_asset)),
+            "quote_total_exact": price_audit.get("requested_quote_total_exact"),
+            "execution_price_exact": price_audit.get("execution_price_exact"),
+            "execution_quote_total_exact": price_audit.get("execution_quote_total_exact"),
+            "price_audit": price_audit,
             "give_asset": give_asset,
             "give_quantity": self._decimal_plain(give_quantity_display, max_places=self._asset_display_decimals(give_asset)),
             "give_quantity_atomic": give_quantity_atomic,

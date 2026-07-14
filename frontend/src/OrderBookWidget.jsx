@@ -233,6 +233,78 @@ function counterpartyLotSize(row) {
   return null;
 }
 
+function counterpartyPlainDecimalText(value) {
+  const raw = String(value ?? "").trim().replace(/^\+/, "");
+  if (!raw) return "";
+
+  const normalizePlain = (plain) => {
+    const cleaned = String(plain || "").replace(/^0+(?=\d)/, "");
+    const safe = cleaned.startsWith(".") ? `0${cleaned}` : cleaned || "0";
+    if (!/^\d+(?:\.\d+)?$/.test(safe)) return "";
+    if (!safe.includes(".")) return safe;
+    const trimmed = safe.replace(/0+$/, "").replace(/\.$/, "");
+    return trimmed || "0";
+  };
+
+  if (/^\d+(?:\.\d+)?$/.test(raw)) return normalizePlain(raw);
+
+  const sci = /^(\d+)(?:\.(\d*))?[eE]([+-]?\d+)$/.exec(raw);
+  if (sci) {
+    const whole = sci[1] || "0";
+    const fraction = sci[2] || "";
+    const exponent = Number(sci[3]);
+    if (!Number.isFinite(exponent)) return "";
+    const digits = `${whole}${fraction}`;
+    const decimalIndex = whole.length + exponent;
+    const expanded = decimalIndex <= 0
+      ? `0.${"0".repeat(Math.abs(decimalIndex))}${digits}`
+      : decimalIndex >= digits.length
+        ? `${digits}${"0".repeat(decimalIndex - digits.length)}`
+        : `${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`;
+    return normalizePlain(expanded);
+  }
+
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return normalizePlain(
+    n.toLocaleString("en-US", {
+      useGrouping: false,
+      maximumFractionDigits: 18,
+    })
+  );
+}
+
+function counterpartyRowExactPriceText(row) {
+  if (!row || typeof row !== "object") return "";
+  const rawDispenser = row?.raw_dispenser && typeof row.raw_dispenser === "object"
+    ? row.raw_dispenser
+    : {};
+  const rawOrder = row?.raw_order && typeof row.raw_order === "object"
+    ? row.raw_order
+    : {};
+  for (const value of [
+    row?.price_exact,
+    row?.priceExact,
+    row?.price_btc_per_unit_exact,
+    rawDispenser?.price_btc_per_unit_exact,
+    rawOrder?.price_exact,
+    row?.price,
+    row?.displayPrice,
+    row?.limitPrice,
+    row?.rate,
+  ]) {
+    const text = counterpartyPlainDecimalText(value);
+    if (text && Number(text) > 0) return text;
+  }
+  return "";
+}
+
+function counterpartyPricePrecisionDecimals(value) {
+  const text = counterpartyPlainDecimalText(value);
+  if (!text || !text.includes(".")) return text ? 0 : null;
+  return text.split(".", 2)[1].length;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Rules helpers (price precision / tick normalization)
 // ─────────────────────────────────────────────────────────────
@@ -1245,7 +1317,12 @@ function clampBox(next) {
     return px;
   }
 
-  function fmtPriceCell(p) {
+  function fmtPriceCell(p, row = null) {
+    if (isCounterpartyVenue) {
+      const exact = counterpartyRowExactPriceText(row || { price: p });
+      if (exact) return exact;
+    }
+
     // If we have rules-derived decimals (common for BTC-quoted pairs), use them.
     const np = normPriceByRules(p);
     if (np === null) return "—";
@@ -1274,10 +1351,16 @@ function clampBox(next) {
     return px * quoteUsd;
   }
 
-  function orderBookPriceTitle(p) {
+  function orderBookPriceTitle(p, row = null) {
     const quote = orderBookQuoteAsset();
     const usd = orderBookPriceUsd(p);
-    const lines = [`Native execution price: ${fmtPriceCell(p)} ${quote || ""}`.trim()];
+    const exact = isCounterpartyVenue ? counterpartyRowExactPriceText(row || { price: p }) : "";
+    const lines = [`Native execution price: ${exact || fmtPriceCell(p, row)} ${quote || ""}`.trim()];
+    if (isCounterpartyVenue && exact) {
+      const source = String(row?.price_source || row?.raw_dispenser?.price_source || "").trim();
+      lines.push(`Exact audit precision: ${counterpartyPricePrecisionDecimals(exact) ?? "unknown"} decimal place(s)`);
+      if (source) lines.push(`Price provenance: ${source}`);
+    }
     if (usd !== null) {
       lines.push(`Derived USD value: ${formatOrderBookUsd(usd)} per ${orderBookPairParts(obSymbol).base || "base unit"}`);
       if (quoteUsdContext?.source) lines.push(`Source: ${quoteUsdContext.source}`);
@@ -1830,6 +1913,22 @@ function clampBox(next) {
   }
 
   function handlePickPrice(px, row = null) {
+    if (isCounterpartyVenue) {
+      const exact = counterpartyRowExactPriceText(row || { price: px });
+      if (!exact || !Number.isFinite(Number(exact)) || Number(exact) <= 0) return;
+      const d = counterpartyPricePrecisionDecimals(exact);
+      if (typeof onPickPrice === "function") {
+        onPickPrice(exact, exact, {
+          priceDecimals: d,
+          priceIncrement: null,
+          exactCounterpartyPrice: true,
+          priceSource: String(row?.price_source || "").trim() || null,
+        });
+      }
+      dispatchCounterpartyBookPick(row, "price");
+      return;
+    }
+
     // Normalize clicked price when rules are known; otherwise pass through.
     const outPx = normPriceByRules(px);
     const n = Number(outPx);
@@ -1838,17 +1937,13 @@ function clampBox(next) {
     // Preserve decimals for venues where order rules may be unknown.
     // Some ticket implementations format clicked prices using "known" decimals
     // (which may default to 0), causing whole-number rounding.
-    const counterpartyDefaultDecimals = isCounterpartyVenue ? 8 : null;
     const d = Number.isFinite(Number(priceDecimals))
       ? clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_CLICK_CAP)
-      : counterpartyDefaultDecimals;
+      : null;
     const pxStr = d !== null ? n.toFixed(clamp(d, 0, 18)) : String(outPx);
 
-    // Back-compat: regular venues keep numeric first arg. Counterparty sends the
-    // fixed-decimal string first so App.jsx implementations that only consume
-    // the first arg do not turn tiny BTC prices into scientific notation/0.
     if (typeof onPickPrice === "function") {
-      onPickPrice(isCounterpartyVenue ? pxStr : n, pxStr, { priceDecimals: d, priceIncrement });
+      onPickPrice(n, pxStr, { priceDecimals: d, priceIncrement });
     }
     dispatchCounterpartyBookPick(row, "price");
   }
@@ -2123,7 +2218,7 @@ function clampBox(next) {
         }}
       >
         <span style={{ flex: "0 0 auto" }}>
-          {fmtPriceCell(row?.price)}
+          {fmtPriceCell(row?.price, row)}
           {displayedQuoteAsset ? <span style={{ opacity: 0.72, marginLeft: 4 }}>{displayedQuoteAsset}</span> : null}
         </span>
         {showDerivedUsd ? (
@@ -2149,10 +2244,13 @@ function clampBox(next) {
     const unit = counterpartyLotSize(row);
     const lines = [
       `Type: ${type === "dispenser" ? "Counterparty dispenser" : type === "limit_order" ? "Counterparty protocol limit order" : "Unknown Counterparty liquidity"}`,
-      `Price: ${fmtPriceCell(row?.price)} ${displayedQuoteAsset || ""}`.trim(),
+      `Price: ${counterpartyRowExactPriceText(row) || fmtPriceCell(row?.price, row)} ${displayedQuoteAsset || ""}`.trim(),
       `Remaining: ${fmtSizeCell(row?.size)} ${displayedBaseAsset || ""}`.trim(),
     ];
     if (unit !== null) lines.push(`Lot size: ${fmtSizeCell(unit)} ${displayedBaseAsset || ""}`.trim());
+    const exactPrice = counterpartyRowExactPriceText(row);
+    if (exactPrice) lines.push(`Audit precision: ${counterpartyPricePrecisionDecimals(exactPrice) ?? "unknown"} decimal place(s)`);
+    if (row?.price_source) lines.push(`Price provenance: ${row.price_source}`);
     if (row?.source) lines.push(`Source: ${row.source}`);
     if (row?.status) lines.push(`Status: ${row.status}`);
     if (type === "unknown") lines.push("Unknown rows are display-only and are not executable as dispenser selections.");
@@ -2506,7 +2604,7 @@ function clampBox(next) {
                         <tr key={`a-${idx}-${x?.tx_hash || x?.source || ""}`} title={rowTitle || undefined}>
                           <td
                             style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
-                            title={orderBookPriceTitle(x.price)}
+                            title={orderBookPriceTitle(x.price, x)}
                             onClick={() => handlePickPrice(x.price, x)}
                           >
                             {renderOrderBookPrice(x)}
@@ -2588,7 +2686,7 @@ function clampBox(next) {
                         <tr key={`b-${idx}-${x?.tx_hash || x?.source || ""}`} title={rowTitle || undefined}>
                           <td
                             style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
-                            title={orderBookPriceTitle(x.price)}
+                            title={orderBookPriceTitle(x.price, x)}
                             onClick={() => handlePickPrice(x.price, x)}
                           >
                             {renderOrderBookPrice(x)}

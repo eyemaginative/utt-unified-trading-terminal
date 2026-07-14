@@ -153,20 +153,46 @@ function counterpartyBookRowCount(payload) {
 }
 
 
-function counterpartyBookRowPrice(row) {
-  return otCounterpartyFiniteNumberOrNull(row?.price ?? row?.displayPrice ?? row?.limitPrice ?? row?.rate);
-}
-
-function counterpartyBookRowPriceText(row) {
-  const raw = row?.price ?? row?.displayPrice ?? row?.limitPrice ?? row?.rate;
-  if (raw === null || raw === undefined || raw === "") return "";
-  const expanded = String(expandExponential(String(raw))).trim().replace(/^\+/, "");
+function counterpartyExactDecimalText(value) {
+  if (value === null || value === undefined || value === "") return "";
+  const expanded = String(expandExponential(String(value))).trim().replace(/^\+/, "");
   if (!/^\d+(?:\.\d+)?$/.test(expanded)) return "";
   const normalized = expanded.includes(".")
     ? expanded.replace(/0+$/, "").replace(/\.$/, "")
     : expanded;
   const n = Number(normalized);
   return Number.isFinite(n) && n > 0 ? normalized : "";
+}
+
+function counterpartyBookRowPrice(row) {
+  return otCounterpartyFiniteNumberOrNull(
+    row?.price_exact ??
+    row?.priceExact ??
+    row?.price_btc_per_unit_exact ??
+    row?.raw_dispenser?.price_btc_per_unit_exact ??
+    row?.price ??
+    row?.displayPrice ??
+    row?.limitPrice ??
+    row?.rate
+  );
+}
+
+function counterpartyBookRowPriceText(row) {
+  for (const value of [
+    row?.price_exact,
+    row?.priceExact,
+    row?.price_btc_per_unit_exact,
+    row?.raw_dispenser?.price_btc_per_unit_exact,
+    row?.raw_order?.price_exact,
+    row?.price,
+    row?.displayPrice,
+    row?.limitPrice,
+    row?.rate,
+  ]) {
+    const exact = counterpartyExactDecimalText(value);
+    if (exact) return exact;
+  }
+  return "";
 }
 
 function counterpartyPickBookRowForTicket(payload, side, limitPrice, executionMode = "dispenser", quantity = null) {
@@ -199,7 +225,7 @@ function counterpartyPickBookRowForTicket(payload, side, limitPrice, executionMo
 function counterpartySafeBookLevelForPreview(row) {
   if (!row || typeof row !== "object") return null;
   const out = {};
-  for (const key of ["price", "size", "unit_size", "lot_size", "lots_available", "side", "quote_asset", "source_type", "liquidity_type", "liquidity_label", "source", "tx_hash", "status", "satoshirate", "lot_satoshirate"]) {
+  for (const key of ["price", "price_exact", "price_source", "price_precision_decimals", "price_btc_per_unit_exact", "price_btc_exact", "size", "unit_size", "lot_size", "lots_available", "side", "quote_asset", "source_type", "liquidity_type", "liquidity_label", "source", "tx_hash", "status", "satoshirate", "lot_satoshirate"]) {
     if (row[key] !== undefined && row[key] !== null && row[key] !== "") out[key] = row[key];
   }
   if (row.raw_dispenser && typeof row.raw_dispenser === "object") {
@@ -661,6 +687,84 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
     backendStatus: String(funding?.status || "").trim(),
     backendReason: String(funding?.status_reason || "").trim(),
     feeNote: String(funding?.fee_note || "").trim(),
+  };
+}
+
+
+function counterpartyPriceSourceLabel(value) {
+  const source = String(value || "").trim();
+  if (source === "dispenser_satoshirate_per_lot_divided_by_lot_size") {
+    return "Exact dispenser satoshirate ÷ lot size";
+  }
+  if (source === "ticket_limit_price") return "Exact ticket limit price";
+  if (source === "upstream_explicit_price") return "Counterparty upstream explicit price";
+  if (source === "quote_quantity_divided_by_base_quantity" || source === "protocol_order_ratio") {
+    return "Counterparty protocol quantities";
+  }
+  if (source === "selected_dispenser_level") return "Selected dispenser level";
+  return source || "Unavailable";
+}
+
+function counterpartyPriceAuditView(payload) {
+  if (!payload || typeof payload !== "object" || !isCounterpartyVenueKey(payload?.venue)) return null;
+  const audit = payload?.price_audit && typeof payload.price_audit === "object"
+    ? payload.price_audit
+    : {};
+
+  const requestedLimitPriceExact = counterpartyExactDecimalText(
+    audit?.requested_limit_price_exact ?? payload?.limit_price_exact ?? payload?.limit_price
+  );
+  const selectedLevelPriceExact = counterpartyExactDecimalText(
+    audit?.selected_level_price_exact ??
+    payload?.selected_level?.price_exact ??
+    payload?.selected_level?.price
+  );
+  const executionPriceExact = counterpartyExactDecimalText(
+    audit?.execution_price_exact ?? payload?.execution_price_exact ?? requestedLimitPriceExact
+  );
+  const requestedQuoteTotalExact = counterpartyExactDecimalText(
+    audit?.requested_quote_total_exact ?? payload?.quote_total_exact ?? payload?.quote_total
+  );
+  const executionQuoteTotalExact = counterpartyExactDecimalText(
+    audit?.execution_quote_total_exact ??
+    payload?.execution_quote_total_exact ??
+    payload?.funding_requirements?.trade_value_btc ??
+    requestedQuoteTotalExact
+  );
+  const quoteAsset = String(audit?.quote_asset || payload?.quote_asset || "").trim().toUpperCase();
+
+  if (!requestedLimitPriceExact && !selectedLevelPriceExact && !executionPriceExact) return null;
+
+  return {
+    status: String(audit?.status || "exact_decimal_audit_available").trim(),
+    quoteAsset,
+    requestedLimitPriceExact,
+    requestedLimitPrecisionDecimals: otCounterpartyFiniteNumberOrNull(
+      audit?.requested_limit_price_precision_decimals
+    ),
+    selectedLevelPriceExact,
+    selectedLevelPrecisionDecimals: otCounterpartyFiniteNumberOrNull(
+      audit?.selected_level_price_precision_decimals
+    ),
+    selectedLevelPriceSource: String(audit?.selected_level_price_source || "").trim(),
+    executionPriceExact,
+    executionPrecisionDecimals: otCounterpartyFiniteNumberOrNull(
+      audit?.execution_price_precision_decimals
+    ),
+    executionPriceSource: String(audit?.execution_price_source || "").trim(),
+    requestedQuoteTotalExact,
+    executionQuoteTotalExact,
+    executionQuoteTotalSatoshis: counterpartySatoshisOrNull(
+      audit?.execution_quote_total_satoshis
+    ),
+    dispenserLotSizeExact: counterpartyExactDecimalText(audit?.dispenser_lot_size_exact),
+    dispenserSatoshiratePerLot: counterpartySatoshisOrNull(
+      audit?.dispenser_satoshirate_per_lot
+    ),
+    legacyLimitPriceDisplay: counterpartyExactDecimalText(audit?.legacy_limit_price_display),
+    legacyExecutionPriceDisplay: counterpartyExactDecimalText(audit?.legacy_execution_price_display),
+    legacyDisplayRoundingVisible: audit?.legacy_display_rounding_visible === true,
+    precisionPreserved: audit?.precision_preserved !== false,
   };
 }
 
@@ -7037,6 +7141,11 @@ async function submitLimitOrder() {
     [submitResultPayload]
   );
 
+  const counterpartySubmitPriceAudit = useMemo(
+    () => counterpartyPriceAuditView(submitResultPayload),
+    [submitResultPayload]
+  );
+
   const counterpartySubmitFunding = useMemo(() => {
     const availableBtc =
       otCounterpartyFiniteNumberOrNull(counterpartyBtcBalanceMeta?.btc) ??
@@ -8556,6 +8665,121 @@ async function submitLimitOrder() {
                     {!hideTableData && counterpartySigningHandoff.reason && (
                       <div style={{ marginTop: 8, fontSize: 10.5, color: "#bdbdbd", lineHeight: 1.3 }}>
                         {counterpartySigningHandoff.reason}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {counterpartySubmitPriceAudit && (
+                  <div
+                    style={{
+                      marginBottom: 10,
+                      borderRadius: 12,
+                      border: "1px solid #66502a",
+                      background: "#17140d",
+                      padding: 10,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 10,
+                        flexWrap: "wrap",
+                        marginBottom: 8,
+                      }}
+                    >
+                      <div style={{ fontSize: 12, fontWeight: 900 }}>Counterparty price audit</div>
+                      <div style={{ fontSize: 11, fontWeight: 900, color: "#f1d98a" }}>
+                        {counterpartySubmitPriceAudit.precisionPreserved ? "EXACT DECIMAL" : "REVIEW"}
+                      </div>
+                    </div>
+
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(145px, 0.8fr) minmax(220px, 1.2fr)",
+                        gap: "6px 12px",
+                        fontSize: 11,
+                        lineHeight: 1.25,
+                      }}
+                    >
+                      <div style={{ color: "#a9a9a9" }}>Requested ticket limit</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitPriceAudit.requestedLimitPriceExact
+                            ? `${counterpartySubmitPriceAudit.requestedLimitPriceExact} ${counterpartySubmitPriceAudit.quoteAsset}`.trim()
+                            : "Unavailable"}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Selected liquidity price</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitPriceAudit.selectedLevelPriceExact
+                            ? `${counterpartySubmitPriceAudit.selectedLevelPriceExact} ${counterpartySubmitPriceAudit.quoteAsset}`.trim()
+                            : "Not applicable for this compose mode"}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Executable unit price</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitPriceAudit.executionPriceExact
+                            ? `${counterpartySubmitPriceAudit.executionPriceExact} ${counterpartySubmitPriceAudit.quoteAsset} · ${
+                                counterpartySubmitPriceAudit.executionPrecisionDecimals ?? "unknown"
+                              } decimal place(s)`
+                            : "Unavailable"}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Price provenance</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartyPriceSourceLabel(counterpartySubmitPriceAudit.executionPriceSource)}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Requested quote total</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitPriceAudit.requestedQuoteTotalExact
+                            ? `${counterpartySubmitPriceAudit.requestedQuoteTotalExact} ${counterpartySubmitPriceAudit.quoteAsset}`.trim()
+                            : "Unavailable"}
+                      </div>
+
+                      <div style={{ color: "#a9a9a9" }}>Executable quote total</div>
+                      <div>
+                        {hideTableData
+                          ? "••••"
+                          : counterpartySubmitPriceAudit.executionQuoteTotalExact
+                            ? `${counterpartySubmitPriceAudit.executionQuoteTotalExact} ${counterpartySubmitPriceAudit.quoteAsset}${
+                                counterpartySubmitPriceAudit.executionQuoteTotalSatoshis !== null
+                                  ? ` (${counterpartyFormatSats(counterpartySubmitPriceAudit.executionQuoteTotalSatoshis)})`
+                                  : ""
+                              }`
+                            : "Unavailable"}
+                      </div>
+
+                      {counterpartySubmitPriceAudit.legacyDisplayRoundingVisible && (
+                        <>
+                          <div style={{ color: "#a9a9a9" }}>Legacy 8-decimal display</div>
+                          <div>
+                            {hideTableData
+                              ? "••••"
+                              : `${counterpartySubmitPriceAudit.legacyExecutionPriceDisplay || "Unavailable"} ${
+                                  counterpartySubmitPriceAudit.quoteAsset
+                                } · audit field above is authoritative`}
+                          </div>
+                        </>
+                      )}
+                    </div>
+
+                    {!hideTableData && (
+                      <div style={{ marginTop: 8, fontSize: 10.5, color: "#bdbdbd", lineHeight: 1.3 }}>
+                        Exact audit fields preserve the submitted or dispenser-derived decimal price. Dispenser execution remains based on integer satoshirate × whole lots; this panel does not change compose, fee, signing, or broadcast behavior.
                       </div>
                     )}
                   </div>

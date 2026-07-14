@@ -3,6 +3,9 @@ from typing import Optional, List, Literal
 from datetime import datetime
 
 Venue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx"]
+# Venue-order history can include read-only/non-trading sources that must not
+# automatically become valid OrderCreate, balance-refresh, or cancel venues.
+VenueOrderVenue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx", "counterparty"]
 Side = Literal["buy", "sell"]
 OrderType = Literal["market", "limit"]
 
@@ -215,11 +218,11 @@ class OrderRulesResponse(BaseModel):
 # Venue Orders (VENUE ingestion table)
 # ─────────────────────────────────────────────────────────────
 class VenueOrderRefreshRequest(BaseModel):
-    venue: Venue
+    venue: VenueOrderVenue
 
 
 class VenueOrderRowOut(BaseModel):
-    venue: Venue
+    venue: VenueOrderVenue
     venue_order_id: str
 
     # IMPORTANT: used by UI cancel-by-ref

@@ -4868,6 +4868,368 @@ class CounterpartyAdapter:
             "read_only": True,
         }
 
+
+    # ------------------------------------------------------------------
+    # Confirmed dispenser-purchase history (CP-ORDERS.1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _history_datetime(value: Any) -> Optional[datetime]:
+        """Normalize Counterparty block-time values to naive UTC datetimes."""
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            try:
+                if value.tzinfo is not None:
+                    return value.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                pass
+            return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+        raw = str(value).strip()
+        if not raw:
+            return None
+
+        try:
+            numeric = float(raw)
+            # Tolerate millisecond epochs while preserving ordinary seconds.
+            if abs(numeric) > 100_000_000_000:
+                numeric /= 1000.0
+            return datetime.fromtimestamp(numeric, tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            pass
+
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
+        except Exception:
+            return None
+
+    @staticmethod
+    def _satoshis_to_btc(value: Any) -> Optional[float]:
+        satoshis = CounterpartyAdapter._as_int(value)
+        if satoshis is None:
+            return None
+        return float(satoshis) / 100_000_000.0
+
+    @classmethod
+    def _btc_amount_from_row(
+        cls,
+        row: Dict[str, Any],
+        *,
+        normalized_keys: Tuple[str, ...],
+        atomic_keys: Tuple[str, ...],
+    ) -> Optional[float]:
+        for key in normalized_keys:
+            value = cls._as_float(row.get(key))
+            if value is not None:
+                return float(value)
+        for key in atomic_keys:
+            if key not in row or row.get(key) in (None, ""):
+                continue
+            raw = str(row.get(key)).strip()
+            value = cls._as_float(row.get(key))
+            if value is None:
+                continue
+            # Counterparty Core's btc_amount / fee fields are integer satoshis.
+            # Explorer-compatible fallbacks may already return a decimal BTC value.
+            if "." in raw:
+                return float(value)
+            return float(value) / 100_000_000.0
+        return None
+
+    def _history_source_address(self) -> str:
+        for name in (
+            "counterparty_effective_source_address",
+            "counterparty_effective_wallet_address",
+        ):
+            fn = getattr(settings, name, None)
+            if callable(fn):
+                try:
+                    value = str(fn() or "").strip()
+                    if value:
+                        return value
+                except Exception:
+                    pass
+
+        for name in ("counterparty_source_address", "counterparty_wallet_address"):
+            try:
+                value = str(getattr(settings, name, None) or "").strip()
+                if value:
+                    return value
+            except Exception:
+                pass
+
+        for name in (
+            "COUNTERPARTY_SOURCE_ADDRESS",
+            "COUNTERPARTY_WALLET_ADDRESS",
+            "COUNTERPARTY_ADDRESS",
+        ):
+            value = str(os.getenv(name) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _history_limit(value: Any = None) -> int:
+        raw = value if value is not None else os.getenv("COUNTERPARTY_ORDER_HISTORY_LIMIT", "200")
+        try:
+            return max(1, min(int(raw or 200), 500))
+        except Exception:
+            return 200
+
+    @staticmethod
+    def _history_lookup_limit() -> int:
+        try:
+            return max(0, min(int(os.getenv("COUNTERPARTY_ORDER_HISTORY_TX_LOOKUPS", "5") or 5), 25))
+        except Exception:
+            return 5
+
+    def _confirmed_transaction_map(self, address: str, *, limit: int) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        addr = quote(str(address or "").strip(), safe="")
+        result = self._first_ok([
+            (
+                f"/v2/addresses/{addr}/transactions",
+                {
+                    "type": "dispense",
+                    "valid": True,
+                    "limit": int(limit),
+                },
+            ),
+        ])
+        if not result.get("ok"):
+            return {}, result
+
+        by_hash: Dict[str, Dict[str, Any]] = {}
+        for row in self._items_from_payload(result.get("raw")):
+            txid = str(self._first_present(row, ("tx_hash", "txid", "hash")) or "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{64}", txid):
+                by_hash[txid] = row
+        return by_hash, result
+
+    def _transaction_detail(self, txid: str) -> Optional[Dict[str, Any]]:
+        txid_norm = str(txid or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", txid_norm):
+            return None
+        result = self._first_ok([
+            (f"/v2/transactions/{quote(txid_norm, safe='')}", None),
+        ])
+        if not result.get("ok"):
+            return None
+        row = self._first_dict_from_payload(result.get("raw"))
+        return row if isinstance(row, dict) and row else None
+
+    def _normalize_confirmed_dispense_order(
+        self,
+        row: Dict[str, Any],
+        *,
+        buyer_address: str,
+        transaction: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        tx = transaction if isinstance(transaction, dict) else {}
+        txid = str(self._first_present(row, ("tx_hash", "txid", "hash")) or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", txid):
+            return None
+
+        buyer = str(self._first_present(row, ("destination", "buyer", "address")) or "").strip()
+        expected_buyer = str(buyer_address or "").strip()
+        if buyer and expected_buyer and buyer != expected_buyer:
+            return None
+
+        asset = str(self._first_present(row, ("asset", "asset_name", "assetName", "symbol")) or "").strip().upper()
+        if not asset:
+            return None
+
+        divisible_hint = self._divisible_hint_from_row(
+            row,
+            ("asset_divisible", "assetDivisible", "divisible", "is_divisible", "isDivisible"),
+        )
+        quantity = self._quantity_from_row(
+            row,
+            asset,
+            (
+                "dispense_quantity_normalized",
+                "dispenseQuantityNormalized",
+                "quantity_normalized",
+                "quantityNormalized",
+            ),
+            ("dispense_quantity", "dispenseQuantity", "quantity"),
+            divisible_hint=divisible_hint,
+        )
+        if quantity is None or quantity <= 0:
+            return None
+
+        gross_btc = self._btc_amount_from_row(
+            row,
+            normalized_keys=("btc_amount_normalized", "btcAmountNormalized", "payment_btc", "paymentBtc"),
+            atomic_keys=("btc_amount", "btcAmount", "payment_satoshis", "paymentSatoshis"),
+        )
+        if gross_btc is None or gross_btc <= 0:
+            return None
+
+        fee_btc = self._btc_amount_from_row(
+            tx,
+            normalized_keys=("fee_normalized", "btc_fee_normalized", "network_fee_btc"),
+            atomic_keys=("fee", "btc_fee", "network_fee", "miner_fee"),
+        )
+
+        block_time = self._history_datetime(
+            self._first_present(row, ("block_time", "blockTime", "timestamp", "time"))
+            or self._first_present(tx, ("block_time", "blockTime", "timestamp", "time"))
+        )
+        block_index = self._as_int(
+            self._first_present(row, ("block_index", "blockIndex", "block_height", "blockHeight"))
+            or self._first_present(tx, ("block_index", "blockIndex", "block_height", "blockHeight"))
+        )
+        dispense_index = self._as_int(self._first_present(row, ("dispense_index", "dispenseIndex", "event_index", "eventIndex")))
+        gross_satoshis = self._as_int(self._first_present(row, ("btc_amount", "btcAmount", "payment_satoshis", "paymentSatoshis")))
+        fee_satoshis = self._as_int(self._first_present(tx, ("fee", "btc_fee", "network_fee", "miner_fee")))
+
+        average_price = float(gross_btc) / float(quantity)
+        symbol = f"{asset}-BTC"
+        total_cost_btc = float(gross_btc) + float(fee_btc or 0.0)
+
+        return {
+            "venue_order_id": txid,
+            "symbol_venue": symbol,
+            "symbol_canon": symbol,
+            "side": "buy",
+            # VenueOrderRow.type is String(16); expose the longer user-facing
+            # label later in services/all_orders.py without truncating the DB value.
+            "type": "dispense_buy",
+            "status": "filled",
+            "qty": float(quantity),
+            "filled_qty": float(quantity),
+            "limit_price": float(average_price),
+            "avg_fill_price": float(average_price),
+            "fee": float(fee_btc) if fee_btc is not None else None,
+            "fee_asset": "BTC" if fee_btc is not None else None,
+            "total_after_fee": float(total_cost_btc),
+            "created_at": block_time,
+            "updated_at": block_time,
+            # Extra read-only audit fields are returned by the direct history
+            # endpoint. The existing VenueOrderRow schema intentionally stores
+            # only the normalized unified-order fields above in CP-ORDERS.1.
+            "counterparty_event": "DISPENSE",
+            "counterparty_txid": txid,
+            "counterparty_dispense_index": int(dispense_index) if dispense_index is not None else None,
+            "counterparty_block_index": int(block_index) if block_index is not None else None,
+            "counterparty_buyer": buyer or expected_buyer,
+            "counterparty_dispenser": str(self._first_present(row, ("source", "dispenser", "seller")) or "").strip() or None,
+            "counterparty_dispenser_tx_hash": str(self._first_present(row, ("dispenser_tx_hash", "dispenserTxHash")) or "").strip() or None,
+            "counterparty_gross_satoshis": int(gross_satoshis) if gross_satoshis is not None else None,
+            "counterparty_fee_satoshis": int(fee_satoshis) if fee_satoshis is not None else None,
+            "counterparty_confirmed": True,
+            "counterparty_raw_dispense": row,
+            "counterparty_raw_transaction": tx or None,
+        }
+
+    def get_confirmed_dispense_orders(self, address: str, limit: int = 200) -> Dict[str, Any]:
+        """Return normalized, confirmed buyer-side dispenser purchases.
+
+        Read-only source of truth:
+          /v2/addresses/{address}/dispenses/receives
+
+        Transaction metadata is joined from confirmed Counterparty transaction
+        rows to obtain Bitcoin block time and miner fee without using browser
+        broadcast state or localStorage.
+        """
+        buyer = str(address or "").strip()
+        if not buyer:
+            raise ValueError("address is required for Counterparty confirmed dispense history")
+
+        lim = self._history_limit(limit)
+        addr = quote(buyer, safe="")
+        dispenses = self._first_ok([
+            (
+                f"/v2/addresses/{addr}/dispenses/receives",
+                {
+                    "limit": lim,
+                    "sort": "block_index:desc,dispense_index:desc",
+                    "verbose": True,
+                },
+            ),
+        ])
+        if not dispenses.get("ok"):
+            return {
+                **dispenses,
+                "address": buyer,
+                "items": [],
+                "count": 0,
+                "read_only": True,
+                "database_mutation": False,
+            }
+
+        tx_by_hash, tx_result = self._confirmed_transaction_map(buyer, limit=lim)
+        normalized: List[Dict[str, Any]] = []
+        looked_up = 0
+        lookup_limit = self._history_lookup_limit()
+
+        for raw_row in self._items_from_payload(dispenses.get("raw")):
+            txid = str(self._first_present(raw_row, ("tx_hash", "txid", "hash")) or "").strip().lower()
+            tx = tx_by_hash.get(txid)
+            if tx is None and looked_up < lookup_limit:
+                tx = self._transaction_detail(txid)
+                looked_up += 1
+                if tx:
+                    tx_by_hash[txid] = tx
+
+            item = self._normalize_confirmed_dispense_order(
+                raw_row,
+                buyer_address=buyer,
+                transaction=tx,
+            )
+            if item:
+                normalized.append(item)
+
+        # Current UTT dispenser compose creates one buyer-side dispense per
+        # Bitcoin transaction. Dedupe by txid to make repeated Sync+Load calls
+        # deterministic and idempotent against VenueOrderRow's 64-char key.
+        best_by_txid: Dict[str, Dict[str, Any]] = {}
+        for item in normalized:
+            txid = str(item.get("venue_order_id") or "")
+            if txid and txid not in best_by_txid:
+                best_by_txid[txid] = item
+
+        items = list(best_by_txid.values())
+        return {
+            "ok": True,
+            "venue": self.venue,
+            "address": buyer,
+            "count": len(items),
+            "items": items,
+            "dispense_source_path": dispenses.get("path"),
+            "transaction_source_path": tx_result.get("path") if isinstance(tx_result, dict) else None,
+            "transaction_detail_lookups": int(looked_up),
+            "read_only": True,
+            "database_mutation": False,
+            "browser_state_required": False,
+        }
+
+    def fetch_orders(self, dry_run: bool = False) -> List[Dict[str, Any]]:
+        """Exchange-adapter contract used by venue-order Sync+Load.
+
+        This fetch is chain-derived and read-only. Persistence is performed by
+        the existing venue_orders service, which upserts on
+        (venue='counterparty', venue_order_id=confirmed Bitcoin txid).
+        """
+        address = self._history_source_address()
+        if not address:
+            raise ValueError(
+                "COUNTERPARTY_SOURCE_ADDRESS is required for Counterparty All Orders history sync"
+            )
+        result = self.get_confirmed_dispense_orders(
+            address=address,
+            limit=self._history_limit(),
+        )
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"Counterparty confirmed dispense history failed: {result.get('errors') or result}"
+            )
+        return [dict(item) for item in (result.get("items") or []) if isinstance(item, dict)]
+
     def get_address_sends(self, address: str, limit: int = 50) -> Dict[str, Any]:
         addr = quote(str(address or "").strip(), safe="")
         lim = max(1, min(int(limit or 50), 500))

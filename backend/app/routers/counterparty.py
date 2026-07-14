@@ -148,6 +148,18 @@ def counterparty_address_asset_balance(address: str, asset: str) -> Dict[str, An
     return result
 
 
+@router.get("/address/{address}/dispense_orders")
+def counterparty_address_dispense_orders(
+    address: str,
+    limit: int = Query(default=200, ge=1, le=500),
+) -> Dict[str, Any]:
+    """Return confirmed buyer-side dispenser purchases without DB mutation."""
+    return _raise_if_failed(
+        _adapter().get_confirmed_dispense_orders(address=address, limit=limit),
+        label="counterparty_confirmed_dispense_orders_failed",
+    )
+
+
 @router.get("/address/{address}/sends")
 def counterparty_address_sends(
     address: str,

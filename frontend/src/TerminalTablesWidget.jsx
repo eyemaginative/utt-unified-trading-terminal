@@ -4509,6 +4509,17 @@ async function refreshSolanaOnchainBalances() {
     title: "",
   }));
 
+  const [counterpartyDetailsRow, setCounterpartyDetailsRow] = useState(null);
+
+  function openCounterpartyDetails(o) {
+    if (!o) return;
+    setCounterpartyDetailsRow(o);
+  }
+
+  function closeCounterpartyDetails() {
+    setCounterpartyDetailsRow(null);
+  }
+
   function closeCancelModal() {
     setCancelModal({ open: false, kind: "", row: null, title: "" });
   }
@@ -5113,6 +5124,29 @@ const bucket = orderBucket(o);
 
     if (col === COLS.actions) {
       const terminal = isTerminalBucket?.(bucket) || isTerminalStatus?.(st);
+      const venueLower = String(o?.venue || "").trim().toLowerCase();
+      const typeLower = String(o?.type || "").trim().toLowerCase();
+      const isCounterpartyDispense =
+        venueLower === "counterparty" &&
+        (typeLower === "dispenser_purchase" || typeLower === "dispense_buy");
+
+      // Confirmed dispenser purchases are terminal chain activity. They expose
+      // Details instead of even a disabled Cancel action.
+      if (isCounterpartyDispense) {
+        return (
+          <td style={td}>
+            <button
+              data-no-drag="1"
+              style={btn?.(false) ?? smallBtn(false)}
+              disabled={!!hideTableDataGlobal}
+              onClick={() => openCounterpartyDetails(o)}
+              title="View confirmed Counterparty dispense transaction details"
+            >
+              Details
+            </button>
+          </td>
+        );
+      }
 
       const src = String(o.source || "").toUpperCase().trim();
       const cancelRef = String(o.cancel_ref || o.cancelRef || "").trim();
@@ -8374,6 +8408,110 @@ function renderFillToasts() {
   }
 
   // Cancel confirmation modal (rendered over widget)
+  function renderCounterpartyOrderDetailsModal() {
+    const o = counterpartyDetailsRow;
+    if (!o) return null;
+
+    const txid = String(o?.transaction_id || o?.txid || o?.venue_order_id || "").trim();
+    const symbol = String(o?.symbol || o?.symbol_canon || o?.symbol_venue || "—");
+    const status = normalizeStatus(pickOrderStatus(o)) || "—";
+    const qty = o?.filled_qty ?? o?.qty;
+    const avgPrice = o?.avg_fill_price ?? o?.limit_price;
+    const gross = calcGrossTotal?.(o);
+    const fee = calcFee?.(o);
+    const total = calcNetTotal?.(o);
+    const closed = o?.closed_at ? fmtTime?.(o.closed_at) : o?.updated_at ? fmtTime?.(o.updated_at) : "—";
+
+    const overlay = {
+      position: "absolute",
+      left: 0,
+      top: 0,
+      width: "100%",
+      height: "100%",
+      background: "rgba(0,0,0,0.55)",
+      zIndex: 108,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 12,
+    };
+    const card = {
+      width: "min(720px, 100%)",
+      border: `1px solid ${pal.border}`,
+      background: pal.widgetBg,
+      borderRadius: 12,
+      boxShadow: `0 18px 40px ${pal.shadow}`,
+      padding: 16,
+      color: pal.text,
+    };
+    const detailRow = {
+      display: "grid",
+      gridTemplateColumns: "170px minmax(0, 1fr)",
+      gap: 10,
+      alignItems: "start",
+      fontSize: 12,
+      padding: "5px 0",
+    };
+    const valueStyle = { color: pal.text, overflowWrap: "anywhere" };
+
+    const copyTxid = async () => {
+      if (!txid) return;
+      try {
+        await navigator.clipboard.writeText(txid);
+      } catch {
+        // Clipboard is best-effort; the full txid remains visible for manual copy.
+      }
+    };
+
+    return (
+      <div
+        data-no-drag="1"
+        style={overlay}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          closeCounterpartyDetails();
+        }}
+      >
+        <div data-no-drag="1" style={card} onPointerDown={(e) => e.stopPropagation()}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
+            <div>
+              <div style={{ fontSize: 17, fontWeight: 900 }}>Counterparty Dispense Purchase</div>
+              <div style={{ ...sx.muted, fontSize: 12, marginTop: 3 }}>
+                Confirmed chain-derived activity. No cancel, signing, broadcast, ledger, FIFO, or basis action is available here.
+              </div>
+            </div>
+            <button data-no-drag="1" style={btn?.(false) ?? smallBtn(false)} onClick={closeCounterpartyDetails}>
+              Close
+            </button>
+          </div>
+
+          <div style={detailRow}><span style={sx.muted}>Venue</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : "counterparty"}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Source</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : (o?.source || "Counterparty dispense")}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Symbol</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : symbol}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Side / Type</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : `${o?.side || "buy"} / ${o?.type || "dispenser_purchase"}`}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Status</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : status}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Quantity / Filled</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : fmtEcoHi(qty)}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Average price</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : `${fmtEcoHi(avgPrice)} BTC`}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Gross dispenser payment</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : `${fmtEcoHi(gross)} BTC`}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Bitcoin network fee</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : fee == null ? "—" : `${fmtEcoHi(fee)} BTC`}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Total BTC cost</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : total == null ? "—" : `${fmtEcoHi(total)} BTC`}</b></div>
+          <div style={detailRow}><span style={sx.muted}>Confirmed / Closed</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : closed}</b></div>
+          <div style={detailRow}>
+            <span style={sx.muted}>Bitcoin transaction ID</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", flexWrap: "wrap" }}>
+              <code style={{ ...valueStyle, fontSize: 11 }}>{hideTableDataGlobal ? "••••" : txid || "—"}</code>
+              {!hideTableDataGlobal && txid ? (
+                <button data-no-drag="1" style={btn?.(false) ?? smallBtn(false)} onClick={copyTxid} title="Copy transaction ID">
+                  Copy TxID
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderCancelConfirmModal() {
     if (!cancelModal.open) return null;
 
@@ -8815,6 +8953,7 @@ function renderFillToasts() {
 
       {/* Modal overlays */}
       {renderManualCancelModal()}
+      {renderCounterpartyOrderDetailsModal()}
       {renderCancelConfirmModal()}
 
       {/* Floating windows */}

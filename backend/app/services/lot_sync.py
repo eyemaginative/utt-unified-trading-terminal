@@ -16,6 +16,11 @@ from ..models_lot_journal import LotJournal
 
 SYNC_MODES = ["ALL", "LOCAL", "VENUE", "DEPOSITS", "WITHDRAWALS"]
 
+# CP-ORDERS.1 visibility is intentionally separated from accounting.
+# Counterparty order snapshots must not create LotJournal rows, BasisLot rows,
+# FIFO consumption, or basis mutations before CP-LEDGER.1 dry-run review.
+_LEDGER_VENUE_EXCLUSIONS = {"counterparty"}
+
 
 def _dt_utcnow() -> datetime:
     return datetime.utcnow()
@@ -425,6 +430,8 @@ def sync_lots_from_activity(
         "dry_run": bool(dry_run),
         "limit": int(limit),
         "wallet_id": wallet_id,
+        "policy_excluded_venues": sorted(_LEDGER_VENUE_EXCLUSIONS),
+        "counterparty_accounting_policy": "blocked_until_cp_ledger_1",
     }
 
     created = 0
@@ -435,6 +442,7 @@ def sync_lots_from_activity(
     skipped_already_applied = 0
     skipped_missing_data = 0
     skipped_unknown_side = 0
+    skipped_policy_excluded = 0
 
     errors: List[str] = []
 
@@ -442,13 +450,15 @@ def sync_lots_from_activity(
     next_cursor: Optional[str] = None
 
     def _bump_skip(reason: Optional[str]) -> None:
-        nonlocal skipped, skipped_already_applied, skipped_missing_data, skipped_unknown_side
+        nonlocal skipped, skipped_already_applied, skipped_missing_data, skipped_unknown_side, skipped_policy_excluded
         skipped += 1
         r = str(reason or "").strip().lower()
         if r == "already_applied":
             skipped_already_applied += 1
         elif r == "unknown_side":
             skipped_unknown_side += 1
+        elif r == "venue_policy_excluded":
+            skipped_policy_excluded += 1
         else:
             # default bucket for anything data-related / guardrail-related:
             # - missing venue/symbol/side/base
@@ -484,6 +494,9 @@ def sync_lots_from_activity(
                 v = _norm_venue(getattr(order, "venue", None))
                 side = str(getattr(order, "side", "") or "").strip().lower()
                 base = _parse_base_asset(getattr(order, "symbol_canon", None), getattr(order, "symbol_venue", None))
+                if v in _LEDGER_VENUE_EXCLUSIONS:
+                    _bump_skip("venue_policy_excluded")
+                    continue
                 if not v or not side or not base:
                     _bump_skip("missing_data")
                     continue
@@ -563,6 +576,11 @@ def sync_lots_from_activity(
 
         try:
             q = select(VenueOrderRow).where(executed_expr)
+
+            # CP-ORDERS.1: Counterparty history is visible in All Orders but is
+            # quarantined from LotJournal/BasisLot/FIFO processing until the
+            # separate CP-LEDGER.1 accounting policy is reviewed and enabled.
+            q = q.where(~func.lower(VenueOrderRow.venue).in_(sorted(_LEDGER_VENUE_EXCLUSIONS)))
 
             # IMPORTANT: The lightweight /api/ledger/sync endpoint only processes a single batch.
             # If historical rows get "re-touched" (updated_at changes), they float into the newest
@@ -709,6 +727,7 @@ def sync_lots_from_activity(
             "skipped_already_applied": int(skipped_already_applied),
             "skipped_missing_data": int(skipped_missing_data),
             "skipped_unknown_side": int(skipped_unknown_side),
+            "skipped_policy_excluded": int(skipped_policy_excluded),
             "errors": errors,
             "rows_fetched": int(rows_fetched),
             "next_cursor": next_cursor,

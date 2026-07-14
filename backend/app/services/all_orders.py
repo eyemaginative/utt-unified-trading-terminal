@@ -474,8 +474,16 @@ def _to_unified_local(o: Order) -> Dict[str, Any]:
 def _to_unified_venue(v: VenueOrderRow) -> Dict[str, Any]:
     closed_at, closed_at_inferred = _closed_at_venue(v.status, v.created_at, v.updated_at)
     view_key = _view_key_venue(v)
+
+    venue_norm = _norm_venue(v.venue)
+    type_norm = str(v.type or "").strip().lower()
+    is_counterparty_dispense = venue_norm == "counterparty" and type_norm == "dispense_buy"
+    display_source = "Counterparty dispense" if is_counterparty_dispense else v.venue
+    display_type = "dispenser_purchase" if is_counterparty_dispense else v.type
+    transaction_id = str(v.venue_order_id or "").strip() if is_counterparty_dispense else None
+
     return {
-        "source": v.venue,
+        "source": display_source,
         "venue": v.venue,
         "id": v.id,
         "venue_order_id": v.venue_order_id,
@@ -484,7 +492,7 @@ def _to_unified_venue(v: VenueOrderRow) -> Dict[str, Any]:
         "symbol_canon": v.symbol_canon,
         "symbol_venue": v.symbol_venue,
         "side": v.side,
-        "type": v.type,
+        "type": display_type,
         "status": v.status,
         "status_bucket": _status_bucket(v.status),
         "qty": float(v.qty) if v.qty is not None else None,
@@ -506,6 +514,11 @@ def _to_unified_venue(v: VenueOrderRow) -> Dict[str, Any]:
         # cancelability (filled later, after enrichment/hydration)
         "can_cancel": False,
         "cancel_ref": None,
+        # CP-ORDERS.1 audit/display aliases. The confirmed Bitcoin txid is the
+        # stable VenueOrderRow identity for UTT-generated one-dispense transactions.
+        "transaction_id": transaction_id,
+        "txid": transaction_id,
+        "counterparty_activity": "DISPENSE" if is_counterparty_dispense else None,
     }
 
 

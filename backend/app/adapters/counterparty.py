@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
@@ -44,6 +44,13 @@ class CounterpartyAdapter:
             "label": "Fast",
             "target_note": "Target approximately 2 blocks; confirmation time is not guaranteed.",
         },
+    }
+
+    _FEE_RATE_FALLBACK_DEFAULT_URL = "https://mempool.space/api/v1/fees/recommended"
+    _FEE_RATE_FALLBACK_FIELDS: Dict[str, Tuple[str, ...]] = {
+        "slow": ("economyFee", "minimumFee", "hourFee"),
+        "normal": ("hourFee", "halfHourFee", "fastestFee"),
+        "fast": ("fastestFee", "halfHourFee", "hourFee"),
     }
 
     _EXECUTION_MODES = {"auto", "dispenser", "limit_order"}
@@ -2910,6 +2917,233 @@ class CounterpartyAdapter:
             "read_only": True,
         }
 
+    def _compose_fee_rate_fallback(self, fee_policy: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch a positive explicit sat/vB fallback for a zero-fee compose.
+
+        Counterparty Core normally resolves ``confirmation_target`` through its
+        Bitcoin backend.  Some backends can return a zero feerate while still
+        producing a syntactically valid unsigned transaction.  UTT never signs
+        that result.  For protocol-order previews only, this read-only fallback
+        may query a recommended-fee endpoint and retry compose with an explicit
+        ``sat_per_vbyte`` value.
+
+        The fallback is operator-configurable and can be disabled with
+        ``COUNTERPARTY_FEE_RATE_FALLBACK_ENABLED=0``.
+        """
+        enabled = self._env_bool("COUNTERPARTY_FEE_RATE_FALLBACK_ENABLED", True)
+        tier = str((fee_policy or {}).get("fee_tier") or "normal").strip().lower()
+        base = {
+            "ok": False,
+            "enabled": bool(enabled),
+            "fee_tier": tier,
+            "source": None,
+            "url": None,
+            "field": None,
+            "sat_per_vbyte": None,
+            "error": None,
+            "read_only": True,
+        }
+        if not enabled:
+            return {**base, "error": "fee_rate_fallback_disabled"}
+
+        raw_url = str(
+            os.getenv("COUNTERPARTY_FEE_RATE_FALLBACK_URL")
+            or self._FEE_RATE_FALLBACK_DEFAULT_URL
+        ).strip()
+        safe_url = self._safe_external_url(raw_url)
+        if not safe_url:
+            return {**base, "url": raw_url or None, "error": "unsafe_or_unsupported_fee_rate_url"}
+
+        timeout_s = self._env_float(
+            "COUNTERPARTY_FEE_RATE_FALLBACK_TIMEOUT_S",
+            6.0,
+            min_value=1.0,
+            max_value=20.0,
+        )
+        max_rate = self._env_int(
+            "COUNTERPARTY_FEE_RATE_FALLBACK_MAX_SAT_VB",
+            5000,
+            min_value=1,
+            max_value=100000,
+        )
+        try:
+            with httpx.Client(
+                timeout=timeout_s,
+                headers={
+                    "accept": "application/json",
+                    "user-agent": "UTT Counterparty fee preview/1.0",
+                },
+                follow_redirects=True,
+            ) as client:
+                response = client.get(safe_url)
+            if response.status_code >= 400:
+                return {
+                    **base,
+                    "url": safe_url,
+                    "source": str(urlparse(safe_url).netloc or "fee_rate_api"),
+                    "error": f"http_{response.status_code}",
+                }
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return {
+                    **base,
+                    "url": safe_url,
+                    "source": str(urlparse(safe_url).netloc or "fee_rate_api"),
+                    "error": "fee_rate_response_not_object",
+                }
+        except Exception as e:
+            return {
+                **base,
+                "url": safe_url,
+                "source": str(urlparse(safe_url).netloc or "fee_rate_api"),
+                "error": str(e)[:300],
+            }
+
+        chosen_field = None
+        chosen_value = None
+        for field in self._FEE_RATE_FALLBACK_FIELDS.get(
+            tier,
+            self._FEE_RATE_FALLBACK_FIELDS["normal"],
+        ):
+            value = self._as_float(payload.get(field))
+            if value is None or value <= 0:
+                continue
+            chosen_field = field
+            chosen_value = value
+            break
+
+        if chosen_value is None or chosen_field is None:
+            return {
+                **base,
+                "url": safe_url,
+                "source": str(urlparse(safe_url).netloc or "fee_rate_api"),
+                "error": "no_positive_fee_rate_for_tier",
+            }
+
+        sat_per_vbyte = int(
+            Decimal(str(chosen_value)).to_integral_value(rounding=ROUND_CEILING)
+        )
+        if sat_per_vbyte <= 0:
+            return {
+                **base,
+                "url": safe_url,
+                "source": str(urlparse(safe_url).netloc or "fee_rate_api"),
+                "field": chosen_field,
+                "error": "non_positive_fee_rate",
+            }
+        if sat_per_vbyte > max_rate:
+            return {
+                **base,
+                "url": safe_url,
+                "source": str(urlparse(safe_url).netloc or "fee_rate_api"),
+                "field": chosen_field,
+                "sat_per_vbyte": sat_per_vbyte,
+                "error": "fee_rate_above_operator_cap",
+            }
+
+        return {
+            **base,
+            "ok": True,
+            "url": safe_url,
+            "source": str(urlparse(safe_url).netloc or "fee_rate_api"),
+            "field": chosen_field,
+            "sat_per_vbyte": sat_per_vbyte,
+            "error": None,
+        }
+
+    def _compose_retry_zero_fee_order(
+        self,
+        *,
+        compose_kind: str,
+        candidates: List[Dict[str, Any]],
+        compose_probe: Dict[str, Any],
+        fee_policy: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+        """Retry a successful zero-fee protocol order with explicit sat/vB.
+
+        The original compose result remains the audit baseline unless the retry
+        also succeeds and returns a positive transaction-specific ``btc_fee``.
+        This helper never signs, broadcasts, persists, or mutates wallet state.
+        """
+        diagnostics: Dict[str, Any] = {
+            "attempted": False,
+            "used": False,
+            "status": "not_needed",
+            "reason": None,
+            "initial_network_fee_satoshis": None,
+            "fallback": None,
+            "retry_network_fee_satoshis": None,
+            "retry_adjusted_vsize": None,
+            "read_only": True,
+        }
+        retry_candidates: List[Dict[str, Any]] = []
+
+        if compose_kind != "order" or not compose_probe.get("ok"):
+            return compose_probe, diagnostics, retry_candidates
+
+        initial_fee = self._compose_network_fee_info(compose_probe.get("raw"))
+        initial_fee_sats = self._as_int(initial_fee.get("satoshis"))
+        diagnostics["initial_network_fee_satoshis"] = initial_fee_sats
+        if initial_fee_sats != 0:
+            return compose_probe, diagnostics, retry_candidates
+
+        diagnostics["attempted"] = True
+        diagnostics["status"] = "zero_fee_detected"
+        diagnostics["reason"] = "counterparty_core_returned_zero_fee"
+
+        fallback = self._compose_fee_rate_fallback(fee_policy)
+        diagnostics["fallback"] = fallback
+        if not fallback.get("ok"):
+            diagnostics["status"] = "fee_rate_fallback_unavailable"
+            diagnostics["reason"] = fallback.get("error") or "fee_rate_fallback_unavailable"
+            return compose_probe, diagnostics, retry_candidates
+
+        sat_per_vbyte = self._as_int(fallback.get("sat_per_vbyte"))
+        if sat_per_vbyte is None or sat_per_vbyte <= 0:
+            diagnostics["status"] = "fee_rate_fallback_invalid"
+            diagnostics["reason"] = "fee_rate_fallback_invalid"
+            return compose_probe, diagnostics, retry_candidates
+
+        for candidate in candidates or []:
+            params = dict(candidate.get("params") or {})
+            params.pop("confirmation_target", None)
+            params["sat_per_vbyte"] = int(sat_per_vbyte)
+            retry_candidate = {
+                **candidate,
+                "params": params,
+                "fee_retry": {
+                    "reason": "counterparty_core_returned_zero_fee",
+                    "fee_rate_source": fallback.get("source"),
+                    "fee_rate_field": fallback.get("field"),
+                    "sat_per_vbyte": int(sat_per_vbyte),
+                    "read_only": True,
+                },
+            }
+            retry_candidates.append(retry_candidate)
+
+        retry_probe = self._compose_try_candidates(retry_candidates)
+        if not retry_probe.get("ok"):
+            diagnostics["status"] = "explicit_fee_recompose_failed"
+            diagnostics["reason"] = "explicit_sat_per_vbyte_compose_failed"
+            diagnostics["retry_errors"] = retry_probe.get("errors") or []
+            return compose_probe, diagnostics, retry_candidates
+
+        retry_fee = self._compose_network_fee_info(retry_probe.get("raw"))
+        retry_fee_sats = self._as_int(retry_fee.get("satoshis"))
+        retry_size = self._compose_size_info(retry_probe.get("raw"))
+        diagnostics["retry_network_fee_satoshis"] = retry_fee_sats
+        diagnostics["retry_adjusted_vsize"] = self._as_int(retry_size.get("adjusted_vsize"))
+
+        if retry_fee_sats is None or retry_fee_sats <= 0:
+            diagnostics["status"] = "explicit_fee_recompose_still_invalid"
+            diagnostics["reason"] = "explicit_sat_per_vbyte_returned_non_positive_fee"
+            return compose_probe, diagnostics, retry_candidates
+
+        diagnostics["used"] = True
+        diagnostics["status"] = "explicit_fee_recompose_succeeded"
+        diagnostics["reason"] = None
+        return retry_probe, diagnostics, retry_candidates
+
     @classmethod
     def _compose_size_info(cls, payload: Any) -> Dict[str, Any]:
         """Extract Counterparty Core's signed-size estimate from a verbose compose result."""
@@ -3609,6 +3843,22 @@ class CounterpartyAdapter:
                     "errors": [],
                 }
 
+        fee_recompose_diagnostics: Dict[str, Any] = {
+            "attempted": False,
+            "used": False,
+            "status": "not_needed",
+            "reason": None,
+            "read_only": True,
+        }
+        fee_retry_candidates: List[Dict[str, Any]] = []
+        if attempt_upstream and candidates:
+            compose_probe, fee_recompose_diagnostics, fee_retry_candidates = self._compose_retry_zero_fee_order(
+                compose_kind=compose_kind,
+                candidates=candidates,
+                compose_probe=compose_probe,
+                fee_policy=fee_policy,
+            )
+
         funding_requirements = self._compose_funding_requirements(
             compose_kind=compose_kind,
             quote_asset=quote_asset,
@@ -3618,6 +3868,14 @@ class CounterpartyAdapter:
             compose_probe=compose_probe,
             fee_policy=fee_policy,
         )
+        funding_requirements["fee_recompose"] = fee_recompose_diagnostics
+        if fee_recompose_diagnostics.get("used"):
+            fallback_row = fee_recompose_diagnostics.get("fallback") or {}
+            funding_requirements["fee_estimator_primary"] = funding_requirements.get("fee_estimator")
+            funding_requirements["fee_estimator"] = "explicit_sat_per_vbyte_fallback"
+            funding_requirements["fee_rate_source"] = fallback_row.get("source")
+            funding_requirements["fee_rate_source_field"] = fallback_row.get("field")
+            funding_requirements["fee_rate_requested_sat_per_vbyte"] = fallback_row.get("sat_per_vbyte")
         if execution_mode_norm == "dispenser" and not (selected_lot_context and selected_lot_context.get("valid")):
             rejection_reasons = list((provided_level_validation or {}).get("reasons") or [])
             supplied_lot_valid = bool(supplied_lot_context and supplied_lot_context.get("valid"))
@@ -3637,6 +3895,20 @@ class CounterpartyAdapter:
                     "No payment was derived from the rounded OrderBook price and signing remains blocked."
                 )
                 funding_requirements["funding_scope"] = "dispenser_lot_validation"
+        if fee_recompose_diagnostics.get("used"):
+            fallback_row = fee_recompose_diagnostics.get("fallback") or {}
+            warnings.append(
+                "Counterparty Core first returned a zero-satoshi miner fee for this protocol order. "
+                f"UTT fetched {fallback_row.get('sat_per_vbyte')} sat/vB from "
+                f"{fallback_row.get('source') or 'the configured fee-rate endpoint'} and recomposed "
+                "with explicit sat_per_vbyte. The retry remained unsigned and was not broadcast."
+            )
+        elif fee_recompose_diagnostics.get("attempted"):
+            warnings.append(
+                "Counterparty Core returned a zero-satoshi protocol-order fee and the explicit fee-rate "
+                "recompose fallback did not produce a positive fee. Signing remains blocked."
+            )
+
         wallet_signing_handoff = self._compose_wallet_signing_handoff(
             compose_probe,
             source_address=source,
@@ -3689,6 +3961,8 @@ class CounterpartyAdapter:
             ),
             "auto_selection_diagnostics": auto_selection_diagnostics,
             "candidate_requests": candidates,
+            "fee_retry_candidate_requests": fee_retry_candidates,
+            "fee_recompose": fee_recompose_diagnostics,
             "attempted_upstream": bool(attempt_upstream),
             "compose_ok": bool(compose_probe.get("ok")),
             "compose_result": compose_probe.get("raw") if compose_probe.get("ok") else None,

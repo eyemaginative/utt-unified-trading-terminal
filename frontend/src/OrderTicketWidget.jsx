@@ -478,6 +478,41 @@ function counterpartySigningHandoffView(payload) {
 }
 
 
+function counterpartySubmitResultTitle(payload, kind, requestedTitle = "") {
+  const explicit = String(requestedTitle || "").trim();
+  if (!payload || typeof payload !== "object" || !isCounterpartyVenueKey(payload?.venue)) {
+    return explicit || (kind === "error" ? "Order Submit Failed" : "Order Submit Result");
+  }
+
+  if (payload?.signed === true && payload?.broadcast !== true) {
+    return "Counterparty Transaction Signed — Not Broadcast";
+  }
+  if (payload?.broadcast === true) {
+    return "Counterparty Transaction Broadcast";
+  }
+
+  const genericTitles = new Set([
+    "",
+    "Order Submitted",
+    "Order Submit Result",
+    "Order Submitted — Refreshing Venue State",
+    "Order Submitted — Venue State Refreshed",
+    "Order Submitted — Refresh Needs Retry",
+  ]);
+  if (explicit && !genericTitles.has(explicit)) return explicit;
+
+  if (kind === "error") {
+    return payload?.signing_error
+      ? "Counterparty UniSat Signing Failed"
+      : "Counterparty Compose Failed";
+  }
+
+  const handoff = counterpartySigningHandoffView(payload);
+  if (handoff?.canSign) return "Counterparty Compose Ready — Review Before UniSat Signing";
+  if (payload?.compose_ok === true) return "Unsigned Counterparty Compose Preview";
+  return "Counterparty Compose Request Preview";
+}
+
 async function counterpartyUniSatMainnetStatus(provider) {
   if (!provider) return { ok: false, label: "UniSat unavailable" };
   try {
@@ -573,6 +608,12 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
   const remainingAfterRequiredSats = availableSats !== null && requiredSats !== null
     ? availableSats - requiredSats
     : null;
+  const feeRecompose = funding?.fee_recompose && typeof funding.fee_recompose === "object"
+    ? funding.fee_recompose
+    : {};
+  const feeRecomposeFallback = feeRecompose?.fallback && typeof feeRecompose.fallback === "object"
+    ? feeRecompose.fallback
+    : {};
 
   return {
     status,
@@ -602,6 +643,14 @@ function counterpartyFundingSummaryView(payload, opts = {}) {
     estimatedVsize,
     estimatedAdjustedVsize,
     feeEstimator: String(funding?.fee_estimator || payload?.fee_policy?.estimator || "").trim(),
+    feeRecomposeAttempted: feeRecompose?.attempted === true,
+    feeRecomposeUsed: feeRecompose?.used === true,
+    feeRecomposeStatus: String(feeRecompose?.status || "").trim(),
+    feeRateSource: String(funding?.fee_rate_source || feeRecomposeFallback?.source || "").trim(),
+    feeRateSourceField: String(funding?.fee_rate_source_field || feeRecomposeFallback?.field || "").trim(),
+    feeRateRequestedSatPerVbyte: otCounterpartyFiniteNumberOrNull(
+      funding?.fee_rate_requested_sat_per_vbyte ?? feeRecomposeFallback?.sat_per_vbyte
+    ),
     requiredSats,
     requiredBtc: counterpartyBtcFromSatoshis(requiredSats),
     remainingAfterTradeSats,
@@ -5602,7 +5651,8 @@ export default function OrderTicketWidget({
 
   // NEW: helper to open the submission result modal deterministically
   function openSubmitResultModal(kind, payload, title, opts = {}) {
-    const t = String(title || (kind === "error" ? "Order Submit Failed" : "Order Submit Result"));
+    const requestedTitle = String(title || (kind === "error" ? "Order Submit Failed" : "Order Submit Result"));
+    const t = counterpartySubmitResultTitle(payload, kind, requestedTitle);
     setSubmitResultKind(kind);
     setSubmitResultPayload(payload);
     setSubmitResultTitle(t);
@@ -8137,7 +8187,7 @@ async function submitLimitOrder() {
           Type: <b>{isCounterpartyVenue ? (isCounterpartyLimitOrderMode ? "Limit Order" : "Dispenser Purchase") : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
           {isSolanaLimitMode ? <> • Expiry: <b>{hideTableData ? "••••" : solanaExpiryLabel}</b></> : null}
           {isCounterpartyLimitOrderMode ? <> • Expiration: <b>{hideTableData ? "••••" : counterpartyExpirationLabel}</b></> : null}
-          {" "}• {isCounterpartyDispenserMode ? "Exact Payment" : "Est. Total"} ({totalLabel}): <b>{
+          {" "}• {isCounterpartyDispenserMode ? "Exact Payment" : isCounterpartyLimitOrderMode ? "Trade Commitment" : "Est. Total"} ({totalLabel}): <b>{
             isCounterpartyDispenserMode
               ? counterpartyExactDispenserTotalBtc === null
                 ? "—"
@@ -8150,6 +8200,7 @@ async function submitLimitOrder() {
                   ? fmtNum(notional)
                   : String(notional)
           }</b>
+          {isCounterpartyLimitOrderMode ? <> • Miner Fee: <b>calculated during preview</b></> : null}
         </div>
 
         <div style={{ marginTop: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -8205,7 +8256,11 @@ async function submitLimitOrder() {
                 openSubmitResultModal(
                   submitResultKind,
                   submitResultPayload,
-                  submitResultKind === "error" ? "Order Submit Failed" : "Order Submitted"
+                  counterpartySubmitResultTitle(
+                    submitResultPayload,
+                    submitResultKind,
+                    submitResultKind === "error" ? "Order Submit Failed" : "Order Submitted"
+                  )
                 )
               }
               title="View the last submit result"
@@ -8634,6 +8689,23 @@ async function submitLimitOrder() {
                               counterpartySubmitFunding.confirmationTargetBlocks ?? COUNTERPARTY_FEE_TIERS[counterpartySubmitFunding.feeTier]?.blocks ?? 6
                             } blocks`}
                       </div>
+
+                      {counterpartySubmitFunding.feeRecomposeUsed && (
+                        <>
+                          <div style={{ color: "#a9a9a9" }}>Fee estimator path</div>
+                          <div>
+                            {hideTableData
+                              ? "••••"
+                              : `Explicit sat/vB fallback · ${counterpartySubmitFunding.feeRateRequestedSatPerVbyte ?? "unknown"} sat/vB · ${
+                                  counterpartySubmitFunding.feeRateSource || "configured fee endpoint"
+                                }${
+                                  counterpartySubmitFunding.feeRateSourceField
+                                    ? ` (${counterpartySubmitFunding.feeRateSourceField})`
+                                    : ""
+                                }`}
+                          </div>
+                        </>
+                      )}
 
                       <div style={{ color: "#a9a9a9" }}>Bitcoin network fee</div>
                       <div>

@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 const LS_SOLANA_DETECTED_TOKENS_KEY = "utt_solana_detected_tokens_v1";
 
-const CHAIN_OPTIONS = ["solana", "polkadot", "hydration"];
+const CHAIN_OPTIONS = ["solana", "polkadot", "hydration", "counterparty"];
 const GENERIC_ADDRESS_LABEL = "Address / Mint / Asset ID";
 const GENERIC_ADDRESS_PLACEHOLDER = "Mint / contract address / asset ID";
 const EXTERNAL_PRICE_SOURCE_OPTIONS = ["", "stable", "coingecko", "derived", "none"];
@@ -654,11 +654,13 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     const s = String(symbol || "").trim();
     const a = String(address || "").trim();
     const d = String(decimals || "").trim();
-    if (!s || !a || !d) return false;
+    const counterpartyPriceMetadata = String(chain || "").trim().toLowerCase() === "counterparty";
+    if (!s || !d) return false;
+    if (!counterpartyPriceMetadata && !a) return false;
     const di = Number(d);
     if (!Number.isFinite(di) || di < 0 || di > 18) return false;
     return true;
-  }, [symbol, address, decimals]);
+  }, [chain, symbol, address, decimals]);
 
   const canUpsertRoute = useMemo(() => {
     const sym = String(routeSymbol || "").trim().toUpperCase();
@@ -882,8 +884,11 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     const s = String(editRow.symbol || "").trim();
     const a = String(editRow.address || "").trim();
     const d = Number(String(editRow.decimals || "").trim());
-    if (!s || !a || !Number.isFinite(d) || d < 0 || d > 18) {
-      setErr("Edit: symbol/identifier/decimals invalid.");
+    const counterpartyPriceMetadata = String(chain || "").trim().toLowerCase() === "counterparty";
+    if (!s || (!counterpartyPriceMetadata && !a) || !Number.isFinite(d) || d < 0 || d > 18) {
+      setErr(counterpartyPriceMetadata
+        ? "Edit: symbol/decimals invalid."
+        : "Edit: symbol/identifier/decimals invalid.");
       return;
     }
 
@@ -953,6 +958,29 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       setErr(null);
       try {
         const c = String(chain || "").trim().toLowerCase();
+        if (c === "counterparty") {
+          const params = new URLSearchParams({
+            assets: a.toUpperCase(),
+            limit: "1",
+            ttl_s: "300",
+            force_refresh: "true",
+          });
+          const r = await fetch(`${API_BASE}/api/market_metrics/summary?${params.toString()}`, {
+            method: "GET",
+            headers: { accept: "application/json" },
+          });
+          const j = await r.json().catch(() => null);
+          if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
+          const row = Array.isArray(j?.items)
+            ? j.items.find((item) => String(item?.asset || "").trim().toUpperCase() === a.toUpperCase())
+            : null;
+          if (!row) {
+            throw new Error(`No Market Metrics row returned for ${a.toUpperCase()}.`);
+          }
+          alert(`Price mapping:\n\nchain=counterparty\nsymbol=${row?.asset || a.toUpperCase()}\npriceUsd=${row?.price_usd ?? "—"}\nsource=${row?.price_source || row?.source || "—"}\nstatus=${row?.price_status || "—"}\nwarnings=${Array.isArray(row?.warnings) && row.warnings.length ? row.warnings.join(" | ") : "none"}`);
+          return;
+        }
+
         const resolvePath = c === "polkadot" || c === "hydration"
           ? "/api/polkadot_dex/resolve"
           : "/api/solana_dex/resolve";
@@ -1394,7 +1422,12 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         <div style={{ fontWeight: 700, marginBottom: 8 }}>Add token</div>
         <div style={addTokenGridStyle}>
           <input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="SYMBOL (e.g. UTTT)" style={inputStyle} />
-          <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder={GENERIC_ADDRESS_PLACEHOLDER} style={inputStyle} />
+          <input
+            value={address}
+            onChange={(e) => setAddress(e.target.value)}
+            placeholder={chain === "counterparty" ? "optional for protocol/global asset" : GENERIC_ADDRESS_PLACEHOLDER}
+            style={inputStyle}
+          />
           <input value={decimals} onChange={(e) => setDecimals(e.target.value)} placeholder="decimals" style={inputStyle} />
           <input value={venue} onChange={(e) => setVenue(e.target.value)} placeholder="venue override" style={inputStyle} />
           <select value={externalPriceSource} onChange={(e) => setExternalPriceSource(e.target.value)} style={selectStyle} title="External price source">
@@ -1408,7 +1441,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
           </button>
         </div>
         <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
-          Tip: leave “venue override” blank for global entries. For Hydration, use polkadot_hydration and put the asset ID (or native for HDX) in Address / Mint / Asset ID. Price source examples: HDX = CoinGecko / hydradx, DOT = CoinGecko / polkadot, USDT = Stable / stable, UTTT = Derived / UTTT-HDX×HDX-USD.
+          Tip: leave “venue override” blank for global entries. For Hydration, use polkadot_hydration and put the asset ID (or native for HDX) in Address / Mint / Asset ID. For Counterparty price metadata, the identifier may be blank; use XCP = CoinGecko / counterparty. Price source examples: HDX = CoinGecko / hydradx, DOT = CoinGecko / polkadot, USDT = Stable / stable, UTTT = Derived / UTTT-HDX×HDX-USD.
         </div>
         {chain !== "solana" && (
           <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
@@ -1853,7 +1886,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                       {!isEdit ? (
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                           <button type="button" style={btnStyle} onClick={() => testResolve(row.symbol)}>
-                            Test resolve
+                            {chain === "counterparty" ? "Test price" : "Test resolve"}
                           </button>
                           <button type="button" style={btnStyle} onClick={() => startEdit(row)}>
                             Edit

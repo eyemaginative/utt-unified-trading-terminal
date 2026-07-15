@@ -4764,6 +4764,52 @@ class CounterpartyAdapter:
             "read_only": True,
         }
 
+    def configured_source_address(self) -> str:
+        """Return the configured Counterparty source address without I/O."""
+        return self._history_source_address()
+
+
+    def get_configured_address_balances(self) -> Dict[str, Any]:
+        """Return read-only balances for the operator-configured source address.
+
+        CP-BAL.1 deliberately resolves the same configured address used by
+        confirmed Counterparty history ingestion.  No browser wallet state,
+        signing permission, database mutation, or balance mutation is required.
+        """
+        address = self._history_source_address()
+        if not address:
+            return {
+                "ok": False,
+                "error": "counterparty_source_address_missing",
+                "message": "COUNTERPARTY_SOURCE_ADDRESS is required for unified Counterparty balances",
+                "address": None,
+                "items": [],
+                "read_only": True,
+                "database_mutation": False,
+                "browser_state_required": False,
+            }
+
+        result = self.get_address_balances(address)
+        if not result.get("ok"):
+            return {
+                **result,
+                "address": address,
+                "items": [],
+                "read_only": True,
+                "database_mutation": False,
+                "browser_state_required": False,
+            }
+
+        return {
+            **result,
+            "address": address,
+            "configured_address": True,
+            "read_only": True,
+            "database_mutation": False,
+            "browser_state_required": False,
+        }
+
+
     def get_address_asset_balance(self, address: str, asset: str) -> Dict[str, Any]:
         asset_norm = str(asset or "").strip().upper()
         balances = self.get_address_balances(address)

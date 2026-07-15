@@ -1454,13 +1454,17 @@ function appNormalizeCounterpartyBalanceRows(payload, addressMaybe = "") {
     const available = appFiniteNumberOrNull(row?.available ?? row?.spendable ?? row?.free) ?? qty;
     const rowAddress = String(row?.address || row?.utxo_address || row?.utxoAddress || address || "").trim();
     const utxo = String(row?.utxo || row?.location || row?.output || "").trim();
+    const pxUsd = appFiniteNumberOrNull(row?.px_usd ?? row?.price_usd ?? row?.priceUsd);
+    const totalUsd = appFiniteNumberOrNull(row?.total_usd ?? row?.totalUsd) ?? (pxUsd !== null ? qty * pxUsd : null);
+    const availableUsd = appFiniteNumberOrNull(row?.available_usd ?? row?.availableUsd) ?? (pxUsd !== null ? available * pxUsd : null);
+    const holdUsd = appFiniteNumberOrNull(row?.hold_usd ?? row?.holdUsd) ?? (pxUsd !== null ? hold * pxUsd : null);
     return withBalanceBasisFields({
       ...row,
       venue: "counterparty",
-      source_type: "Counterparty wallet",
+      source_type: row?.source_type || "Counterparty configured address",
       network: "bitcoin",
       chain: "bitcoin",
-      wallet_id: "counterparty_unisat",
+      wallet_id: row?.wallet_id || "counterparty_default",
       address: rowAddress,
       wallet_address: rowAddress,
       utxo,
@@ -1470,33 +1474,88 @@ function appNormalizeCounterpartyBalanceRows(payload, addressMaybe = "") {
       total: qty,
       available,
       hold,
-      px_usd: null,
-      total_usd: null,
-      available_usd: null,
-      hold_usd: null,
-      usd_source_symbol: "—",
-      balance_status: "wallet_live",
-      basis_status: "not_loaded",
+      px_usd: pxUsd,
+      total_usd: totalUsd,
+      available_usd: availableUsd,
+      hold_usd: holdUsd,
+      usd_source_symbol: row?.usd_source_symbol || row?.price_source || "—",
+      price_status: row?.price_status || (pxUsd !== null ? "cached" : "unavailable"),
+      price_basis: row?.price_basis || null,
+      price_btc: appFiniteNumberOrNull(row?.price_btc),
+      price_updated_at: row?.price_updated_at || null,
+      price_warnings: Array.isArray(row?.price_warnings) ? row.price_warnings : [],
+      balance_status: row?.balance_status || "live",
+      balance_stale: row?.balance_stale === true,
+      captured_at: row?.captured_at || payload?.captured_at || null,
+      basis_status: row?.basis_status || "basis_missing",
+      basis_lot_count: row?.basis_lot_count ?? 0,
+      cost_basis_usd: row?.cost_basis_usd ?? null,
+      cost_avg_usd: row?.cost_avg_usd ?? null,
     });
   }).filter(Boolean);
 }
 
 async function appFetchCounterpartyPortfolioBalanceRows(opts = {}) {
   const allowPrompt = !!opts?.allowPrompt;
+  const forceRefresh = !!opts?.forceRefresh;
   const explicitAddress = String(opts?.address || "").trim();
-  const address = explicitAddress || (allowPrompt ? await appGetCounterpartyAddressWithPrompt() : await appGetCounterpartyAddressNoPrompt());
-  if (!address) return [];
 
+  let address = explicitAddress;
   let counterpartyRows = [];
-  try {
-    const data = await appFetchJson(`/api/counterparty/address/${encodeURIComponent(address)}/balances`);
-    counterpartyRows = appNormalizeCounterpartyBalanceRows(data, address);
-  } catch {
-    counterpartyRows = [];
+  let configuredPayload = null;
+  let configuredError = null;
+
+  // Preferred CP-BAL.1 path: backend-configured source address. This path is
+  // deterministic after restart and does not require UniSat or browser state.
+  if (!explicitAddress) {
+    try {
+      const qs = new URLSearchParams();
+      if (forceRefresh) qs.set("force_refresh", "true");
+      qs.set("derive_btc_prices", "true");
+      const data = await appFetchJson(`/api/counterparty/balances/portfolio?${qs.toString()}`);
+      configuredPayload = data;
+      address = String(data?.address || "").trim();
+      counterpartyRows = appNormalizeCounterpartyBalanceRows(data, address);
+    } catch (e) {
+      configuredError = e;
+    }
   }
 
-  const btcRow = await appFetchCounterpartyBtcBalanceRow(address, { allowPrompt });
-  if (!btcRow) return counterpartyRows;
+  // Compatibility fallback: an explicitly supplied or user-approved UniSat
+  // address can still use the existing read-only address endpoint.
+  if (counterpartyRows.length === 0 && (explicitAddress || allowPrompt)) {
+    address = explicitAddress || (allowPrompt ? await appGetCounterpartyAddressWithPrompt() : await appGetCounterpartyAddressNoPrompt());
+    if (address) {
+      try {
+        const data = await appFetchJson(`/api/counterparty/address/${encodeURIComponent(address)}/balances`);
+        counterpartyRows = appNormalizeCounterpartyBalanceRows(data, address);
+      } catch {
+        counterpartyRows = [];
+      }
+    }
+  }
+
+  if (!address && configuredError) throw configuredError;
+  if (!address) return counterpartyRows;
+
+  // BTC remains optional and browser-wallet sourced. Protocol asset balances
+  // above never depend on this row. Do not prompt unless the caller explicitly
+  // requested the compatibility fallback.
+  const btcRowRaw = await appFetchCounterpartyBtcBalanceRow(address, { allowPrompt });
+  if (!btcRowRaw) return counterpartyRows;
+
+  const btcUsd = appFiniteNumberOrNull(configuredPayload?.btc_usd);
+  const btcQty = appFiniteNumberOrNull(btcRowRaw?.total) ?? 0;
+  const btcRow = withBalanceBasisFields({
+    ...btcRowRaw,
+    px_usd: btcUsd,
+    total_usd: btcUsd !== null ? btcQty * btcUsd : null,
+    available_usd: btcUsd !== null ? btcQty * btcUsd : null,
+    hold_usd: btcUsd !== null ? 0 : null,
+    usd_source_symbol: btcUsd !== null ? (configuredPayload?.btc_usd_source || "BTC-USD") : (btcRowRaw?.usd_source_symbol || "—"),
+    price_status: btcUsd !== null ? "cached" : (btcRowRaw?.price_status || "unavailable"),
+    price_basis: btcUsd !== null ? "direct_usd" : (btcRowRaw?.price_basis || null),
+  });
 
   const hasBtc = (counterpartyRows || []).some((row) => String(row?.asset || "").trim().toUpperCase() === "BTC");
   return hasBtc ? counterpartyRows : [btcRow, ...counterpartyRows];
@@ -4124,22 +4183,16 @@ export default function App() {
       setError(null);
 
       if (isCounterpartyView) {
-        const address = await appGetCounterpartyAddressWithPrompt();
-        if (!address) {
-          if (balancesReqIdRef.current !== reqId) return;
-          setBalances([]);
-          setPortfolioTotalUsd(null);
-          setError("Counterparty balances need UniSat. Connect or unlock UniSat, then refresh Balances again.");
-          return;
-        }
-        const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows({ address, allowPrompt: true });
+        const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows({ forceRefresh: true, allowPrompt: false });
         if (balancesReqIdRef.current !== reqId) return;
         setBalances(counterpartyRows);
         const cpTotalUsd = appCounterpartyRowsTotalUsd(counterpartyRows);
         setPortfolioTotalUsd(cpTotalUsd);
         const btcRow = (counterpartyRows || []).find((row) => String(row?.asset || "").trim().toUpperCase() === "BTC");
         if (btcRow?.balance_stale) {
-          setError("Counterparty BTC is showing the last cached UniSat balance. Unlock/connect UniSat and refresh to update it live.");
+          setError("Counterparty protocol balances are live. BTC is showing the last cached UniSat balance; unlock/connect UniSat only when you want to refresh BTC.");
+        } else if (counterpartyRows.length === 0) {
+          setError("No positive Counterparty protocol balances were returned for COUNTERPARTY_SOURCE_ADDRESS.");
         }
         return;
       }

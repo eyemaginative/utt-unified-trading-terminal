@@ -5,10 +5,16 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from ..adapters.counterparty import CounterpartyAdapter
+from ..db import get_db
+from ..services.counterparty_ledger_preview import (
+    CounterpartyLedgerPreviewError,
+    build_counterparty_ledger_preview,
+)
 from ..services.market_metrics import get_market_metrics_summary
 
 router = APIRouter(prefix="/api/counterparty", tags=["counterparty"])
@@ -216,6 +222,46 @@ def counterparty_address_source() -> Dict[str, Any]:
 @router.get("/wallet_provider/unisat")
 def counterparty_unisat_provider() -> Dict[str, Any]:
     return _adapter().wallet_provider_info("unisat")
+
+
+@router.get("/ledger/preview")
+def counterparty_ledger_preview(
+    txid: str = Query(..., min_length=64, max_length=64, description="Confirmed Bitcoin transaction id"),
+    dispense_index: Optional[int] = Query(default=None, ge=0, description="Optional Counterparty dispense event index"),
+    allow_external_fee_lookup: bool = Query(default=True, description="Read a public Bitcoin transaction API only when Counterparty metadata lacks a positive miner fee"),
+    history_limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return a read-only Counterparty accounting preview.
+
+    The preview separates the acquired asset, BTC dispenser consideration, and
+    Bitcoin miner fee. It performs no deposit, withdrawal, ledger, lot, FIFO,
+    basis, signing, or broadcast mutation.
+    """
+    try:
+        return build_counterparty_ledger_preview(
+            db=db,
+            adapter=_adapter(),
+            txid=txid,
+            dispense_index=dispense_index,
+            allow_external_fee_lookup=bool(allow_external_fee_lookup),
+            history_limit=history_limit,
+        )
+    except CounterpartyLedgerPreviewError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_dict()) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "counterparty_ledger_preview_failed",
+                "message": str(exc),
+                "read_only": True,
+                "database_mutation": False,
+                "ledger_mutation": False,
+                "lot_mutation": False,
+                "basis_mutation": False,
+            },
+        ) from exc
 
 
 @router.get("/balances/portfolio")

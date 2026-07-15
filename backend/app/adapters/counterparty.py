@@ -5264,6 +5264,11 @@ class CounterpartyAdapter:
             "ok": True,
             "venue": self.venue,
             "address": buyer,
+            # Preserve the existing txid-deduped order rows for VenueOrderRow,
+            # while exposing every confirmed dispense event to CP-LEDGER.1 so
+            # tx-level miner fees are never allocated more than once.
+            "event_count": len(normalized),
+            "events": normalized,
             "count": len(items),
             "items": items,
             "dispense_source_path": dispenses.get("path"),

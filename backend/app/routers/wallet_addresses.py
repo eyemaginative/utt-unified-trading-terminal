@@ -173,6 +173,16 @@ def _is_counterparty_network(network: str) -> bool:
     }
 
 
+def _is_counterparty_wallet_row(row) -> bool:
+    wallet_id = str(getattr(row, "wallet_id", None) or "").strip().lower().replace("-", "_")
+    network = str(getattr(row, "network", None) or "").strip()
+    return _is_counterparty_network(network) or wallet_id in {
+        "counterparty",
+        "counterparty_default",
+        "counterparty_unisat",
+    }
+
+
 def _fetch_counterparty_asset_balance_atomic(address: str, asset: str) -> Tuple[int, int, Dict]:
     """Return Counterparty asset balance for a Bitcoin/UniSat address.
 
@@ -956,9 +966,17 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
 
     refreshed = 0
     errors: List[Dict] = []
+    counterparty_live_read_only_skipped = 0
 
     for a in addrs:
         asset_norm = _norm_asset(a.asset)
+        if _is_counterparty_wallet_row(a):
+            # Counterparty account rows are authoritative address metadata. Their
+            # multi-asset balances are read live through
+            # /api/counterparty/balances/portfolio and are not persisted as one
+            # zero-valued generic WalletAddressSnapshot.
+            counterparty_live_read_only_skipped += 1
+            continue
         if asset_norm in ("ALL", "*"):
             # Metadata-only rows are useful for bridge/treasury address selection.
             # They do not represent one specific on-chain asset, so create a zero
@@ -1007,7 +1025,12 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
             db.rollback()
             errors.append({"id": a.id, "asset": a.asset, "address": a.address, "error": str(e)})
 
-    return {"ok": True, "refreshed": refreshed, "errors": errors}
+    return {
+        "ok": True,
+        "refreshed": refreshed,
+        "errors": errors,
+        "counterparty_live_read_only_skipped": counterparty_live_read_only_skipped,
+    }
 
 
 # ------------------------------------------------------------------------------
@@ -1268,6 +1291,7 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
     ledger_written = 0
     metadata_only_skipped = 0
     solana_spl_tx_skipped = 0
+    counterparty_tx_ingest_skipped = 0
 
     def _wa_tx_skip_reason(raw) -> Optional[str]:
         try:
@@ -1309,6 +1333,13 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
 
     for a in addrs:
         asset = _norm_asset(a.asset)
+
+        if _is_counterparty_wallet_row(a):
+            # CP-LEDGER.1 has not been accepted.  Counterparty Wallet Addresses
+            # rows may resolve balances/history, but generic transaction ingest
+            # must not create deposits, withdrawals, lots, FIFO, or basis state.
+            counterparty_tx_ingest_skipped += 1
+            continue
 
         if asset in ("ALL", "*"):
             # Metadata-only address rows are for address selection/bridge context.
@@ -1867,6 +1898,8 @@ async def wallet_addresses_tx_ingest(payload: WalletAddressTxIngestRequest, db: 
         skipped_by_reason["metadata_only_asset"] = skipped_by_reason.get("metadata_only_asset", 0) + metadata_only_skipped
     if solana_spl_tx_skipped:
         skipped_by_reason["solana_spl_tx_ingest_not_wired"] = skipped_by_reason.get("solana_spl_tx_ingest_not_wired", 0) + solana_spl_tx_skipped
+    if counterparty_tx_ingest_skipped:
+        skipped_by_reason["counterparty_tx_ingest_quarantined"] = skipped_by_reason.get("counterparty_tx_ingest_quarantined", 0) + counterparty_tx_ingest_skipped
 
     skipped_total = sum(skipped_by_reason.values())
 

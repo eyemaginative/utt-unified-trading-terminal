@@ -207,6 +207,12 @@ def counterparty_diagnostics() -> Dict[str, Any]:
     return _adapter().diagnostics()
 
 
+@router.get("/address/source")
+def counterparty_address_source() -> Dict[str, Any]:
+    """Report the read-only Counterparty address resolution provenance."""
+    return _adapter().configured_source_address_info()
+
+
 @router.get("/wallet_provider/unisat")
 def counterparty_unisat_provider() -> Dict[str, Any]:
     return _adapter().wallet_provider_info("unisat")
@@ -231,26 +237,30 @@ def counterparty_configured_balance_portfolio(
     writes, ledger writes, lot creation, FIFO consumption, or basis mutation.
     """
     adapter = _adapter()
-    address = str(adapter.configured_source_address() or "").strip()
-    if not address:
+    source_address = adapter.configured_source_address_info()
+    address = str(source_address.get("address") or "").strip()
+    if not source_address.get("ok") or not address:
+        status_code = 409 if source_address.get("error") == "counterparty_wallet_address_ambiguous" else 422
         raise HTTPException(
-            status_code=422,
+            status_code=status_code,
             detail={
-                "error": "counterparty_configured_balances_failed",
-                "message": "COUNTERPARTY_SOURCE_ADDRESS is required for unified Counterparty balances",
+                "error": source_address.get("error") or "counterparty_configured_balances_failed",
+                "message": source_address.get("message") or "Counterparty Wallet Addresses account row is required",
+                "source_address": source_address,
                 "read_only": True,
                 "database_mutation": False,
                 "browser_state_required": False,
             },
         )
 
-    cache_key = f"{address.lower()}|derive={int(bool(derive_btc_prices))}|cap={int(max_derived_assets)}|zero={int(bool(include_zero))}"
+    resolution_key = str(source_address.get("resolution_key") or address.lower())
+    cache_key = f"{resolution_key}|derive={int(bool(derive_btc_prices))}|cap={int(max_derived_assets)}|zero={int(bool(include_zero))}"
     if not force_refresh:
         cached = _counterparty_balance_cache_get(cache_key)
         if cached is not None:
             return cached
 
-    configured = adapter.get_configured_address_balances()
+    configured = adapter.get_configured_address_balances(source_resolution=source_address)
     if not configured.get("ok"):
         stale = _counterparty_balance_cache_get(cache_key, allow_stale=True)
         if stale is not None:
@@ -285,12 +295,16 @@ def counterparty_configured_balance_portfolio(
         normalized.append({
             **row,
             "venue": "counterparty",
-            "source_type": "Counterparty configured address",
+            "source_type": "Counterparty Wallet Addresses",
             "network": "bitcoin",
             "chain": "bitcoin",
-            "wallet_id": "counterparty_default",
+            "wallet_id": source_address.get("wallet_id") or "counterparty",
             "address": address,
             "wallet_address": address,
+            "wallet_address_id": source_address.get("wallet_address_id"),
+            "address_source": source_address.get("address_source"),
+            "wallet_network": source_address.get("network"),
+            "asset_scope": source_address.get("asset_scope"),
             "asset": asset,
             "symbol": asset,
             "total": float(quantity),
@@ -382,6 +396,15 @@ def counterparty_configured_balance_portfolio(
         "ok": True,
         "venue": "counterparty",
         "address": address,
+        "address_source": source_address.get("address_source"),
+        "wallet_address_id": source_address.get("wallet_address_id"),
+        "wallet_id": source_address.get("wallet_id"),
+        "wallet_network": source_address.get("network"),
+        "asset_scope": source_address.get("asset_scope"),
+        "environment_fallback": bool(source_address.get("environment_fallback")),
+        "environment_address_configured": bool(source_address.get("environment_address_configured")),
+        "environment_address_matches": source_address.get("environment_address_matches"),
+        "source_address": source_address,
         "count": len(out_items),
         "items": out_items,
         "portfolio_total_usd": portfolio_total_usd if has_portfolio_total else None,

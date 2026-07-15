@@ -4473,6 +4473,7 @@ class CounterpartyAdapter:
             ("/", None),
         ]
         probe = self._first_ok(candidates)
+        source_address = self.configured_source_address_info()
         return {
             "ok": True,
             "venue": self.venue,
@@ -4487,6 +4488,10 @@ class CounterpartyAdapter:
             ),
             "live_broadcast_method": "unisat_pushPsbt",
             "automatic_broadcast": False,
+            "source_address": source_address,
+            "address": source_address.get("address"),
+            "address_source": source_address.get("address_source"),
+            "environment_fallback": bool(source_address.get("environment_fallback")),
             "probe": probe,
         }
 
@@ -4764,26 +4769,46 @@ class CounterpartyAdapter:
             "read_only": True,
         }
 
-    def configured_source_address(self) -> str:
-        """Return the configured Counterparty source address without I/O."""
-        return self._history_source_address()
+    def configured_source_address_info(self) -> Dict[str, Any]:
+        """Resolve the authoritative Counterparty account from Wallet Addresses.
 
-
-    def get_configured_address_balances(self) -> Dict[str, Any]:
-        """Return read-only balances for the operator-configured source address.
-
-        CP-BAL.1 deliberately resolves the same configured address used by
-        confirmed Counterparty history ingestion.  No browser wallet state,
-        signing permission, database mutation, or balance mutation is required.
+        Wallet Addresses is authoritative.  The legacy environment address is
+        retained only as a bounded migration fallback until operators remove it.
+        This lookup is read-only and fails closed when multiple distinct account
+        addresses exist in the selected priority tier.
         """
-        address = self._history_source_address()
-        if not address:
+        from ..services.counterparty_wallet_address import resolve_counterparty_wallet_address
+
+        return resolve_counterparty_wallet_address()
+
+    def configured_source_address(self) -> str:
+        """Return the resolved Counterparty source address, or an empty string."""
+        resolution = self.configured_source_address_info()
+        return str(resolution.get("address") or "").strip() if resolution.get("ok") else ""
+
+
+    def get_configured_address_balances(
+        self,
+        source_resolution: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Return read-only balances for the Wallet Addresses account row.
+
+        CP-WALLET.1 resolves the same authoritative address used by confirmed
+        Counterparty history ingestion.  No browser wallet state, signing
+        permission, database mutation, or balance mutation is required.
+        """
+        resolution = source_resolution or self.configured_source_address_info()
+        address = str(resolution.get("address") or "").strip()
+        if not resolution.get("ok") or not address:
             return {
                 "ok": False,
-                "error": "counterparty_source_address_missing",
-                "message": "COUNTERPARTY_SOURCE_ADDRESS is required for unified Counterparty balances",
+                "error": resolution.get("error") or "counterparty_wallet_address_missing",
+                "message": resolution.get("message") or "Counterparty Wallet Addresses account row is required",
                 "address": None,
                 "items": [],
+                "source_address": resolution,
+                "address_source": resolution.get("address_source"),
+                "environment_fallback": bool(resolution.get("environment_fallback")),
                 "read_only": True,
                 "database_mutation": False,
                 "browser_state_required": False,
@@ -4795,6 +4820,10 @@ class CounterpartyAdapter:
                 **result,
                 "address": address,
                 "items": [],
+                "source_address": resolution,
+                "address_source": resolution.get("address_source"),
+                "wallet_address_id": resolution.get("wallet_address_id"),
+                "environment_fallback": bool(resolution.get("environment_fallback")),
                 "read_only": True,
                 "database_mutation": False,
                 "browser_state_required": False,
@@ -4804,6 +4833,13 @@ class CounterpartyAdapter:
             **result,
             "address": address,
             "configured_address": True,
+            "source_address": resolution,
+            "address_source": resolution.get("address_source"),
+            "wallet_address_id": resolution.get("wallet_address_id"),
+            "wallet_id": resolution.get("wallet_id"),
+            "wallet_network": resolution.get("network"),
+            "asset_scope": resolution.get("asset_scope"),
+            "environment_fallback": bool(resolution.get("environment_fallback")),
             "read_only": True,
             "database_mutation": False,
             "browser_state_required": False,
@@ -4987,36 +5023,20 @@ class CounterpartyAdapter:
         return None
 
     def _history_source_address(self) -> str:
-        for name in (
-            "counterparty_effective_source_address",
-            "counterparty_effective_wallet_address",
-        ):
-            fn = getattr(settings, name, None)
-            if callable(fn):
-                try:
-                    value = str(fn() or "").strip()
-                    if value:
-                        return value
-                except Exception:
-                    pass
+        resolution = self.configured_source_address_info()
+        return str(resolution.get("address") or "").strip() if resolution.get("ok") else ""
 
-        for name in ("counterparty_source_address", "counterparty_wallet_address"):
-            try:
-                value = str(getattr(settings, name, None) or "").strip()
-                if value:
-                    return value
-            except Exception:
-                pass
-
-        for name in (
-            "COUNTERPARTY_SOURCE_ADDRESS",
-            "COUNTERPARTY_WALLET_ADDRESS",
-            "COUNTERPARTY_ADDRESS",
-        ):
-            value = str(os.getenv(name) or "").strip()
-            if value:
-                return value
-        return ""
+    def _required_history_source_resolution(self) -> Dict[str, Any]:
+        resolution = self.configured_source_address_info()
+        address = str(resolution.get("address") or "").strip()
+        if resolution.get("ok") and address:
+            return resolution
+        raise ValueError(
+            str(
+                resolution.get("message")
+                or "Counterparty Wallet Addresses account row is required for All Orders history sync"
+            )
+        )
 
     @staticmethod
     def _history_limit(value: Any = None) -> int:
@@ -5261,11 +5281,8 @@ class CounterpartyAdapter:
         the existing venue_orders service, which upserts on
         (venue='counterparty', venue_order_id=confirmed Bitcoin txid).
         """
-        address = self._history_source_address()
-        if not address:
-            raise ValueError(
-                "COUNTERPARTY_SOURCE_ADDRESS is required for Counterparty All Orders history sync"
-            )
+        resolution = self._required_history_source_resolution()
+        address = str(resolution.get("address") or "").strip()
         result = self.get_confirmed_dispense_orders(
             address=address,
             limit=self._history_limit(),

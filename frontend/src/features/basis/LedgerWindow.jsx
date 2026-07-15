@@ -996,6 +996,98 @@ export default function LedgerWindow({
     const [ledgerStale, setLedgerStale] = useState(false);
     const syncAbortRef = useRef(null);
 
+    // -------------------- Counterparty accounting preview (read-only) --------------------
+    const [cpPreviewOpen, setCpPreviewOpen] = useState(false);
+    const [cpPreviewTxid, setCpPreviewTxid] = useState(() =>
+      String(readStrLS(lsKey("counterpartyPreviewTxid"), "") || "").trim()
+    );
+    const [cpPreviewAllowExternalFeeLookup, setCpPreviewAllowExternalFeeLookup] = useState(() =>
+      readBoolLS(lsKey("counterpartyPreviewExternalFeeLookup"), true)
+    );
+    const [cpPreviewLoading, setCpPreviewLoading] = useState(false);
+    const [cpPreviewError, setCpPreviewError] = useState("");
+    const [cpPreviewData, setCpPreviewData] = useState(null);
+    const cpPreviewAbortRef = useRef(null);
+
+    useEffect(() => {
+      lsSet(lsKey("counterpartyPreviewTxid"), cpPreviewTxid);
+    }, [cpPreviewTxid]);
+
+    useEffect(() => {
+      lsSet(
+        lsKey("counterpartyPreviewExternalFeeLookup"),
+        cpPreviewAllowExternalFeeLookup ? "1" : "0"
+      );
+    }, [cpPreviewAllowExternalFeeLookup]);
+
+    useEffect(() => {
+      return () => {
+        try {
+          cpPreviewAbortRef.current?.abort?.();
+        } catch {}
+      };
+    }, []);
+
+    async function loadCounterpartyLedgerPreview() {
+      const txid = String(cpPreviewTxid || "").trim().toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(txid)) {
+        setCpPreviewData(null);
+        setCpPreviewError("Enter a complete 64-character Bitcoin transaction ID.");
+        return;
+      }
+
+      const base = trimApiBase(apiBase) || "";
+      const params = new URLSearchParams();
+      params.set("txid", txid);
+      params.set(
+        "allow_external_fee_lookup",
+        cpPreviewAllowExternalFeeLookup ? "true" : "false"
+      );
+
+      try {
+        cpPreviewAbortRef.current?.abort?.();
+      } catch {}
+
+      const controller = new AbortController();
+      cpPreviewAbortRef.current = controller;
+      setCpPreviewLoading(true);
+      setCpPreviewError("");
+
+      try {
+        const result = await rawFetchJSON(
+          `${base}/api/counterparty/ledger/preview?${params.toString()}`,
+          {
+            method: "GET",
+            signal: controller.signal,
+            timeoutMs: 120000,
+          }
+        );
+
+        if (!result || result.ok !== true) {
+          throw new Error(
+            pickStr(
+              result,
+              ["detail", "error", "message"],
+              "Counterparty ledger preview returned ok=false."
+            )
+          );
+        }
+
+        setCpPreviewData(result);
+      } catch (e) {
+        if (String(e?.name || "").toLowerCase() === "aborterror") return;
+        setCpPreviewData(null);
+        setCpPreviewError(
+          String(e?.message || e || "Failed to load Counterparty ledger preview.")
+        );
+      } finally {
+        if (cpPreviewAbortRef.current === controller) {
+          cpPreviewAbortRef.current = null;
+          setCpPreviewLoading(false);
+        }
+      }
+    }
+
     function markLedgerStale(reason = '') {
       setLedgerStale(true);
       if (reason) {
@@ -3247,6 +3339,31 @@ async function onUnlinkWithdrawalRow(wdwRow) {
     return { ...base, ...(w || {}), ...(align || {}) };
   }
 
+  const cpPreviewComponents = Array.isArray(cpPreviewData?.components)
+    ? cpPreviewData.components
+    : [];
+  const cpPreviewBlockers = Array.isArray(cpPreviewData?.blockers)
+    ? cpPreviewData.blockers
+    : [];
+  const cpPreviewWarnings = Array.isArray(cpPreviewData?.warnings)
+    ? cpPreviewData.warnings
+    : [];
+  const cpPreviewExisting = cpPreviewData?.idempotency_preview?.existing || {};
+  const cpBasisPreview = cpPreviewData?.basis_preview || {};
+  const cpBtcDispositionPreview = cpPreviewData?.btc_disposition_preview || {};
+
+  const cpPreviewMutationSafe = !!cpPreviewData && (
+    cpPreviewData.read_only === true &&
+    cpPreviewData.dry_run === true &&
+    cpPreviewData.database_mutation === false &&
+    cpPreviewData.deposit_mutation === false &&
+    cpPreviewData.withdrawal_mutation === false &&
+    cpPreviewData.ledger_mutation === false &&
+    cpPreviewData.lot_mutation === false &&
+    cpPreviewData.fifo_mutation === false &&
+    cpPreviewData.basis_mutation === false
+  );
+
   const headerTitle = "Ledger";
   const headerSub =
     tab === "withdrawals"
@@ -3333,6 +3450,15 @@ async function onUnlinkWithdrawalRow(wdwRow) {
   <span style={{ fontSize: 12, opacity: ledgerStale ? 1 : 0.75, color: ledgerStale ? '#ffcc66' : undefined }}>
     {ledgerStale ? 'STALE' : 'OK'}
   </span>
+
+  <button
+    type="button"
+    style={cpPreviewOpen ? ui.btnPrimary : ui.btn}
+    onClick={() => setCpPreviewOpen((v) => !v)}
+    title="Open the read-only Counterparty accounting preview. This does not write deposits, withdrawals, ledger rows, lots, FIFO, or basis."
+  >
+    Counterparty Preview
+  </button>
 </div>
 
 
@@ -3670,6 +3796,491 @@ async function onUnlinkWithdrawalRow(wdwRow) {
               </div>
             ) : null}
 
+        </div>
+      ) : null}
+
+
+      {cpPreviewOpen ? (
+        <div
+          style={{
+            ...ui.panel,
+            flex: "0 0 auto",
+            maxHeight: "min(560px, 66vh)",
+            overflow: "hidden",
+          }}
+        >
+          <div style={ui.panelHdr}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 950 }}>
+                Counterparty Accounting Preview
+              </div>
+              <div style={{ marginTop: 3, fontSize: 11, opacity: 0.72 }}>
+                Confirmed chain reconstruction only. No Apply action and no accounting mutation.
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <input
+                style={{ ...ui.ctl, width: 430, maxWidth: "46vw", ...ui.mono }}
+                value={cpPreviewTxid}
+                onChange={(e) => setCpPreviewTxid(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !cpPreviewLoading) {
+                    loadCounterpartyLedgerPreview();
+                  }
+                }}
+                placeholder="64-character Bitcoin txid"
+                aria-label="Counterparty Bitcoin transaction ID"
+                spellCheck={false}
+              />
+
+              <label
+                style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12 }}
+                title="Allow a read-only public Bitcoin transaction lookup when Counterparty metadata has no positive miner fee."
+              >
+                <input
+                  type="checkbox"
+                  checked={!!cpPreviewAllowExternalFeeLookup}
+                  onChange={(e) =>
+                    setCpPreviewAllowExternalFeeLookup(!!e.target.checked)
+                  }
+                />
+                External fee lookup
+              </label>
+
+              <button
+                type="button"
+                style={cpPreviewLoading ? ui.btnDisabled : ui.btnPrimary}
+                disabled={cpPreviewLoading}
+                onClick={loadCounterpartyLedgerPreview}
+              >
+                {cpPreviewLoading ? "Loading…" : cpPreviewData ? "Refresh Preview" : "Load Preview"}
+              </button>
+
+              <button
+                type="button"
+                style={ui.btn}
+                disabled={cpPreviewLoading}
+                onClick={() => {
+                  setCpPreviewData(null);
+                  setCpPreviewError("");
+                }}
+              >
+                Clear
+              </button>
+
+              <button
+                type="button"
+                style={ui.btn}
+                onClick={() => setCpPreviewOpen(false)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+
+          <div style={{ overflow: "auto", padding: 12 }}>
+            {cpPreviewError ? (
+              <div style={{ ...ui.warn, margin: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 900, marginBottom: 5 }}>
+                  Counterparty preview error
+                </div>
+                <div style={{ fontSize: 12 }}>{cpPreviewError}</div>
+              </div>
+            ) : null}
+
+            {!cpPreviewError && !cpPreviewData && !cpPreviewLoading ? (
+              <div
+                style={{
+                  border: "1px solid rgba(255,255,255,0.10)",
+                  borderRadius: 12,
+                  padding: 12,
+                  fontSize: 12,
+                  lineHeight: 1.45,
+                  opacity: 0.82,
+                }}
+              >
+                Enter a confirmed Counterparty dispenser-purchase Bitcoin transaction ID,
+                then load the dry-run preview. The panel will show acquisition, BTC
+                consideration, miner fee, basis blockers, FIFO inventory, existing-row
+                counts, and mutation guards.
+              </div>
+            ) : null}
+
+            {cpPreviewData ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div
+                  style={{
+                    border: cpPreviewMutationSafe
+                      ? "1px solid rgba(90,255,140,0.35)"
+                      : "1px solid rgba(255,90,90,0.50)",
+                    background: cpPreviewMutationSafe
+                      ? "rgba(70,255,120,0.06)"
+                      : "rgba(255,40,40,0.08)",
+                    borderRadius: 12,
+                    padding: 10,
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 950 }}>
+                    {cpPreviewMutationSafe
+                      ? "READ-ONLY · DRY RUN · ZERO ACCOUNTING WRITES"
+                      : "SAFETY CONTRACT WARNING"}
+                  </div>
+                  <div style={{ fontSize: 11, opacity: 0.78, ...ui.mono }}>
+                    {mask(cpPreviewData.version || "counterparty_ledger_preview")}
+                    {" · "}
+                    {mask(cpPreviewData.status || "—")}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+                    gap: 10,
+                  }}
+                >
+                  <div
+                    style={{
+                      border: "1px solid rgba(255,255,255,0.10)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950, marginBottom: 8 }}>
+                      Confirmed event
+                    </div>
+                    {[
+                      ["Event", cpPreviewData.event],
+                      ["Identity", cpPreviewData.event_identity],
+                      ["Transaction", cpPreviewData.txid],
+                      ["Dispense index", cpPreviewData.dispense_index],
+                      ["Dispenses in tx", cpPreviewData.transaction_dispense_count],
+                      ["Confirmed", cpPreviewData.confirmed],
+                      ["Block", cpPreviewData.block_index],
+                      ["Confirmed at", cpPreviewData.confirmed_at],
+                      ["Address source", cpPreviewData.address_source],
+                      ["Wallet", cpPreviewData.wallet_id],
+                    ].map(([label, value]) => (
+                      <div
+                        key={label}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "120px minmax(0, 1fr)",
+                          gap: 8,
+                          marginTop: 5,
+                          fontSize: 11,
+                        }}
+                      >
+                        <span style={{ opacity: 0.68 }}>{label}</span>
+                        <span
+                          style={{
+                            ...ui.mono,
+                            overflowWrap: "anywhere",
+                          }}
+                        >
+                          {mask(value === undefined || value === null || value === "" ? "—" : value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div
+                    style={{
+                      border: "1px solid rgba(255,255,255,0.10)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950, marginBottom: 8 }}>
+                      Exact economics
+                    </div>
+                    {[
+                      ["Asset acquired", `${cpPreviewData.quantity ?? "—"} ${cpPreviewData.asset || ""}`.trim()],
+                      ["Unit price BTC", cpPreviewData.unit_price_btc_exact],
+                      ["Payment sats", cpPreviewData.gross_payment_satoshis],
+                      ["Payment BTC", cpPreviewData.gross_payment_btc_exact],
+                      ["Miner fee sats", cpPreviewData.network_fee_satoshis],
+                      ["Miner fee BTC", cpPreviewData.network_fee_btc_exact],
+                      ["Fee source", cpPreviewData.network_fee_source],
+                      ["Total outflow sats", cpPreviewData.total_btc_outflow_satoshis],
+                      ["Total outflow BTC", cpPreviewData.total_btc_outflow_exact],
+                    ].map(([label, value]) => (
+                      <div
+                        key={label}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "130px minmax(0, 1fr)",
+                          gap: 8,
+                          marginTop: 5,
+                          fontSize: 11,
+                        }}
+                      >
+                        <span style={{ opacity: 0.68 }}>{label}</span>
+                        <span style={{ ...ui.mono, overflowWrap: "anywhere" }}>
+                          {mask(value === undefined || value === null || value === "" ? "—" : value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div
+                    style={{
+                      border: "1px solid rgba(255,255,255,0.10)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950, marginBottom: 8 }}>
+                      Basis and FIFO preview
+                    </div>
+                    {[
+                      ["Basis asset", cpBasisPreview.asset],
+                      ["Basis quantity", cpBasisPreview.quantity],
+                      ["Basis BTC", cpBasisPreview.basis_btc_before_historical_usd_conversion_exact],
+                      ["Historical BTC/USD", cpBasisPreview.historical_btc_usd],
+                      ["Basis USD", cpBasisPreview.total_basis_usd],
+                      ["Cost average USD", cpBasisPreview.cost_average_usd],
+                      ["Basis status", cpBasisPreview.status],
+                      ["Fee allocation", cpBasisPreview.network_fee_allocation_policy],
+                      ["BTC required", cpBtcDispositionPreview.quantity_required_exact],
+                      ["BTC lots available", cpBtcDispositionPreview.available_counterparty_btc_lot_qty],
+                      ["FIFO policy", cpBtcDispositionPreview.fifo_policy],
+                      ["Universal pooling", cpBtcDispositionPreview.universal_pooling],
+                    ].map(([label, value]) => (
+                      <div
+                        key={label}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "130px minmax(0, 1fr)",
+                          gap: 8,
+                          marginTop: 5,
+                          fontSize: 11,
+                        }}
+                      >
+                        <span style={{ opacity: 0.68 }}>{label}</span>
+                        <span style={{ ...ui.mono, overflowWrap: "anywhere" }}>
+                          {mask(value === undefined || value === null || value === "" ? "—" : value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div
+                    style={{
+                      border: "1px solid rgba(255,255,255,0.10)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950, marginBottom: 8 }}>
+                      Existing-state audit
+                    </div>
+                    {[
+                      ["VenueOrderRow", cpPreviewExisting.venue_order_rows],
+                      ["AssetDeposit", cpPreviewExisting.asset_deposit_rows],
+                      ["AssetWithdrawal", cpPreviewExisting.asset_withdrawal_rows],
+                      ["LotJournal", cpPreviewExisting.lot_journal_rows],
+                      ["Acquired open lots", cpPreviewExisting.acquired_asset_open_lot_rows],
+                      ["Acquired lot qty", cpPreviewExisting.acquired_asset_open_lot_qty],
+                      ["BTC open lot qty", cpPreviewExisting.btc_open_lot_qty],
+                    ].map(([label, value]) => (
+                      <div
+                        key={label}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "135px minmax(0, 1fr)",
+                          gap: 8,
+                          marginTop: 5,
+                          fontSize: 11,
+                        }}
+                      >
+                        <span style={{ opacity: 0.68 }}>{label}</span>
+                        <span style={{ ...ui.mono, overflowWrap: "anywhere" }}>
+                          {mask(value === undefined || value === null || value === "" ? "—" : value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    border: "1px solid rgba(255,255,255,0.10)",
+                    borderRadius: 12,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      padding: "9px 11px",
+                      borderBottom: "1px solid rgba(255,255,255,0.08)",
+                      fontSize: 12,
+                      fontWeight: 950,
+                    }}
+                  >
+                    Economic components
+                  </div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ ...ui.table, minWidth: 980 }}>
+                      <thead>
+                        <tr>
+                          {[
+                            "Identity",
+                            "Kind",
+                            "Direction",
+                            "Asset",
+                            "Quantity",
+                            "Satoshis",
+                            "Fee source",
+                            "Allocation",
+                          ].map((label) => (
+                            <th key={label} style={{ ...ui.th, position: "static" }}>
+                              {label}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {cpPreviewComponents.length ? (
+                          cpPreviewComponents.map((component, idx) => (
+                            <tr key={String(component?.identity || idx)}>
+                              <td style={{ ...ui.td, ...ui.mono, maxWidth: 420 }}>
+                                {mask(component?.identity || "—")}
+                              </td>
+                              <td style={ui.td}>{mask(component?.kind || "—")}</td>
+                              <td style={ui.td}>{mask(component?.direction || "—")}</td>
+                              <td style={ui.td}>{mask(component?.asset || "—")}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>
+                                {mask(component?.quantity_exact ?? "—")}
+                              </td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>
+                                {mask(component?.satoshis ?? "—")}
+                              </td>
+                              <td style={ui.td}>{mask(component?.fee_source || "—")}</td>
+                              <td style={ui.td}>{mask(component?.allocation_policy || "—")}</td>
+                            </tr>
+                          ))
+                        ) : (
+                          <tr>
+                            <td style={ui.td} colSpan={8}>No components returned.</td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
+                    gap: 10,
+                  }}
+                >
+                  <div
+                    style={{
+                      border: "1px solid rgba(255,190,80,0.35)",
+                      background: "rgba(255,190,80,0.06)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950 }}>Blockers</div>
+                    {cpPreviewBlockers.length ? (
+                      <ul style={{ margin: "8px 0 0 18px", padding: 0, fontSize: 11 }}>
+                        {cpPreviewBlockers.map((item, idx) => (
+                          <li key={`${String(item)}:${idx}`} style={{ marginTop: 4, ...ui.mono }}>
+                            {mask(item)}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div style={{ marginTop: 7, fontSize: 11, opacity: 0.75 }}>
+                        None reported.
+                      </div>
+                    )}
+                  </div>
+
+                  <div
+                    style={{
+                      border: "1px solid rgba(120,160,255,0.30)",
+                      background: "rgba(120,160,255,0.05)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950 }}>Warnings</div>
+                    {cpPreviewWarnings.length ? (
+                      <ul style={{ margin: "8px 0 0 18px", padding: 0, fontSize: 11 }}>
+                        {cpPreviewWarnings.map((item, idx) => (
+                          <li key={`${String(item)}:${idx}`} style={{ marginTop: 4 }}>
+                            {mask(item)}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div style={{ marginTop: 7, fontSize: 11, opacity: 0.75 }}>
+                        None reported.
+                      </div>
+                    )}
+                  </div>
+
+                  <div
+                    style={{
+                      border: cpPreviewMutationSafe
+                        ? "1px solid rgba(90,255,140,0.30)"
+                        : "1px solid rgba(255,90,90,0.50)",
+                      background: cpPreviewMutationSafe
+                        ? "rgba(70,255,120,0.05)"
+                        : "rgba(255,40,40,0.08)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950 }}>Mutation guards</div>
+                    {[
+                      ["Database", cpPreviewData.database_mutation],
+                      ["Deposit", cpPreviewData.deposit_mutation],
+                      ["Withdrawal", cpPreviewData.withdrawal_mutation],
+                      ["Ledger", cpPreviewData.ledger_mutation],
+                      ["Lot", cpPreviewData.lot_mutation],
+                      ["FIFO", cpPreviewData.fifo_mutation],
+                      ["Basis", cpPreviewData.basis_mutation],
+                    ].map(([label, value]) => (
+                      <div
+                        key={label}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "100px 1fr",
+                          gap: 8,
+                          marginTop: 5,
+                          fontSize: 11,
+                        }}
+                      >
+                        <span style={{ opacity: 0.68 }}>{label}</span>
+                        <span style={{ ...ui.mono, fontWeight: 900 }}>
+                          {value === false ? "False" : mask(value ?? "—")}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div style={{ fontSize: 11, opacity: 0.68, lineHeight: 1.45 }}>
+                  This panel intentionally has no Apply button. Counterparty deposit,
+                  withdrawal, ledger, lot, FIFO, and basis persistence remain blocked
+                  until the storage model, historical BTC/USD source, and BTC inventory
+                  scope are reviewed.
+                </div>
+              </div>
+            ) : null}
+          </div>
         </div>
       ) : null}
 

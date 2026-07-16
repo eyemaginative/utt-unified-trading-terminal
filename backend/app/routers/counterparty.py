@@ -229,14 +229,17 @@ def counterparty_ledger_preview(
     txid: str = Query(..., min_length=64, max_length=64, description="Confirmed Bitcoin transaction id"),
     dispense_index: Optional[int] = Query(default=None, ge=0, description="Optional Counterparty dispense event index"),
     allow_external_fee_lookup: bool = Query(default=True, description="Read a public Bitcoin transaction API only when Counterparty metadata lacks a positive miner fee"),
+    allow_external_price_lookup: bool = Query(default=True, description="Read an auditable historical BTC/USD observation when the preview lacks historical basis pricing"),
+    force_historical_price_refresh: bool = Query(default=False, description="Refresh the immutable historical BTC/USD cache instead of using an existing observation"),
     history_limit: int = Query(default=200, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Return a read-only Counterparty accounting preview.
 
     The preview separates the acquired asset, BTC dispenser consideration, and
-    Bitcoin miner fee. It performs no deposit, withdrawal, ledger, lot, FIFO,
-    basis, signing, or broadcast mutation.
+    Bitcoin miner fee, then optionally resolves an auditable historical BTC/USD
+    observation for basis review. It performs no deposit, withdrawal, ledger,
+    lot, FIFO, basis, signing, or broadcast mutation.
     """
     try:
         return build_counterparty_ledger_preview(
@@ -245,6 +248,8 @@ def counterparty_ledger_preview(
             txid=txid,
             dispense_index=dispense_index,
             allow_external_fee_lookup=bool(allow_external_fee_lookup),
+            allow_external_price_lookup=bool(allow_external_price_lookup),
+            force_historical_price_refresh=bool(force_historical_price_refresh),
             history_limit=history_limit,
         )
     except CounterpartyLedgerPreviewError as exc:

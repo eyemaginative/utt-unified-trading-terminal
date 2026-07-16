@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..models import AssetDeposit, AssetWithdrawal, BasisLot, VenueOrderRow
 from ..models_lot_journal import LotJournal
+from .counterparty_historical_btc_usd import lookup_historical_btc_usd
 
 
 _SATOSHIS_PER_BTC = Decimal("100000000")
@@ -351,6 +352,8 @@ def build_counterparty_ledger_preview(
     txid: str,
     dispense_index: Optional[int] = None,
     allow_external_fee_lookup: bool = True,
+    allow_external_price_lookup: bool = True,
+    force_historical_price_refresh: bool = False,
     history_limit: int = 200,
 ) -> Dict[str, Any]:
     """Build a deterministic Counterparty accounting preview without writes.
@@ -453,6 +456,23 @@ def build_counterparty_ledger_preview(
     total_outflow_btc = _satoshis_to_btc(total_outflow_satoshis)
     acquisition_basis_btc = gross_btc + fee_btc if fee_btc is not None and tx_event_count == 1 else gross_btc
 
+    historical_price = lookup_historical_btc_usd(
+        confirmed_at,
+        allow_external_lookup=bool(allow_external_price_lookup),
+        force_refresh=bool(force_historical_price_refresh),
+    )
+    historical_btc_usd = (
+        _positive_decimal(
+            historical_price.get("price_usd_exact")
+            if historical_price.get("price_usd_exact") is not None
+            else historical_price.get("price_usd")
+        )
+        if historical_price.get("ok")
+        else None
+    )
+    total_basis_usd = acquisition_basis_btc * historical_btc_usd if historical_btc_usd is not None else None
+    cost_average_usd = total_basis_usd / quantity if total_basis_usd is not None and quantity > 0 else None
+
     wallet_id = str(source.get("wallet_id") or "counterparty").strip() or "counterparty"
     existing = _existing_state(
         db,
@@ -463,8 +483,10 @@ def build_counterparty_ledger_preview(
         acquired_asset=asset,
     )
 
-    blockers: List[str] = ["historical_btc_usd_price_required", "storage_model_review_required"]
-    warnings: List[str] = []
+    blockers: List[str] = ["storage_model_review_required"]
+    warnings: List[str] = [str(item) for item in (historical_price.get("warnings") or []) if str(item or "").strip()]
+    if historical_btc_usd is None:
+        blockers.append("historical_btc_usd_price_required")
     if fee_satoshis is None:
         blockers.append("bitcoin_miner_fee_unresolved")
     if tx_event_count > 1:
@@ -524,7 +546,7 @@ def build_counterparty_ledger_preview(
 
     return {
         "ok": True,
-        "version": "counterparty_ledger_preview_v1",
+        "version": "counterparty_ledger_preview_v2",
         "status": "review_required",
         "read_only": True,
         "dry_run": True,
@@ -567,15 +589,26 @@ def build_counterparty_ledger_preview(
         "total_btc_outflow": float(total_outflow_btc) if total_outflow_btc is not None else None,
         "total_btc_outflow_exact": _decimal_text(total_outflow_btc, max_places=8),
         "components": components,
+        "historical_price_lookup": historical_price,
         "basis_preview": {
             "asset": asset,
             "quantity": float(quantity),
             "basis_btc_before_historical_usd_conversion": float(acquisition_basis_btc),
             "basis_btc_before_historical_usd_conversion_exact": _decimal_text(acquisition_basis_btc, max_places=8),
-            "historical_btc_usd": None,
-            "total_basis_usd": None,
-            "cost_average_usd": None,
-            "status": "historical_btc_usd_price_required",
+            "historical_btc_usd": float(historical_btc_usd) if historical_btc_usd is not None else None,
+            "historical_btc_usd_exact": _decimal_text(historical_btc_usd, max_places=12),
+            "historical_price_status": historical_price.get("status"),
+            "historical_price_source": historical_price.get("source"),
+            "historical_price_requested_at": historical_price.get("requested_at"),
+            "historical_price_observation_at": historical_price.get("observation_at"),
+            "historical_price_distance_s": historical_price.get("distance_s"),
+            "historical_price_max_distance_s": historical_price.get("max_distance_s"),
+            "historical_price_cache": historical_price.get("cache"),
+            "total_basis_usd": float(total_basis_usd) if total_basis_usd is not None else None,
+            "total_basis_usd_exact": _decimal_text(total_basis_usd, max_places=12),
+            "cost_average_usd": float(cost_average_usd) if cost_average_usd is not None else None,
+            "cost_average_usd_exact": _decimal_text(cost_average_usd, max_places=12),
+            "status": "historical_btc_usd_resolved" if historical_btc_usd is not None else "historical_btc_usd_price_required",
             "network_fee_allocation_policy": fee_allocation_policy,
         },
         "btc_disposition_preview": {
@@ -586,7 +619,8 @@ def build_counterparty_ledger_preview(
             "classification": "crypto_purchase_disposition_review_required",
             "fifo_policy": "counterparty_venue_and_wallet_only",
             "universal_pooling": False,
-            "historical_btc_usd_required": True,
+            "historical_btc_usd_required": historical_btc_usd is None,
+            "historical_btc_usd": float(historical_btc_usd) if historical_btc_usd is not None else None,
             "fifo_consumption": False,
         },
         "idempotency_preview": {

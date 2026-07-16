@@ -1004,6 +1004,9 @@ export default function LedgerWindow({
     const [cpPreviewAllowExternalFeeLookup, setCpPreviewAllowExternalFeeLookup] = useState(() =>
       readBoolLS(lsKey("counterpartyPreviewExternalFeeLookup"), true)
     );
+    const [cpPreviewAllowExternalPriceLookup, setCpPreviewAllowExternalPriceLookup] = useState(() =>
+      readBoolLS(lsKey("counterpartyPreviewExternalPriceLookup"), true)
+    );
     const [cpPreviewLoading, setCpPreviewLoading] = useState(false);
     const [cpPreviewError, setCpPreviewError] = useState("");
     const [cpPreviewData, setCpPreviewData] = useState(null);
@@ -1019,6 +1022,13 @@ export default function LedgerWindow({
         cpPreviewAllowExternalFeeLookup ? "1" : "0"
       );
     }, [cpPreviewAllowExternalFeeLookup]);
+
+    useEffect(() => {
+      lsSet(
+        lsKey("counterpartyPreviewExternalPriceLookup"),
+        cpPreviewAllowExternalPriceLookup ? "1" : "0"
+      );
+    }, [cpPreviewAllowExternalPriceLookup]);
 
     useEffect(() => {
       return () => {
@@ -1042,6 +1052,10 @@ export default function LedgerWindow({
       params.set(
         "allow_external_fee_lookup",
         cpPreviewAllowExternalFeeLookup ? "true" : "false"
+      );
+      params.set(
+        "allow_external_price_lookup",
+        cpPreviewAllowExternalPriceLookup ? "true" : "false"
       );
 
       try {
@@ -3351,6 +3365,7 @@ async function onUnlinkWithdrawalRow(wdwRow) {
   const cpPreviewExisting = cpPreviewData?.idempotency_preview?.existing || {};
   const cpBasisPreview = cpPreviewData?.basis_preview || {};
   const cpBtcDispositionPreview = cpPreviewData?.btc_disposition_preview || {};
+  const cpHistoricalPrice = cpPreviewData?.historical_price_lookup || {};
 
   const cpPreviewMutationSafe = !!cpPreviewData && (
     cpPreviewData.read_only === true &&
@@ -3848,6 +3863,20 @@ async function onUnlinkWithdrawalRow(wdwRow) {
                 External fee lookup
               </label>
 
+              <label
+                style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12 }}
+                title="Allow a read-only historical BTC/USD lookup at the confirmed transaction time. Cached immutable observations are reused."
+              >
+                <input
+                  type="checkbox"
+                  checked={!!cpPreviewAllowExternalPriceLookup}
+                  onChange={(e) =>
+                    setCpPreviewAllowExternalPriceLookup(!!e.target.checked)
+                  }
+                />
+                Historical BTC/USD
+              </label>
+
               <button
                 type="button"
                 style={cpPreviewLoading ? ui.btnDisabled : ui.btnPrimary}
@@ -3902,8 +3931,8 @@ async function onUnlinkWithdrawalRow(wdwRow) {
               >
                 Enter a confirmed Counterparty dispenser-purchase Bitcoin transaction ID,
                 then load the dry-run preview. The panel will show acquisition, BTC
-                consideration, miner fee, basis blockers, FIFO inventory, existing-row
-                counts, and mutation guards.
+                consideration, miner fee, historical BTC/USD basis, FIFO inventory,
+                existing-row counts, blockers, and mutation guards.
               </div>
             ) : null}
 
@@ -4043,9 +4072,14 @@ async function onUnlinkWithdrawalRow(wdwRow) {
                       ["Basis asset", cpBasisPreview.asset],
                       ["Basis quantity", cpBasisPreview.quantity],
                       ["Basis BTC", cpBasisPreview.basis_btc_before_historical_usd_conversion_exact],
-                      ["Historical BTC/USD", cpBasisPreview.historical_btc_usd],
-                      ["Basis USD", cpBasisPreview.total_basis_usd],
-                      ["Cost average USD", cpBasisPreview.cost_average_usd],
+                      ["Historical BTC/USD", cpBasisPreview.historical_btc_usd_exact ?? cpBasisPreview.historical_btc_usd],
+                      ["Historical source", cpBasisPreview.historical_price_source ?? cpHistoricalPrice.source],
+                      ["Price observed at", cpBasisPreview.historical_price_observation_at ?? cpHistoricalPrice.observation_at],
+                      ["Observation distance", cpBasisPreview.historical_price_distance_s === undefined || cpBasisPreview.historical_price_distance_s === null ? null : `${cpBasisPreview.historical_price_distance_s}s`],
+                      ["Historical cache", cpBasisPreview.historical_price_cache ?? cpHistoricalPrice.cache],
+                      ["Lookup status", cpBasisPreview.historical_price_status ?? cpHistoricalPrice.status],
+                      ["Basis USD", cpBasisPreview.total_basis_usd_exact ?? cpBasisPreview.total_basis_usd],
+                      ["Cost average USD", cpBasisPreview.cost_average_usd_exact ?? cpBasisPreview.cost_average_usd],
                       ["Basis status", cpBasisPreview.status],
                       ["Fee allocation", cpBasisPreview.network_fee_allocation_policy],
                       ["BTC required", cpBtcDispositionPreview.quantity_required_exact],

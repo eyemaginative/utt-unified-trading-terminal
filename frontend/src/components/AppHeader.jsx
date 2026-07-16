@@ -2845,21 +2845,6 @@ addDexAccount,
     root.style.setProperty("--utt-hdr-shadow", pal.shadow);
   }, [pal]);
 
-  const screenshotLinkStyle = {
-    background: "transparent",
-    border: "none",
-    color: "var(--utt-hdr-link, #9ad)",
-    padding: 0,
-    cursor: shotBusy ? "not-allowed" : "pointer",
-    textDecoration: "underline",
-    fontSize: 12,
-    opacity: shotBusy ? 0.7 : 1,
-    whiteSpace: "nowrap",
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 6,
-  };
-
   const toolTabsRowRef = useRef(null);
 
   useEffect(() => {
@@ -2919,6 +2904,234 @@ addDexAccount,
     overscrollBehaviorX: "contain",
     WebkitOverflowScrolling: "touch",
   };
+
+
+  // UI-HDR.2: shared presentation tokens for the visible AppHeader control shell.
+  // Handlers, state ownership, polling, safety gates, and backend calls remain unchanged.
+  const unifiedHeaderShellStyle = {
+    marginTop: 10,
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    padding: 8,
+    borderRadius: 12,
+    border: "1px solid color-mix(in srgb, var(--utt-hdr-border, rgba(255,255,255,0.12)) 82%, var(--utt-hdr-link, #9ad) 18%)",
+    background:
+      "linear-gradient(180deg, color-mix(in srgb, var(--utt-hdr-pill-bg, rgba(255,255,255,0.04)) 94%, var(--utt-hdr-link, #9ad) 6%), color-mix(in srgb, var(--utt-hdr-bg, #0f1114) 96%, black 4%))",
+    boxShadow: "0 12px 28px rgba(0,0,0,0.24), 0 0 0 1px rgba(255,255,255,0.025) inset",
+    minWidth: 0,
+  };
+
+  const unifiedHeaderBandStyle = {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    rowGap: 8,
+    flexWrap: "wrap",
+    minWidth: 0,
+  };
+
+  const unifiedHeaderGroupStyle = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    minHeight: 36,
+    minWidth: 0,
+    padding: "4px 6px 4px 10px",
+    borderRadius: 10,
+    border: "1px solid var(--utt-hdr-pill-border, rgba(255,255,255,0.12))",
+    background:
+      "linear-gradient(180deg, color-mix(in srgb, var(--utt-hdr-pill-bg, rgba(255,255,255,0.04)) 94%, rgba(80,210,255,0.05)), var(--utt-hdr-pill-bg, rgba(255,255,255,0.04)))",
+    color: "var(--utt-hdr-fg, #e8eef8)",
+    boxSizing: "border-box",
+  };
+
+  const unifiedHeaderLabelStyle = {
+    fontSize: 10,
+    fontWeight: 900,
+    letterSpacing: 0.72,
+    textTransform: "uppercase",
+    color: "var(--utt-hdr-muted, rgba(232,238,248,0.62))",
+    whiteSpace: "nowrap",
+  };
+
+  const unifiedHeaderInputStyle = {
+    ...headerStyles.input,
+    height: 30,
+    minHeight: 30,
+    padding: "4px 9px",
+    borderRadius: 8,
+    border: "1px solid var(--utt-hdr-ctl-border, rgba(255,255,255,0.10))",
+    background: "color-mix(in srgb, var(--utt-hdr-ctl-bg, #111) 94%, black 6%)",
+    color: "var(--utt-hdr-fg, #e8eef8)",
+    boxSizing: "border-box",
+    outline: "none",
+    colorScheme: "dark",
+    fontSize: 12,
+    fontWeight: 700,
+  };
+
+  const unifiedHeaderSelectStyle = {
+    ...headerStyles.select,
+    height: 30,
+    minHeight: 30,
+    padding: "4px 28px 4px 9px",
+    borderRadius: 8,
+    border: "1px solid var(--utt-hdr-ctl-border, rgba(255,255,255,0.10))",
+    background: "color-mix(in srgb, var(--utt-hdr-ctl-bg, #111) 94%, black 6%)",
+    color: "var(--utt-hdr-fg, #f2f2f2)",
+    boxSizing: "border-box",
+    outline: "none",
+    colorScheme: "dark",
+    fontSize: 12,
+    fontWeight: 700,
+  };
+
+  const unifiedHeaderActionStyle = (disabled = false, tone = "secondary") => {
+    const inherited = typeof btnHeader === "function" ? btnHeader(Boolean(disabled)) : {};
+    const toneStyles = {
+      primary: {
+        border: "1px solid color-mix(in srgb, var(--utt-hdr-link, #9ad) 62%, transparent)",
+        background: "color-mix(in srgb, var(--utt-hdr-link, #9ad) 15%, var(--utt-hdr-btn-bg, rgba(255,255,255,0.04)))",
+        boxShadow: "0 0 0 1px color-mix(in srgb, var(--utt-hdr-link, #9ad) 18%, transparent) inset, 0 0 12px color-mix(in srgb, var(--utt-hdr-link, #9ad) 10%, transparent)",
+      },
+      warning: {
+        border: "1px solid color-mix(in srgb, var(--utt-warn, #f7b955) 58%, transparent)",
+        background: "color-mix(in srgb, var(--utt-warn, #f7b955) 13%, var(--utt-hdr-btn-bg, rgba(255,255,255,0.04)))",
+        boxShadow: "0 0 0 1px color-mix(in srgb, var(--utt-warn, #f7b955) 14%, transparent) inset",
+      },
+      danger: {
+        border: "1px solid color-mix(in srgb, var(--utt-danger, #ff6b6b) 62%, transparent)",
+        background: "color-mix(in srgb, var(--utt-danger, #ff6b6b) 14%, var(--utt-hdr-btn-bg, rgba(255,255,255,0.04)))",
+        boxShadow: "0 0 0 1px color-mix(in srgb, var(--utt-danger, #ff6b6b) 16%, transparent) inset",
+      },
+      tertiary: {
+        border: "1px solid var(--utt-hdr-ctl-border, rgba(255,255,255,0.10))",
+        background: "color-mix(in srgb, var(--utt-hdr-btn-bg, rgba(255,255,255,0.04)) 78%, transparent)",
+        opacity: disabled ? 0.5 : 0.82,
+      },
+      secondary: {
+        border: "1px solid var(--utt-hdr-btn-border, rgba(255,255,255,0.12))",
+        background: "var(--utt-hdr-btn-bg, rgba(255,255,255,0.04))",
+      },
+    };
+
+    return {
+      ...inherited,
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      minHeight: 30,
+      height: 30,
+      padding: "4px 10px",
+      borderRadius: 8,
+      color: "var(--utt-hdr-fg, #e8eef8)",
+      fontSize: 12,
+      fontWeight: 800,
+      lineHeight: 1,
+      whiteSpace: "nowrap",
+      boxSizing: "border-box",
+      cursor: disabled ? "not-allowed" : "pointer",
+      opacity: disabled ? 0.5 : 1,
+      ...(toneStyles[tone] || toneStyles.secondary),
+    };
+  };
+
+  const unifiedHeaderToggleStyle = (active) => ({
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    minHeight: 28,
+    padding: "4px 8px",
+    borderRadius: 8,
+    border: active
+      ? "1px solid color-mix(in srgb, var(--utt-hdr-link, #9ad) 44%, var(--utt-hdr-ctl-border, rgba(255,255,255,0.10)))"
+      : "1px solid transparent",
+    background: active
+      ? "color-mix(in srgb, var(--utt-hdr-link, #9ad) 9%, transparent)"
+      : "transparent",
+    color: active ? "var(--utt-hdr-fg, #e8eef8)" : "var(--utt-hdr-muted, rgba(232,238,248,0.62))",
+    cursor: "pointer",
+    fontSize: 12,
+    fontWeight: active ? 750 : 650,
+    lineHeight: 1,
+    whiteSpace: "nowrap",
+    userSelect: "none",
+    boxSizing: "border-box",
+  });
+
+  const unifiedHeaderStatusTone = {
+    neutral: {
+      dot: "#6f7b8d",
+      border: "rgba(145,158,178,0.22)",
+      background: "rgba(145,158,178,0.07)",
+      glow: "rgba(111,123,141,0.22)",
+    },
+    info: {
+      dot: "#62d9ff",
+      border: "rgba(98,217,255,0.34)",
+      background: "rgba(98,217,255,0.08)",
+      glow: "rgba(98,217,255,0.48)",
+    },
+    good: {
+      dot: "#5cff9d",
+      border: "rgba(92,255,157,0.32)",
+      background: "rgba(92,255,157,0.08)",
+      glow: "rgba(92,255,157,0.52)",
+    },
+    warning: {
+      dot: "#f7b955",
+      border: "rgba(247,185,85,0.34)",
+      background: "rgba(247,185,85,0.08)",
+      glow: "rgba(247,185,85,0.48)",
+    },
+    danger: {
+      dot: "#ff6b7a",
+      border: "rgba(255,107,122,0.36)",
+      background: "rgba(255,107,122,0.09)",
+      glow: "rgba(255,107,122,0.52)",
+    },
+  };
+
+  const unifiedHeaderStatusStyle = (tone = "neutral") => {
+    const t = unifiedHeaderStatusTone[tone] || unifiedHeaderStatusTone.neutral;
+    return {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 6,
+      minHeight: 26,
+      padding: "3px 8px",
+      borderRadius: 999,
+      border: `1px solid ${t.border}`,
+      background: t.background,
+      color: "var(--utt-hdr-fg, #e8eef8)",
+      fontSize: 10,
+      fontWeight: 900,
+      letterSpacing: 0.4,
+      lineHeight: 1,
+      whiteSpace: "nowrap",
+      boxSizing: "border-box",
+    };
+  };
+
+  const unifiedHeaderStatusDotStyle = (tone = "neutral") => {
+    const t = unifiedHeaderStatusTone[tone] || unifiedHeaderStatusTone.neutral;
+    return {
+      width: 7,
+      height: 7,
+      borderRadius: 999,
+      flex: "0 0 auto",
+      background: t.dot,
+      boxShadow: `0 0 8px ${t.glow}`,
+    };
+  };
+
+  const dryRunStatusTone = !dryRunKnown ? "neutral" : isDryRun ? "info" : "good";
+  const dryRunStatusText = !dryRunKnown ? "MODE …" : isDryRun ? "DRY RUN" : "LIVE MODE";
+  const armedStatusTone = !armedKnown ? "neutral" : isArmed ? "good" : "neutral";
+  const armedStatusText = !armedKnown ? "ARM …" : isArmed ? "ARMED" : "DISARMED";
+  const apiStatusTone = loadingSupportedVenues ? "info" : venuesLoaded ? "good" : "neutral";
+  const apiStatusText = loadingSupportedVenues ? "CONNECTING" : venuesLoaded ? "CONNECTED" : "AWAITING";
 
   // Banner controls are kept in a compact dock so the banner itself can stay stable.
   const bannerCtlWrapStyle = {
@@ -4941,6 +5154,76 @@ const autoFitBanner = async () => {
   return (
     <div ref={headerRef} style={headerStyles.headerWrap}>
       <style>{`
+        .utt-header-unified-shell .utt-header-band + .utt-header-band {
+          padding-top: 8px;
+          border-top: 1px solid color-mix(in srgb, var(--utt-hdr-border, rgba(255,255,255,0.12)) 62%, transparent);
+        }
+        .utt-header-unified-shell .utt-header-action,
+        .utt-header-unified-shell .utt-header-toggle,
+        .utt-header-unified-shell .utt-header-control {
+          transition: border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease, filter 140ms ease, opacity 140ms ease;
+        }
+        .utt-header-unified-shell .utt-header-action:hover:not(:disabled),
+        .utt-header-unified-shell .utt-header-toggle:hover {
+          border-color: color-mix(in srgb, var(--utt-hdr-link, #9ad) 52%, var(--utt-hdr-border, rgba(255,255,255,0.12))) !important;
+          filter: brightness(1.06);
+        }
+        .utt-header-unified-shell .utt-header-action:focus-visible,
+        .utt-header-unified-shell .utt-header-toggle:focus-within,
+        .utt-header-unified-shell .utt-header-control:focus-visible {
+          outline: 2px solid color-mix(in srgb, var(--utt-hdr-link, #9ad) 78%, white 12%) !important;
+          outline-offset: 2px;
+          box-shadow: 0 0 0 1px rgba(0,0,0,0.72), 0 0 14px color-mix(in srgb, var(--utt-hdr-link, #9ad) 28%, transparent) !important;
+        }
+        .utt-header-unified-shell .utt-header-toggle-input {
+          width: 14px;
+          height: 14px;
+          margin: 0;
+          flex: 0 0 auto;
+          accent-color: var(--utt-hdr-link, #9ad);
+          cursor: pointer;
+        }
+        .utt-header-unified-shell .utt-header-control:disabled,
+        .utt-header-unified-shell .utt-header-action:disabled {
+          filter: saturate(0.5);
+        }
+        @media (max-width: 980px) {
+          .utt-header-unified-shell .utt-header-band {
+            align-items: stretch !important;
+          }
+          .utt-header-unified-shell .utt-header-group--market,
+          .utt-header-unified-shell .utt-header-group--widgets {
+            flex-basis: 100% !important;
+          }
+          .utt-header-unified-shell .utt-header-group--portfolio,
+          .utt-header-unified-shell .utt-header-group--api {
+            flex: 1 1 auto;
+          }
+        }
+        .utt-header-unified-shell .utt-header-widgets-status {
+          display: inline-flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 8px;
+          margin-left: auto;
+          flex: 0 0 auto;
+          min-width: 0;
+          flex-wrap: wrap;
+        }
+        @media (max-width: 620px) {
+          .utt-header-unified-shell .utt-header-group {
+            flex: 1 1 100% !important;
+            max-width: 100%;
+          }
+          .utt-header-unified-shell .utt-header-widgets-status {
+            width: 100%;
+            margin-left: 0;
+            justify-content: flex-start;
+          }
+          .utt-header-unified-shell .utt-header-toggle--privacy {
+            width: 100%;
+          }
+        }
         .utt-tool-tabs-row::-webkit-scrollbar {
           height: 6px;
         }
@@ -6617,197 +6900,309 @@ const autoFitBanner = async () => {
       )}
 
 
-      <div style={headerStyles.toolbar}>
-        <div style={headerStyles.pill}>
-          <span>Venue</span>
-          <select
-            style={{
-              ...headerStyles.select,
-              color: "var(--utt-hdr-fg, #f2f2f2)",
-              background: "var(--utt-hdr-ctl-bg, #111)",
-            }}
-            value={venue}
-            onChange={(e) => setVenue(e.target.value)}
+      <div
+        className="utt-header-unified-shell"
+        data-ui-hdr="2"
+        style={unifiedHeaderShellStyle}
+        role="group"
+        aria-label="Terminal controls and status"
+      >
+        <div className="utt-header-band utt-header-band--context" style={unifiedHeaderBandStyle}>
+          <div
+            className="utt-header-group utt-header-group--venue"
+            style={{ ...unifiedHeaderGroupStyle, flex: "0 1 auto" }}
           >
-            <option
-              value={ALL_VENUES_VALUE}
-              style={{ backgroundColor: "#111", color: "#f2f2f2" }}
+            <span style={unifiedHeaderLabelStyle}>Venue</span>
+            <select
+              className="utt-header-control"
+              style={{ ...unifiedHeaderSelectStyle, width: 165, maxWidth: "42vw" }}
+              value={venue}
+              onChange={(e) => setVenue(e.target.value)}
+              aria-label="Venue"
             >
-              {labelVenueOption(ALL_VENUES_VALUE)}
-            </option>
-            {(supportedVenues || []).map((v) => (
               <option
-                key={v}
-                value={v}
+                value={ALL_VENUES_VALUE}
                 style={{ backgroundColor: "#111", color: "#f2f2f2" }}
               >
-                {labelVenueOption(v)}
+                {labelVenueOption(ALL_VENUES_VALUE)}
               </option>
-            ))}
-          </select>
-          <button
-            ref={venueMgrBtnRef}
-            type="button"
-            style={{ ...headerStyles.button, padding: "6px 8px" }}
-            onClick={() => {
-              const next = !venueMgrOpen;
-              setVenueMgrOpen(next);
-              if (next) setTimeout(() => placeVenueMgrNearButton(), 0);
-            }}
-            title="Enable/disable venues (local UI override)"
-          >
-            Manage
-          </button>
-        </div>
-
-        <div style={headerStyles.pill} title="Trading safety: DRY_RUN is process-level; ARMED is runtime toggle.">
-          <span>Safety</span>
-          <span style={{ ...headerStyles.mutedSmall, fontSize: 12 }}>
-            DRY_RUN: <b>{dryRunKnown ? (isDryRun ? "ON" : "OFF") : "…"}</b>
-          </span>
-          <span style={{ ...headerStyles.mutedSmall, fontSize: 12 }}>
-            ARMED: <b>{armedKnown ? (isArmed ? "YES" : "NO") : "…"}</b>
-          </span>
-
-          <button
-            style={btnHeader(isArmed ? disarmDisabled : armDisabled)}
-            disabled={isArmed ? disarmDisabled : armDisabled}
-            onClick={() => (isArmed ? doSetArmed(false) : doSetArmed(true))}
-            title={
-              isArmed
-                ? "Disarm live trading (forces dry-run routing)."
-                : dryRunKnown && isDryRun
-                ? "Cannot ARM while DRY_RUN=true. Set DRY_RUN=false and restart backend."
-                : "Arm live trading (only effective if DRY_RUN=false and LIVE_VENUES allows the venue)."
-            }
-          >
-            {loadingArm ? "Working…" : isArmed ? "Disarm" : "Arm"}
-          </button>
-
-          <button style={btnHeader(loadingArm)} disabled={loadingArm} onClick={() => loadArmStatus()} title="Refresh safety status">
-            Refresh
-          </button>
-        </div>
-
-        <label style={headerStyles.pill}>
-          <input type="checkbox" checked={pollEnabled} onChange={(e) => setPollEnabled(e.target.checked)} />
-          <span>Background refresh</span>
-        </label>
-
-        <div style={headerStyles.pill}>
-          <span>Every</span>
-          <input
-            style={{ ...headerStyles.input, width: 90 }}
-            type="number"
-            min="3"
-            max="300"
-            value={pollSeconds}
-            onChange={(e) => setPollSeconds(e.target.value)}
-            disabled={!pollEnabled}
-          />
-          <span className="muted">sec</span>
-        </div>
-
-        <div style={headerStyles.pill}>
-          <span>Market</span>
-          <input
-            style={{ ...headerStyles.input, width: 200 }}
-            value={marketInput}
-            placeholder="e.g. BTC-USD"
-            onChange={(e) => setMarketInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") applyMarketSymbol();
-            }}
-          />
-          <button style={btnHeader(!marketInput.trim())} disabled={!marketInput.trim()} onClick={() => applyMarketSymbol()}>
-            Apply
-          </button>
-        </div>
-
-        <label style={headerStyles.pill} title="When checked, Apply will also set the current tab’s symbol filter (Orders tabs).">
-          <input type="checkbox" checked={applyMarketToTab} onChange={(e) => setApplyMarketToTab(e.target.checked)} />
-          <span>Apply to tab</span>
-        </label>
-
-        <label style={headerStyles.pill} title="Masks table values and also hides venue names across the UI/widgets.">
-          <input type="checkbox" checked={hideTableDataGlobal} onChange={(e) => setHideTableDataGlobal(e.target.checked)} />
-          <span>Hide table data</span>
-        </label>
-
-        <div style={headerStyles.pill} title="Show/hide widgets (persisted).">
-          <span>Widgets</span>
-
-          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <input type="checkbox" checked={!!visible.chart} onChange={(e) => setVisible((v) => ({ ...v, chart: e.target.checked }))} />
-            <span>Chart</span>
-          </label>
-
-          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <input type="checkbox" checked={!!visible.tables} onChange={(e) => setVisible((v) => ({ ...v, tables: e.target.checked }))} />
-            <span>Tables</span>
-          </label>
-
-          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <input type="checkbox" checked={!!visible.orderBook} onChange={(e) => setVisible((v) => ({ ...v, orderBook: e.target.checked }))} />
-            <span>Order Book</span>
-          </label>
-
-          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <input type="checkbox" checked={!!visible.orderTicket} onChange={(e) => setVisible((v) => ({ ...v, orderTicket: e.target.checked }))} />
-            <span>Order Ticket</span>
-          </label>
-        </div>
-
-        <button style={btnHeader(false)} onClick={onResetWidgets} title="Reset widget visibility">
-          Reset Widgets
-        </button>
-
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
-          <button
-            type="button"
-            style={screenshotLinkStyle}
-            disabled={shotBusy}
-            onClick={captureFullUiScreenshot}
-            title="Capture a screenshot of the rendered UI (select your current browser tab when prompted)."
-            aria-label={shotBusy ? "Capturing screenshot" : "Capture screenshot"}
-          >
-            {shotBusy ? (
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                <CameraIcon size={14} />
-                <span>Capturing…</span>
-              </span>
-            ) : (
-              <CameraIcon size={14} />
-            )}
-          </button>
-
-          <div
-            style={{ ...headerStyles.mutedSmall, fontSize: 12, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 6 }}
-            title={hideHeaderPortfolioTotal ? "Total Portfolio is hidden by the header privacy toggle." : "Total Portfolio is visible. This toggle is independent from Hide table data."}
-          >
-            <span>
-              Total Portfolio (All Venues): <b>${hideHeaderPortfolioTotal ? "••••" : headerAllVenuesTotalText}</b>
-            </span>
+              {(supportedVenues || []).map((v) => (
+                <option
+                  key={v}
+                  value={v}
+                  style={{ backgroundColor: "#111", color: "#f2f2f2" }}
+                >
+                  {labelVenueOption(v)}
+                </option>
+              ))}
+            </select>
             <button
+              ref={venueMgrBtnRef}
               type="button"
-              style={{
-                ...btnHeader(false),
-                padding: "3px 7px",
-                fontSize: 11,
-                lineHeight: 1.2,
-                minHeight: 0,
+              className="utt-header-action"
+              style={unifiedHeaderActionStyle(false, "secondary")}
+              onClick={() => {
+                const next = !venueMgrOpen;
+                setVenueMgrOpen(next);
+                if (next) setTimeout(() => placeVenueMgrNearButton(), 0);
               }}
-              onClick={toggleHeaderPortfolioTotalHidden}
-              title={hideHeaderPortfolioTotal ? "Show Total Portfolio balance" : "Hide Total Portfolio balance"}
-              aria-label={hideHeaderPortfolioTotal ? "Show Total Portfolio balance" : "Hide Total Portfolio balance"}
+              title="Enable/disable venues (local UI override)"
             >
-              {hideHeaderPortfolioTotal ? "Show" : "Hide"}
+              Manage
             </button>
           </div>
 
-          <div style={{ ...headerStyles.mutedSmall, fontSize: 12 }}>
-            API: {API_BASE}
-            {loadingSupportedVenues ? " (venues…)" : venuesLoaded ? "" : " (venues…)"}{" "}
+          <div
+            className="utt-header-group utt-header-group--market"
+            style={{ ...unifiedHeaderGroupStyle, flex: "1 1 390px" }}
+          >
+            <span style={unifiedHeaderLabelStyle}>Market</span>
+            <input
+              className="utt-header-control"
+              style={{ ...unifiedHeaderInputStyle, width: 220, minWidth: 150, flex: "1 1 180px" }}
+              value={marketInput}
+              placeholder="e.g. BTC-USD"
+              onChange={(e) => setMarketInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") applyMarketSymbol();
+              }}
+              aria-label="Market symbol"
+            />
+            <button
+              type="button"
+              className="utt-header-action"
+              style={unifiedHeaderActionStyle(!marketInput.trim(), "primary")}
+              disabled={!marketInput.trim()}
+              onClick={() => applyMarketSymbol()}
+            >
+              Apply
+            </button>
+            <label
+              className="utt-header-toggle"
+              style={unifiedHeaderToggleStyle(applyMarketToTab)}
+              title="When checked, Apply will also set the current tab’s symbol filter (Orders tabs)."
+            >
+              <input
+                className="utt-header-toggle-input"
+                type="checkbox"
+                checked={applyMarketToTab}
+                onChange={(e) => setApplyMarketToTab(e.target.checked)}
+              />
+              <span>Apply to tab</span>
+            </label>
+          </div>
+
+          <label
+            className="utt-header-toggle utt-header-toggle--privacy"
+            style={unifiedHeaderToggleStyle(hideTableDataGlobal)}
+            title="Masks table values and also hides venue names across the UI/widgets."
+          >
+            <input
+              className="utt-header-toggle-input"
+              type="checkbox"
+              checked={hideTableDataGlobal}
+              onChange={(e) => setHideTableDataGlobal(e.target.checked)}
+            />
+            <span>Hide table data</span>
+          </label>
+        </div>
+
+        <div className="utt-header-band utt-header-band--runtime" style={unifiedHeaderBandStyle}>
+          <div
+            className="utt-header-group utt-header-group--safety"
+            style={{
+              ...unifiedHeaderGroupStyle,
+              flex: "0 1 auto",
+              border: isArmed
+                ? "1px solid color-mix(in srgb, var(--utt-good, #55e38c) 46%, var(--utt-hdr-pill-border, rgba(255,255,255,0.12)))"
+                : unifiedHeaderGroupStyle.border,
+            }}
+            title="Trading safety: DRY_RUN is process-level; ARMED is runtime toggle."
+          >
+            <span style={unifiedHeaderLabelStyle}>Safety</span>
+            <span style={unifiedHeaderStatusStyle(dryRunStatusTone)}>
+              <span aria-hidden="true" style={unifiedHeaderStatusDotStyle(dryRunStatusTone)} />
+              <span>{dryRunStatusText}</span>
+            </span>
+            <span style={unifiedHeaderStatusStyle(armedStatusTone)}>
+              <span aria-hidden="true" style={unifiedHeaderStatusDotStyle(armedStatusTone)} />
+              <span>{armedStatusText}</span>
+            </span>
+
+            <button
+              type="button"
+              className="utt-header-action"
+              style={unifiedHeaderActionStyle(
+                isArmed ? disarmDisabled : armDisabled,
+                isArmed ? "danger" : "warning"
+              )}
+              disabled={isArmed ? disarmDisabled : armDisabled}
+              onClick={() => (isArmed ? doSetArmed(false) : doSetArmed(true))}
+              title={
+                isArmed
+                  ? "Disarm live trading (forces dry-run routing)."
+                  : dryRunKnown && isDryRun
+                  ? "Cannot ARM while DRY_RUN=true. Set DRY_RUN=false and restart backend."
+                  : "Arm live trading (only effective if DRY_RUN=false and LIVE_VENUES allows the venue)."
+              }
+            >
+              {loadingArm ? "Working…" : isArmed ? "Disarm" : "Arm"}
+            </button>
+
+            <button
+              type="button"
+              className="utt-header-action"
+              style={unifiedHeaderActionStyle(loadingArm, "secondary")}
+              disabled={loadingArm}
+              onClick={() => loadArmStatus()}
+              title="Refresh safety status"
+            >
+              Refresh
+            </button>
+          </div>
+
+          <div
+            className="utt-header-group utt-header-group--refresh"
+            style={{ ...unifiedHeaderGroupStyle, flex: "0 1 auto" }}
+          >
+            <span style={unifiedHeaderLabelStyle}>Refresh</span>
+            <label className="utt-header-toggle" style={unifiedHeaderToggleStyle(pollEnabled)}>
+              <input
+                className="utt-header-toggle-input"
+                type="checkbox"
+                checked={pollEnabled}
+                onChange={(e) => setPollEnabled(e.target.checked)}
+              />
+              <span style={unifiedHeaderStatusStyle(pollEnabled ? "good" : "neutral")}>
+                <span aria-hidden="true" style={unifiedHeaderStatusDotStyle(pollEnabled ? "good" : "neutral")} />
+                <span>{pollEnabled ? "ON" : "OFF"}</span>
+              </span>
+              <span>Background</span>
+            </label>
+            <span style={{ ...unifiedHeaderLabelStyle, letterSpacing: 0.35, textTransform: "none" }}>Every</span>
+            <input
+              className="utt-header-control"
+              style={{ ...unifiedHeaderInputStyle, width: 76, textAlign: "right", fontVariantNumeric: "tabular-nums" }}
+              type="number"
+              min="3"
+              max="300"
+              value={pollSeconds}
+              onChange={(e) => setPollSeconds(e.target.value)}
+              disabled={!pollEnabled}
+              aria-label="Background refresh interval in seconds"
+            />
+            <span style={{ ...unifiedHeaderLabelStyle, letterSpacing: 0.35, textTransform: "none" }}>sec</span>
+          </div>
+
+          <div
+            className="utt-header-group utt-header-group--widgets"
+            style={{ ...unifiedHeaderGroupStyle, flex: "1 1 500px", flexWrap: "wrap" }}
+            title="Show/hide widgets (persisted)."
+          >
+            <span style={unifiedHeaderLabelStyle}>Widgets</span>
+
+            <label className="utt-header-toggle" style={unifiedHeaderToggleStyle(!!visible.chart)}>
+              <input
+                className="utt-header-toggle-input"
+                type="checkbox"
+                checked={!!visible.chart}
+                onChange={(e) => setVisible((v) => ({ ...v, chart: e.target.checked }))}
+              />
+              <span>Chart</span>
+            </label>
+
+            <label className="utt-header-toggle" style={unifiedHeaderToggleStyle(!!visible.tables)}>
+              <input
+                className="utt-header-toggle-input"
+                type="checkbox"
+                checked={!!visible.tables}
+                onChange={(e) => setVisible((v) => ({ ...v, tables: e.target.checked }))}
+              />
+              <span>Tables</span>
+            </label>
+
+            <label className="utt-header-toggle" style={unifiedHeaderToggleStyle(!!visible.orderBook)}>
+              <input
+                className="utt-header-toggle-input"
+                type="checkbox"
+                checked={!!visible.orderBook}
+                onChange={(e) => setVisible((v) => ({ ...v, orderBook: e.target.checked }))}
+              />
+              <span>Order Book</span>
+            </label>
+
+            <label className="utt-header-toggle" style={unifiedHeaderToggleStyle(!!visible.orderTicket)}>
+              <input
+                className="utt-header-toggle-input"
+                type="checkbox"
+                checked={!!visible.orderTicket}
+                onChange={(e) => setVisible((v) => ({ ...v, orderTicket: e.target.checked }))}
+              />
+              <span>Order Ticket</span>
+            </label>
+
+            <button
+              type="button"
+              className="utt-header-action"
+              style={unifiedHeaderActionStyle(false, "tertiary")}
+              onClick={onResetWidgets}
+              title="Reset widget visibility"
+            >
+              Reset
+            </button>
+
+            <div className="utt-header-widgets-status">
+              <button
+                type="button"
+                className="utt-header-action utt-header-action--icon"
+                style={{ ...unifiedHeaderActionStyle(shotBusy, "tertiary"), width: 30, minWidth: 30, padding: 0 }}
+                disabled={shotBusy}
+                onClick={captureFullUiScreenshot}
+                title="Capture a screenshot of the rendered UI (select your current browser tab when prompted)."
+                aria-label={shotBusy ? "Capturing screenshot" : "Capture screenshot"}
+              >
+                {shotBusy ? (
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <CameraIcon size={14} />
+                  </span>
+                ) : (
+                  <CameraIcon size={14} />
+                )}
+              </button>
+
+              <div
+                className="utt-header-group utt-header-group--portfolio"
+                style={{ ...unifiedHeaderGroupStyle, minHeight: 34, padding: "3px 5px 3px 9px" }}
+                title={hideHeaderPortfolioTotal ? "Total Portfolio is hidden by the header privacy toggle." : "Total Portfolio is visible. This toggle is independent from Hide table data."}
+              >
+                <span style={unifiedHeaderLabelStyle}>Portfolio</span>
+                <span style={{ fontSize: 12, fontWeight: 900, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
+                  ${hideHeaderPortfolioTotal ? "••••" : headerAllVenuesTotalText}
+                </span>
+                <button
+                  type="button"
+                  className="utt-header-action"
+                  style={{ ...unifiedHeaderActionStyle(false, "tertiary"), minHeight: 26, height: 26, padding: "3px 8px", fontSize: 10 }}
+                  onClick={toggleHeaderPortfolioTotalHidden}
+                  title={hideHeaderPortfolioTotal ? "Show Total Portfolio balance" : "Hide Total Portfolio balance"}
+                  aria-label={hideHeaderPortfolioTotal ? "Show Total Portfolio balance" : "Hide Total Portfolio balance"}
+                >
+                  {hideHeaderPortfolioTotal ? "Show" : "Hide"}
+                </button>
+              </div>
+
+              <div
+                className="utt-header-group utt-header-group--api"
+                style={{ ...unifiedHeaderGroupStyle, minHeight: 34, padding: "3px 9px" }}
+                title={`API base: ${API_BASE}${loadingSupportedVenues ? " · loading venues" : venuesLoaded ? " · venues loaded" : " · venue status pending"}`}
+              >
+                <span style={unifiedHeaderLabelStyle}>API</span>
+                <span style={unifiedHeaderStatusStyle(apiStatusTone)}>
+                  <span aria-hidden="true" style={unifiedHeaderStatusDotStyle(apiStatusTone)} />
+                  <span>{apiStatusText}</span>
+                </span>
+              </div>
+            </div>
           </div>
         </div>
       </div>

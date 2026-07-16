@@ -1,5 +1,5 @@
 // frontend/src/features/wallets/WalletAddressesWindow.jsx
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * WalletAddressesWindow (MVP)
@@ -22,10 +22,327 @@ import React, { useEffect, useMemo, useState } from "react";
  *  - hideTableData: boolean (redacts addresses)
  *  - onClose: () => void
  */
+const ROBINHOOD_CHAIN_NETWORK = Object.freeze({
+  chainIdHex: "0x1237",
+  chainIdDecimal: 4663,
+  chainName: "Robinhood Chain",
+  nativeCurrency: Object.freeze({ name: "Ether", symbol: "ETH", decimals: 18 }),
+  rpcUrls: Object.freeze(["https://rpc.mainnet.chain.robinhood.com/"]),
+  blockExplorerUrls: Object.freeze(["https://robinhoodchain.blockscout.com"]),
+});
+
+const WALLET_CYBER_CSS = `
+.utt-wallet-addresses-cyber {
+  --wallet-cyan: var(--utt-cyber-cyan, #42e8ff);
+  --wallet-cyan-soft: rgba(66, 232, 255, 0.14);
+  --wallet-green: var(--utt-cyber-green, #5dff9a);
+  --wallet-amber: var(--utt-cyber-amber, #ffc857);
+  --wallet-red: var(--utt-cyber-red, #ff5f7a);
+  --wallet-panel: var(--utt-surface-1, #08131c);
+  --wallet-panel-strong: var(--utt-surface-2, #0b1d29);
+  --wallet-border: var(--utt-border-1, rgba(66,232,255,0.28));
+  position: relative;
+  min-height: 100%;
+  padding: 12px;
+  overflow: auto;
+  color: var(--utt-page-fg, #e9faff);
+  background:
+    linear-gradient(rgba(66,232,255,0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(66,232,255,0.025) 1px, transparent 1px),
+    radial-gradient(900px 420px at 12% -10%, rgba(0, 204, 255, 0.15), transparent 60%),
+    var(--utt-page-bg, #050a0f);
+  background-size: 28px 28px, 28px 28px, auto, auto;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+.utt-wallet-addresses-cyber::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(180deg, transparent 0, transparent 3px, rgba(255,255,255,0.012) 4px);
+  mix-blend-mode: screen;
+}
+.utt-wallet-addresses-cyber > * { position: relative; z-index: 1; }
+.utt-wallet-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--wallet-border);
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(66,232,255,0.11), rgba(0,0,0,0.18) 55%, rgba(93,255,154,0.06));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 12px 28px rgba(0,0,0,0.28);
+}
+.utt-wallet-title {
+  color: var(--wallet-cyan);
+  font-family: "Roboto Mono", "Cascadia Code", ui-monospace, monospace;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-shadow: 0 0 14px rgba(66,232,255,0.35);
+}
+.utt-wallet-subtitle { color: var(--utt-hdr-muted, rgba(233,250,255,0.68)); font-family: ui-monospace, monospace; }
+.utt-wallet-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 5px;
+  border: 1px solid var(--wallet-border);
+  border-radius: 10px;
+  background: rgba(0,0,0,0.22);
+}
+.utt-wallet-addresses-cyber button {
+  min-height: 30px;
+  border: 1px solid var(--wallet-border);
+  border-radius: 8px;
+  padding: 5px 10px;
+  color: var(--utt-page-fg, #e9faff);
+  background: linear-gradient(180deg, rgba(66,232,255,0.09), rgba(0,0,0,0.24));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+  cursor: pointer;
+  font-weight: 700;
+  letter-spacing: 0.015em;
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+}
+.utt-wallet-addresses-cyber button:hover:not(:disabled) {
+  border-color: var(--wallet-cyan);
+  background: linear-gradient(180deg, rgba(66,232,255,0.18), rgba(0,0,0,0.24));
+  box-shadow: 0 0 0 1px rgba(66,232,255,0.14), 0 0 16px rgba(66,232,255,0.12);
+  transform: translateY(-1px);
+}
+.utt-wallet-addresses-cyber button:focus-visible,
+.utt-wallet-addresses-cyber input:focus-visible {
+  outline: 2px solid var(--wallet-cyan);
+  outline-offset: 2px;
+}
+.utt-wallet-addresses-cyber button:disabled { opacity: 0.48; cursor: not-allowed; transform: none; }
+.utt-wallet-tabs button[disabled] {
+  opacity: 1;
+  color: #041014;
+  border-color: var(--wallet-cyan);
+  background: var(--wallet-cyan);
+  box-shadow: 0 0 18px rgba(66,232,255,0.22);
+}
+.utt-wallet-addresses-cyber input:not([type="checkbox"]) {
+  min-width: 0;
+  min-height: 30px;
+  box-sizing: border-box;
+  border: 1px solid var(--wallet-border);
+  border-radius: 7px;
+  padding: 5px 8px;
+  color: var(--utt-page-fg, #e9faff);
+  background: var(--utt-control-bg, #061018);
+  font-family: inherit;
+}
+.utt-wallet-addresses-cyber input::placeholder { color: rgba(210,238,246,0.44); }
+.utt-wallet-addresses-cyber input[type="checkbox"] { accent-color: var(--wallet-cyan); }
+.utt-wallet-addresses-cyber label {
+  color: var(--utt-hdr-muted, rgba(233,250,255,0.72));
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.utt-wallet-addresses-cyber code {
+  color: var(--wallet-cyan);
+  background: rgba(66,232,255,0.08);
+  border: 1px solid rgba(66,232,255,0.16);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.utt-wallet-panel {
+  margin-bottom: 12px;
+  padding: 11px;
+  border: 1px solid var(--wallet-border) !important;
+  border-radius: 12px;
+  background: linear-gradient(145deg, var(--wallet-panel), rgba(0,0,0,0.18));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.035), 0 10px 24px rgba(0,0,0,0.2);
+}
+.utt-wallet-panel-title {
+  margin-bottom: 9px;
+  color: var(--wallet-cyan);
+  font-family: "Roboto Mono", "Cascadia Code", ui-monospace, monospace;
+  font-weight: 800;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+.utt-wallet-form-grid {
+  display: grid !important;
+  grid-template-columns: minmax(120px, 140px) minmax(180px, 1fr) minmax(120px, 140px) minmax(180px, 1fr) !important;
+  gap: 8px 10px !important;
+  align-items: center;
+}
+.utt-wallet-action-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.utt-wallet-error {
+  margin-bottom: 10px;
+  padding: 9px 10px;
+  border: 1px solid rgba(255,95,122,0.58);
+  border-radius: 9px;
+  color: #ffd9e0;
+  background: rgba(90,10,28,0.48);
+  box-shadow: 0 0 18px rgba(255,95,122,0.08);
+  font-weight: 700;
+}
+.utt-wallet-terminal-output {
+  margin-top: 10px;
+  padding: 9px;
+  border: 1px solid var(--wallet-border) !important;
+  border-radius: 9px;
+  color: var(--utt-page-fg, #e9faff) !important;
+  background: rgba(1,8,12,0.86) !important;
+  font-family: "Cascadia Code", ui-monospace, monospace;
+}
+.utt-wallet-table-wrap {
+  overflow: auto;
+  max-width: 100%;
+  border: 1px solid rgba(66,232,255,0.13);
+  border-radius: 9px;
+  background: rgba(0,0,0,0.18);
+}
+.utt-wallet-table { width: 100%; border-collapse: separate !important; border-spacing: 0; }
+.utt-wallet-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 7px !important;
+  border-bottom: 1px solid var(--wallet-border) !important;
+  color: var(--wallet-cyan);
+  background: var(--wallet-panel-strong) !important;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.utt-wallet-table tbody td {
+  padding: 7px !important;
+  border-bottom: 1px solid rgba(66,232,255,0.08) !important;
+  background: transparent;
+  white-space: nowrap;
+}
+.utt-wallet-table tbody tr:hover td { background: rgba(66,232,255,0.045); }
+.utt-wallet-metamask-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 8px 0 10px;
+}
+.utt-wallet-metamask-cell {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(66,232,255,0.16);
+  border-radius: 8px;
+  background: rgba(0,0,0,0.24);
+}
+.utt-wallet-metamask-label {
+  margin-bottom: 4px;
+  color: rgba(224,246,252,0.58);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.utt-wallet-metamask-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; }
+.utt-wallet-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--wallet-border);
+  border-radius: 999px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+.utt-wallet-chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 10px currentColor; }
+.utt-wallet-chip--good { color: var(--wallet-green); border-color: rgba(93,255,154,0.38); background: rgba(93,255,154,0.08); }
+.utt-wallet-chip--warn { color: var(--wallet-amber); border-color: rgba(255,200,87,0.38); background: rgba(255,200,87,0.08); }
+.utt-wallet-chip--bad { color: var(--wallet-red); border-color: rgba(255,95,122,0.38); background: rgba(255,95,122,0.08); }
+.utt-wallet-chip--neutral { color: var(--wallet-cyan); background: rgba(66,232,255,0.07); }
+.utt-wallet-metamask-note { color: var(--utt-hdr-muted, rgba(233,250,255,0.7)); line-height: 1.45; }
+.utt-wallet-metamask-message { margin-top: 8px; padding: 7px 8px; border-left: 3px solid var(--wallet-cyan); background: rgba(66,232,255,0.06); }
+.utt-wallet-metamask-message--error { border-left-color: var(--wallet-red); color: #ffd9e0; background: rgba(255,95,122,0.07); }
+.utt-wallet-danger-button { border-color: rgba(255,95,122,0.42) !important; color: #ffd0d9 !important; }
+.utt-wallet-primary-button { border-color: rgba(66,232,255,0.64) !important; color: var(--wallet-cyan) !important; }
+.utt-wallet-good-button { border-color: rgba(93,255,154,0.52) !important; color: var(--wallet-green) !important; }
+@media (max-width: 900px) {
+  .utt-wallet-metamask-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .utt-wallet-form-grid { grid-template-columns: minmax(110px, 135px) minmax(0, 1fr) !important; }
+}
+@media (max-width: 580px) {
+  .utt-wallet-addresses-cyber { padding: 8px; }
+  .utt-wallet-titlebar { align-items: flex-start; flex-wrap: wrap; }
+  .utt-wallet-metamask-grid { grid-template-columns: 1fr; }
+  .utt-wallet-form-grid { grid-template-columns: 1fr !important; }
+  .utt-wallet-form-grid label { margin-top: 4px; }
+}
+`;
+
+function getMetaMaskProvider() {
+  if (typeof window === "undefined") return null;
+  const injected = window.ethereum;
+  if (!injected) return null;
+  if (Array.isArray(injected.providers)) {
+    const exact = injected.providers.find((provider) => provider?.isMetaMask);
+    if (exact) return exact;
+  }
+  return injected?.isMetaMask ? injected : null;
+}
+
+function hasInjectedEvmProvider() {
+  return typeof window !== "undefined" && !!window.ethereum;
+}
+
+function normalizeEvmChainId(value) {
+  try {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "";
+    return `0x${BigInt(raw).toString(16)}`;
+  } catch {
+    return "";
+  }
+}
+
+function chainIdDecimalLabel(value) {
+  try {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "Unknown";
+    return String(BigInt(raw));
+  } catch {
+    return "Unknown";
+  }
+}
+
+function compactEvmAddress(address) {
+  const raw = String(address || "").trim();
+  if (raw.length <= 18) return raw || "—";
+  return `${raw.slice(0, 10)}…${raw.slice(-8)}`;
+}
+
 export default function WalletAddressesWindow({ apiBase = "", hideTableData = false, onClose }) {
   const [tab, setTab] = useState("addresses"); // addresses | balances
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  const metamaskProviderRef = useRef(null);
+  const [metamaskState, setMetamaskState] = useState({
+    checked: false,
+    available: false,
+    injectedAvailable: false,
+    address: "",
+    chainId: "",
+    lastEvent: "",
+  });
+  const [metamaskBusy, setMetamaskBusy] = useState(false);
+  const [metamaskError, setMetamaskError] = useState("");
+  const [metamaskNotice, setMetamaskNotice] = useState("");
 
   const [addresses, setAddresses] = useState([]);
   const [balances, setBalances] = useState([]);
@@ -62,6 +379,187 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
   const txStats = useMemo(() => deriveTxStats(txLastResult), [txLastResult]);
 
   const redacted = (v) => (hideTableData ? "••••••••" : v);
+
+  const metamaskChainIdHex = normalizeEvmChainId(metamaskState.chainId);
+  const metamaskConnected = !!String(metamaskState.address || "").trim();
+  const metamaskOnRobinhoodChain = metamaskChainIdHex === ROBINHOOD_CHAIN_NETWORK.chainIdHex;
+  const metamaskReady = metamaskState.available && metamaskConnected && metamaskOnRobinhoodChain;
+
+  function metamaskErrorMessage(error, fallback) {
+    const code = Number(error?.code);
+    if (code === 4001) return "MetaMask request was declined.";
+    if (code === 4902) return "Robinhood Chain is not installed in MetaMask. Use Add Robinhood Chain.";
+    return error?.message || String(error || fallback || "MetaMask request failed.");
+  }
+
+  async function readMetaMaskState({ requestAccounts = false, reason = "refresh" } = {}) {
+    const provider = metamaskProviderRef.current || getMetaMaskProvider();
+    metamaskProviderRef.current = provider;
+
+    if (!provider) {
+      setMetamaskState((prev) => ({
+        ...prev,
+        checked: true,
+        available: false,
+        injectedAvailable: hasInjectedEvmProvider(),
+        address: "",
+        chainId: "",
+        lastEvent: reason,
+      }));
+      return { provider: null, accounts: [], chainId: "" };
+    }
+
+    const accounts = requestAccounts
+      ? await provider.request({ method: "eth_requestAccounts" })
+      : await provider.request({ method: "eth_accounts" });
+    const chainId = await provider.request({ method: "eth_chainId" });
+    const normalizedAccounts = Array.isArray(accounts) ? accounts : [];
+    const address = String(normalizedAccounts[0] || "").trim();
+    const normalizedChainId = normalizeEvmChainId(chainId);
+
+    setMetamaskState({
+      checked: true,
+      available: true,
+      injectedAvailable: true,
+      address,
+      chainId: normalizedChainId,
+      lastEvent: reason,
+    });
+
+    return { provider, accounts: normalizedAccounts, chainId: normalizedChainId };
+  }
+
+  async function connectMetaMask() {
+    setMetamaskBusy(true);
+    setMetamaskError("");
+    setMetamaskNotice("");
+    try {
+      const result = await readMetaMaskState({ requestAccounts: true, reason: "connect" });
+      const address = String(result?.accounts?.[0] || "").trim();
+      if (!address) throw new Error("MetaMask returned no account.");
+      setMetamaskNotice("MetaMask account connected to UTT. No signature or transaction was requested.");
+    } catch (error) {
+      setMetamaskError(metamaskErrorMessage(error, "MetaMask connection failed."));
+    } finally {
+      setMetamaskBusy(false);
+    }
+  }
+
+  async function switchMetaMaskToRobinhoodChain() {
+    const provider = metamaskProviderRef.current || getMetaMaskProvider();
+    if (!provider) {
+      setMetamaskError("MetaMask was not detected.");
+      return;
+    }
+    setMetamaskBusy(true);
+    setMetamaskError("");
+    setMetamaskNotice("");
+    try {
+      await provider.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: ROBINHOOD_CHAIN_NETWORK.chainIdHex }],
+      });
+      await readMetaMaskState({ reason: "network_switch" });
+      setMetamaskNotice("MetaMask is now set to Robinhood Chain.");
+    } catch (error) {
+      setMetamaskError(metamaskErrorMessage(error, "Unable to switch MetaMask network."));
+    } finally {
+      setMetamaskBusy(false);
+    }
+  }
+
+  async function addRobinhoodChainToMetaMask() {
+    const provider = metamaskProviderRef.current || getMetaMaskProvider();
+    if (!provider) {
+      setMetamaskError("MetaMask was not detected.");
+      return;
+    }
+    setMetamaskBusy(true);
+    setMetamaskError("");
+    setMetamaskNotice("");
+    try {
+      await provider.request({
+        method: "wallet_addEthereumChain",
+        params: [{
+          chainId: ROBINHOOD_CHAIN_NETWORK.chainIdHex,
+          chainName: ROBINHOOD_CHAIN_NETWORK.chainName,
+          nativeCurrency: ROBINHOOD_CHAIN_NETWORK.nativeCurrency,
+          rpcUrls: [...ROBINHOOD_CHAIN_NETWORK.rpcUrls],
+          blockExplorerUrls: [...ROBINHOOD_CHAIN_NETWORK.blockExplorerUrls],
+        }],
+      });
+      await readMetaMaskState({ reason: "network_add" });
+      setMetamaskNotice("Robinhood Chain network details were submitted to MetaMask for approval.");
+    } catch (error) {
+      setMetamaskError(metamaskErrorMessage(error, "Unable to add Robinhood Chain."));
+    } finally {
+      setMetamaskBusy(false);
+    }
+  }
+
+  function useConnectedMetaMaskAddress() {
+    const address = String(metamaskState.address || "").trim();
+    if (!address) {
+      setMetamaskError("Connect a MetaMask account first.");
+      return;
+    }
+    setEditingId(null);
+    setForm({
+      asset: "ALL",
+      wallet_id: "robinhood_chain",
+      network: "robinhood_chain",
+      address,
+      label: "Robinhood Chain MetaMask",
+      owner_scope: "user",
+    });
+    setMetamaskError("");
+    setMetamaskNotice("Connected address copied into the wallet form. Review it, then use Create to save it.");
+  }
+
+  async function saveConnectedMetaMaskWallet() {
+    const address = String(metamaskState.address || "").trim();
+    if (!address) {
+      setMetamaskError("Connect a MetaMask account first.");
+      return;
+    }
+    if (!metamaskOnRobinhoodChain) {
+      setMetamaskError("Switch MetaMask to Robinhood Chain before saving this wallet record.");
+      return;
+    }
+
+    const payload = {
+      asset: "ALL",
+      wallet_id: "robinhood_chain",
+      network: "robinhood_chain",
+      address,
+      label: "Robinhood Chain MetaMask",
+      owner_scope: "user",
+    };
+
+    setBusy(true);
+    setMetamaskBusy(true);
+    setErr("");
+    setMetamaskError("");
+    setMetamaskNotice("");
+    try {
+      await api(`/api/wallet_addresses`, { method: "POST", body: payload });
+      await loadAddresses();
+      setForm(payload);
+      setEditingId(null);
+      setMetamaskNotice("Robinhood Chain wallet saved. The ALL row is metadata-only until EVM balance reads are enabled.");
+    } catch (error) {
+      setMetamaskError(error?.message || String(error));
+    } finally {
+      setMetamaskBusy(false);
+      setBusy(false);
+    }
+  }
+
+  function clearLocalMetaMaskState() {
+    setMetamaskState((prev) => ({ ...prev, address: "", lastEvent: "local_clear" }));
+    setMetamaskError("");
+    setMetamaskNotice("UTT local connection state was cleared. MetaMask itself was not disconnected or locked.");
+  }
 
   function applyHydrationWalletMode() {
     setForm((p) => ({
@@ -830,15 +1328,102 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
   }
 
   useEffect(() => {
+    let active = true;
+    const provider = getMetaMaskProvider();
+    metamaskProviderRef.current = provider;
+
+    if (!provider) {
+      setMetamaskState({
+        checked: true,
+        available: false,
+        injectedAvailable: hasInjectedEvmProvider(),
+        address: "",
+        chainId: "",
+        lastEvent: "detect",
+      });
+      return undefined;
+    }
+
+    const onAccountsChanged = (accounts) => {
+      if (!active) return;
+      const next = Array.isArray(accounts) ? String(accounts[0] || "").trim() : "";
+      setMetamaskState((prev) => ({
+        ...prev,
+        checked: true,
+        available: true,
+        injectedAvailable: true,
+        address: next,
+        lastEvent: "accountsChanged",
+      }));
+      setMetamaskNotice(next ? "MetaMask account changed." : "MetaMask reported no connected account.");
+      setMetamaskError("");
+    };
+
+    const onChainChanged = (chainId) => {
+      if (!active) return;
+      setMetamaskState((prev) => ({
+        ...prev,
+        checked: true,
+        available: true,
+        injectedAvailable: true,
+        chainId: normalizeEvmChainId(chainId),
+        lastEvent: "chainChanged",
+      }));
+      setMetamaskNotice("MetaMask network changed.");
+      setMetamaskError("");
+    };
+
+    try {
+      provider.on?.("accountsChanged", onAccountsChanged);
+      provider.on?.("chainChanged", onChainChanged);
+    } catch {
+      // Event support is optional; explicit refresh/connect controls remain available.
+    }
+
+    Promise.allSettled([
+      provider.request({ method: "eth_accounts" }),
+      provider.request({ method: "eth_chainId" }),
+    ]).then(([accountsResult, chainResult]) => {
+      if (!active) return;
+      const accounts = accountsResult.status === "fulfilled" && Array.isArray(accountsResult.value)
+        ? accountsResult.value
+        : [];
+      const chainId = chainResult.status === "fulfilled" ? normalizeEvmChainId(chainResult.value) : "";
+      setMetamaskState({
+        checked: true,
+        available: true,
+        injectedAvailable: true,
+        address: String(accounts[0] || "").trim(),
+        chainId,
+        lastEvent: "initial_silent_read",
+      });
+    }).catch(() => {
+      if (!active) return;
+      setMetamaskState((prev) => ({ ...prev, checked: true, available: true, injectedAvailable: true }));
+    });
+
+    return () => {
+      active = false;
+      try {
+        provider.removeListener?.("accountsChanged", onAccountsChanged);
+        provider.removeListener?.("chainChanged", onChainChanged);
+      } catch {
+        // ignore provider cleanup failures
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     loadAddresses();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
-    <div style={{ padding: 12, fontFamily: "system-ui, sans-serif", fontSize: 13 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-        <div style={{ fontWeight: 700, fontSize: 16 }}>Wallet Addresses</div>
-        <div style={{ opacity: 0.7 }}>({tab})</div>
+    <div className="utt-wallet-addresses-cyber">
+      <style>{WALLET_CYBER_CSS}</style>
+      <div className="utt-wallet-titlebar">
+        <div className="utt-wallet-title">Wallet Addresses // Chain Registry</div>
+        <div className="utt-wallet-subtitle">[{tab}]</div>
         <div style={{ flex: 1 }} />
         <button onClick={() => (tab === "balances" ? loadBalances() : loadAddresses())} disabled={busy}>
           Refresh
@@ -846,7 +1431,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
         {typeof onClose === "function" && <button onClick={onClose}>Close</button>}
       </div>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+      <div className="utt-wallet-tabs">
         <button onClick={() => setTab("addresses")} disabled={tab === "addresses"}>
           Addresses
         </button>
@@ -864,25 +1449,84 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
       </div>
 
       {err && (
-        <div
-          style={{
-            marginBottom: 10,
-            padding: 8,
-            background: "#ffecec",
-            border: "1px solid #ffb3b3",
-            borderRadius: 8,
-            color: "#111",
-            fontWeight: 600,
-          }}
-        >
+        <div className="utt-wallet-error">
           <b>Error:</b> {err}
         </div>
       )}
 
       {tab === "addresses" && (
         <>
-          <div style={{ marginBottom: 12, padding: 10, border: "1px solid #ddd" }}>
-            <div style={{ fontWeight: 700, marginBottom: 8 }}>Add Wallet Address (MVP)</div>
+          <div className="utt-wallet-panel utt-wallet-metamask-panel">
+            <div className="utt-wallet-panel-title">Robinhood Chain // MetaMask Link</div>
+
+            <div className="utt-wallet-action-row" style={{ marginBottom: 8 }}>
+              <span className={`utt-wallet-chip ${metamaskState.available ? "utt-wallet-chip--good" : metamaskState.injectedAvailable ? "utt-wallet-chip--warn" : "utt-wallet-chip--bad"}`}>
+                {!metamaskState.checked
+                  ? "Checking provider"
+                  : metamaskState.available
+                    ? "MetaMask detected"
+                    : metamaskState.injectedAvailable
+                      ? "Other EVM provider"
+                      : "MetaMask unavailable"}
+              </span>
+              <span className={`utt-wallet-chip ${metamaskConnected ? "utt-wallet-chip--good" : "utt-wallet-chip--neutral"}`}>
+                {metamaskConnected ? "Account connected" : "UTT disconnected"}
+              </span>
+              <span className={`utt-wallet-chip ${metamaskOnRobinhoodChain ? "utt-wallet-chip--good" : metamaskState.chainId ? "utt-wallet-chip--warn" : "utt-wallet-chip--neutral"}`}>
+                {metamaskOnRobinhoodChain ? "Robinhood Chain" : metamaskState.chainId ? "Wrong network" : "Chain unknown"}
+              </span>
+            </div>
+
+            <div className="utt-wallet-metamask-grid">
+              <div className="utt-wallet-metamask-cell">
+                <div className="utt-wallet-metamask-label">Provider</div>
+                <div className="utt-wallet-metamask-value">{metamaskState.available ? "MetaMask / EIP-1193" : metamaskState.injectedAvailable ? "Non-MetaMask EVM provider" : "Not detected"}</div>
+              </div>
+              <div className="utt-wallet-metamask-cell" title={hideTableData ? "Address hidden" : metamaskState.address || "No connected account"}>
+                <div className="utt-wallet-metamask-label">Selected account</div>
+                <div className="utt-wallet-metamask-value">{metamaskConnected ? redacted(compactEvmAddress(metamaskState.address)) : "—"}</div>
+              </div>
+              <div className="utt-wallet-metamask-cell">
+                <div className="utt-wallet-metamask-label">Current chain</div>
+                <div className="utt-wallet-metamask-value">{metamaskState.chainId ? `${chainIdDecimalLabel(metamaskState.chainId)} / ${metamaskChainIdHex}` : "Unknown"}</div>
+              </div>
+              <div className="utt-wallet-metamask-cell">
+                <div className="utt-wallet-metamask-label">Expected chain</div>
+                <div className="utt-wallet-metamask-value">{ROBINHOOD_CHAIN_NETWORK.chainIdDecimal} / {ROBINHOOD_CHAIN_NETWORK.chainIdHex}</div>
+              </div>
+            </div>
+
+            <div className="utt-wallet-action-row">
+              <button type="button" className="utt-wallet-primary-button" onClick={connectMetaMask} disabled={busy || metamaskBusy || !metamaskState.available}>
+                {metamaskConnected ? "Refresh MetaMask account" : "Connect MetaMask"}
+              </button>
+              <button type="button" onClick={switchMetaMaskToRobinhoodChain} disabled={busy || metamaskBusy || !metamaskState.available || metamaskOnRobinhoodChain}>
+                Switch to Robinhood Chain
+              </button>
+              <button type="button" onClick={addRobinhoodChainToMetaMask} disabled={busy || metamaskBusy || !metamaskState.available}>
+                Add Robinhood Chain
+              </button>
+              <button type="button" onClick={useConnectedMetaMaskAddress} disabled={busy || metamaskBusy || !metamaskConnected}>
+                Use connected address
+              </button>
+              <button type="button" className="utt-wallet-good-button" onClick={saveConnectedMetaMaskWallet} disabled={busy || metamaskBusy || !metamaskReady}>
+                Save Robinhood Chain wallet
+              </button>
+              <button type="button" onClick={clearLocalMetaMaskState} disabled={busy || metamaskBusy || !metamaskConnected}>
+                Clear UTT state
+              </button>
+              {metamaskBusy ? <span className="utt-wallet-subtitle">MetaMask request pending…</span> : null}
+            </div>
+
+            <div className="utt-wallet-metamask-note" style={{ marginTop: 9 }}>
+              Connection is read-only. UTT requests only account access and network information. Saving creates an <code>ALL</code> metadata row for <code>robinhood_chain</code>; it does not read balances, sign messages, approve tokens, or send transactions.
+            </div>
+            {metamaskNotice ? <div className="utt-wallet-metamask-message">{metamaskNotice}</div> : null}
+            {metamaskError ? <div className="utt-wallet-metamask-message utt-wallet-metamask-message--error">{metamaskError}</div> : null}
+          </div>
+
+          <div className="utt-wallet-panel">
+            <div className="utt-wallet-panel-title">Add Wallet Address</div>
 
             <div style={{ marginBottom: 10, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
               <div style={{ fontWeight: 600, opacity: 0.9 }}>Hydration/SubWallet:</div>
@@ -895,7 +1539,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               </div>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "140px 1fr 140px 1fr", gap: 8 }}>
+            <div className="utt-wallet-form-grid">
               <label>Asset / scope</label>
               <input
                 placeholder="e.g. BTC, SOL, UTTT, or ALL for metadata-only rows"
@@ -905,7 +1549,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
 
               <label>Venue</label>
               <input
-                placeholder="e.g. polkadot_hydration, robinhood, dex-trade (blank = self-custody)"
+                placeholder="e.g. robinhood_chain, polkadot_hydration, robinhood (blank = self-custody)"
                 value={form.wallet_id}
                 onChange={(e) => setForm((p) => ({ ...p, wallet_id: e.target.value }))}
               />
@@ -923,8 +1567,8 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               <input value={form.owner_scope} onChange={(e) => setForm((p) => ({ ...p, owner_scope: e.target.value }))} />
             </div>
 
-            <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center" }}>
-              <button onClick={createAddress} disabled={busy || !String(form.address || "").trim()}>
+            <div className="utt-wallet-action-row" style={{ marginTop: 10 }}>
+              <button className="utt-wallet-primary-button" onClick={createAddress} disabled={busy || !String(form.address || "").trim()}>
                 {editingId ? "Save" : "Create"}
               </button>
               {editingId ? (
@@ -945,10 +1589,10 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
             </div>
           </div>
 
-          <div style={{ marginBottom: 12, padding: 10, border: "1px solid #ddd" }}>
-            <div style={{ fontWeight: 700, marginBottom: 8 }}>Tx Ingest → Deposits/Withdrawals</div>
+          <div className="utt-wallet-panel">
+            <div className="utt-wallet-panel-title">Tx Ingest → Deposits/Withdrawals</div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "140px 1fr 140px 1fr", gap: 8 }}>
+            <div className="utt-wallet-form-grid">
               <label>Write to ledger</label>
               <input type="checkbox" checked={txWriteLedger} onChange={(e) => setTxWriteLedger(e.target.checked)} />
 
@@ -962,7 +1606,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               />
             </div>
 
-            <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center" }}>
+            <div className="utt-wallet-action-row" style={{ marginTop: 10 }}>
               <button
                 onClick={() => {
                   if (!window.confirm("Run on-chain tx ingest for ALL wallet addresses?")) return;
@@ -978,7 +1622,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
             </div>
 
             {txLastResult ? (
-              <div style={{ marginTop: 10, padding: 8, background: "#111", border: "1px solid #333", borderRadius: 8, color: "#eee" }}>
+              <div className="utt-wallet-terminal-output">
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>Last ingest result</div>
                 {txStats ? (
                   <div style={{ marginBottom: 8, padding: 8, background: "#171717", border: "1px solid #2a2a2a", borderRadius: 8 }}>
@@ -1033,15 +1677,15 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
             ) : null}
           </div>
 
-          <div style={{ marginBottom: 12, padding: 10, border: "1px solid #ddd" }}>
-            <div style={{ fontWeight: 700, marginBottom: 8 }}>Filters</div>
-            <div style={{ display: "grid", gridTemplateColumns: "140px 1fr 140px 1fr", gap: 8 }}>
+          <div className="utt-wallet-panel">
+            <div className="utt-wallet-panel-title">Filters</div>
+            <div className="utt-wallet-form-grid">
               <label>Asset</label>
               <input value={flt.asset} onChange={(e) => setFlt((p) => ({ ...p, asset: e.target.value.toUpperCase() }))} />
 
               <label>Venue</label>
               <input
-                placeholder="e.g. polkadot_hydration, robinhood, dex-trade"
+                placeholder="e.g. robinhood_chain, polkadot_hydration, robinhood"
                 value={flt.wallet_id}
                 onChange={(e) => setFlt((p) => ({ ...p, wallet_id: e.target.value }))}
               />
@@ -1059,7 +1703,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               />
             </div>
 
-            <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <div className="utt-wallet-action-row" style={{ marginTop: 10 }}>
               <button onClick={loadAddresses} disabled={busy}>
                 Apply
               </button>
@@ -1076,10 +1720,10 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
             </div>
           </div>
 
-          <div style={{ padding: 10, border: "1px solid #ddd" }}>
-            <div style={{ fontWeight: 700, marginBottom: 8 }}>Wallet Addresses</div>
-            <div style={{ overflowX: "auto" }}>
-              <table style={{ borderCollapse: "collapse", width: "100%" }}>
+          <div className="utt-wallet-panel">
+            <div className="utt-wallet-panel-title">Wallet Addresses</div>
+            <div className="utt-wallet-table-wrap">
+              <table className="utt-wallet-table">
                 <thead>
                   <tr>
                     {["id", "asset", "venue", "network", "address", "label", "owner_scope", "created_at", "actions"].map((h) => (
@@ -1124,7 +1768,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
                         <button onClick={() => beginEdit(a)} disabled={busy} style={{ marginRight: 6 }}>
                           Edit
                         </button>
-                        <button onClick={() => deleteAddress(a.id)} disabled={busy}>
+                        <button className="utt-wallet-danger-button" onClick={() => deleteAddress(a.id)} disabled={busy}>
                           Delete
                         </button>
                       </td>
@@ -1146,9 +1790,9 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
 
       {tab === "balances" && (
         <>
-          <div style={{ marginBottom: 12, padding: 10, border: "1px solid #ddd" }}>
-            <div style={{ fontWeight: 700, marginBottom: 8 }}>Balances Controls</div>
-            <div style={{ display: "grid", gridTemplateColumns: "140px 1fr 140px 1fr", gap: 8 }}>
+          <div className="utt-wallet-panel">
+            <div className="utt-wallet-panel-title">Balances Controls</div>
+            <div className="utt-wallet-form-grid">
               <label>With prices</label>
               <input type="checkbox" checked={withPrices} onChange={(e) => setWithPrices(e.target.checked)} />
 
@@ -1162,7 +1806,7 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
               />
             </div>
 
-            <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <div className="utt-wallet-action-row" style={{ marginTop: 10 }}>
               <button onClick={loadBalances} disabled={busy}>
                 Load latest
               </button>
@@ -1210,10 +1854,10 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
             ) : null}
           </div>
 
-          <div style={{ padding: 10, border: "1px solid #ddd" }}>
-            <div style={{ fontWeight: 700, marginBottom: 8 }}>Latest Balances</div>
-            <div style={{ overflowX: "auto" }}>
-              <table style={{ borderCollapse: "collapse", width: "100%" }}>
+          <div className="utt-wallet-panel">
+            <div className="utt-wallet-panel-title">Latest Balances</div>
+            <div className="utt-wallet-table-wrap">
+              <table className="utt-wallet-table">
                 <thead>
                   <tr>
                     {["id", "asset", "network", "address", "label", "balance", "usd_price", "usd_value", "usd_source_symbol", "fetched_at"].map((h) => (

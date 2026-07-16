@@ -3367,6 +3367,20 @@ async function onUnlinkWithdrawalRow(wdwRow) {
   const cpBtcDispositionPreview = cpPreviewData?.btc_disposition_preview || {};
   const cpHistoricalPrice = cpPreviewData?.historical_price_lookup || {};
   const cpBtcCustodyScope = cpPreviewData?.btc_custody_scope_preview || {};
+  const cpBtcSourceLot = cpPreviewData?.btc_source_lot_preview || {};
+  const cpBtcTxReconstruction = cpBtcSourceLot?.transaction_reconstruction || {};
+  const cpBtcSourceInputs = Array.isArray(cpBtcTxReconstruction?.inputs)
+    ? cpBtcTxReconstruction.inputs
+    : [];
+  const cpBtcSourceOutputs = Array.isArray(cpBtcTxReconstruction?.outputs)
+    ? cpBtcTxReconstruction.outputs
+    : [];
+  const cpBtcSourceCandidates = Array.isArray(cpBtcSourceLot?.db_candidates?.all_candidates)
+    ? cpBtcSourceLot.db_candidates.all_candidates
+    : [];
+  const cpBtcNativeLots = Array.isArray(cpBtcSourceLot?.native_btc_lots)
+    ? cpBtcSourceLot.native_btc_lots
+    : [];
   const cpBtcLotScopes = Array.isArray(cpBtcCustodyScope?.current_btc_lot_scopes)
     ? cpBtcCustodyScope.current_btc_lot_scopes
     : [];
@@ -3855,7 +3869,7 @@ async function onUnlinkWithdrawalRow(wdwRow) {
 
               <label
                 style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12 }}
-                title="Allow a read-only public Bitcoin transaction lookup when Counterparty metadata has no positive miner fee."
+                title="Allow a read-only public Bitcoin transaction lookup for miner-fee recovery and native BTC source-UTXO reconstruction."
               >
                 <input
                   type="checkbox"
@@ -3864,7 +3878,7 @@ async function onUnlinkWithdrawalRow(wdwRow) {
                     setCpPreviewAllowExternalFeeLookup(!!e.target.checked)
                   }
                 />
-                External fee lookup
+                External Bitcoin lookup
               </label>
 
               <label
@@ -4179,7 +4193,66 @@ async function onUnlinkWithdrawalRow(wdwRow) {
                       ["Shortfall BTC", cpBtcDispositionPreview.shortfall_btc],
                       ["Duplicate inventory", cpBtcDispositionPreview.duplicate_inventory_risk],
                       ["Universal pooling", cpBtcDispositionPreview.universal_pooling],
+                      ["Source-lot status", cpBtcDispositionPreview.source_lot_status],
+                      ["Tx inputs", cpBtcDispositionPreview.transaction_input_count],
+                      ["Tx outputs", cpBtcDispositionPreview.transaction_output_count],
+                      ["Wallet change sats", cpBtcDispositionPreview.wallet_change_satoshis],
+                      ["Net outflow sats", cpBtcDispositionPreview.net_wallet_outflow_satoshis],
+                      ["Outflow matches", cpBtcDispositionPreview.net_outflow_matches_expected],
                       ["FIFO mutation", cpBtcDispositionPreview.fifo_consumption],
+                    ].map(([label, value]) => (
+                      <div
+                        key={label}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "135px minmax(0, 1fr)",
+                          gap: 8,
+                          marginTop: 5,
+                          fontSize: 11,
+                        }}
+                      >
+                        <span style={{ opacity: 0.68 }}>{label}</span>
+                        <span style={{ ...ui.mono, overflowWrap: "anywhere" }}>
+                          {mask(value === undefined || value === null || value === "" ? "—" : value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div
+                    style={{
+                      border: "1px solid rgba(185,145,255,0.30)",
+                      background: "rgba(185,145,255,0.04)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950, marginBottom: 8 }}>
+                      BTC source-lot recovery
+                    </div>
+                    {[
+                      ["Status", cpBtcSourceLot.status],
+                      ["Identity", cpBtcSourceLot.identity],
+                      ["Target lookup", cpBtcSourceLot.target_transaction_lookup?.status],
+                      ["Lookup source", cpBtcSourceLot.target_transaction_lookup?.source],
+                      ["Lookup cache", cpBtcSourceLot.target_transaction_lookup?.cache],
+                      ["Input count", cpBtcTxReconstruction.input_count],
+                      ["Output count", cpBtcTxReconstruction.output_count],
+                      ["Owned input sats", cpBtcTxReconstruction.owned_input_satoshis],
+                      ["Change sats", cpBtcTxReconstruction.wallet_change_satoshis],
+                      ["Net outflow sats", cpBtcTxReconstruction.net_wallet_outflow_satoshis],
+                      ["Expected outflow sats", cpBtcTxReconstruction.expected_total_outflow_satoshis],
+                      ["Outflow matches", cpBtcTxReconstruction.net_outflow_matches_expected],
+                      ["Payment matches", cpBtcTxReconstruction.payment_matches_preview],
+                      ["Parent transactions", cpBtcSourceLot.funding_parent_count],
+                      ["DB candidates", cpBtcSourceCandidates.length],
+                      ["Native BTC lots", cpBtcSourceLot.native_btc_lot_count],
+                      ["Native BTC available", cpBtcSourceLot.native_btc_available],
+                      ["Native BTC shortfall", cpBtcSourceLot.native_btc_shortfall],
+                      ["Recovery policy", cpBtcSourceLot.recovery_proposal?.policy],
+                      ["Transfer carry-forward", cpBtcSourceLot.recovery_proposal?.transfer_basis_carryforward_required],
+                      ["FIFO mutation", cpBtcSourceLot.fifo_mutation],
+                      ["Basis mutation", cpBtcSourceLot.basis_mutation],
                     ].map(([label, value]) => (
                       <div
                         key={label}
@@ -4260,6 +4333,125 @@ async function onUnlinkWithdrawalRow(wdwRow) {
                         )}
                       </tbody>
                     </table>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    border: "1px solid rgba(185,145,255,0.24)",
+                    borderRadius: 12,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "9px 11px", borderBottom: "1px solid rgba(255,255,255,0.08)", fontSize: 12, fontWeight: 950 }}>
+                    Bitcoin inputs — read-only source reconstruction
+                  </div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ ...ui.table, minWidth: 1250 }}>
+                      <thead><tr>{["UTXO", "Address", "Value sats", "Value BTC", "Custody", "Parent status", "Parent time", "Source addresses", "Wallet tx", "Deposits", "Withdrawals"].map((label) => <th key={label} style={{ ...ui.th, position: "static" }}>{label}</th>)}</tr></thead>
+                      <tbody>
+                        {cpBtcSourceInputs.length ? cpBtcSourceInputs.map((row, idx) => (
+                          <tr key={`${String(row?.identity || "input")}:${idx}`}>
+                            <td style={{ ...ui.td, ...ui.mono, maxWidth: 280, overflowWrap: "anywhere" }}>{mask(row?.identity || "—")}</td>
+                            <td style={{ ...ui.td, ...ui.mono, maxWidth: 260, overflowWrap: "anywhere" }}>{mask(row?.address || "—")}</td>
+                            <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.value_satoshis ?? "—")}</td>
+                            <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.value_btc ?? "—")}</td>
+                            <td style={ui.td}>{mask(row?.owned_by_custody)}</td>
+                            <td style={ui.td}>{mask(row?.parent?.lookup_status || "—")}</td>
+                            <td style={{ ...ui.td, ...ui.mono }}>{mask(row?.parent?.block_time || "—")}</td>
+                            <td style={{ ...ui.td, ...ui.mono, maxWidth: 320, overflowWrap: "anywhere" }}>{mask((row?.parent?.source_addresses || []).join(", ") || "—")}</td>
+                            <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.wallet_address_tx_count ?? 0)}</td>
+                            <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.deposit_count ?? 0)}</td>
+                            <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.withdrawal_count ?? 0)}</td>
+                          </tr>
+                        )) : <tr><td colSpan={11} style={{ ...ui.td, opacity: 0.65 }}>No input reconstruction is available.</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    border: "1px solid rgba(185,145,255,0.24)",
+                    borderRadius: 12,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "9px 11px", borderBottom: "1px solid rgba(255,255,255,0.08)", fontSize: 12, fontWeight: 950 }}>
+                    Bitcoin outputs — payment, protocol data, and change
+                  </div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ ...ui.table, minWidth: 1050 }}>
+                      <thead><tr>{["Index", "Classification", "Address", "Value sats", "Value BTC", "Change", "Script type", "Script"].map((label) => <th key={label} style={{ ...ui.th, position: "static" }}>{label}</th>)}</tr></thead>
+                      <tbody>
+                        {cpBtcSourceOutputs.length ? cpBtcSourceOutputs.map((row, idx) => (
+                          <tr key={`${String(row?.identity || "output")}:${idx}`}>
+                            <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.index ?? idx)}</td>
+                            <td style={ui.td}>{mask(row?.classification || "—")}</td>
+                            <td style={{ ...ui.td, ...ui.mono, maxWidth: 300, overflowWrap: "anywhere" }}>{mask(row?.address || "—")}</td>
+                            <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.value_satoshis ?? "—")}</td>
+                            <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.value_btc ?? "—")}</td>
+                            <td style={ui.td}>{mask(row?.is_change)}</td>
+                            <td style={ui.td}>{mask(row?.script_type || "—")}</td>
+                            <td style={{ ...ui.td, ...ui.mono, maxWidth: 420, overflowWrap: "anywhere" }}>{mask(row?.script_asm || "—")}</td>
+                          </tr>
+                        )) : <tr><td colSpan={8} style={{ ...ui.td, opacity: 0.65 }}>No output reconstruction is available.</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "minmax(0, 1.35fr) minmax(0, 1fr)",
+                    gap: 10,
+                  }}
+                >
+                  <div style={{ border: "1px solid rgba(185,145,255,0.24)", borderRadius: 12, overflow: "hidden" }}>
+                    <div style={{ padding: "9px 11px", borderBottom: "1px solid rgba(255,255,255,0.08)", fontSize: 12, fontWeight: 950 }}>Funding-record candidates — read-only</div>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ ...ui.table, minWidth: 1000 }}>
+                        <thead><tr>{["Kind", "Match", "Venue", "Wallet", "Qty", "Time", "Txid", "Linked deposit", "Linked withdrawal"].map((label) => <th key={label} style={{ ...ui.th, position: "static" }}>{label}</th>)}</tr></thead>
+                        <tbody>
+                          {cpBtcSourceCandidates.length ? cpBtcSourceCandidates.map((row, idx) => (
+                            <tr key={`${String(row?.kind || "candidate")}:${String(row?.id || idx)}`}>
+                              <td style={ui.td}>{mask(row?.kind || "—")}</td>
+                              <td style={ui.td}>{mask(row?.match_type || "—")}</td>
+                              <td style={ui.td}>{mask(row?.venue || "—")}</td>
+                              <td style={ui.td}>{mask(row?.wallet_id || "—")}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.qty ?? "—")}</td>
+                              <td style={{ ...ui.td, ...ui.mono }}>{mask(row?.time || "—")}</td>
+                              <td style={{ ...ui.td, ...ui.mono, maxWidth: 280, overflowWrap: "anywhere" }}>{mask(row?.txid || "—")}</td>
+                              <td style={{ ...ui.td, ...ui.mono }}>{mask(row?.deposit_id || row?.transfer_deposit_id || "—")}</td>
+                              <td style={{ ...ui.td, ...ui.mono }}>{mask(row?.withdrawal_id || row?.transfer_withdrawal_id || "—")}</td>
+                            </tr>
+                          )) : <tr><td colSpan={9} style={{ ...ui.td, opacity: 0.65 }}>No matching cached wallet, deposit, or withdrawal records were found for the funding input transaction ids.</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div style={{ border: "1px solid rgba(185,145,255,0.24)", borderRadius: 12, overflow: "hidden" }}>
+                    <div style={{ padding: "9px 11px", borderBottom: "1px solid rgba(255,255,255,0.08)", fontSize: 12, fontWeight: 950 }}>Resolved-scope BTC lots — read-only</div>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ ...ui.table, minWidth: 780 }}>
+                        <thead><tr>{["Lot", "Acquired", "Qty remaining", "Basis USD", "Missing", "Origin", "Source"].map((label) => <th key={label} style={{ ...ui.th, position: "static" }}>{label}</th>)}</tr></thead>
+                        <tbody>
+                          {cpBtcNativeLots.length ? cpBtcNativeLots.map((row, idx) => (
+                            <tr key={`${String(row?.id || "lot")}:${idx}`}>
+                              <td style={{ ...ui.td, ...ui.mono }}>{mask(row?.id || "—")}</td>
+                              <td style={{ ...ui.td, ...ui.mono }}>{mask(row?.acquired_at || "—")}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.qty_remaining ?? 0)}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>{mask(row?.total_basis_usd ?? "—")}</td>
+                              <td style={ui.td}>{mask(row?.basis_is_missing)}</td>
+                              <td style={ui.td}>{mask(row?.origin_type || "—")}</td>
+                              <td style={ui.td}>{mask(row?.basis_source || "—")}</td>
+                            </tr>
+                          )) : <tr><td colSpan={7} style={{ ...ui.td, opacity: 0.65 }}>No BTC BasisLots exist in the resolved self-custody wallet-address scope.</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 </div>
 

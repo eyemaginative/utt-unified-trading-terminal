@@ -14,6 +14,7 @@ from ..models import AssetDeposit, AssetWithdrawal, BasisLot, VenueOrderRow
 from ..models_lot_journal import LotJournal
 from .counterparty_historical_btc_usd import lookup_historical_btc_usd
 from .counterparty_btc_custody_scope import resolve_counterparty_btc_custody_scope
+from .counterparty_btc_source_lot_preview import build_counterparty_btc_source_lot_preview
 
 
 _SATOSHIS_PER_BTC = Decimal("100000000")
@@ -498,6 +499,24 @@ def build_counterparty_ledger_preview(
         counterparty_wallet_id=wallet_id,
     )
     proposed_btc_scope = btc_custody_scope.get("proposed_btc_disposition_scope") or {}
+    source_lot_target_raw = (
+        external_tx.get("raw")
+        if isinstance(external_tx.get("raw"), dict)
+        else raw_tx
+        if isinstance(raw_tx, dict)
+        else None
+    )
+    btc_source_lot_preview = build_counterparty_btc_source_lot_preview(
+        db=db,
+        txid=txid_norm,
+        custody_scope=btc_custody_scope,
+        custody_address=address,
+        expected_gross_satoshis=gross_satoshis,
+        expected_fee_satoshis=fee_satoshis,
+        dispenser_address=event.get("counterparty_dispenser"),
+        supplied_target_tx_raw=source_lot_target_raw,
+        allow_external_lookup=bool(allow_external_fee_lookup),
+    )
     existing = _existing_state(
         db,
         txid=txid_norm,
@@ -522,9 +541,15 @@ def build_counterparty_ledger_preview(
         for item in (
             list(historical_price.get("warnings") or [])
             + list(btc_custody_scope.get("warnings") or [])
+            + list(btc_source_lot_preview.get("warnings") or [])
         )
         if str(item or "").strip()
     ]
+    blockers.extend(
+        str(item)
+        for item in (btc_source_lot_preview.get("blockers") or [])
+        if str(item or "").strip()
+    )
     if historical_btc_usd is None:
         blockers.append("historical_btc_usd_price_required")
     if fee_satoshis is None:
@@ -592,7 +617,7 @@ def build_counterparty_ledger_preview(
 
     return {
         "ok": True,
-        "version": "counterparty_ledger_preview_v3",
+        "version": "counterparty_ledger_preview_v4",
         "status": "review_required",
         "read_only": True,
         "dry_run": True,
@@ -637,6 +662,7 @@ def build_counterparty_ledger_preview(
         "components": components,
         "historical_price_lookup": historical_price,
         "btc_custody_scope_preview": btc_custody_scope,
+        "btc_source_lot_preview": btc_source_lot_preview,
         "basis_preview": {
             "asset": asset,
             "quantity": float(quantity),
@@ -677,6 +703,14 @@ def build_counterparty_ledger_preview(
             "shortfall_btc": float(btc_custody_scope.get("shortfall_btc") or 0.0),
             "inventory_sufficient": bool(btc_custody_scope.get("inventory_sufficient")),
             "duplicate_inventory_risk": bool(btc_custody_scope.get("duplicate_inventory_risk")),
+            "source_lot_status": btc_source_lot_preview.get("status"),
+            "source_lot_identity": btc_source_lot_preview.get("identity"),
+            "source_lot_candidate_count": len((btc_source_lot_preview.get("db_candidates") or {}).get("all_candidates") or []),
+            "transaction_input_count": (btc_source_lot_preview.get("transaction_reconstruction") or {}).get("input_count"),
+            "transaction_output_count": (btc_source_lot_preview.get("transaction_reconstruction") or {}).get("output_count"),
+            "wallet_change_satoshis": (btc_source_lot_preview.get("transaction_reconstruction") or {}).get("wallet_change_satoshis"),
+            "net_wallet_outflow_satoshis": (btc_source_lot_preview.get("transaction_reconstruction") or {}).get("net_wallet_outflow_satoshis"),
+            "net_outflow_matches_expected": (btc_source_lot_preview.get("transaction_reconstruction") or {}).get("net_outflow_matches_expected"),
             "classification": "crypto_purchase_disposition_review_required",
             "fifo_policy": "underlying_bitcoin_wallet_address_scope_only",
             "universal_pooling": False,
@@ -699,6 +733,7 @@ def build_counterparty_ledger_preview(
                 "Persist acquired-asset basis only after historical BTC/USD is resolved.",
                 "Model BTC consideration as a disposal under the resolved underlying Bitcoin Wallet Addresses FIFO scope.",
                 "Preserve the Bitcoin miner fee separately and allocate it once per transaction.",
+                "Reconstruct the native Bitcoin funding UTXOs and carry forward linked transfer basis before FIFO consumption.",
             ],
         },
         "blockers": sorted(set(blockers)),

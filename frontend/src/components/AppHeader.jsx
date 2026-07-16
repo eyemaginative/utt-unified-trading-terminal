@@ -1164,42 +1164,65 @@ function ToolChip({
   showSubLabel = true,
   minWidth,
 }) {
+  const stateLabel = isOpen ? "Open" : "Closed";
+  const accessibleSubLabel = showSubLabel ? String(subLabel || "—") : "";
   const base = {
     display: "inline-flex",
     flexDirection: "column",
     alignItems: "flex-start",
     justifyContent: "center",
     gap: 2,
-    padding: "8px 12px",
-    borderRadius: 999,
+    padding: "6px 9px",
+    borderRadius: 10,
     border: "1px solid var(--utt-hdr-pill-border, rgba(255,255,255,0.12))",
-    background: "var(--utt-hdr-pill-bg, rgba(255,255,255,0.04))",
+    background: "linear-gradient(180deg, color-mix(in srgb, var(--utt-hdr-pill-bg, rgba(255,255,255,0.04)) 92%, rgba(55,210,255,0.06)), var(--utt-hdr-pill-bg, rgba(255,255,255,0.04)))",
     color: "inherit",
     cursor: "pointer",
     userSelect: "none",
-    minWidth: minWidth ?? (showStatus || showSubLabel ? 124 : 104),
-    maxWidth: 164,
-    flexShrink: 1,
+    minWidth: minWidth ?? (showSubLabel ? 108 : 90),
+    maxWidth: 152,
+    minHeight: 40,
+    flex: "0 0 auto",
+    boxSizing: "border-box",
+    overflow: "hidden",
+    whiteSpace: "nowrap",
   };
 
   const open = {
     ...base,
-    border: "1px solid color-mix(in srgb, var(--utt-hdr-link, #9ad) 55%, transparent)",
-    background: "color-mix(in srgb, var(--utt-hdr-link, #9ad) 12%, var(--utt-hdr-pill-bg, rgba(255,255,255,0.04)))",
-    boxShadow: "0 0 0 1px color-mix(in srgb, var(--utt-hdr-link, #9ad) 22%, transparent) inset",
+    border: "1px solid color-mix(in srgb, var(--utt-hdr-link, #9ad) 62%, transparent)",
+    background: "linear-gradient(180deg, color-mix(in srgb, var(--utt-hdr-link, #9ad) 15%, var(--utt-hdr-pill-bg, rgba(255,255,255,0.04))), color-mix(in srgb, var(--utt-hdr-link, #9ad) 8%, var(--utt-hdr-pill-bg, rgba(255,255,255,0.04))))",
+    boxShadow: "0 0 0 1px color-mix(in srgb, var(--utt-hdr-link, #9ad) 22%, transparent) inset, 0 0 12px rgba(70,235,196,0.08)",
   };
 
-	  return (
-	    <button type="button" onClick={onClick} style={isOpen ? open : base} title={`${title} window`}>
-	      <div style={{ display: "flex", alignItems: "baseline", gap: 8, lineHeight: 1.1 }}>
-	        <span style={{ fontWeight: 800, fontSize: 13, whiteSpace: "nowrap" }}>{title}</span>
-	        {showStatus ? (
-	          <span style={{ fontSize: 11, opacity: 0.75 }}>{isOpen ? "Open" : "Closed"}</span>
-	        ) : null}
-	      </div>
-	      {showSubLabel ? <div style={{ fontSize: 11, opacity: 0.75, maxWidth: "100%", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{subLabel || "—"}</div> : null}
-	    </button>
-	  );
+  const statusDotStyle = {
+    width: 7,
+    height: 7,
+    borderRadius: 999,
+    flex: "0 0 auto",
+    background: isOpen ? "#5cff9d" : "#8f3447",
+    border: isOpen ? "1px solid rgba(211,255,228,0.72)" : "1px solid rgba(255,130,150,0.30)",
+    boxShadow: isOpen ? "0 0 8px rgba(92,255,157,0.72)" : "0 0 3px rgba(143,52,71,0.25)",
+  };
+
+  return (
+    <button
+      type="button"
+      className="utt-tooltab-chip"
+      data-utt-window-state={isOpen ? "open" : "closed"}
+      aria-expanded={isOpen ? "true" : "false"}
+      aria-label={`${title} window ${stateLabel}${accessibleSubLabel ? `. ${accessibleSubLabel}` : ""}`}
+      onClick={onClick}
+      style={isOpen ? open : base}
+      title={`${title} window — ${stateLabel}${accessibleSubLabel ? ` — ${accessibleSubLabel}` : ""}`}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 6, lineHeight: 1.1, minWidth: 0, maxWidth: "100%" }}>
+        {showStatus ? <span aria-hidden="true" style={statusDotStyle} /> : null}
+        <span style={{ fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%" }}>{title}</span>
+      </div>
+      {showSubLabel ? <div style={{ fontSize: 10, opacity: 0.75, maxWidth: "100%", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontVariantNumeric: "tabular-nums" }}>{subLabel || "—"}</div> : null}
+    </button>
+  );
 }
 
 
@@ -1239,7 +1262,7 @@ function writeFloatingToolPos(storageKey, pos) {
 function FloatingMetricToolChip({
   title,
   subLabel,
-  minWidth = 132,
+  minWidth = 112,
   panelWidth = 860,
   panelHeight = 620,
   storageKey,
@@ -1367,7 +1390,7 @@ function FloatingMetricToolChip({
       : Math.min(panelHeight, Math.max(360, (window.innerHeight || 720) - POP_MARGIN * 2));
 
   return (
-    <div ref={chipRef} style={{ position: "relative", display: "inline-block" }}>
+    <div ref={chipRef} className="utt-tooltab-host" style={{ position: "relative", display: "inline-block", flex: "0 0 auto" }}>
       <ToolChip
         title={title}
         subLabel={hideTableData ? "••••" : subLabel}
@@ -2837,13 +2860,64 @@ addDexAccount,
     gap: 6,
   };
 
+  const toolTabsRowRef = useRef(null);
+
+  useEffect(() => {
+    const row = toolTabsRowRef.current;
+    if (!row || typeof MutationObserver === "undefined") return undefined;
+
+    const syncExternalToolTabs = () => {
+      const hosts = row.querySelectorAll('[data-utt-external-tooltab="true"]');
+      for (const host of hosts) {
+        const button = host.querySelector("button");
+        if (!button) continue;
+
+        const statusNode = Array.from(button.querySelectorAll("span")).find((node) => {
+          const value = String(node?.textContent || "").trim();
+          return value === "Open" || value === "Closed";
+        });
+        if (!statusNode) continue;
+
+        const stateLabel = String(statusNode.textContent || "Closed").trim() === "Open" ? "Open" : "Closed";
+        const stateKey = stateLabel.toLowerCase();
+        const titleNode = Array.from(button.querySelectorAll("span")).find((node) => node !== statusNode && String(node?.textContent || "").trim());
+        const titleLabel = String(titleNode?.textContent || "Tool").trim();
+        const subLabel = String(button.children?.[1]?.textContent || "").trim();
+
+        button.classList.add("utt-tooltab-chip", "utt-tooltab-chip--external");
+        button.dataset.uttWindowState = stateKey;
+        button.setAttribute("aria-expanded", stateKey === "open" ? "true" : "false");
+        button.setAttribute("aria-label", `${titleLabel} window ${stateLabel}${subLabel ? `. ${subLabel}` : ""}`);
+        statusNode.setAttribute("aria-hidden", "true");
+
+        if (!button.dataset.uttBaseTitle) {
+          button.dataset.uttBaseTitle = button.getAttribute("title") || `${titleLabel} window`;
+        }
+        button.setAttribute("title", `${button.dataset.uttBaseTitle} · ${stateLabel}`);
+      }
+    };
+
+    syncExternalToolTabs();
+    const observer = new MutationObserver(syncExternalToolTabs);
+    observer.observe(row, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, []);
+
   const toolTabsRowStyle = {
     marginTop: 10,
     display: "flex",
-    alignItems: "center",
-    justifyContent: "flex-end",
-    gap: 8,
-    flexWrap: "wrap",
+    alignItems: "stretch",
+    justifyContent: "flex-start",
+    gap: 6,
+    flexWrap: "nowrap",
+    overflowX: "auto",
+    overflowY: "hidden",
+    minWidth: 0,
+    padding: "2px 2px 6px",
+    scrollbarWidth: "thin",
+    scrollbarColor: "color-mix(in srgb, var(--utt-hdr-link, #9ad) 38%, transparent) transparent",
+    overscrollBehaviorX: "contain",
+    WebkitOverflowScrolling: "touch",
   };
 
   // Banner controls are kept in a compact dock so the banner itself can stay stable.
@@ -4866,6 +4940,87 @@ const autoFitBanner = async () => {
 
   return (
     <div ref={headerRef} style={headerStyles.headerWrap}>
+      <style>{`
+        .utt-tool-tabs-row::-webkit-scrollbar {
+          height: 6px;
+        }
+        .utt-tool-tabs-row::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .utt-tool-tabs-row::-webkit-scrollbar-thumb {
+          background: color-mix(in srgb, var(--utt-hdr-link, #9ad) 34%, transparent);
+          border-radius: 999px;
+        }
+        .utt-tooltab-host {
+          flex: 0 0 auto;
+          min-width: 0;
+        }
+        .utt-tooltab-chip:focus-visible {
+          outline: 2px solid color-mix(in srgb, var(--utt-hdr-link, #9ad) 78%, white 12%) !important;
+          outline-offset: 2px;
+          box-shadow: 0 0 0 1px rgba(0,0,0,0.72), 0 0 14px color-mix(in srgb, var(--utt-hdr-link, #9ad) 34%, transparent) !important;
+        }
+        .utt-tooltab-chip--external {
+          position: relative !important;
+          flex: 0 0 auto !important;
+          min-width: 112px !important;
+          max-width: 152px !important;
+          min-height: 40px !important;
+          padding: 6px 9px 6px 23px !important;
+          border-radius: 10px !important;
+          box-sizing: border-box !important;
+          overflow: hidden !important;
+          white-space: nowrap !important;
+        }
+        .utt-tooltab-host[data-utt-tooltab-kind="arb"] .utt-tooltab-chip--external {
+          min-width: 118px !important;
+          max-width: 148px !important;
+        }
+        .utt-tooltab-host[data-utt-tooltab-kind="spread-bridge"] .utt-tooltab-chip--external {
+          min-width: 132px !important;
+          max-width: 156px !important;
+        }
+        .utt-tooltab-chip--external::before {
+          content: "";
+          position: absolute;
+          left: 9px;
+          top: 10px;
+          width: 7px;
+          height: 7px;
+          border-radius: 999px;
+          background: #8f3447;
+          border: 1px solid rgba(255,130,150,0.30);
+          box-shadow: 0 0 3px rgba(143,52,71,0.25);
+          pointer-events: none;
+        }
+        .utt-tooltab-chip--external[data-utt-window-state="open"]::before {
+          background: #5cff9d;
+          border-color: rgba(211,255,228,0.72);
+          box-shadow: 0 0 8px rgba(92,255,157,0.72);
+        }
+        .utt-tooltab-chip--external > div:first-child {
+          gap: 0 !important;
+          min-width: 0;
+          max-width: 100%;
+          overflow: hidden;
+        }
+        .utt-tooltab-chip--external > div:first-child > span:first-child,
+        .utt-tooltab-chip--external > div:nth-child(2) {
+          max-width: 100%;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .utt-tooltab-chip--external > div:first-child > span:last-child {
+          display: none !important;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .utt-tooltab-chip {
+            transition: none !important;
+            animation: none !important;
+          }
+        }
+      `}</style>
       <div style={{ margin: "4px 0 8px 0", position: "relative" }}>
         <h1 style={{ position: "absolute", left: -9999, width: 1, height: 1, overflow: "hidden" }}>Unified Trading Terminal</h1>
 
@@ -6657,26 +6812,36 @@ const autoFitBanner = async () => {
         </div>
       </div>
 
-      <div style={toolTabsRowStyle}>
-        <ArbChip
-          apiBase={API_BASE}
-          symbol={obSymbol}
-          venues={arbVenues}
-          refreshMs={8000}
-          fmtPrice={fmtPrice}
-          hideTableData={hideTableDataGlobal}
-          hideVenueNames={hideVenueNames}
-          styles={styles}
-          thresholdPct={0.1}
-          fetchArbSnapshot={fetchArbSnapshot}
-          popoverAlign="left"
-          chipVariant="tooltab"
-          chipTitle="Arbitrage"
-        />
+      <div
+        ref={toolTabsRowRef}
+        className="utt-tool-tabs-row"
+        style={toolTabsRowStyle}
+        role="toolbar"
+        aria-label="Tool windows"
+      >
+        <div className="utt-tooltab-host" data-utt-external-tooltab="true" data-utt-tooltab-kind="arb">
+          <ArbChip
+            apiBase={API_BASE}
+            symbol={obSymbol}
+            venues={arbVenues}
+            refreshMs={8000}
+            fmtPrice={fmtPrice}
+            hideTableData={hideTableDataGlobal}
+            hideVenueNames={hideVenueNames}
+            styles={styles}
+            thresholdPct={0.1}
+            fetchArbSnapshot={fetchArbSnapshot}
+            popoverAlign="left"
+            chipVariant="tooltab"
+            chipTitle="Arbitrage"
+          />
+        </div>
 
-        <SpreadBridgeDashboardChip apiBase={API_BASE} hideTableData={hideTableDataGlobal} />
+        <div className="utt-tooltab-host" data-utt-external-tooltab="true" data-utt-tooltab-kind="spread-bridge">
+          <SpreadBridgeDashboardChip apiBase={API_BASE} hideTableData={hideTableDataGlobal} />
+        </div>
 
-        <div style={{ position: "relative" }}>
+        <div className="utt-tooltab-host" style={{ position: "relative", flex: "0 0 auto" }}>
           <span ref={tgBtnRef} style={{ display: "inline-block" }}>
             <ToolChip
               title={tg.title || "Top Gainers"}
@@ -6717,7 +6882,7 @@ const autoFitBanner = async () => {
           storageKey="utt_market_cap_tool_panel_pos_v1"
           panelWidth={900}
           panelHeight={620}
-          minWidth={140}
+          minWidth={112}
           hideTableData={hideTableDataGlobal}
         >
           {({ close, onDragHandleMouseDown, height }) => (
@@ -6738,7 +6903,7 @@ const autoFitBanner = async () => {
           storageKey="utt_volume_tool_panel_pos_v1"
           panelWidth={900}
           panelHeight={620}
-          minWidth={132}
+          minWidth={104}
           hideTableData={hideTableDataGlobal}
         >
           {({ close, onDragHandleMouseDown, height }) => (
@@ -6784,9 +6949,9 @@ const autoFitBanner = async () => {
 	                    ? (hideTableDataGlobal ? "••••" : "UniSat / Ordinals")
 	                    : "—"
 	            }
-	            showStatus={!isLedger && !isTokenRegistry}
+	            showStatus={true}
 	            showSubLabel={!isLedger && !isTokenRegistry}
-	            minWidth={isLedger ? 104 : isTokenRegistry ? 134 : isNftCollectibles ? 168 : undefined}
+	            minWidth={isLedger ? 86 : isTokenRegistry ? 116 : isWalletAddresses ? 128 : isNftCollectibles ? 142 : undefined}
 	            isOpen={!!w.isOpen || !!w.open}
 	            onClick={() => toggleToolWindow?.(w.id)}
 	          />

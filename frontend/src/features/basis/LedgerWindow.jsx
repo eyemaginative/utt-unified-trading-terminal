@@ -3366,6 +3366,10 @@ async function onUnlinkWithdrawalRow(wdwRow) {
   const cpBasisPreview = cpPreviewData?.basis_preview || {};
   const cpBtcDispositionPreview = cpPreviewData?.btc_disposition_preview || {};
   const cpHistoricalPrice = cpPreviewData?.historical_price_lookup || {};
+  const cpBtcCustodyScope = cpPreviewData?.btc_custody_scope_preview || {};
+  const cpBtcLotScopes = Array.isArray(cpBtcCustodyScope?.current_btc_lot_scopes)
+    ? cpBtcCustodyScope.current_btc_lot_scopes
+    : [];
 
   const cpPreviewMutationSafe = !!cpPreviewData && (
     cpPreviewData.read_only === true &&
@@ -4083,7 +4087,13 @@ async function onUnlinkWithdrawalRow(wdwRow) {
                       ["Basis status", cpBasisPreview.status],
                       ["Fee allocation", cpBasisPreview.network_fee_allocation_policy],
                       ["BTC required", cpBtcDispositionPreview.quantity_required_exact],
-                      ["BTC lots available", cpBtcDispositionPreview.available_counterparty_btc_lot_qty],
+                      ["BTC lots available", cpBtcDispositionPreview.available_btc_lot_qty],
+                      ["BTC shortfall", cpBtcDispositionPreview.shortfall_btc],
+                      ["Custody scope", cpBtcDispositionPreview.custody_scope_status],
+                      ["Custody venue", cpBtcDispositionPreview.custody_venue],
+                      ["Custody lot wallet", cpBtcDispositionPreview.custody_wallet_id],
+                      ["Inventory sufficient", cpBtcDispositionPreview.inventory_sufficient],
+                      ["Duplicate BTC risk", cpBtcDispositionPreview.duplicate_inventory_risk],
                       ["FIFO policy", cpBtcDispositionPreview.fifo_policy],
                       ["Universal pooling", cpBtcDispositionPreview.universal_pooling],
                     ].map(([label, value]) => (
@@ -4140,6 +4150,116 @@ async function onUnlinkWithdrawalRow(wdwRow) {
                         </span>
                       </div>
                     ))}
+                  </div>
+
+                  <div
+                    style={{
+                      border: "1px solid rgba(120,180,255,0.28)",
+                      background: "rgba(120,180,255,0.04)",
+                      borderRadius: 12,
+                      padding: 11,
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950, marginBottom: 8 }}>
+                      BTC custody scope
+                    </div>
+                    {[
+                      ["Status", cpBtcCustodyScope.status],
+                      ["Bitcoin address", cpBtcDispositionPreview.custody_address],
+                      ["Native wallet row", cpBtcDispositionPreview.custody_wallet_address_id],
+                      ["Native label", cpBtcDispositionPreview.custody_label],
+                      ["Native network", cpBtcDispositionPreview.custody_network],
+                      ["Native asset scope", cpBtcDispositionPreview.custody_asset_scope],
+                      ["Proposed venue", cpBtcDispositionPreview.custody_venue],
+                      ["Proposed lot wallet", cpBtcDispositionPreview.custody_wallet_id],
+                      ["Candidate rows", cpBtcDispositionPreview.native_wallet_candidate_count],
+                      ["Distinct scopes", cpBtcDispositionPreview.native_wallet_distinct_scope_count],
+                      ["Required BTC", cpBtcDispositionPreview.quantity_required_exact],
+                      ["Available BTC", cpBtcDispositionPreview.available_btc_lot_qty],
+                      ["Shortfall BTC", cpBtcDispositionPreview.shortfall_btc],
+                      ["Duplicate inventory", cpBtcDispositionPreview.duplicate_inventory_risk],
+                      ["Universal pooling", cpBtcDispositionPreview.universal_pooling],
+                      ["FIFO mutation", cpBtcDispositionPreview.fifo_consumption],
+                    ].map(([label, value]) => (
+                      <div
+                        key={label}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "135px minmax(0, 1fr)",
+                          gap: 8,
+                          marginTop: 5,
+                          fontSize: 11,
+                        }}
+                      >
+                        <span style={{ opacity: 0.68 }}>{label}</span>
+                        <span style={{ ...ui.mono, overflowWrap: "anywhere" }}>
+                          {mask(value === undefined || value === null || value === "" ? "—" : value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    border: "1px solid rgba(120,180,255,0.22)",
+                    borderRadius: 12,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      padding: "9px 11px",
+                      borderBottom: "1px solid rgba(255,255,255,0.08)",
+                      fontSize: 12,
+                      fontWeight: 950,
+                    }}
+                  >
+                    Current BTC lot scopes — read-only
+                  </div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ ...ui.table, minWidth: 900 }}>
+                      <thead>
+                        <tr>
+                          {[
+                            "Venue",
+                            "Wallet",
+                            "Lots",
+                            "Positive lots",
+                            "Qty remaining",
+                            "Qty total",
+                            "Missing basis",
+                            "Origin types",
+                            "Basis sources",
+                          ].map((label) => (
+                            <th key={label} style={{ ...ui.th, position: "static" }}>
+                              {label}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {cpBtcLotScopes.length ? (
+                          cpBtcLotScopes.map((scope, idx) => (
+                            <tr key={`${String(scope?.venue || "")}:${String(scope?.wallet_id || "")}:${idx}`}>
+                              <td style={ui.td}>{mask(scope?.venue || "—")}</td>
+                              <td style={ui.td}>{mask(scope?.wallet_id || "—")}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>{mask(scope?.lot_count ?? 0)}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>{mask(scope?.positive_lot_count ?? 0)}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>{mask(scope?.qty_remaining ?? 0)}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>{mask(scope?.qty_total ?? 0)}</td>
+                              <td style={{ ...ui.tdR, ...ui.mono }}>{mask(scope?.basis_missing_lot_count ?? 0)}</td>
+                              <td style={ui.td}>{mask((scope?.origin_types || []).join(", ") || "—")}</td>
+                              <td style={ui.td}>{mask((scope?.basis_sources || []).join(", ") || "—")}</td>
+                            </tr>
+                          ))
+                        ) : (
+                          <tr>
+                            <td style={ui.td} colSpan={9}>No BTC BasisLot scopes currently exist.</td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
                   </div>
                 </div>
 

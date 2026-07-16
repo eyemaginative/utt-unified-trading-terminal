@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ..models import AssetDeposit, AssetWithdrawal, BasisLot, VenueOrderRow
 from ..models_lot_journal import LotJournal
 from .counterparty_historical_btc_usd import lookup_historical_btc_usd
+from .counterparty_btc_custody_scope import resolve_counterparty_btc_custody_scope
 
 
 _SATOSHIS_PER_BTC = Decimal("100000000")
@@ -280,6 +281,8 @@ def _existing_state(
     venue: str,
     wallet_id: str,
     acquired_asset: str,
+    btc_scope_venue: Optional[str] = None,
+    btc_scope_wallet_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     venue_order_rows = _count_query(
         db,
@@ -336,7 +339,19 @@ def _existing_state(
             wallet_id=wallet_id,
             asset=acquired_asset,
         ),
-        "btc_open_lot_qty": _sum_basis_qty(
+        "btc_scope_venue": btc_scope_venue,
+        "btc_scope_wallet_id": btc_scope_wallet_id,
+        "btc_open_lot_qty": (
+            _sum_basis_qty(
+                db,
+                venue=btc_scope_venue,
+                wallet_id=btc_scope_wallet_id,
+                asset="BTC",
+            )
+            if btc_scope_venue and btc_scope_wallet_id
+            else 0.0
+        ),
+        "counterparty_protocol_btc_open_lot_qty": _sum_basis_qty(
             db,
             venue=venue,
             wallet_id=wallet_id,
@@ -474,6 +489,15 @@ def build_counterparty_ledger_preview(
     cost_average_usd = total_basis_usd / quantity if total_basis_usd is not None and quantity > 0 else None
 
     wallet_id = str(source.get("wallet_id") or "counterparty").strip() or "counterparty"
+    btc_custody_scope = resolve_counterparty_btc_custody_scope(
+        db=db,
+        source_address=source,
+        required_btc=float(total_outflow_btc or gross_btc),
+        acquired_asset=asset,
+        counterparty_venue="counterparty",
+        counterparty_wallet_id=wallet_id,
+    )
+    proposed_btc_scope = btc_custody_scope.get("proposed_btc_disposition_scope") or {}
     existing = _existing_state(
         db,
         txid=txid_norm,
@@ -481,18 +505,32 @@ def build_counterparty_ledger_preview(
         venue="counterparty",
         wallet_id=wallet_id,
         acquired_asset=asset,
+        btc_scope_venue=proposed_btc_scope.get("venue"),
+        btc_scope_wallet_id=proposed_btc_scope.get("wallet_id"),
     )
 
-    blockers: List[str] = ["storage_model_review_required"]
-    warnings: List[str] = [str(item) for item in (historical_price.get("warnings") or []) if str(item or "").strip()]
+    blockers: List[str] = [
+        "storage_model_review_required",
+        *[
+            str(item)
+            for item in (btc_custody_scope.get("blockers") or [])
+            if str(item or "").strip()
+        ],
+    ]
+    warnings: List[str] = [
+        str(item)
+        for item in (
+            list(historical_price.get("warnings") or [])
+            + list(btc_custody_scope.get("warnings") or [])
+        )
+        if str(item or "").strip()
+    ]
     if historical_btc_usd is None:
         blockers.append("historical_btc_usd_price_required")
     if fee_satoshis is None:
         blockers.append("bitcoin_miner_fee_unresolved")
     if tx_event_count > 1:
         blockers.append("bitcoin_fee_allocation_required")
-    if float(existing.get("btc_open_lot_qty") or 0.0) + 1e-18 < float(total_outflow_btc or gross_btc):
-        blockers.append("counterparty_btc_fifo_inventory_missing")
     if confirmed_at is None:
         blockers.append("confirmed_timestamp_missing")
     if existing.get("asset_deposit_rows") or existing.get("asset_withdrawal_rows") or existing.get("lot_journal_rows"):
@@ -523,6 +561,10 @@ def build_counterparty_ledger_preview(
             "quantity_exact": _decimal_text(gross_btc, max_places=8),
             "satoshis": int(gross_satoshis),
             "counterparty": event.get("counterparty_dispenser"),
+            "venue": proposed_btc_scope.get("venue"),
+            "wallet_id": proposed_btc_scope.get("wallet_id"),
+            "wallet_address_id": proposed_btc_scope.get("wallet_address_id"),
+            "custody_scope_status": btc_custody_scope.get("status"),
             "txid": txid_norm,
             "confirmed_at": confirmed_at,
             "block_index": block_index,
@@ -538,6 +580,10 @@ def build_counterparty_ledger_preview(
             "fee_source": fee_source,
             "allocation_policy": fee_allocation_policy,
             "allocated_to_this_dispense_satoshis": int(fee_allocated_satoshis) if fee_allocated_satoshis is not None else None,
+            "venue": proposed_btc_scope.get("venue"),
+            "wallet_id": proposed_btc_scope.get("wallet_id"),
+            "wallet_address_id": proposed_btc_scope.get("wallet_address_id"),
+            "custody_scope_status": btc_custody_scope.get("status"),
             "txid": txid_norm,
             "confirmed_at": confirmed_at,
             "block_index": block_index,
@@ -546,7 +592,7 @@ def build_counterparty_ledger_preview(
 
     return {
         "ok": True,
-        "version": "counterparty_ledger_preview_v2",
+        "version": "counterparty_ledger_preview_v3",
         "status": "review_required",
         "read_only": True,
         "dry_run": True,
@@ -590,6 +636,7 @@ def build_counterparty_ledger_preview(
         "total_btc_outflow_exact": _decimal_text(total_outflow_btc, max_places=8),
         "components": components,
         "historical_price_lookup": historical_price,
+        "btc_custody_scope_preview": btc_custody_scope,
         "basis_preview": {
             "asset": asset,
             "quantity": float(quantity),
@@ -615,9 +662,23 @@ def build_counterparty_ledger_preview(
             "asset": "BTC",
             "quantity_required": float(total_outflow_btc or gross_btc),
             "quantity_required_exact": _decimal_text(total_outflow_btc or gross_btc, max_places=8),
-            "available_counterparty_btc_lot_qty": float(existing.get("btc_open_lot_qty") or 0.0),
+            "custody_scope_status": btc_custody_scope.get("status"),
+            "custody_scope_resolved": bool(btc_custody_scope.get("resolved")),
+            "custody_address": proposed_btc_scope.get("address"),
+            "custody_wallet_address_id": proposed_btc_scope.get("wallet_address_id"),
+            "custody_label": proposed_btc_scope.get("label"),
+            "custody_network": proposed_btc_scope.get("network"),
+            "custody_asset_scope": proposed_btc_scope.get("asset_scope"),
+            "custody_venue": proposed_btc_scope.get("venue"),
+            "custody_wallet_id": proposed_btc_scope.get("wallet_id"),
+            "native_wallet_candidate_count": btc_custody_scope.get("native_bitcoin_candidate_count"),
+            "native_wallet_distinct_scope_count": btc_custody_scope.get("native_bitcoin_distinct_scope_count"),
+            "available_btc_lot_qty": float(btc_custody_scope.get("available_btc_lot_qty") or 0.0),
+            "shortfall_btc": float(btc_custody_scope.get("shortfall_btc") or 0.0),
+            "inventory_sufficient": bool(btc_custody_scope.get("inventory_sufficient")),
+            "duplicate_inventory_risk": bool(btc_custody_scope.get("duplicate_inventory_risk")),
             "classification": "crypto_purchase_disposition_review_required",
-            "fifo_policy": "counterparty_venue_and_wallet_only",
+            "fifo_policy": "underlying_bitcoin_wallet_address_scope_only",
             "universal_pooling": False,
             "historical_btc_usd_required": historical_btc_usd is None,
             "historical_btc_usd": float(historical_btc_usd) if historical_btc_usd is not None else None,
@@ -636,7 +697,7 @@ def build_counterparty_ledger_preview(
             "recommended": [
                 "Persist one dedicated Counterparty event identity per dispense.",
                 "Persist acquired-asset basis only after historical BTC/USD is resolved.",
-                "Model BTC consideration as a disposal under the Counterparty venue/account FIFO pool.",
+                "Model BTC consideration as a disposal under the resolved underlying Bitcoin Wallet Addresses FIFO scope.",
                 "Preserve the Bitcoin miner fee separately and allocate it once per transaction.",
             ],
         },

@@ -102,6 +102,13 @@ except Exception as e:
     counterparty_router = None
 
 
+# Robinhood Chain read-only diagnostics router (/api/robinhood_chain/*)
+try:
+    from .routers.robinhood_chain import router as robinhood_chain_router
+except Exception as e:
+    print("robinhood_chain router import failed:", repr(e))
+    robinhood_chain_router = None
+
 
 # NEW: Hydration wallet-history ingestion skeleton (/api/hydration_wallet_history/*)
 try:
@@ -175,6 +182,10 @@ def create_app() -> FastAPI:
     # Counterparty / Bitcoin metaprotocol (reads first)
     if counterparty_router is not None:
         app.include_router(counterparty_router)
+
+    # Robinhood Chain read-only status and bounded RPC probes
+    if robinhood_chain_router is not None:
+        app.include_router(robinhood_chain_router)
 
     # Airdrop registration / status
     if airdrop_router is not None:

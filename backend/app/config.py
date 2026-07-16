@@ -172,6 +172,25 @@ class Settings(BaseSettings):
     robinhood_crypto_base_url: Optional[str] = Field(default=None, alias="ROBINHOOD_CRYPTO_BASE_URL")
 
     # ─────────────────────────────────────────────────────────────
+    # Robinhood Chain — mainnet, read-only foundation
+    #
+    # This is deliberately separate from the Robinhood Crypto brokerage adapter
+    # above.  No wallet signing, transaction broadcast, or brokerage credentials
+    # are used by the first Robinhood Chain tranche.
+    # ─────────────────────────────────────────────────────────────
+    robinhood_chain_enabled: bool = Field(default=False, alias="ROBINHOOD_CHAIN_ENABLED")
+    robinhood_chain_rpc_http: Optional[str] = Field(
+        default="https://rpc.mainnet.chain.robinhood.com/",
+        alias="ROBINHOOD_CHAIN_RPC_HTTP",
+    )
+    robinhood_chain_rpc_ws: Optional[str] = Field(default=None, alias="ROBINHOOD_CHAIN_RPC_WS")
+    robinhood_chain_chain_id: int = Field(default=4663, alias="ROBINHOOD_CHAIN_CHAIN_ID", ge=1)
+    robinhood_chain_timeout_s: float = Field(default=15.0, alias="ROBINHOOD_CHAIN_TIMEOUT_S", ge=1.0, le=60.0)
+    robinhood_chain_cache_ttl_s: float = Field(default=30.0, alias="ROBINHOOD_CHAIN_CACHE_TTL_S", ge=0.0, le=3600.0)
+    robinhood_chain_error_backoff_s: float = Field(default=120.0, alias="ROBINHOOD_CHAIN_ERROR_BACKOFF_S", ge=0.0, le=3600.0)
+    robinhood_chain_max_concurrent: int = Field(default=1, alias="ROBINHOOD_CHAIN_MAX_CONCURRENT", ge=1, le=8)
+
+    # ─────────────────────────────────────────────────────────────
     # Dex-Trade integration — optional & guarded
     #
     # Docs: token header "login-token", signature "X-Auth-Sign"
@@ -656,6 +675,9 @@ class Settings(BaseSettings):
         "robinhood_crypto_public_key_b64",
         "robinhood_crypto_private_key_b64",
         "robinhood_crypto_base_url",
+        # Robinhood Chain fields
+        "robinhood_chain_rpc_http",
+        "robinhood_chain_rpc_ws",
         # Dex-Trade fields
         "dex_trade_login_token",
         "dex_trade_secret",
@@ -737,6 +759,24 @@ class Settings(BaseSettings):
 
         return True
 
+
+    def robinhood_chain_effective_rpc_http(self) -> str:
+        """Return the configured Robinhood Chain HTTP RPC endpoint."""
+        return str(getattr(self, "robinhood_chain_rpc_http", None) or "").strip().rstrip("/")
+
+    def robinhood_chain_effective_rpc_ws(self) -> Optional[str]:
+        """Return the optional WebSocket endpoint, or None when intentionally unset."""
+        value = str(getattr(self, "robinhood_chain_rpc_ws", None) or "").strip()
+        return value or None
+
+    def robinhood_chain_effective_enabled(self) -> bool:
+        """Fail-closed enable gate for the read-only Robinhood Chain foundation."""
+        if not bool(getattr(self, "robinhood_chain_enabled", False)):
+            return False
+        if int(getattr(self, "robinhood_chain_chain_id", 0) or 0) != 4663:
+            return False
+        rpc = self.robinhood_chain_effective_rpc_http()
+        return bool(rpc.startswith("https://") or rpc.startswith("http://"))
 
     def dex_trade_effective_enabled(self) -> bool:
         """

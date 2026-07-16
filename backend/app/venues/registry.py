@@ -51,6 +51,14 @@ def _robinhood_enabled() -> bool:
         return False
 
 
+def _robinhood_chain_enabled() -> bool:
+    """Robinhood Chain is a distinct, read-only EVM source in this tranche."""
+    try:
+        return bool(settings.robinhood_chain_effective_enabled())
+    except Exception:
+        return False
+
+
 def _dex_trade_enabled() -> bool:
     # Guarded by your config method (won’t show unless properly configured)
     try:
@@ -128,6 +136,10 @@ def _make_registry() -> Dict[str, VenueSpec]:
         from ..adapters.robinhood import RobinhoodAdapter
         return RobinhoodAdapter()
 
+    def robinhood_chain_factory():
+        from ..adapters.robinhood_chain import RobinhoodChainAdapter
+        return RobinhoodChainAdapter()
+
     def dex_trade_factory():
         from ..adapters.dex_trade import DexTradeAdapter
         return DexTradeAdapter()
@@ -191,6 +203,16 @@ def _make_registry() -> Dict[str, VenueSpec]:
             supports_trading=True,
             supports_balances=True,
             supports_orderbook=True,  # your market.py already supports a pricing fallback for robinhood
+            supports_markets=False,
+        ),
+        "robinhood_chain": VenueSpec(
+            key="robinhood_chain",
+            display_name="Robinhood Chain",
+            enabled=_robinhood_chain_enabled,
+            adapter_factory=robinhood_chain_factory,
+            supports_trading=False,
+            supports_balances=False,  # dedicated EVM wallet reads arrive in RH-CHAIN.4
+            supports_orderbook=False,
             supports_markets=False,
         ),
         "dex_trade": VenueSpec(

@@ -15,7 +15,11 @@ from ..config import settings
 from ..db import get_db
 from ..models import TokenRegistry
 from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
-from ..services.robinhood_chain_history import get_robinhood_chain_history_service
+from ..services.robinhood_chain_accounting_preview import build_robinhood_chain_accounting_preview
+from ..services.robinhood_chain_history import (
+    get_robinhood_chain_history_service,
+    validate_transaction_hash,
+)
 
 
 router = APIRouter(prefix="/api/robinhood_chain", tags=["robinhood_chain"])
@@ -194,6 +198,18 @@ class RobinhoodChainProbeRequest(BaseModel):
         description="Optional fixed check names; arbitrary RPC methods are not accepted.",
     )
     force_refresh: bool = False
+
+
+class RobinhoodChainAccountingPreviewRequest(BaseModel):
+    wallet_address_id: Optional[str] = Field(
+        default=None,
+        max_length=36,
+        description="Optional exact Wallet Addresses row id for source-scope verification.",
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="Bypass the bounded transaction-detail cache for this explicit preview request.",
+    )
 
 
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -672,3 +688,71 @@ async def robinhood_chain_address_history(
     else:
         status_code = 502
     raise HTTPException(status_code=status_code, detail=result)
+
+@router.post("/address/{address}/transactions/{tx_hash}/accounting-preview")
+async def robinhood_chain_transaction_accounting_preview(
+    address: str,
+    tx_hash: str,
+    request: Optional[RobinhoodChainAccountingPreviewRequest] = None,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return a transaction-group accounting preview without persisting anything."""
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    if not settings.robinhood_chain_effective_explorer_api_base():
+        raise HTTPException(status_code=503, detail="ROBINHOOD_CHAIN_EXPLORER_API_BASE is not configured")
+
+    try:
+        normalized_address = validate_evm_address(address)
+        normalized_tx_hash = validate_transaction_hash(tx_hash)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    payload = request or RobinhoodChainAccountingPreviewRequest()
+    activity = await get_robinhood_chain_history_service().get_transaction_activity(
+        normalized_address,
+        normalized_tx_hash,
+        force_refresh=bool(payload.force_refresh),
+        registry_tokens=_registered_history_token_map(db),
+    )
+    if not activity.get("ok"):
+        error = str(activity.get("error") or "transaction_activity_failed")
+        if error in {"invalid_transaction_request", "transaction_not_related_to_address"}:
+            status_code = 400
+        elif error == "transaction_not_found":
+            status_code = 404
+        elif error in {"history_backoff_active", "history_api_not_configured", "chain_id_mismatch_or_unavailable"}:
+            status_code = 503
+        else:
+            status_code = 502
+        raise HTTPException(status_code=status_code, detail=activity)
+
+    try:
+        preview = build_robinhood_chain_accounting_preview(
+            db,
+            address=normalized_address,
+            tx_hash=normalized_tx_hash,
+            transaction_activity=activity,
+            wallet_address_id=payload.wallet_address_id,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "robinhood_chain_accounting_preview_failed",
+                "message": str(exc),
+                "exc": type(exc).__name__,
+                "read_only": True,
+                "will_mutate": False,
+            },
+        ) from exc
+
+    # Defensive session reset: the preview service performs SELECTs only.
+    db.rollback()
+    return preview

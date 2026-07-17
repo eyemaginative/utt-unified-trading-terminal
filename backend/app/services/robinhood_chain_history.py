@@ -21,6 +21,16 @@ _EXPECTED_CHAIN_ID = 4663
 _EXPECTED_CHAIN_ID_HEX = hex(_EXPECTED_CHAIN_ID)
 _TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 _ALLOWED_CURSOR_KEYS = frozenset({"block_number", "index", "items_count"})
+_TRANSACTION_TOKEN_CURSOR_KEYS = frozenset({
+    "block_number",
+    "index",
+    "items_count",
+    "transaction_hash",
+    "batch_block_hash",
+    "batch_log_index",
+    "batch_transaction_hash",
+    "index_in_batch",
+})
 _APPROVE_SELECTOR = "0x095ea7b3"
 _MAX_CACHE_ENTRIES = 256
 _MAX_CURSOR_LENGTH = 4096
@@ -54,6 +64,14 @@ def _address_hash(value: Any) -> Optional[str]:
 def _transaction_hash(value: Any) -> Optional[str]:
     text = str(value or "").strip()
     return text if _TX_HASH_RE.fullmatch(text) else None
+
+
+def validate_transaction_hash(value: Any) -> str:
+    """Validate one canonical EVM transaction hash for fixed Blockscout reads."""
+    tx_hash = _transaction_hash(value)
+    if not tx_hash:
+        raise ValueError("transaction hash must be 0x followed by 64 hexadecimal characters")
+    return tx_hash
 
 
 def _format_atomic(atomic: int, decimals: int) -> str:
@@ -191,6 +209,16 @@ def _next_page_params(value: Any) -> Optional[Dict[str, Any]]:
         return None
     out: Dict[str, Any] = {}
     for key in _ALLOWED_CURSOR_KEYS:
+        if key in value and value.get(key) is not None:
+            out[key] = value.get(key)
+    return out or None
+
+
+def _transaction_token_next_page_params(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    out: Dict[str, Any] = {}
+    for key in _TRANSACTION_TOKEN_CURSOR_KEYS:
         if key in value and value.get(key) is not None:
             out[key] = value.get(key)
     return out or None
@@ -432,6 +460,9 @@ class RobinhoodChainHistoryService:
     def _cache_key(self, address: str, cursor: Optional[str]) -> str:
         return f"{address.lower()}:{str(cursor or '').strip()}"
 
+    def _transaction_cache_key(self, address: str, tx_hash: str) -> str:
+        return f"transaction:{address.lower()}:{tx_hash.lower()}"
+
     async def _cached(self, key: str, *, allow_stale: bool = False) -> Optional[Dict[str, Any]]:
         now = time.monotonic()
         stale_window = max(300.0, min(3600.0, self.cache_ttl_s * 10.0))
@@ -508,6 +539,195 @@ class RobinhoodChainHistoryService:
         if not isinstance(body, Mapping):
             raise RuntimeError("Robinhood Chain Blockscout returned a non-object payload")
         return dict(body)
+
+    async def get_transaction_activity(
+        self,
+        address: str,
+        tx_hash: str,
+        *,
+        force_refresh: bool,
+        registry_tokens: Mapping[str, Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Return one canonical transaction group for read-only accounting preview.
+
+        Only the fixed Blockscout v2 transaction-info and transaction-token-transfer
+        resources are used. The result remains display data and is never persisted.
+        """
+        try:
+            normalized_address = validate_evm_address(address)
+            normalized_tx_hash = validate_transaction_hash(tx_hash)
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_transaction_request", "message": str(exc), "read_only": True}
+
+        cache_key = self._transaction_cache_key(normalized_address, normalized_tx_hash)
+        if not force_refresh:
+            cached = await self._cached(cache_key)
+            if cached is not None:
+                return cached
+
+        if not self.api_base.startswith(("https://", "http://")):
+            return {"ok": False, "error": "history_api_not_configured", "read_only": True}
+
+        if self._backoff_until_monotonic > time.monotonic():
+            stale = await self._cached(cache_key, allow_stale=True)
+            if stale is not None:
+                stale["provider_backoff_active"] = True
+                stale["backoff_until"] = _iso(self._backoff_until_utc)
+                return stale
+            return {
+                "ok": False,
+                "error": "history_backoff_active",
+                "backoff_until": _iso(self._backoff_until_utc),
+                "read_only": True,
+            }
+
+        chain = await get_robinhood_chain_client().verify_expected_chain(force_refresh=bool(force_refresh))
+        if not chain.get("ok"):
+            return {
+                "ok": False,
+                "error": "chain_id_mismatch_or_unavailable",
+                "expected_chain_id": _EXPECTED_CHAIN_ID,
+                "expected_chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+                "chain": chain,
+                "read_only": True,
+            }
+
+        try:
+            transaction_payload = await self._get_json(
+                f"transactions/{normalized_tx_hash}",
+                None,
+            )
+        except Exception as exc:
+            stale = await self._cached(cache_key, allow_stale=True)
+            if stale is not None:
+                stale["provider_errors"] = [{"source": "transaction", "error": str(exc)}]
+                stale["partial"] = True
+                return stale
+            error_text = str(exc)
+            return {
+                "ok": False,
+                "error": "transaction_not_found" if "HTTP 404" in error_text else "transaction_provider_unavailable",
+                "message": error_text,
+                "read_only": True,
+            }
+
+        returned_hash = _transaction_hash(transaction_payload.get("hash") or transaction_payload.get("transaction_hash"))
+        if not returned_hash or returned_hash.lower() != normalized_tx_hash.lower():
+            return {
+                "ok": False,
+                "error": "transaction_hash_mismatch",
+                "requested_transaction_hash": normalized_tx_hash,
+                "provider_transaction_hash": returned_hash,
+                "read_only": True,
+            }
+
+        provider_errors: List[Dict[str, Any]] = []
+        token_items: List[Mapping[str, Any]] = []
+        token_params: Dict[str, Any] = {"type": "ERC-20"}
+        try:
+            # A single transaction can emit more than one provider page. Keep the
+            # exact-hash read bounded to two pages / 100 normalized ERC-20 rows.
+            for _ in range(2):
+                token_payload = await self._get_json(
+                    f"transactions/{normalized_tx_hash}/token-transfers",
+                    token_params,
+                )
+                page_items = [
+                    item
+                    for item in token_payload.get("items") or []
+                    if isinstance(item, Mapping)
+                    and str((item.get("token") or {}).get("type") or "ERC-20").strip().upper() == "ERC-20"
+                ]
+                token_items.extend(page_items[:50])
+                next_params = _transaction_token_next_page_params(token_payload.get("next_page_params"))
+                if not next_params or len(token_items) >= 100:
+                    break
+                token_params = dict(next_params)
+                token_params["type"] = "ERC-20"
+        except Exception as exc:
+            provider_errors.append({"source": "transaction_token_transfers", "error": str(exc)})
+
+        token_items = token_items[:100]
+        tx_lookup: Dict[str, Mapping[str, Any]] = {normalized_tx_hash.lower(): transaction_payload}
+        normalized: List[Dict[str, Any]] = []
+
+        for item in token_items:
+            row = _normalize_token_transfer(
+                item,
+                owner=normalized_address,
+                tx_lookup=tx_lookup,
+                registry_tokens=registry_tokens,
+            )
+            if row is not None:
+                normalized.append(row)
+
+        transaction_row = _normalize_transaction(
+            transaction_payload,
+            owner=normalized_address,
+            has_token_transfer=bool(token_items),
+            registry_tokens=registry_tokens,
+        )
+        if transaction_row is not None:
+            normalized.append(transaction_row)
+
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for row in normalized:
+            row_id = str(row.get("id") or "")
+            if row_id and row_id not in deduped:
+                deduped[row_id] = row
+        items = sorted(deduped.values(), key=_sort_key, reverse=True)
+
+        related = any(str(row.get("direction") or "").lower() in {"in", "out", "self"} for row in items)
+        if not related:
+            return {
+                "ok": False,
+                "error": "transaction_not_related_to_address",
+                "address": normalized_address,
+                "transaction_hash": normalized_tx_hash,
+                "read_only": True,
+            }
+
+        fetched_at = _utc_now().isoformat()
+        payload = {
+            "ok": True,
+            "venue": "robinhood_chain",
+            "network": "robinhood_chain",
+            "chain_id": _EXPECTED_CHAIN_ID,
+            "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+            "address": normalized_address,
+            "transaction_hash": normalized_tx_hash,
+            "transaction": transaction_payload,
+            "items": items,
+            "item_count": len(items),
+            "cached": False,
+            "stale": False,
+            "partial": bool(provider_errors),
+            "provider_errors": provider_errors,
+            "provider_counts": {
+                "transaction": 1,
+                "token_transfers": len(token_items),
+            },
+            "fetched_at": fetched_at,
+            "source": _HISTORY_SOURCE,
+            "explorer_url": f"{_EXPLORER_URL}/tx/{normalized_tx_hash}",
+            "read_only": True,
+            "persistence": {
+                "wallet_address_txs": False,
+                "asset_deposits": False,
+                "asset_withdrawals": False,
+                "bridge_transfer_records": False,
+                "ledger_entries": False,
+                "basis_lots": False,
+            },
+        }
+        if not provider_errors:
+            self._clear_backoff()
+        else:
+            self._last_good_at = _utc_now()
+        payload["history_status"] = self.status()
+        await self._store(cache_key, payload)
+        return payload
+
 
     async def get_address_history(
         self,

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import RobinhoodChainAccountingPreview from "./RobinhoodChainAccountingPreview";
 
 const HISTORY_CSS = `
 .utt-rh-history { display: grid; gap: 10px; }
@@ -49,7 +50,13 @@ const HISTORY_CSS = `
   background: rgba(0,0,0,0.18);
   text-align: center;
 }
-.utt-rh-history-table { min-width: 1500px; }
+.utt-rh-history-table { min-width: 1600px; }
+.utt-rh-history-accounting-button[aria-pressed="true"] {
+  color: #d7c2ff;
+  border-color: rgba(153,101,255,0.72);
+  background: rgba(153,101,255,0.15);
+  box-shadow: 0 0 14px rgba(153,101,255,0.12);
+}
 .utt-rh-history-table td { vertical-align: top; }
 .utt-rh-history-mono { font-family: "Cascadia Code", ui-monospace, monospace; }
 .utt-rh-history-link { color: var(--wallet-cyan, #42e8ff); text-decoration: none; }
@@ -116,6 +123,10 @@ export default function RobinhoodChainHistoryPanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState({});
+  const [accountingPreview, setAccountingPreview] = useState(null);
+  const [accountingTxHash, setAccountingTxHash] = useState("");
+  const [accountingLoading, setAccountingLoading] = useState(false);
+  const [accountingError, setAccountingError] = useState("");
 
   const address = String(wallet?.address || "").trim();
   const isRobinhoodChain = (
@@ -132,6 +143,31 @@ export default function RobinhoodChainHistoryPanel({
     }
     return out;
   }, [items]);
+
+  async function loadAccountingPreview(item, { forceRefresh = false } = {}) {
+    const txHash = String(item?.transaction_hash || accountingTxHash || "").trim();
+    if (!txHash || !address || !isRobinhoodChain || typeof api !== "function") return;
+    setAccountingLoading(true);
+    setAccountingError("");
+    setAccountingTxHash(txHash);
+    try {
+      const result = await api(
+        `/api/robinhood_chain/address/${encodeURIComponent(address)}/transactions/${encodeURIComponent(txHash)}/accounting-preview`,
+        {
+          method: "POST",
+          body: {
+            wallet_address_id: wallet?.id || null,
+            force_refresh: !!forceRefresh,
+          },
+        },
+      );
+      setAccountingPreview(result || null);
+    } catch (previewError) {
+      setAccountingError(previewError?.message || String(previewError));
+    } finally {
+      setAccountingLoading(false);
+    }
+  }
 
   async function loadHistory({ cursor = "", append = false, forceRefresh = false } = {}) {
     if (!address || !isRobinhoodChain || typeof api !== "function") return;
@@ -173,6 +209,9 @@ export default function RobinhoodChainHistoryPanel({
     setNextCursor("");
     setHistoryMeta(null);
     setExpanded({});
+    setAccountingPreview(null);
+    setAccountingTxHash("");
+    setAccountingError("");
     loadHistory({ forceRefresh: false });
     // loadRequestId is intentionally the explicit user-action trigger.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -237,6 +276,9 @@ export default function RobinhoodChainHistoryPanel({
             setNextCursor("");
             setHistoryMeta(null);
             setExpanded({});
+            setAccountingPreview(null);
+            setAccountingTxHash("");
+            setAccountingError("");
             setError("");
           }}
           disabled={loading || (!items.length && !historyMeta)}
@@ -266,6 +308,7 @@ export default function RobinhoodChainHistoryPanel({
               <tr>
                 {[
                   "details",
+                  "accounting",
                   "timestamp",
                   "transaction",
                   "status",
@@ -300,6 +343,19 @@ export default function RobinhoodChainHistoryPanel({
                           {isExpanded ? "Hide" : "Inspect"}
                         </button>
                       </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="utt-rh-history-accounting-button"
+                          onClick={() => loadAccountingPreview(item)}
+                          disabled={accountingLoading || !item?.transaction_hash}
+                          aria-pressed={String(item?.transaction_hash || "").toLowerCase() === accountingTxHash.toLowerCase()}
+                        >
+                          {String(item?.transaction_hash || "").toLowerCase() === accountingTxHash.toLowerCase() && accountingLoading
+                            ? "Loading…"
+                            : "Preview"}
+                        </button>
+                      </td>
                       <td>{formatTimestamp(item?.timestamp)}</td>
                       <td className="utt-rh-history-mono" title={hideTableData ? "Transaction hidden" : item?.transaction_hash || ""}>
                         {hideTableData ? "••••••••" : compact(item?.transaction_hash, 10, 8)}
@@ -324,7 +380,7 @@ export default function RobinhoodChainHistoryPanel({
                     </tr>
                     {isExpanded ? (
                       <tr className="utt-rh-history-detail">
-                        <td colSpan={16}>
+                        <td colSpan={17}>
                           <pre>{JSON.stringify({
                             ...item,
                             from_address: hideTableData ? "••••••••" : item?.from_address,
@@ -341,6 +397,19 @@ export default function RobinhoodChainHistoryPanel({
           </table>
         </div>
       ) : null}
+
+      <RobinhoodChainAccountingPreview
+        preview={accountingPreview}
+        loading={accountingLoading}
+        error={accountingError}
+        hideTableData={hideTableData}
+        onRefresh={() => loadAccountingPreview({ transaction_hash: accountingTxHash }, { forceRefresh: true })}
+        onClose={() => {
+          setAccountingPreview(null);
+          setAccountingTxHash("");
+          setAccountingError("");
+        }}
+      />
 
       <div className="utt-rh-history-meta">
         Fixed sources: Blockscout address transactions and ERC-20 transfers. No wallet-address transaction cache, deposits,

@@ -15,6 +15,7 @@ from ..config import settings
 from ..db import get_db
 from ..models import TokenRegistry
 from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
+from ..services.robinhood_chain_history import get_robinhood_chain_history_service
 
 
 router = APIRouter(prefix="/api/robinhood_chain", tags=["robinhood_chain"])
@@ -116,6 +117,61 @@ def _resolve_registered_erc20(db: Session, symbol: str) -> Tuple[TokenRegistry, 
         )
 
     return row, contract, decimals
+
+
+def _registered_history_token_map(db: Session) -> Dict[str, Dict[str, Any]]:
+    """Return a bounded contract-keyed Token Registry view for history labels.
+
+    Venue-specific Robinhood Chain rows win over global rows. Malformed rows are
+    skipped rather than weakening the history endpoint's strict address rules.
+    """
+    overrides = (
+        db.query(TokenRegistry)
+        .filter(
+            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
+            TokenRegistry.venue == _TOKEN_REGISTRY_VENUE,
+            TokenRegistry.symbol != _NATIVE_CURRENCY,
+        )
+        .order_by(TokenRegistry.symbol.asc())
+        .limit(100)
+        .all()
+    )
+    global_rows = (
+        db.query(TokenRegistry)
+        .filter(
+            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
+            ((TokenRegistry.venue.is_(None)) | (TokenRegistry.venue == "")),
+            TokenRegistry.symbol != _NATIVE_CURRENCY,
+        )
+        .order_by(TokenRegistry.symbol.asc())
+        .limit(100)
+        .all()
+    )
+
+    selected: Dict[str, Dict[str, Any]] = {}
+    for row in [*(overrides or []), *(global_rows or [])]:
+        try:
+            contract = validate_evm_address(str(row.address or "").strip())
+            contract_key = contract.lower()
+            if contract_key in selected:
+                continue
+            decimals = int(row.decimals)
+            if decimals < 0 or decimals > 18:
+                continue
+            symbol = str(row.symbol or "").strip().upper()
+            if not symbol or symbol == _NATIVE_CURRENCY:
+                continue
+            selected[contract_key] = {
+                "registry_id": int(row.id),
+                "registry_venue": row.venue,
+                "symbol": symbol,
+                "decimals": decimals,
+                "label": row.label,
+                "contract_address": contract,
+            }
+        except Exception:
+            continue
+    return selected
 
 
 # Callers select stable check names, never arbitrary JSON-RPC methods or params.
@@ -573,3 +629,46 @@ async def robinhood_chain_erc20_balance(
         "source": "robinhood_chain_erc20_rpc",
         "read_only": True,
     }
+
+@router.get("/address/{address}/history")
+async def robinhood_chain_address_history(
+    address: str,
+    cursor: Optional[str] = Query(default=None, max_length=4096),
+    force_refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return bounded, display-only Robinhood Chain address activity.
+
+    The endpoint reads only fixed Blockscout address-history resources and the
+    existing chain-identity RPC check. It does not cache transactions in the
+    database, create deposits/withdrawals, or mutate ledger/FIFO/basis state.
+    """
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    if not settings.robinhood_chain_effective_explorer_api_base():
+        raise HTTPException(status_code=503, detail="ROBINHOOD_CHAIN_EXPLORER_API_BASE is not configured")
+
+    try:
+        normalized_address = validate_evm_address(address)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    result = await get_robinhood_chain_history_service().get_address_history(
+        normalized_address,
+        cursor=cursor,
+        force_refresh=bool(force_refresh),
+        registry_tokens=_registered_history_token_map(db),
+    )
+    if result.get("ok"):
+        return result
+
+    error = str(result.get("error") or "robinhood_chain_history_failed")
+    if error == "invalid_history_request":
+        status_code = 400
+    elif error in {"history_backoff_active", "history_api_not_configured"}:
+        status_code = 503
+    else:
+        status_code = 502
+    raise HTTPException(status_code=status_code, detail=result)

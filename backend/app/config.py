@@ -190,6 +190,42 @@ class Settings(BaseSettings):
     robinhood_chain_error_backoff_s: float = Field(default=120.0, alias="ROBINHOOD_CHAIN_ERROR_BACKOFF_S", ge=0.0, le=3600.0)
     robinhood_chain_max_concurrent: int = Field(default=1, alias="ROBINHOOD_CHAIN_MAX_CONCURRENT", ge=1, le=8)
 
+    # RH-CHAIN.8: bounded, display-only Blockscout transaction history.
+    robinhood_chain_explorer_api_base: Optional[str] = Field(
+        default="https://robinhoodchain.blockscout.com/api/v2",
+        alias="ROBINHOOD_CHAIN_EXPLORER_API_BASE",
+    )
+    robinhood_chain_history_timeout_s: float = Field(
+        default=12.0,
+        alias="ROBINHOOD_CHAIN_HISTORY_TIMEOUT_S",
+        ge=2.0,
+        le=30.0,
+    )
+    robinhood_chain_history_cache_ttl_s: float = Field(
+        default=60.0,
+        alias="ROBINHOOD_CHAIN_HISTORY_CACHE_TTL_S",
+        ge=0.0,
+        le=3600.0,
+    )
+    robinhood_chain_history_error_backoff_s: float = Field(
+        default=120.0,
+        alias="ROBINHOOD_CHAIN_HISTORY_ERROR_BACKOFF_S",
+        ge=0.0,
+        le=3600.0,
+    )
+    robinhood_chain_history_max_pages: int = Field(
+        default=5,
+        alias="ROBINHOOD_CHAIN_HISTORY_MAX_PAGES",
+        ge=1,
+        le=20,
+    )
+    robinhood_chain_history_page_size: int = Field(
+        default=100,
+        alias="ROBINHOOD_CHAIN_HISTORY_PAGE_SIZE",
+        ge=10,
+        le=100,
+    )
+
     # ─────────────────────────────────────────────────────────────
     # Dex-Trade integration — optional & guarded
     #
@@ -678,6 +714,7 @@ class Settings(BaseSettings):
         # Robinhood Chain fields
         "robinhood_chain_rpc_http",
         "robinhood_chain_rpc_ws",
+        "robinhood_chain_explorer_api_base",
         # Dex-Trade fields
         "dex_trade_login_token",
         "dex_trade_secret",
@@ -768,6 +805,13 @@ class Settings(BaseSettings):
         """Return the optional WebSocket endpoint, or None when intentionally unset."""
         value = str(getattr(self, "robinhood_chain_rpc_ws", None) or "").strip()
         return value or None
+
+    def robinhood_chain_effective_explorer_api_base(self) -> str:
+        """Return the fixed Blockscout API base used by display-only history reads."""
+        value = str(getattr(self, "robinhood_chain_explorer_api_base", None) or "").strip().rstrip("/")
+        if not value.startswith(("https://", "http://")):
+            return ""
+        return value
 
     def robinhood_chain_effective_enabled(self) -> bool:
         """Fail-closed enable gate for the read-only Robinhood Chain foundation."""

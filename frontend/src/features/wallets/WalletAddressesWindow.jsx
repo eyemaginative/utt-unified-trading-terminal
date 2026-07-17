@@ -1,5 +1,6 @@
 // frontend/src/features/wallets/WalletAddressesWindow.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import RobinhoodChainHistoryPanel from "./RobinhoodChainHistoryPanel";
 
 /**
  * WalletAddressesWindow (MVP)
@@ -327,7 +328,7 @@ function compactEvmAddress(address) {
 }
 
 export default function WalletAddressesWindow({ apiBase = "", hideTableData = false, onClose }) {
-  const [tab, setTab] = useState("addresses"); // addresses | balances
+  const [tab, setTab] = useState("addresses"); // addresses | balances | transactions
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -375,6 +376,11 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
   const [txWriteLedger, setTxWriteLedger] = useState(true);
   const [txLimitPerAddress, setTxLimitPerAddress] = useState(200);
   const [txLastResult, setTxLastResult] = useState(null);
+
+  // RH-CHAIN.8 display-only history selection. Incrementing the request id is
+  // the explicit user action that permits a bounded history read.
+  const [historyWallet, setHistoryWallet] = useState(null);
+  const [historyLoadRequestId, setHistoryLoadRequestId] = useState(0);
 
   const txStats = useMemo(() => deriveTxStats(txLastResult), [txLastResult]);
 
@@ -1236,6 +1242,19 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
     }
   }
 
+  function isRobinhoodChainAddressRow(row) {
+    const walletId = String(row?.wallet_id || "").trim().toLowerCase();
+    const network = String(row?.network || "").trim().toLowerCase();
+    return walletId === "robinhood_chain" || network === "robinhood_chain";
+  }
+
+  function openRobinhoodChainHistory(row) {
+    setErr("");
+    setHistoryWallet(row);
+    setTab("transactions");
+    setHistoryLoadRequestId((current) => current + 1);
+  }
+
   async function ingestTx(ids = null) {
     setBusy(true);
     setErr("");
@@ -1425,7 +1444,18 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
         <div className="utt-wallet-title">Wallet Addresses // Chain Registry</div>
         <div className="utt-wallet-subtitle">[{tab}]</div>
         <div style={{ flex: 1 }} />
-        <button onClick={() => (tab === "balances" ? loadBalances() : loadAddresses())} disabled={busy}>
+        <button
+          onClick={() => {
+            if (tab === "balances") {
+              loadBalances();
+            } else if (tab === "transactions") {
+              if (historyWallet) setHistoryLoadRequestId((current) => current + 1);
+            } else {
+              loadAddresses();
+            }
+          }}
+          disabled={busy || (tab === "transactions" && !historyWallet)}
+        >
           Refresh
         </button>
         {typeof onClose === "function" && <button onClick={onClose}>Close</button>}
@@ -1443,6 +1473,9 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
           disabled={tab === "balances"}
         >
           Balances
+        </button>
+        <button onClick={() => setTab("transactions")} disabled={tab === "transactions"}>
+          Transactions
         </button>
         <div style={{ flex: 1 }} />
         {busy && <div style={{ opacity: 0.8 }}>Working…</div>}
@@ -1757,11 +1790,16 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
                         </button>
                         <button
                           onClick={() => {
+                            if (isRobinhoodChainAddressRow(a)) {
+                              openRobinhoodChainHistory(a);
+                              return;
+                            }
                             if (!window.confirm("Ingest on-chain tx history for this address?")) return;
                             ingestTx([a.id]);
                           }}
                           disabled={busy}
                           style={{ marginRight: 6 }}
+                          title={isRobinhoodChainAddressRow(a) ? "Open display-only Robinhood Chain history" : "Run the existing transaction ingest workflow"}
                         >
                           Txs
                         </button>
@@ -1786,6 +1824,15 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
             </div>
           </div>
         </>
+      )}
+
+      {tab === "transactions" && (
+        <RobinhoodChainHistoryPanel
+          api={api}
+          wallet={historyWallet}
+          hideTableData={hideTableData}
+          loadRequestId={historyLoadRequestId}
+        />
       )}
 
       {tab === "balances" && (

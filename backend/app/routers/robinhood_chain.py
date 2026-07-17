@@ -7,10 +7,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..config import settings
+from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
 
 
 router = APIRouter(prefix="/api/robinhood_chain", tags=["robinhood_chain"])
@@ -365,4 +366,53 @@ async def robinhood_chain_rpc_probe(
         "requested_checks": checks,
         "results": results,
         "status": _status_payload(),
+    }
+
+@router.get("/address/{address}/balance")
+async def robinhood_chain_address_balance(
+    address: str,
+    force_refresh: bool = Query(default=False),
+) -> Dict[str, Any]:
+    """Return the native ETH balance for one Robinhood Chain address.
+
+    This endpoint is read-only. It verifies chain ID 4663 before reading the
+    latest balance and never constructs, signs, or broadcasts a transaction.
+    """
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    if not _configured_rpc_http():
+        raise HTTPException(status_code=503, detail="ROBINHOOD_CHAIN_RPC_HTTP is not configured")
+
+    try:
+        normalized_address = validate_evm_address(address)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    result = await get_robinhood_chain_client().get_native_balance(
+        normalized_address,
+        block_tag="latest",
+        force_refresh=bool(force_refresh),
+    )
+    if not result.get("ok"):
+        error = str(result.get("error") or "Robinhood Chain native balance read failed")
+        status_code = 503 if error == "native_balance_rpc_failed" and (result.get("rpc") or {}).get("error") == "rpc_backoff_active" else 502
+        raise HTTPException(status_code=status_code, detail=result)
+
+    return {
+        "ok": True,
+        "venue": "robinhood_chain",
+        "network": "robinhood_chain",
+        "chain_id": _EXPECTED_CHAIN_ID_DECIMAL,
+        "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+        "address": result.get("address"),
+        "asset": _NATIVE_CURRENCY,
+        "balance_wei": result.get("balance_wei"),
+        "balance_eth": result.get("balance_eth"),
+        "block_tag": result.get("block_tag"),
+        "cached": bool(result.get("cached")),
+        "fetched_at": result.get("fetched_at"),
+        "source": "robinhood_chain_rpc",
+        "read_only": True,
     }

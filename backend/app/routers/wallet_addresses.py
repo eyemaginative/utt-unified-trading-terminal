@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from datetime import datetime
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -25,6 +26,7 @@ from ..schemas_wallet_addresses import (
 # Reuse existing USD pricing helper so on-chain balances display like venue balances
 from ..services.market import prices_usd_from_assets
 from ..services.basis_enrichment import build_basis_summary_map, basis_fields_for_balance
+from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
 from ..config import settings
 
 # Pricing venue used for USD valuation (market data venue, not where funds are held)
@@ -181,6 +183,12 @@ def _is_counterparty_wallet_row(row) -> bool:
         "counterparty_default",
         "counterparty_unisat",
     }
+
+
+def _is_robinhood_chain_wallet_row(row) -> bool:
+    wallet_id = str(getattr(row, "wallet_id", None) or "").strip().lower().replace("-", "_")
+    network = str(getattr(row, "network", None) or "").strip().lower().replace("-", "_")
+    return wallet_id == "robinhood_chain" or network == "robinhood_chain"
 
 
 def _fetch_counterparty_asset_balance_atomic(address: str, asset: str) -> Tuple[int, int, Dict]:
@@ -881,15 +889,17 @@ def wallet_balances_latest(
     # wallet_id="wallet_address".  This only reads basis_lots and does not
     # mutate FIFO state.
     basis_keys = []
-    for _snap, addr in latest.values():
+    for snap, addr in latest.values():
+        snapshot_asset = _norm_asset(snap.asset or addr.asset)
         basis_venue = (str(addr.wallet_id or "").strip().lower() or "self_custody")
-        basis_keys.append((basis_venue, "wallet_address", addr.asset))
+        basis_keys.append((basis_venue, "wallet_address", snapshot_asset))
     basis_map = build_basis_summary_map(db, basis_keys)
 
-    # Build pricing map (optional)
+    # Build pricing map (optional). Snapshot asset is authoritative because an
+    # account-level ALL row may emit one or more asset-specific snapshots.
     prices_usd = {}
     if with_prices:
-        assets = sorted({addr.asset for _, addr in latest.values()})
+        assets = sorted({_norm_asset(snap.asset or addr.asset) for snap, addr in latest.values()})
         try:
             prices_usd = prices_usd_from_assets(_PRICING_VENUE, assets) or {}
         except Exception:
@@ -897,8 +907,9 @@ def wallet_balances_latest(
 
     out: List[WalletAddressBalanceOut] = []
     for snap, addr in latest.values():
+        snapshot_asset = _norm_asset(snap.asset or addr.asset)
         qty = float(snap.balance_qty)
-        usd_price = float(prices_usd.get(addr.asset) or 0.0)
+        usd_price = float(prices_usd.get(snapshot_asset) or 0.0)
         usd_value = qty * usd_price
 
         # IMPORTANT: make UUID-ish ids strings defensively + include fetched_at
@@ -909,7 +920,7 @@ def wallet_balances_latest(
             basis_map,
             venue=basis_venue,
             wallet_id="wallet_address",
-            asset=addr.asset,
+            asset=snapshot_asset,
             balance_qty=qty,
         )
         # Preserve WalletAddressBalanceOut.wallet_id as the visible wallet/venue grouping.
@@ -925,8 +936,8 @@ def wallet_balances_latest(
 
                 wallet_id=addr.wallet_id,
                 owner_scope=addr.owner_scope,
-                asset=addr.asset,
-                network=addr.network,
+                asset=snapshot_asset,
+                network=snap.network or addr.network,
                 address=addr.address,
                 label=addr.label,
 
@@ -967,9 +978,65 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
     refreshed = 0
     errors: List[Dict] = []
     counterparty_live_read_only_skipped = 0
+    robinhood_chain_native_refreshed = 0
 
     for a in addrs:
         asset_norm = _norm_asset(a.asset)
+        if _is_robinhood_chain_wallet_row(a):
+            # Robinhood Chain account rows use Asset=ALL as authoritative address
+            # metadata. RH-CHAIN.4 materializes the native ETH balance as an
+            # asset-specific snapshot after verifying chain ID 4663.
+            if asset_norm not in ("ALL", "*", "ETH"):
+                errors.append({
+                    "id": a.id,
+                    "asset": a.asset,
+                    "address": a.address,
+                    "error": f"Robinhood Chain ERC-20 balance reads are not enabled for asset {asset_norm}",
+                })
+                continue
+            try:
+                if not bool(settings.robinhood_chain_effective_enabled()):
+                    raise RuntimeError("Robinhood Chain is disabled or not configured for chain ID 4663")
+                normalized_address = validate_evm_address(a.address)
+                result = await get_robinhood_chain_client().get_native_balance(
+                    normalized_address,
+                    block_tag="latest",
+                    force_refresh=False,
+                )
+                if not result.get("ok"):
+                    raise RuntimeError(str(result.get("error") or result))
+
+                balance_wei = int(str(result.get("balance_wei") or "0"))
+                balance_eth = Decimal(str(result.get("balance_eth") or "0"))
+                snap = WalletAddressSnapshot(
+                    wallet_address_id=a.id,
+                    asset="ETH",
+                    network="robinhood_chain",
+                    address=normalized_address,
+                    balance_qty=float(balance_eth),
+                    balance_raw={
+                        "read_only": True,
+                        "chain_id": int(settings.robinhood_chain_chain_id),
+                        "chain_id_hex": hex(int(settings.robinhood_chain_chain_id)),
+                        "block_tag": result.get("block_tag") or "latest",
+                        "balance_wei": str(balance_wei),
+                        "balance_eth": str(result.get("balance_eth") or "0"),
+                        "cached": bool(result.get("cached")),
+                        "fetched_at": result.get("fetched_at"),
+                        "source": "robinhood_chain_rpc",
+                    },
+                    source="robinhood_chain_rpc",
+                    fetched_at=datetime.utcnow(),
+                )
+                db.add(snap)
+                db.commit()
+                refreshed += 1
+                robinhood_chain_native_refreshed += 1
+            except Exception as e:
+                db.rollback()
+                errors.append({"id": a.id, "asset": a.asset, "address": a.address, "error": str(e)})
+            continue
+
         if _is_counterparty_wallet_row(a):
             # Counterparty account rows are authoritative address metadata. Their
             # multi-asset balances are read live through
@@ -1030,6 +1097,7 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
         "refreshed": refreshed,
         "errors": errors,
         "counterparty_live_read_only_skipped": counterparty_live_read_only_skipped,
+        "robinhood_chain_native_refreshed": robinhood_chain_native_refreshed,
     }
 
 

@@ -3,10 +3,154 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 const LS_SOLANA_DETECTED_TOKENS_KEY = "utt_solana_detected_tokens_v1";
 
-const CHAIN_OPTIONS = ["solana", "polkadot", "hydration", "counterparty"];
+const CHAIN_OPTIONS = ["solana", "polkadot", "hydration", "counterparty", "robinhood_chain"];
 const GENERIC_ADDRESS_LABEL = "Address / Mint / Asset ID";
 const GENERIC_ADDRESS_PLACEHOLDER = "Mint / contract address / asset ID";
 const EXTERNAL_PRICE_SOURCE_OPTIONS = ["", "stable", "coingecko", "derived", "none"];
+
+const ROBINHOOD_CHAIN_ID = 4663;
+const ROBINHOOD_CHAIN_ID_HEX = "0x1237";
+const ROBINHOOD_CHAIN_NATIVE_SYMBOL = "ETH";
+const ROBINHOOD_CHAIN_NATIVE_DECIMALS = 18;
+const EVM_CONTRACT_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+function isRobinhoodChain(value) {
+  return String(value || "").trim().toLowerCase() === "robinhood_chain";
+}
+
+function chainDisplayName(value) {
+  const c = String(value || "").trim().toLowerCase();
+  if (c === "robinhood_chain") return "Robinhood Chain";
+  if (c === "counterparty") return "Counterparty";
+  if (c === "polkadot") return "Polkadot";
+  if (c === "hydration") return "Hydration";
+  if (c === "solana") return "Solana";
+  return c || "Unknown chain";
+}
+
+function addressLabelForChain(value) {
+  return isRobinhoodChain(value) ? "Contract address / native marker" : GENERIC_ADDRESS_LABEL;
+}
+
+function addressPlaceholderForChain(value, symbolValue = "") {
+  const c = String(value || "").trim().toLowerCase();
+  const s = String(symbolValue || "").trim().toUpperCase();
+  if (c === "counterparty") return "optional for protocol/global asset";
+  if (c === "robinhood_chain" && s === ROBINHOOD_CHAIN_NATIVE_SYMBOL) {
+    return "blank for native ETH";
+  }
+  if (c === "robinhood_chain") return "0x + 40 hex contract address";
+  return GENERIC_ADDRESS_PLACEHOLDER;
+}
+
+function validateTokenIdentityInput(chainValue, symbolValue, addressValue, decimalsValue) {
+  const c = String(chainValue || "").trim().toLowerCase();
+  const s = String(symbolValue || "").trim().toUpperCase();
+  const a = String(addressValue || "").trim();
+  const rawDecimals = String(decimalsValue ?? "").trim();
+
+  if (!s) return { ok: false, message: "Symbol is required." };
+  if (!rawDecimals) return { ok: false, message: "Decimals are required." };
+
+  const d = Number(rawDecimals);
+  if (!Number.isFinite(d) || d < 0 || d > 18) {
+    return { ok: false, message: "Decimals must be between 0 and 18." };
+  }
+
+  if (c === "counterparty") {
+    return { ok: true, native: false, message: "Counterparty metadata identity is valid." };
+  }
+
+  if (c === "robinhood_chain") {
+    if (s === ROBINHOOD_CHAIN_NATIVE_SYMBOL) {
+      if (a) {
+        return {
+          ok: false,
+          native: true,
+          message: "Native ETH must use a blank contract address. Use WETH or another distinct symbol for ERC-20 contracts.",
+        };
+      }
+      if (d !== ROBINHOOD_CHAIN_NATIVE_DECIMALS) {
+        return {
+          ok: false,
+          native: true,
+          message: "Native Robinhood Chain ETH must use exactly 18 decimals.",
+        };
+      }
+      return {
+        ok: true,
+        native: true,
+        message: "Native ETH identity is valid: blank contract address and 18 decimals.",
+      };
+    }
+
+    if (!a) {
+      return {
+        ok: false,
+        native: false,
+        message: "Robinhood Chain ERC-20 rows require a contract address.",
+      };
+    }
+    if (!EVM_CONTRACT_ADDRESS_RE.test(a)) {
+      return {
+        ok: false,
+        native: false,
+        message: "Contract address must be 0x followed by exactly 40 hexadecimal characters.",
+      };
+    }
+    return {
+      ok: true,
+      native: false,
+      message: "Robinhood Chain ERC-20 identity is structurally valid.",
+    };
+  }
+
+  if (!a) return { ok: false, message: "Address / mint / asset ID is required." };
+  return { ok: true, native: false, message: "Token identity is valid." };
+}
+
+function chainIdentityProfile(value) {
+  const c = String(value || "").trim().toLowerCase();
+  if (c === "robinhood_chain") {
+    return {
+      name: "Robinhood Chain",
+      code: "RH-EVM",
+      accent: "cyan",
+      badges: [
+        `Mainnet ${ROBINHOOD_CHAIN_ID} / ${ROBINHOOD_CHAIN_ID_HEX}`,
+        "Native ETH · 18 decimals",
+        "ERC-20 contracts · strict EVM address",
+        "Registry-only · no wallet prompt",
+      ],
+      detail: "Native ETH uses a blank contract address. All non-ETH rows are treated as future ERC-20 identities and require an exact 20-byte EVM contract address.",
+    };
+  }
+  if (c === "hydration" || c === "polkadot") {
+    return {
+      name: chainDisplayName(c),
+      code: "HYDRA-DOT",
+      accent: "violet",
+      badges: ["Asset IDs", "Route Registry", "Manual routing safeguards"],
+      detail: "Hydration and Polkadot identities preserve asset IDs, route templates, and venue-scoped mappings.",
+    };
+  }
+  if (c === "counterparty") {
+    return {
+      name: "Counterparty",
+      code: "BTC-META",
+      accent: "amber",
+      badges: ["Protocol assets", "Optional identifier", "Price metadata"],
+      detail: "Counterparty price metadata may use a blank identifier for protocol/global assets.",
+    };
+  }
+  return {
+    name: "Solana",
+    code: "SOL-SPL",
+    accent: "green",
+    badges: ["SPL mint", "Detected suggestions", "Decimals required"],
+    detail: "Solana mappings use SPL mint addresses and can be prefilled from detected order-row suggestions.",
+  };
+}
 
 function externalPriceSourceLabel(value) {
   const v = String(value || "").trim().toLowerCase();
@@ -556,6 +700,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const [symbol, setSymbol] = useState("");
   const [address, setAddress] = useState("");
   const [decimals, setDecimals] = useState("");
+  const [label, setLabel] = useState("");
   const [venue, setVenue] = useState(""); // optional override scope (blank = global)
   const [externalPriceSource, setExternalPriceSource] = useState("");
   const [externalPriceId, setExternalPriceId] = useState("");
@@ -566,6 +711,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     symbol: "",
     address: "",
     decimals: "",
+    label: "",
     venue: "",
     external_price_source: "",
     external_price_id: "",
@@ -595,6 +741,11 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const [selectedRouteTemplateId, setSelectedRouteTemplateId] = useState("builtin:DOT-HDX:manual_router");
 
   const activeVenueFilter = useMemo(() => defaultVenueForChain(chain), [chain]);
+  const activeChainProfile = useMemo(() => chainIdentityProfile(chain), [chain]);
+  const tokenIdentityValidation = useMemo(
+    () => validateTokenIdentityInput(chain, symbol, address, decimals),
+    [chain, symbol, address, decimals]
+  );
   const showHydrationRoutes = useMemo(() => {
     const c = String(chain || "").trim().toLowerCase();
     return c === "hydration" || c === "polkadot";
@@ -650,17 +801,10 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     });
   }, [chain, suggestions, dismissed, existingAddressSet]);
 
-  const canAdd = useMemo(() => {
-    const s = String(symbol || "").trim();
-    const a = String(address || "").trim();
-    const d = String(decimals || "").trim();
-    const counterpartyPriceMetadata = String(chain || "").trim().toLowerCase() === "counterparty";
-    if (!s || !d) return false;
-    if (!counterpartyPriceMetadata && !a) return false;
-    const di = Number(d);
-    if (!Number.isFinite(di) || di < 0 || di > 18) return false;
-    return true;
-  }, [chain, symbol, address, decimals]);
+  const canAdd = useMemo(
+    () => tokenIdentityValidation.ok,
+    [tokenIdentityValidation]
+  );
 
   const canUpsertRoute = useMemo(() => {
     const sym = String(routeSymbol || "").trim().toUpperCase();
@@ -784,6 +928,17 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     setVenue(String(sug?.venue || "").trim());
   }, []);
 
+  const useRobinhoodNativeEthPreset = useCallback(() => {
+    setSymbol(ROBINHOOD_CHAIN_NATIVE_SYMBOL);
+    setAddress("");
+    setDecimals(String(ROBINHOOD_CHAIN_NATIVE_DECIMALS));
+    setLabel("Robinhood Chain ETH");
+    setVenue("");
+    setExternalPriceSource("coingecko");
+    setExternalPriceId("ethereum");
+    setErr(null);
+  }, []);
+
   const addSuggestion = useCallback(async (sug) => {
     const payload = {
       chain,
@@ -829,6 +984,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         symbol: String(symbol || "").trim(),
         address: String(address || "").trim(),
         decimals: Number(String(decimals || "").trim()),
+        label: String(label || "").trim(),
       };
       const v = String(venue || "").trim();
       if (v) payload.venue = v;
@@ -848,6 +1004,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       setSymbol("");
       setAddress("");
       setDecimals("");
+      setLabel("");
       setVenue("");
       setExternalPriceSource("");
       setExternalPriceId("");
@@ -858,7 +1015,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     } finally {
       setSaving(false);
     }
-  }, [API_BASE, canAdd, chain, symbol, address, decimals, venue, externalPriceSource, externalPriceId, load]);
+  }, [API_BASE, canAdd, chain, symbol, address, decimals, label, venue, externalPriceSource, externalPriceId, load, loadSuggestions]);
 
   const startEdit = useCallback((row) => {
     setEditId(row?.id || null);
@@ -866,6 +1023,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       symbol: String(row?.symbol || ""),
       address: String(row?.address || ""),
       decimals: String(row?.decimals ?? ""),
+      label: String(row?.label || ""),
       venue: String(row?.venue || ""),
       external_price_source: String(row?.external_price_source || ""),
       external_price_id: String(row?.external_price_id || ""),
@@ -874,7 +1032,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
   const cancelEdit = useCallback(() => {
     setEditId(null);
-    setEditRow({ symbol: "", address: "", decimals: "", venue: "", external_price_source: "", external_price_id: "" });
+    setEditRow({ symbol: "", address: "", decimals: "", label: "", venue: "", external_price_source: "", external_price_id: "" });
   }, []);
 
   const saveEdit = useCallback(async () => {
@@ -884,11 +1042,9 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     const s = String(editRow.symbol || "").trim();
     const a = String(editRow.address || "").trim();
     const d = Number(String(editRow.decimals || "").trim());
-    const counterpartyPriceMetadata = String(chain || "").trim().toLowerCase() === "counterparty";
-    if (!s || (!counterpartyPriceMetadata && !a) || !Number.isFinite(d) || d < 0 || d > 18) {
-      setErr(counterpartyPriceMetadata
-        ? "Edit: symbol/decimals invalid."
-        : "Edit: symbol/identifier/decimals invalid.");
+    const editValidation = validateTokenIdentityInput(chain, s, a, editRow.decimals);
+    if (!editValidation.ok) {
+      setErr(`Edit: ${editValidation.message}`);
       return;
     }
 
@@ -900,6 +1056,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         symbol: s,
         address: a,
         decimals: d,
+        label: String(editRow.label || "").trim(),
       };
       const v = String(editRow.venue || "").trim();
       if (v) payload.venue = v;
@@ -958,6 +1115,26 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       setErr(null);
       try {
         const c = String(chain || "").trim().toLowerCase();
+        if (c === "robinhood_chain") {
+          const row = (items || []).find(
+            (item) => String(item?.symbol || "").trim().toUpperCase() === a.toUpperCase()
+          );
+          if (!row) {
+            throw new Error(`No Robinhood Chain registry row returned for ${a.toUpperCase()}.`);
+          }
+          const validation = validateTokenIdentityInput(
+            c,
+            row?.symbol,
+            row?.address,
+            row?.decimals
+          );
+          if (!validation.ok) {
+            throw new Error(validation.message);
+          }
+          alert(`Registry identity valid:\n\nchain=robinhood_chain\nsymbol=${row?.symbol || a.toUpperCase()}\nkind=${validation.native ? "native ETH" : "ERC-20 contract"}\naddress=${row?.address || "(blank native address)"}\ndecimals=${row?.decimals}\nvenue=${row?.venue || "global"}\npriceSource=${row?.external_price_source || "—"}\npriceId=${row?.external_price_id || "—"}\n\nNo RPC balance read or wallet request was performed.`);
+          return;
+        }
+
         if (c === "counterparty") {
           const params = new URLSearchParams({
             assets: a.toUpperCase(),
@@ -999,7 +1176,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         setErr(String(e?.message || e));
       }
     },
-    [API_BASE, chain]
+    [API_BASE, chain, items]
   );
 
   const clearRouteForm = useCallback(() => {
@@ -1351,20 +1528,25 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const onChainChange = useCallback((nextChain) => {
     setChain(nextChain);
     setEditId(null);
-    setEditRow({ symbol: "", address: "", decimals: "", venue: "", external_price_source: "", external_price_id: "" });
+    setEditRow({ symbol: "", address: "", decimals: "", label: "", venue: "", external_price_source: "", external_price_id: "" });
     setErr(null);
     setRouteErr(null);
     setRouteTestResult(null);
   }, []);
 
   return (
-    <div style={{ color: "var(--utt-text, #e9eef7)", minWidth: 0, maxWidth: "100%" }}>
+    <div className="utt-token-registry-cyber" style={tokenRegistryRootStyle}>
+      <style>{tokenRegistryCyberCss}</style>
       <div style={tokenRegistryHeaderStyle}>
-        <div style={{ fontWeight: 800, fontSize: 14, minWidth: 0 }}>Token / Symbol Registry</div>
+        <div style={{ minWidth: 0 }}>
+          <div style={terminalEyebrowStyle}>UTT // IDENTITY MATRIX</div>
+          <div style={tokenRegistryTitleStyle}>Token / Symbol Registry</div>
+          <div style={tokenRegistrySubtitleStyle}>Canonical asset metadata · operator-controlled · read-only identity layer</div>
+        </div>
         <div style={tokenRegistryHeaderActionsStyle}>
-          <select value={chain} onChange={(e) => onChainChange(e.target.value)} style={headerSelectStyle}>
+          <select value={chain} onChange={(e) => onChainChange(e.target.value)} style={headerSelectStyle} aria-label="Registry chain">
             {CHAIN_OPTIONS.map((opt) => (
-              <option key={opt} value={opt} style={selectOptionStyle}>{opt}</option>
+              <option key={opt} value={opt} style={selectOptionStyle}>{chainDisplayName(opt)}</option>
             ))}
           </select>
           <button type="button" onClick={load} style={headerBtnStyle} disabled={loading}>
@@ -1376,6 +1558,22 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
             </button>
           )}
         </div>
+      </div>
+
+      <div style={chainIdentityPanelStyle}>
+        <div style={chainIdentityHeaderStyle}>
+          <div>
+            <div style={chainIdentityCodeStyle}>{activeChainProfile.code}</div>
+            <div style={chainIdentityNameStyle}>{activeChainProfile.name}</div>
+          </div>
+          <div style={readOnlyBadgeStyle}>IDENTITY ONLY</div>
+        </div>
+        <div style={chainBadgeWrapStyle}>
+          {activeChainProfile.badges.map((badge) => (
+            <span key={badge} style={chainBadgeStyle}>{badge}</span>
+          ))}
+        </div>
+        <div style={chainIdentityDetailStyle}>{activeChainProfile.detail}</div>
       </div>
 
       {visibleSuggestions.length ? (
@@ -1419,16 +1617,34 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       ) : null}
 
       <div style={panelStyle}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Add token</div>
+        <div style={panelHeadingRowStyle}>
+          <div>
+            <div style={panelEyebrowStyle}>REGISTRY WRITE PREVIEW</div>
+            <div style={panelTitleStyle}>Add token identity</div>
+          </div>
+          {isRobinhoodChain(chain) ? (
+            <button
+              type="button"
+              onClick={useRobinhoodNativeEthPreset}
+              style={presetBtnStyle}
+              disabled={saving}
+              title="Fill the native ETH identity without saving it"
+            >
+              Load native ETH preset
+            </button>
+          ) : null}
+        </div>
         <div style={addTokenGridStyle}>
           <input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="SYMBOL (e.g. UTTT)" style={inputStyle} />
           <input
             value={address}
             onChange={(e) => setAddress(e.target.value)}
-            placeholder={chain === "counterparty" ? "optional for protocol/global asset" : GENERIC_ADDRESS_PLACEHOLDER}
+            placeholder={addressPlaceholderForChain(chain, symbol)}
+            aria-label={addressLabelForChain(chain)}
             style={inputStyle}
           />
           <input value={decimals} onChange={(e) => setDecimals(e.target.value)} placeholder="decimals" style={inputStyle} />
+          <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="display label (optional)" style={inputStyle} />
           <input value={venue} onChange={(e) => setVenue(e.target.value)} placeholder="venue override" style={inputStyle} />
           <select value={externalPriceSource} onChange={(e) => setExternalPriceSource(e.target.value)} style={selectStyle} title="External price source">
             {EXTERNAL_PRICE_SOURCE_OPTIONS.map((opt) => (
@@ -1440,9 +1656,18 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
             {saving ? "Saving…" : "Add"}
           </button>
         </div>
-        <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
+        <div style={tokenValidationStyle(tokenIdentityValidation.ok)}>
+          <span style={tokenValidationDotStyle(tokenIdentityValidation.ok)} />
+          <span>{tokenIdentityValidation.message}</span>
+        </div>
+        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.78, lineHeight: 1.5 }}>
           Tip: leave “venue override” blank for global entries. For Hydration, use polkadot_hydration and put the asset ID (or native for HDX) in Address / Mint / Asset ID. For Counterparty price metadata, the identifier may be blank; use XCP = CoinGecko / counterparty. Price source examples: HDX = CoinGecko / hydradx, DOT = CoinGecko / polkadot, USDT = Stable / stable, UTTT = Derived / UTTT-HDX×HDX-USD.
         </div>
+        {isRobinhoodChain(chain) ? (
+          <div style={robinhoodHelpStyle}>
+            <b>Robinhood Chain rules:</b> native ETH must be <code style={codeStyle}>ETH</code>, blank contract address, and 18 decimals. Every other symbol is treated as an ERC-20 identity and requires an exact <code style={codeStyle}>0x</code> + 40-hex contract address. Preset loading never writes to the database.
+          </div>
+        ) : null}
         {chain !== "solana" && (
           <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
             Selected chain: <code style={codeStyle}>{chain}</code>{activeVenueFilter ? <> · default DEX venue filter: <code style={codeStyle}>{activeVenueFilter}</code></> : null}
@@ -1816,15 +2041,22 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       {err && <div style={{ ...panelStyle, borderColor: "rgba(255,120,120,0.35)", background: "rgba(40,10,10,0.45)" }}>{err}</div>}
 
       <div style={{ marginTop: 10 }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Mappings</div>
+        <div style={panelHeadingRowStyle}>
+          <div>
+            <div style={panelEyebrowStyle}>CANONICAL RECORDS</div>
+            <div style={panelTitleStyle}>Mappings</div>
+          </div>
+          <div style={mappingCountBadgeStyle}>{items?.length || 0} ROWS</div>
+        </div>
 
-        <div style={{ overflowX: "auto" }}>
+        <div style={{ overflowX: "auto", marginTop: 8 }}>
           <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
             <thead>
               <tr>
                 <th style={thStyle}>Symbol</th>
-                <th style={thStyle}>{GENERIC_ADDRESS_LABEL}</th>
+                <th style={thStyle}>{addressLabelForChain(chain)}</th>
                 <th style={thStyle}>Decimals</th>
+                <th style={thStyle}>Label</th>
                 <th style={thStyle}>Venue</th>
                 <th style={thStyle}>Price Src</th>
                 <th style={thStyle}>Price ID</th>
@@ -1847,7 +2079,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                       {isEdit ? (
                         <input value={editRow.address} onChange={(e) => setEditRow((p) => ({ ...p, address: e.target.value }))} style={inputStyle} />
                       ) : (
-                        <code style={codeStyle}>{row.address}</code>
+                        <code style={codeStyle}>{row.address || (isRobinhoodChain(chain) && String(row.symbol || "").toUpperCase() === ROBINHOOD_CHAIN_NATIVE_SYMBOL ? "native · no contract" : "—")}</code>
                       )}
                     </td>
                     <td style={tdStyle}>
@@ -1855,6 +2087,13 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                         <input value={editRow.decimals} onChange={(e) => setEditRow((p) => ({ ...p, decimals: e.target.value }))} style={inputStyle} />
                       ) : (
                         <span>{row.decimals}</span>
+                      )}
+                    </td>
+                    <td style={tdStyle}>
+                      {isEdit ? (
+                        <input value={editRow.label} onChange={(e) => setEditRow((p) => ({ ...p, label: e.target.value }))} style={inputStyle} />
+                      ) : (
+                        <span style={{ opacity: row.label ? 1 : 0.55 }}>{row.label || "—"}</span>
                       )}
                     </td>
                     <td style={tdStyle}>
@@ -1886,7 +2125,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                       {!isEdit ? (
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                           <button type="button" style={btnStyle} onClick={() => testResolve(row.symbol)}>
-                            {chain === "counterparty" ? "Test price" : "Test resolve"}
+                            {chain === "counterparty" ? "Test price" : (isRobinhoodChain(chain) ? "Validate identity" : "Test resolve")}
                           </button>
                           <button type="button" style={btnStyle} onClick={() => startEdit(row)}>
                             Edit
@@ -1911,7 +2150,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
               })}
               {!items?.length && (
                 <tr>
-                  <td colSpan={7} style={{ ...tdStyle, opacity: 0.7 }}>
+                  <td colSpan={8} style={{ ...tdStyle, opacity: 0.7 }}>
                     No mappings yet. Add a symbol + identifier + decimals above.
                   </td>
                 </tr>
@@ -1928,12 +2167,28 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   );
 }
 
+const tokenRegistryRootStyle = {
+  position: "relative",
+  isolation: "isolate",
+  minWidth: 0,
+  maxWidth: "100%",
+  color: "var(--utt-page-fg, var(--utt-text, #e9eef7))",
+  padding: 12,
+  borderRadius: 16,
+  border: "1px solid rgba(34,211,238,0.22)",
+  background: "linear-gradient(145deg, rgba(2,8,16,0.96), rgba(7,18,28,0.94) 48%, rgba(10,10,24,0.96))",
+  boxShadow: "inset 0 0 0 1px rgba(125,211,252,0.035), 0 18px 44px rgba(0,0,0,0.34)",
+  overflow: "hidden",
+};
+
 const panelStyle = {
-  marginTop: 10,
-  padding: 10,
+  position: "relative",
+  marginTop: 12,
+  padding: 12,
   borderRadius: 12,
-  border: "1px solid rgba(255,255,255,0.10)",
-  background: "rgba(255,255,255,0.04)",
+  border: "1px solid rgba(34,211,238,0.18)",
+  background: "linear-gradient(180deg, rgba(8,23,35,0.82), rgba(3,12,22,0.82))",
+  boxShadow: "inset 3px 0 0 rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.025)",
 };
 
 const addTokenGridStyle = {
@@ -1986,12 +2241,13 @@ const inputStyle = {
   width: "100%",
   minWidth: 0,
   padding: "8px 10px",
-  borderRadius: 10,
-  border: "1px solid rgba(255,255,255,0.12)",
-  background: "rgba(0,0,0,0.25)",
-  color: "var(--utt-text, #e9eef7)",
+  borderRadius: 8,
+  border: "1px solid rgba(56,189,248,0.20)",
+  background: "rgba(1,8,15,0.78)",
+  color: "var(--utt-page-fg, var(--utt-text, #e9eef7))",
   outline: "none",
   boxSizing: "border-box",
+  boxShadow: "inset 0 0 18px rgba(14,116,144,0.05)",
 };
 
 const selectStyle = {
@@ -1999,11 +2255,11 @@ const selectStyle = {
   minWidth: 0,
   boxSizing: "border-box",
   padding: "8px 10px",
-  borderRadius: 10,
-  border: "1px solid rgba(255,255,255,0.12)",
-  background: "rgba(0,0,0,0.25)",
-  backgroundColor: "#111821",
-  color: "var(--utt-text, #e9eef7)",
+  borderRadius: 8,
+  border: "1px solid rgba(56,189,248,0.20)",
+  background: "rgba(1,8,15,0.78)",
+  backgroundColor: "var(--utt-control-bg, #07111b)",
+  color: "var(--utt-page-fg, var(--utt-text, #e9eef7))",
   colorScheme: "dark",
   outline: "none",
 };
@@ -2016,24 +2272,33 @@ const selectOptionStyle = {
 const btnStyle = {
   minWidth: 0,
   fontSize: 12,
+  fontWeight: 700,
+  letterSpacing: "0.02em",
   padding: "8px 10px",
-  borderRadius: 10,
-  border: "1px solid rgba(255,255,255,0.16)",
-  background: "rgba(255,255,255,0.06)",
-  color: "var(--utt-text, #e9eef7)",
+  borderRadius: 8,
+  border: "1px solid rgba(56,189,248,0.24)",
+  background: "linear-gradient(180deg, rgba(14,116,144,0.20), rgba(8,47,73,0.16))",
+  color: "var(--utt-page-fg, var(--utt-text, #e9eef7))",
   cursor: "pointer",
 };
 
 
 const tokenRegistryHeaderStyle = {
+  position: "relative",
+  zIndex: 1,
   display: "flex",
   justifyContent: "space-between",
-  gap: 10,
+  gap: 14,
   alignItems: "center",
-  marginBottom: 10,
+  marginBottom: 12,
+  padding: "10px 12px",
   flexWrap: "wrap",
   minWidth: 0,
   maxWidth: "100%",
+  border: "1px solid rgba(34,211,238,0.24)",
+  borderRadius: 12,
+  background: "linear-gradient(90deg, rgba(8,47,73,0.50), rgba(30,27,75,0.28), rgba(2,8,23,0.70))",
+  boxShadow: "inset 4px 0 0 rgba(34,211,238,0.55), 0 0 28px rgba(6,182,212,0.06)",
 };
 
 const tokenRegistryHeaderActionsStyle = {
@@ -2066,18 +2331,23 @@ const dangerBtnStyle = {
 
 const thStyle = {
   textAlign: "left",
-  fontSize: 12,
-  padding: "8px 10px",
-  borderBottom: "1px solid rgba(255,255,255,0.10)",
-  opacity: 0.85,
+  fontSize: 11,
+  fontWeight: 800,
+  letterSpacing: "0.06em",
+  textTransform: "uppercase",
+  padding: "9px 10px",
+  borderBottom: "1px solid rgba(34,211,238,0.22)",
+  background: "rgba(8,47,73,0.36)",
+  color: "rgba(207,250,254,0.88)",
   whiteSpace: "nowrap",
 };
 
 const tdStyle = {
   fontSize: 12,
   padding: "10px",
-  borderBottom: "1px solid rgba(255,255,255,0.06)",
+  borderBottom: "1px solid rgba(56,189,248,0.08)",
   verticalAlign: "top",
+  background: "rgba(1,8,15,0.18)",
 };
 
 const codeStyle = {
@@ -2085,6 +2355,214 @@ const codeStyle = {
   fontSize: 11,
   opacity: 0.9,
 };
+
+const terminalEyebrowStyle = {
+  fontSize: 10,
+  fontWeight: 900,
+  letterSpacing: "0.16em",
+  color: "#67e8f9",
+};
+
+const tokenRegistryTitleStyle = {
+  marginTop: 2,
+  fontSize: 17,
+  fontWeight: 900,
+  letterSpacing: "0.02em",
+  color: "var(--utt-page-fg, #e9eef7)",
+};
+
+const tokenRegistrySubtitleStyle = {
+  marginTop: 3,
+  fontSize: 11,
+  color: "rgba(186,230,253,0.68)",
+};
+
+const chainIdentityPanelStyle = {
+  position: "relative",
+  zIndex: 1,
+  padding: 12,
+  border: "1px solid rgba(139,92,246,0.24)",
+  borderRadius: 12,
+  background: "linear-gradient(135deg, rgba(30,27,75,0.34), rgba(8,47,73,0.24), rgba(2,8,23,0.72))",
+  boxShadow: "inset 3px 0 0 rgba(139,92,246,0.42)",
+};
+
+const chainIdentityHeaderStyle = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: 10,
+  flexWrap: "wrap",
+};
+
+const chainIdentityCodeStyle = {
+  fontSize: 10,
+  fontWeight: 900,
+  letterSpacing: "0.18em",
+  color: "#c4b5fd",
+};
+
+const chainIdentityNameStyle = {
+  marginTop: 2,
+  fontSize: 15,
+  fontWeight: 850,
+};
+
+const readOnlyBadgeStyle = {
+  padding: "3px 8px",
+  borderRadius: 999,
+  border: "1px solid rgba(34,211,238,0.34)",
+  background: "rgba(8,145,178,0.12)",
+  color: "#a5f3fc",
+  fontSize: 10,
+  fontWeight: 900,
+  letterSpacing: "0.08em",
+};
+
+const chainBadgeWrapStyle = {
+  display: "flex",
+  gap: 6,
+  flexWrap: "wrap",
+  marginTop: 9,
+};
+
+const chainBadgeStyle = {
+  display: "inline-flex",
+  padding: "3px 7px",
+  borderRadius: 999,
+  border: "1px solid rgba(125,211,252,0.18)",
+  background: "rgba(14,116,144,0.10)",
+  color: "rgba(207,250,254,0.84)",
+  fontSize: 10,
+  fontWeight: 700,
+};
+
+const chainIdentityDetailStyle = {
+  marginTop: 8,
+  maxWidth: 980,
+  fontSize: 12,
+  lineHeight: 1.5,
+  color: "rgba(226,232,240,0.74)",
+};
+
+const panelHeadingRowStyle = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: 10,
+  flexWrap: "wrap",
+  marginBottom: 9,
+};
+
+const panelEyebrowStyle = {
+  fontSize: 9,
+  fontWeight: 900,
+  letterSpacing: "0.14em",
+  color: "rgba(103,232,249,0.72)",
+};
+
+const panelTitleStyle = {
+  marginTop: 2,
+  fontSize: 14,
+  fontWeight: 850,
+};
+
+const presetBtnStyle = {
+  ...btnStyle,
+  border: "1px solid rgba(167,139,250,0.34)",
+  background: "linear-gradient(180deg, rgba(109,40,217,0.22), rgba(49,46,129,0.18))",
+  color: "#ddd6fe",
+};
+
+const mappingCountBadgeStyle = {
+  padding: "3px 7px",
+  borderRadius: 999,
+  border: "1px solid rgba(34,211,238,0.24)",
+  color: "#a5f3fc",
+  fontSize: 10,
+  fontWeight: 900,
+  letterSpacing: "0.08em",
+};
+
+const tokenValidationStyle = (ok) => ({
+  display: "flex",
+  alignItems: "center",
+  gap: 7,
+  marginTop: 8,
+  padding: "6px 8px",
+  borderRadius: 8,
+  border: ok ? "1px solid rgba(74,222,128,0.24)" : "1px solid rgba(245,158,11,0.28)",
+  background: ok ? "rgba(22,101,52,0.12)" : "rgba(120,72,16,0.13)",
+  color: ok ? "#bbf7d0" : "#fde68a",
+  fontSize: 11,
+});
+
+const tokenValidationDotStyle = (ok) => ({
+  width: 7,
+  height: 7,
+  flex: "0 0 7px",
+  borderRadius: 999,
+  background: ok ? "#4ade80" : "#f59e0b",
+  boxShadow: ok ? "0 0 12px rgba(74,222,128,0.65)" : "0 0 12px rgba(245,158,11,0.55)",
+});
+
+const robinhoodHelpStyle = {
+  marginTop: 8,
+  padding: 9,
+  borderRadius: 9,
+  border: "1px solid rgba(167,139,250,0.22)",
+  background: "rgba(49,46,129,0.14)",
+  color: "rgba(237,233,254,0.84)",
+  fontSize: 12,
+  lineHeight: 1.5,
+};
+
+const tokenRegistryCyberCss = `
+.utt-token-registry-cyber::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.22;
+  background-image:
+    linear-gradient(rgba(34,211,238,0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34,211,238,0.035) 1px, transparent 1px),
+    repeating-linear-gradient(180deg, transparent 0, transparent 3px, rgba(255,255,255,0.012) 4px);
+  background-size: 24px 24px, 24px 24px, 100% 4px;
+}
+.utt-token-registry-cyber > * {
+  position: relative;
+  z-index: 1;
+}
+.utt-token-registry-cyber input,
+.utt-token-registry-cyber select,
+.utt-token-registry-cyber textarea,
+.utt-token-registry-cyber button {
+  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease, background 120ms ease;
+}
+.utt-token-registry-cyber input:focus-visible,
+.utt-token-registry-cyber select:focus-visible,
+.utt-token-registry-cyber textarea:focus-visible,
+.utt-token-registry-cyber button:focus-visible {
+  outline: 2px solid rgba(34,211,238,0.72);
+  outline-offset: 2px;
+  border-color: rgba(34,211,238,0.62) !important;
+  box-shadow: 0 0 0 3px rgba(6,182,212,0.12), 0 0 22px rgba(6,182,212,0.10);
+}
+.utt-token-registry-cyber button:not(:disabled):hover {
+  transform: translateY(-1px);
+  border-color: rgba(34,211,238,0.58) !important;
+  box-shadow: 0 0 18px rgba(6,182,212,0.10);
+}
+.utt-token-registry-cyber button:disabled {
+  cursor: not-allowed !important;
+  opacity: 0.48;
+}
+.utt-token-registry-cyber table tbody tr:hover td {
+  background: rgba(8,47,73,0.22) !important;
+}
+`;
 
 const poolAccountWrapStyle = {
   display: "flex",

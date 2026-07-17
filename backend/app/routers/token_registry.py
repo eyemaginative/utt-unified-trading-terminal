@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from ..db import get_db
 from ..models import TokenRegistry
+from ..services.evm_rpc import validate_evm_address
 
 router = APIRouter(prefix="/api/token_registry", tags=["token_registry"])
 
@@ -47,6 +48,74 @@ def _validate_address(addr: Optional[str]) -> Optional[str]:
         return None
     a = (addr or "").strip()
     return a or None
+
+
+ROBINHOOD_CHAIN = "robinhood_chain"
+ROBINHOOD_CHAIN_NATIVE_SYMBOL = "ETH"
+ROBINHOOD_CHAIN_NATIVE_DECIMALS = 18
+
+
+def _token_identity_error(error: str, message: str, **context: Any) -> None:
+    detail: Dict[str, Any] = {
+        "error": error,
+        "message": message,
+        "chain": ROBINHOOD_CHAIN,
+    }
+    detail.update(context)
+    raise HTTPException(status_code=422, detail=detail)
+
+
+def _validate_chain_token_identity(
+    *,
+    chain: str,
+    symbol: str,
+    address: Optional[str],
+    decimals: int,
+) -> tuple[Optional[str], int]:
+    c = _norm_chain(chain)
+    s = _norm_symbol(symbol)
+    a = _validate_address(address)
+    d = _validate_decimals(decimals)
+
+    if c != ROBINHOOD_CHAIN:
+        return a, d
+
+    if s == ROBINHOOD_CHAIN_NATIVE_SYMBOL:
+        if a is not None:
+            _token_identity_error(
+                "robinhood_chain_native_address_must_be_blank",
+                "Robinhood Chain native ETH must use a blank contract address. Use a distinct symbol such as WETH for ERC-20 contracts.",
+                symbol=s,
+                address=a,
+            )
+        if d != ROBINHOOD_CHAIN_NATIVE_DECIMALS:
+            _token_identity_error(
+                "robinhood_chain_native_decimals_must_be_18",
+                "Robinhood Chain native ETH must use exactly 18 decimals.",
+                symbol=s,
+                decimals=d,
+                expected_decimals=ROBINHOOD_CHAIN_NATIVE_DECIMALS,
+            )
+        return None, ROBINHOOD_CHAIN_NATIVE_DECIMALS
+
+    if a is None:
+        _token_identity_error(
+            "robinhood_chain_erc20_contract_required",
+            "Robinhood Chain ERC-20 registry rows require a contract address.",
+            symbol=s,
+        )
+
+    try:
+        normalized = validate_evm_address(a)
+    except ValueError as exc:
+        _token_identity_error(
+            "invalid_robinhood_chain_contract_address",
+            str(exc),
+            symbol=s,
+            address=a,
+        )
+
+    return normalized, d
 
 
 def _clean_optional_str(value: Optional[str]) -> Optional[str]:
@@ -226,8 +295,12 @@ def create_token(req: TokenRegistryCreate, db: Session = Depends(get_db)) -> Dic
     c = _norm_chain(req.chain)
     v = _norm_venue(req.venue)
     s = _norm_symbol(req.symbol)
-    a = _validate_address(req.address)
-    d = _validate_decimals(req.decimals)
+    a, d = _validate_chain_token_identity(
+        chain=c,
+        symbol=s,
+        address=req.address,
+        decimals=req.decimals,
+    )
     label = (req.label or "").strip() or None
     external_price_source = _norm_external_price_source(req.external_price_source)
     external_price_id = _clean_optional_str(req.external_price_id)
@@ -270,12 +343,21 @@ def update_token(token_id: int, req: TokenRegistryUpdate, db: Session = Depends(
 
     if req.venue is not None:
         row.venue = _norm_venue(req.venue)
-    if req.symbol is not None:
-        row.symbol = _norm_symbol(req.symbol)
-    if req.address is not None:
-        row.address = _validate_address(req.address)
-    if req.decimals is not None:
-        row.decimals = _validate_decimals(req.decimals)
+
+    next_symbol = _norm_symbol(req.symbol) if req.symbol is not None else _norm_symbol(row.symbol)
+    next_address = _validate_address(req.address) if req.address is not None else _validate_address(row.address)
+    next_decimals = _validate_decimals(req.decimals) if req.decimals is not None else _validate_decimals(row.decimals)
+    next_address, next_decimals = _validate_chain_token_identity(
+        chain=row.chain,
+        symbol=next_symbol,
+        address=next_address,
+        decimals=next_decimals,
+    )
+
+    row.symbol = next_symbol
+    row.address = next_address
+    row.decimals = next_decimals
+
     if req.label is not None:
         row.label = (req.label or "").strip() or None
 

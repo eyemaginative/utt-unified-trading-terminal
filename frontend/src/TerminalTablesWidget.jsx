@@ -995,41 +995,6 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       return venueId === "robinhood_chain" || network === "robinhood_chain";
     }
 
-    const robinhoodChainBalanceRows = useMemo(
-      () => (balancesSorted || []).filter((row) => isRobinhoodChainBalanceRow(row)),
-      [balancesSorted]
-    );
-
-    const robinhoodChainBalanceSummary = useMemo(() => {
-      const rows = robinhoodChainBalanceRows || [];
-      let priced = 0;
-      let unpriced = 0;
-      let includedUsd = 0;
-      let hasIncludedUsd = false;
-      let latestFetchedAt = null;
-
-      for (const row of rows) {
-        const px = asFiniteNumberOrNull(row?.px_usd ?? row?.usd_price);
-        const totalUsd = asFiniteNumberOrNull(row?.total_usd ?? row?.usd_value);
-        if (px !== null && px > 0) priced += 1;
-        else unpriced += 1;
-        if (totalUsd !== null) {
-          includedUsd += totalUsd;
-          hasIncludedUsd = true;
-        }
-        const fetched = row?.fetched_at || row?.captured_at || row?.created_at || null;
-        if (fetched && (!latestFetchedAt || String(fetched) > String(latestFetchedAt))) latestFetchedAt = fetched;
-      }
-
-      return {
-        assetCount: rows.length,
-        priced,
-        unpriced,
-        includedUsd: hasIncludedUsd ? includedUsd : null,
-        latestFetchedAt,
-      };
-    }, [robinhoodChainBalanceRows]);
-
     function getSolanaUsdPriceForMint(mint) {
       const m = String(mint || "").trim();
       if (!m) return null;
@@ -6977,58 +6942,6 @@ function renderFillToasts() {
             </b>
           </div>
         </div>
-        {(isRobinhoodChainVenue || (isAllVenuesSelected && robinhoodChainBalanceSummary.assetCount > 0)) && (
-          <div
-            data-no-drag="1"
-            style={{
-              marginTop: 10,
-              border: `1px solid ${pal.link}`,
-              borderRadius: 12,
-              padding: "10px 12px",
-              background: `linear-gradient(135deg, ${pal.panelBg}, ${pal.widgetBg2})`,
-              boxShadow: `inset 3px 0 0 ${pal.link}, 0 10px 24px ${pal.shadow}`,
-              display: "grid",
-              gap: 8,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ color: pal.link, fontSize: 11, fontWeight: 950, letterSpacing: "0.12em" }}>
-                RH-EVM // ROBINHOOD CHAIN
-              </span>
-              <span style={{ border: `1px solid ${pal.link}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, fontWeight: 900, color: pal.link }}>
-                READ ONLY
-              </span>
-              <span style={{ border: `1px solid ${pal.border2}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, color: pal.text }}>
-                MAINNET 4663 / 0x1237
-              </span>
-              <span style={{ border: `1px solid ${pal.border2}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, color: pal.text }}>
-                {robinhoodChainBalanceSummary.assetCount} ASSET{robinhoodChainBalanceSummary.assetCount === 1 ? "" : "S"}
-              </span>
-              <span style={{ border: `1px solid ${pal.good}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, color: pal.good }}>
-                {robinhoodChainBalanceSummary.priced} PRICED
-              </span>
-              {robinhoodChainBalanceSummary.unpriced > 0 ? (
-                <span style={{ border: `1px solid ${pal.warn}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, color: pal.warn }}>
-                  {robinhoodChainBalanceSummary.unpriced} UNPRICED
-                </span>
-              ) : null}
-              <span style={{ marginLeft: "auto", color: pal.text, fontSize: 11, fontWeight: 800 }}>
-                Included USD: {hideTableDataGlobal
-                  ? "••••"
-                  : robinhoodChainBalanceSummary.includedUsd === null
-                    ? "—"
-                    : `$${fmtUsd?.(robinhoodChainBalanceSummary.includedUsd)}`}
-              </span>
-            </div>
-            <div style={{ color: pal.muted, fontSize: 11 }}>
-              Source: Wallet Addresses → bounded Robinhood Chain RPC · registry-managed pricing · no wallet prompt · no signing
-              {robinhoodChainBalanceSummary.latestFetchedAt
-                ? ` · snapshot ${new Date(robinhoodChainBalanceSummary.latestFetchedAt).toLocaleString()}`
-                : ""}
-            </div>
-          </div>
-        )}
-
         {balancesBanner.open && (
           <div
             data-no-drag="1"

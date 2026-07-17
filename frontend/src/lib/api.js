@@ -158,6 +158,65 @@ export async function getLatestBalancesSafe(opts = {}) {
   }
 }
 
+/**
+ * Read the newest Wallet Addresses balance snapshot rows.
+ * Optional network / wallet_id / owner_scope filters keep on-chain portfolio
+ * views bounded without routing them through the CEX adapter balance endpoint.
+ */
+export async function getWalletAddressBalancesLatest({
+  with_prices = true,
+  limit = 5000,
+  network,
+  wallet_id,
+  owner_scope,
+  timeout_ms = DEFAULT_BALANCES_TIMEOUT_MS,
+} = {}) {
+  const res = await http.get(`/api/wallet_addresses/balances/latest`, {
+    params: cleanParams({
+      with_prices: with_prices ? 1 : 0,
+      limit,
+      network,
+      wallet_id,
+      owner_scope,
+    }),
+    timeout: timeout_ms,
+  });
+  return res.data;
+}
+
+export async function listWalletAddresses({ asset, network, wallet_id, limit = 500 } = {}) {
+  const res = await http.get(`/api/wallet_addresses`, {
+    params: cleanParams({ asset, network, wallet_id, limit }),
+  });
+  return res.data;
+}
+
+export async function refreshWalletAddressBalances({
+  ids,
+  owner_scope = "user",
+  timeout_ms = DEFAULT_BALANCES_TIMEOUT_MS,
+} = {}) {
+  const body = { owner_scope };
+  if (Array.isArray(ids) && ids.length) body.ids = ids;
+  const res = await http.post(`/api/wallet_addresses/balances/refresh`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function getTokenRegistryRows({
+  chain,
+  venue,
+  include_global = true,
+} = {}) {
+  const res = await http.get(`/api/token_registry`, {
+    params: cleanParams({
+      chain,
+      venue,
+      include_global: include_global ? 1 : 0,
+    }),
+  });
+  return res.data;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Market
 // ─────────────────────────────────────────────────────────────

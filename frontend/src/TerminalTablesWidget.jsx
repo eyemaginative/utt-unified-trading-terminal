@@ -964,6 +964,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   // because /api/balances/latest is CEX/adapter snapshot only.
   const isSolanaVenue = String(venue || "").toLowerCase().startsWith("solana");
   const isAllVenuesSelected = String(venue || "") === String(ALL_VENUES_VALUE || "");
+  const isRobinhoodChainVenue = String(venue || "").trim().toLowerCase() === "robinhood_chain";
   const shouldIncludeSolanaOnchainBalances = isSolanaVenue || isAllVenuesSelected;
   const [showSolanaOnchainDetails, setShowSolanaOnchainDetails] = useState(false);
 
@@ -987,6 +988,47 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
   }));
   const [showHydrationOnchainDetails, setShowHydrationOnchainDetails] = useState(false);
 
+
+    function isRobinhoodChainBalanceRow(row) {
+      const venueId = String(row?.venue || row?.wallet_id || row?.walletId || "").trim().toLowerCase();
+      const network = String(row?.network || row?.chain || "").trim().toLowerCase();
+      return venueId === "robinhood_chain" || network === "robinhood_chain";
+    }
+
+    const robinhoodChainBalanceRows = useMemo(
+      () => (balancesSorted || []).filter((row) => isRobinhoodChainBalanceRow(row)),
+      [balancesSorted]
+    );
+
+    const robinhoodChainBalanceSummary = useMemo(() => {
+      const rows = robinhoodChainBalanceRows || [];
+      let priced = 0;
+      let unpriced = 0;
+      let includedUsd = 0;
+      let hasIncludedUsd = false;
+      let latestFetchedAt = null;
+
+      for (const row of rows) {
+        const px = asFiniteNumberOrNull(row?.px_usd ?? row?.usd_price);
+        const totalUsd = asFiniteNumberOrNull(row?.total_usd ?? row?.usd_value);
+        if (px !== null && px > 0) priced += 1;
+        else unpriced += 1;
+        if (totalUsd !== null) {
+          includedUsd += totalUsd;
+          hasIncludedUsd = true;
+        }
+        const fetched = row?.fetched_at || row?.captured_at || row?.created_at || null;
+        if (fetched && (!latestFetchedAt || String(fetched) > String(latestFetchedAt))) latestFetchedAt = fetched;
+      }
+
+      return {
+        assetCount: rows.length,
+        priced,
+        unpriced,
+        includedUsd: hasIncludedUsd ? includedUsd : null,
+        latestFetchedAt,
+      };
+    }, [robinhoodChainBalanceRows]);
 
     function getSolanaUsdPriceForMint(mint) {
       const m = String(mint || "").trim();
@@ -3218,7 +3260,10 @@ async function refreshSolanaOnchainBalances() {
         // Always pass the current venue explicitly. App owns CEX/all-venue fan-out + skip guards.
         // Solana-Jupiter balances live outside /api/balances/latest, so refresh them
         // alongside All Venues instead of requiring a prior Solana-Jupiter selection.
-        await Promise.resolve(doRefreshBalances({ venue }));
+        await Promise.resolve(doRefreshBalances({
+          venue,
+          refreshRobinhoodChain: isRobinhoodChainVenue || isAllVenuesSelected,
+        }));
         if (isAllVenuesSelected) {
           await refreshSolanaOnchainBalances();
         }
@@ -4209,6 +4254,7 @@ async function refreshSolanaOnchainBalances() {
     const title = clickable ? `Pick market: ${market}${venueMaybe ? ` (${venueMaybe})` : ""}` : undefined;
 
     const assetUpper = String(asset || "").trim().toUpperCase();
+    const isRobinhoodChain = isRobinhoodChainBalanceRow(b);
 
     return (
       <td
@@ -4249,11 +4295,34 @@ async function refreshSolanaOnchainBalances() {
           <span
             data-no-drag="1"
             style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 7,
               color: clickable ? pal.link : undefined,
               fontWeight: clickable ? 700 : undefined,
             }}
           >
             {display}
+            {isRobinhoodChain && !hideTableDataGlobal ? (
+              <span
+                title="Robinhood Chain mainnet 4663 · Wallet Addresses · read only"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  border: `1px solid ${pal.link}`,
+                  borderRadius: 999,
+                  padding: "1px 6px",
+                  fontSize: 9,
+                  fontWeight: 900,
+                  letterSpacing: "0.08em",
+                  color: pal.link,
+                  background: pal.panelBg,
+                  textDecoration: "none",
+                }}
+              >
+                RH-EVM
+              </span>
+            ) : null}
           </span>
           {showMint ? <span style={{ fontSize: 11, opacity: 0.7 }}>{mintShort2}</span> : null}
         </div>
@@ -6908,6 +6977,58 @@ function renderFillToasts() {
             </b>
           </div>
         </div>
+        {(isRobinhoodChainVenue || (isAllVenuesSelected && robinhoodChainBalanceSummary.assetCount > 0)) && (
+          <div
+            data-no-drag="1"
+            style={{
+              marginTop: 10,
+              border: `1px solid ${pal.link}`,
+              borderRadius: 12,
+              padding: "10px 12px",
+              background: `linear-gradient(135deg, ${pal.panelBg}, ${pal.widgetBg2})`,
+              boxShadow: `inset 3px 0 0 ${pal.link}, 0 10px 24px ${pal.shadow}`,
+              display: "grid",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ color: pal.link, fontSize: 11, fontWeight: 950, letterSpacing: "0.12em" }}>
+                RH-EVM // ROBINHOOD CHAIN
+              </span>
+              <span style={{ border: `1px solid ${pal.link}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, fontWeight: 900, color: pal.link }}>
+                READ ONLY
+              </span>
+              <span style={{ border: `1px solid ${pal.border2}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, color: pal.text }}>
+                MAINNET 4663 / 0x1237
+              </span>
+              <span style={{ border: `1px solid ${pal.border2}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, color: pal.text }}>
+                {robinhoodChainBalanceSummary.assetCount} ASSET{robinhoodChainBalanceSummary.assetCount === 1 ? "" : "S"}
+              </span>
+              <span style={{ border: `1px solid ${pal.good}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, color: pal.good }}>
+                {robinhoodChainBalanceSummary.priced} PRICED
+              </span>
+              {robinhoodChainBalanceSummary.unpriced > 0 ? (
+                <span style={{ border: `1px solid ${pal.warn}`, borderRadius: 999, padding: "2px 7px", fontSize: 10, color: pal.warn }}>
+                  {robinhoodChainBalanceSummary.unpriced} UNPRICED
+                </span>
+              ) : null}
+              <span style={{ marginLeft: "auto", color: pal.text, fontSize: 11, fontWeight: 800 }}>
+                Included USD: {hideTableDataGlobal
+                  ? "••••"
+                  : robinhoodChainBalanceSummary.includedUsd === null
+                    ? "—"
+                    : `$${fmtUsd?.(robinhoodChainBalanceSummary.includedUsd)}`}
+              </span>
+            </div>
+            <div style={{ color: pal.muted, fontSize: 11 }}>
+              Source: Wallet Addresses → bounded Robinhood Chain RPC · registry-managed pricing · no wallet prompt · no signing
+              {robinhoodChainBalanceSummary.latestFetchedAt
+                ? ` · snapshot ${new Date(robinhoodChainBalanceSummary.latestFetchedAt).toLocaleString()}`
+                : ""}
+            </div>
+          </div>
+        )}
+
         {balancesBanner.open && (
           <div
             data-no-drag="1"
@@ -6991,7 +7112,16 @@ function renderFillToasts() {
                 return (
                   <Fragment key={`${b.venue || ""}:${b.asset || ""}:${groupKey || ""}:${i}`}>
                     <tr
-                      style={isGroupedChild ? { background: "rgba(255,255,255,0.025)" } : undefined}
+                      style={
+                        isRobinhoodChainBalanceRow(b)
+                          ? {
+                              background: isGroupedChild ? pal.widgetBg2 : pal.panelBg,
+                              boxShadow: `inset 3px 0 0 ${pal.link}`,
+                            }
+                          : isGroupedChild
+                            ? { background: "rgba(255,255,255,0.025)" }
+                            : undefined
+                      }
                     >
                     {venue === ALL_VENUES_VALUE && (
                       <td style={sx.td}>
@@ -7073,7 +7203,13 @@ function renderFillToasts() {
                         maxWidth: 220,
                         minWidth: 120,
                       }}
-                      title={hideTableDataGlobal ? "" : String(b.usd_source_symbol || "—")}
+                      title={hideTableDataGlobal ? "" : [
+                        `USD source: ${String(b.usd_source_symbol || "—")}`,
+                        isRobinhoodChainBalanceRow(b) ? `Network: robinhood_chain` : "",
+                        isRobinhoodChainBalanceRow(b) ? `Source: ${String(b.source_type || "Wallet Addresses / Robinhood Chain RPC")}` : "",
+                        isRobinhoodChainBalanceRow(b) ? `Price status: ${String(b.price_status || (b.px_usd == null ? "unpriced" : "priced"))}` : "",
+                        isRobinhoodChainBalanceRow(b) && b.contract_address ? `Contract: ${String(b.contract_address)}` : "",
+                      ].filter(Boolean).join("\n")}
                     >
                       <span
                         style={{

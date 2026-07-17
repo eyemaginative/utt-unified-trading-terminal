@@ -5,6 +5,10 @@ import {
   API_BASE,
   refreshBalances,
   getLatestBalances,
+  getWalletAddressBalancesLatest,
+  listWalletAddresses,
+  refreshWalletAddressBalances,
+  getTokenRegistryRows,
   getPricesUSD,
   getOrders,
   cancelOrder,
@@ -312,6 +316,7 @@ const workspaceShellStyles = {
 };
 
 const ALL_VENUES_VALUE = "ALL";
+const ROBINHOOD_CHAIN_VENUE = "robinhood_chain";
 
 // NOTE: This list is used for *core trading/balances polling* fallback.
 // Do not restrict it to “discovery-capable” venues.
@@ -1136,6 +1141,115 @@ async function appFetchSolanaRegisteredWalletPortfolioBalanceRows() {
   }
 }
 
+const APP_ROBINHOOD_CHAIN_REGISTRY_CACHE_TTL_MS = 5 * 60 * 1000;
+let appRobinhoodChainRegistryCache = { fetchedAt: 0, bySymbol: {} };
+
+function appNormalizeRowsPayload(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.rows)) return payload.rows;
+  if (Array.isArray(payload?.balances)) return payload.balances;
+  if (Array.isArray(payload?.addresses)) return payload.addresses;
+  if (Array.isArray(payload?.data)) return payload.data;
+  return [];
+}
+
+async function appLoadRobinhoodChainRegistryMap({ force = false } = {}) {
+  const now = Date.now();
+  if (
+    !force &&
+    appRobinhoodChainRegistryCache.fetchedAt > 0 &&
+    now - appRobinhoodChainRegistryCache.fetchedAt <= APP_ROBINHOOD_CHAIN_REGISTRY_CACHE_TTL_MS
+  ) {
+    return appRobinhoodChainRegistryCache.bySymbol || {};
+  }
+
+  try {
+    const payload = await getTokenRegistryRows({
+      chain: ROBINHOOD_CHAIN_VENUE,
+      venue: ROBINHOOD_CHAIN_VENUE,
+      include_global: true,
+    });
+    const rows = appNormalizeRowsPayload(payload);
+    const bySymbol = {};
+
+    // Global rows are accepted first; the explicit robinhood_chain venue override
+    // then replaces the same symbol deterministically.
+    const ordered = [...rows].sort((a, b) => {
+      const av = String(a?.venue || "").trim().toLowerCase() === ROBINHOOD_CHAIN_VENUE ? 1 : 0;
+      const bv = String(b?.venue || "").trim().toLowerCase() === ROBINHOOD_CHAIN_VENUE ? 1 : 0;
+      return av - bv;
+    });
+
+    for (const row of ordered) {
+      const symbol = String(row?.symbol || "").trim().toUpperCase();
+      if (!symbol) continue;
+      bySymbol[symbol] = {
+        registry_id: row?.id ?? null,
+        registry_venue: String(row?.venue || "").trim().toLowerCase() || null,
+        contract_address: String(row?.address || "").trim() || null,
+        decimals: appFiniteNumberOrNull(row?.decimals),
+        label: String(row?.label || "").trim() || null,
+        external_price_source: String(row?.external_price_source || "").trim().toLowerCase() || null,
+        external_price_id: String(row?.external_price_id || "").trim() || null,
+      };
+    }
+
+    appRobinhoodChainRegistryCache = { fetchedAt: now, bySymbol };
+    return bySymbol;
+  } catch {
+    return appRobinhoodChainRegistryCache.bySymbol || {};
+  }
+}
+
+function appRobinhoodChainUsdSourceLabel(registryMeta, px) {
+  const source = String(registryMeta?.external_price_source || "").trim().toLowerCase();
+  const priceId = String(registryMeta?.external_price_id || "").trim();
+  if (px === null || px === undefined) {
+    if (source === "none") return "Unpriced · registry none";
+    if (source && priceId) return `Unpriced · ${source}/${priceId}`;
+    return "Unpriced";
+  }
+  if (source === "stable") return "Token Registry · stable USD";
+  if ((source === "coingecko" || source === "coingecko_simple") && priceId) {
+    return `Token Registry · CoinGecko ${priceId}`;
+  }
+  if (source && priceId) return `Token Registry · ${source} ${priceId}`;
+  return "Registry / market fallback";
+}
+
+async function appRefreshRobinhoodChainWalletBalances() {
+  const payload = await listWalletAddresses({
+    wallet_id: ROBINHOOD_CHAIN_VENUE,
+    network: ROBINHOOD_CHAIN_VENUE,
+    limit: 100,
+  });
+  const rows = appNormalizeRowsPayload(payload).filter((row) => {
+    const walletId = String(row?.wallet_id || row?.walletId || "").trim().toLowerCase();
+    const network = String(row?.network || row?.chain || "").trim().toLowerCase();
+    return walletId === ROBINHOOD_CHAIN_VENUE || network === ROBINHOOD_CHAIN_VENUE;
+  });
+  const accountRows = rows.filter((row) => {
+    const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+    return asset === "ALL" || asset === "*";
+  });
+  const selected = accountRows.length ? accountRows : rows;
+  const ids = selected.map((row) => row?.id).filter(Boolean);
+  if (!ids.length) {
+    return {
+      ok: true,
+      refreshed: 0,
+      errors: [],
+      robinhood_chain_native_refreshed: 0,
+      robinhood_chain_erc20_refreshed: 0,
+      robinhood_chain_erc20_failed: 0,
+      robinhood_chain_erc20_registered: 0,
+    };
+  }
+  const ownerScope = String(selected[0]?.owner_scope || selected[0]?.ownerScope || "user").trim() || "user";
+  return refreshWalletAddressBalances({ ids, owner_scope: ownerScope });
+}
+
 function appWalletBalanceUsdValue(row) {
   const direct = appFiniteNumberOrNull(
     row?.usd_value ??
@@ -1576,7 +1690,7 @@ function appCounterpartyRowsTotalUsd(rowsMaybe) {
 
 async function appFetchWalletAddressSnapshotPortfolioTotalsUsd() {
   try {
-    const data = await appFetchJson("/api/wallet_addresses/balances/latest?with_prices=1&limit=5000");
+    const data = await getWalletAddressBalancesLatest({ with_prices: true, limit: 5000 });
     const rows = Array.isArray(data)
       ? data
       : Array.isArray(data?.items)
@@ -1621,20 +1735,27 @@ async function appFetchWalletAddressSnapshotPortfolioTotalsUsd() {
   }
 }
 
-async function appFetchWalletAddressSnapshotPortfolioBalanceRows() {
+async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
   try {
-    const data = await appFetchJson("/api/wallet_addresses/balances/latest?with_prices=1&limit=5000");
-    const rows = Array.isArray(data)
-      ? data
-      : Array.isArray(data?.items)
-        ? data.items
-        : Array.isArray(data?.rows)
-          ? data.rows
-          : Array.isArray(data?.balances)
-            ? data.balances
-            : Array.isArray(data?.data)
-              ? data.data
-              : [];
+    const networkFilter = String(opts?.network || "").trim().toLowerCase() || undefined;
+    const walletIdFilter = String(opts?.wallet_id || opts?.walletId || "").trim() || undefined;
+    const ownerScopeFilter = String(opts?.owner_scope || opts?.ownerScope || "").trim() || undefined;
+    const data = await getWalletAddressBalancesLatest({
+      with_prices: true,
+      limit: 5000,
+      network: networkFilter,
+      wallet_id: walletIdFilter,
+      owner_scope: ownerScopeFilter,
+    });
+    const rows = appNormalizeRowsPayload(data);
+    const hasRobinhoodChainRows = (rows || []).some((row) => {
+      const walletId = String(row?.wallet_id || row?.walletId || "").trim().toLowerCase();
+      const network = String(row?.network || row?.chain || "").trim().toLowerCase();
+      return walletId === ROBINHOOD_CHAIN_VENUE || network === ROBINHOOD_CHAIN_VENUE;
+    });
+    const robinhoodRegistryMap = hasRobinhoodChainRows
+      ? await appLoadRobinhoodChainRegistryMap()
+      : {};
 
     return (rows || []).map((row) => {
       const asset = String(row?.asset || row?.symbol || "").toUpperCase().trim();
@@ -1647,11 +1768,21 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows() {
       const network = String(row?.network || row?.chain || "").trim().toLowerCase();
       const address = String(row?.address || row?.wallet_address || row?.walletAddress || "").trim();
       const bucket = appWalletBalanceBucket(row);
+      const isRobinhoodChain = (
+        walletId.toLowerCase() === ROBINHOOD_CHAIN_VENUE ||
+        network === ROBINHOOD_CHAIN_VENUE
+      );
+      const registryMeta = isRobinhoodChain ? robinhoodRegistryMap?.[asset] || null : null;
+      const usdSource = isRobinhoodChain
+        ? appRobinhoodChainUsdSourceLabel(registryMeta, px)
+        : (px !== null ? `${asset}-USD` : (totalUsd !== null ? "snapshot" : "—"));
 
       return {
         ...row,
-        venue: walletId || (bucket === "solana" ? "self_custody_solana" : bucket === "hydration" ? "self_custody_hydration" : "self_custody"),
-        source_type: "Self custody",
+        venue: isRobinhoodChain
+          ? ROBINHOOD_CHAIN_VENUE
+          : walletId || (bucket === "solana" ? "self_custody_solana" : bucket === "hydration" ? "self_custody_hydration" : "self_custody"),
+        source_type: isRobinhoodChain ? "Wallet Addresses / Robinhood Chain RPC" : "Self custody",
         network,
         chain: network,
         address,
@@ -1665,7 +1796,15 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows() {
         total_usd: totalUsd,
         available_usd: totalUsd,
         hold_usd: 0,
-        usd_source_symbol: px !== null ? `${asset}-USD` : (totalUsd !== null ? "snapshot" : "—"),
+        usd_source_symbol: usdSource,
+        price_status: px !== null ? "priced" : "unpriced",
+        price_basis: isRobinhoodChain && registryMeta ? "token_registry" : (px !== null ? "market_symbol" : null),
+        registry_id: registryMeta?.registry_id ?? null,
+        registry_venue: registryMeta?.registry_venue ?? null,
+        contract_address: registryMeta?.contract_address ?? null,
+        token_decimals: registryMeta?.decimals ?? null,
+        read_only: isRobinhoodChain ? true : row?.read_only,
+        portfolio_included: totalUsd !== null && Math.abs(qty) > 0,
         balance_status: row?.balance_status || row?.status || "snapshot",
         fetched_at: row?.fetched_at || row?.captured_at || row?.created_at || null,
       };
@@ -1679,11 +1818,17 @@ function appPortfolioBalanceDedupKey(row) {
   const asset = String(row?.asset || row?.symbol || "").toUpperCase().trim();
   if (!asset) return "";
   const address = String(row?.address || row?.wallet_address || row?.walletAddress || "").trim().toLowerCase();
-  if (!address) return "";
   const networkRaw = String(row?.network || row?.chain || row?.venue || "").trim().toLowerCase();
   let network = networkRaw;
   if (network.includes("solana") || networkRaw === "solana_jupiter") network = "solana";
   else if (network.includes("hydration") || network.includes("polkadot")) network = "hydration";
+
+  if (network === ROBINHOOD_CHAIN_VENUE) {
+    const walletAddressId = String(row?.wallet_address_id || row?.walletAddressId || "").trim().toLowerCase();
+    if (walletAddressId) return `${network}:${walletAddressId}:${asset}`;
+  }
+
+  if (!address) return "";
   return `${network}:${address}:${asset}`;
 }
 
@@ -2880,6 +3025,7 @@ export default function App() {
       // Counterparty balances and protocol orderbooks are browser-wallet/protocol scoped,
       // not served through the generic CEX adapter snapshot path.
       if (v === "counterparty" && c === "balances") return true;
+      if (v === ROBINHOOD_CHAIN_VENUE && c === "balances") return true;
       if (v === "counterparty" && c === "orderbook") return true;
 
       // DEX venues are swap/status based, but we still surface them as trade/orderbook-capable
@@ -4143,7 +4289,7 @@ export default function App() {
     }
   }
 
-  async function doRefreshBalances({ forceAllVenuesTotal = true } = {}) {
+  async function doRefreshBalances({ forceAllVenuesTotal = true, refreshRobinhoodChain = false } = {}) {
     if (balancesRefreshInFlightRef.current) return;
     balancesRefreshInFlightRef.current = true;
 
@@ -4151,8 +4297,9 @@ export default function App() {
 
     const isAllVenuesView = venue === ALL_VENUES_VALUE;
     const isCounterpartyView = normalizeVenue(venue) === "counterparty";
+    const isRobinhoodChainView = normalizeVenue(venue) === ROBINHOOD_CHAIN_VENUE;
 
-    if (!isAllVenuesView && !isCounterpartyView) {
+    if (!isAllVenuesView && !isCounterpartyView && !isRobinhoodChainView) {
       const vNorm = normalizeVenue(venue);
       if (vNorm && !venueSupports(vNorm, "balances")) {
         setError(`Balances are not supported for venue "${prettyVenueName(vNorm)}". Select a balances-capable venue or use ALL.`);
@@ -4163,7 +4310,7 @@ export default function App() {
 
     // Some venue-like sources are valid for markets/activity but are not balances-refreshable on the backend.
     // If they slip into the ALL candidate list, /api/balances/refresh will 422 and poison the fan-out.
-    const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty"]);
+    const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty", ROBINHOOD_CHAIN_VENUE]);
     const filterBalancesRefreshVenues = (arr) =>
       (arr || []).filter((v) => {
         const vNorm = normalizeVenue(v);
@@ -4182,6 +4329,43 @@ export default function App() {
       setLoadingBalances(true);
       setError(null);
 
+      if (isRobinhoodChainView) {
+        let refreshResult = null;
+        if (refreshRobinhoodChain) {
+          refreshResult = await appRefreshRobinhoodChainWalletBalances();
+          appRobinhoodChainRegistryCache = { fetchedAt: 0, bySymbol: {} };
+        }
+
+        const robinhoodRows = await appFetchWalletAddressSnapshotPortfolioBalanceRows({
+          network: ROBINHOOD_CHAIN_VENUE,
+          wallet_id: ROBINHOOD_CHAIN_VENUE,
+        });
+        if (balancesReqIdRef.current !== reqId) return;
+
+        let totalUsd = 0;
+        let hasPricedRow = false;
+        for (const row of robinhoodRows) {
+          const value = appFiniteNumberOrNull(row?.total_usd);
+          if (value !== null) {
+            totalUsd += value;
+            hasPricedRow = true;
+          }
+        }
+
+        setBalances(robinhoodRows);
+        setPortfolioTotalUsd(hasPricedRow ? totalUsd : null);
+
+        const refreshErrors = Array.isArray(refreshResult?.errors) ? refreshResult.errors : [];
+        if (refreshErrors.length) {
+          setError(`Robinhood Chain refresh completed with ${refreshErrors.length} token/address error${refreshErrors.length === 1 ? "" : "s"}. Successful snapshots were preserved.`);
+        } else if (robinhoodRows.length === 0) {
+          setError("No Robinhood Chain balance snapshots were found. Save an ALL / robinhood_chain Wallet Addresses row and refresh it.");
+        }
+
+        if (forceAllVenuesTotal) await refreshAllVenuesTotalOnlySafe();
+        return;
+      }
+
       if (isCounterpartyView) {
         const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows({ forceRefresh: true, allowPrompt: false });
         if (balancesReqIdRef.current !== reqId) return;
@@ -4195,6 +4379,20 @@ export default function App() {
           setError("No positive Counterparty protocol balances were returned for COUNTERPARTY_SOURCE_ADDRESS.");
         }
         return;
+      }
+
+      let robinhoodChainRefreshWarning = "";
+      if (isAllVenuesView && refreshRobinhoodChain) {
+        try {
+          const refreshResult = await appRefreshRobinhoodChainWalletBalances();
+          appRobinhoodChainRegistryCache = { fetchedAt: 0, bySymbol: {} };
+          const refreshErrors = Array.isArray(refreshResult?.errors) ? refreshResult.errors : [];
+          if (refreshErrors.length) {
+            robinhoodChainRefreshWarning = `Robinhood Chain refresh preserved successful snapshots but reported ${refreshErrors.length} error${refreshErrors.length === 1 ? "" : "s"}.`;
+          }
+        } catch (e) {
+          robinhoodChainRefreshWarning = `Robinhood Chain refresh was unavailable: ${e?.message || e}`;
+        }
       }
 
       if (isAllVenuesView) {
@@ -4364,6 +4562,7 @@ export default function App() {
         : merged;
 
       setBalances(displayMerged);
+      if (robinhoodChainRefreshWarning) setError(robinhoodChainRefreshWarning);
 
       setPortfolioTotalUsd(Number.isFinite(unifiedPortCurrentView) ? unifiedPortCurrentView : null);
 
@@ -4444,7 +4643,7 @@ export default function App() {
   // Recompute ONLY the header “All Venues” total without depending on current tab/venue.
   async function refreshAllVenuesTotalOnlySafe() {
     try {
-      const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty"]);
+      const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty", ROBINHOOD_CHAIN_VENUE]);
       const balancesVenueCandidates = (
         balancesVenuesList && balancesVenuesList.length > 0
           ? balancesVenuesList
@@ -5585,7 +5784,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
 
         // Keep background polling aligned with the manual ALL-venues refresh filtering.
         // These venue-like sources are not balances-refreshable on the backend.
-        const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty"]);
+        const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty", ROBINHOOD_CHAIN_VENUE]);
         const balancesVenueCandidates = (balancesVenuesList.length > 0 ? balancesVenuesList : supportedVenues)
           .map((v) => normalizeVenue(v))
           .filter((v) => v && v !== ALL_VENUES_VALUE)

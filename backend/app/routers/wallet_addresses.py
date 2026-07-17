@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
+import time
 from datetime import datetime
 from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -195,6 +197,195 @@ _ROBINHOOD_CHAIN_REGISTRY_CHAIN = "robinhood_chain"
 _ROBINHOOD_CHAIN_REGISTRY_VENUE = "robinhood_chain"
 _ROBINHOOD_CHAIN_MAX_REGISTERED_ERC20 = 100
 _WALLET_SNAPSHOT_ASSET_MAX_LENGTH = 16
+
+# RH-CHAIN.7 registry-managed external price cache. The cache is intentionally
+# process-local and bounded: one CoinGecko simple-price request can resolve every
+# registered Robinhood Chain token that shares an external price ID (ETH/WETH).
+def _bounded_env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = str(os.getenv(name, "") or "").strip()
+    try:
+        value = float(raw) if raw else float(default)
+    except Exception:
+        value = float(default)
+    return max(float(minimum), min(float(maximum), value))
+
+
+_ROBINHOOD_CHAIN_PRICE_MAX_IDS = 100
+_ROBINHOOD_CHAIN_PRICE_TTL_S = _bounded_env_float("ROBINHOOD_CHAIN_PRICE_TTL_S", 300.0, 30.0, 3600.0)
+_ROBINHOOD_CHAIN_PRICE_STALE_MAX_S = max(
+    _ROBINHOOD_CHAIN_PRICE_TTL_S,
+    _bounded_env_float("ROBINHOOD_CHAIN_PRICE_STALE_MAX_S", 3600.0, 30.0, 86400.0),
+)
+_ROBINHOOD_CHAIN_PRICE_TIMEOUT_S = _bounded_env_float("ROBINHOOD_CHAIN_PRICE_TIMEOUT_S", 8.0, 2.0, 20.0)
+_ROBINHOOD_CHAIN_PRICE_ERROR_BACKOFF_S = _bounded_env_float(
+    "ROBINHOOD_CHAIN_PRICE_ERROR_BACKOFF_S",
+    120.0,
+    30.0,
+    3600.0,
+)
+_ROBINHOOD_CHAIN_PRICE_LOCK = threading.Lock()
+_ROBINHOOD_CHAIN_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
+_ROBINHOOD_CHAIN_PRICE_BACKOFF_UNTIL = 0.0
+
+
+def _robinhood_chain_registry_price_metadata(
+    db: Session,
+    assets: List[str],
+) -> Dict[str, Dict[str, Optional[str]]]:
+    wanted = {_norm_asset(asset) for asset in assets or [] if _norm_asset(asset)}
+    if not wanted:
+        return {}
+
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, venue, symbol, external_price_source, external_price_id
+                FROM token_registry
+                WHERE chain = :chain
+                  AND (venue = :venue OR venue IS NULL OR venue = '')
+                """
+            ),
+            {
+                "chain": _ROBINHOOD_CHAIN_REGISTRY_CHAIN,
+                "venue": _ROBINHOOD_CHAIN_REGISTRY_VENUE,
+            },
+        ).mappings().all()
+    except Exception:
+        # RH-CHAIN.5 owns these additive columns. Fail closed as unpriced when
+        # an older database has not yet received that accepted registry update.
+        return {}
+
+    ordered = sorted(
+        rows or [],
+        key=lambda row: (
+            0 if str(row.get("venue") or "").strip().lower() == _ROBINHOOD_CHAIN_REGISTRY_VENUE else 1,
+            _norm_asset(row.get("symbol")),
+        ),
+    )
+
+    selected: Dict[str, Dict[str, Optional[str]]] = {}
+    for row in ordered:
+        symbol = _norm_asset(row.get("symbol"))
+        if not symbol or symbol not in wanted or symbol in selected:
+            continue
+        selected[symbol] = {
+            "registry_id": str(row.get("id") or "") or None,
+            "registry_venue": str(row.get("venue") or "").strip().lower() or None,
+            "external_price_source": str(row.get("external_price_source") or "").strip().lower() or None,
+            "external_price_id": str(row.get("external_price_id") or "").strip() or None,
+        }
+    return selected
+
+
+def _robinhood_chain_coingecko_prices(price_ids: List[str]) -> Dict[str, float]:
+    global _ROBINHOOD_CHAIN_PRICE_BACKOFF_UNTIL
+
+    ids = []
+    seen = set()
+    for value in price_ids or []:
+        price_id = str(value or "").strip().lower()
+        if not price_id or price_id in seen:
+            continue
+        seen.add(price_id)
+        ids.append(price_id)
+        if len(ids) >= _ROBINHOOD_CHAIN_PRICE_MAX_IDS:
+            break
+
+    if not ids:
+        return {}
+
+    now = time.monotonic()
+    resolved: Dict[str, float] = {}
+    missing: List[str] = []
+    stale: Dict[str, float] = {}
+
+    with _ROBINHOOD_CHAIN_PRICE_LOCK:
+        backoff_active = now < _ROBINHOOD_CHAIN_PRICE_BACKOFF_UNTIL
+        for price_id in ids:
+            hit = _ROBINHOOD_CHAIN_PRICE_CACHE.get(price_id)
+            if not hit:
+                missing.append(price_id)
+                continue
+            fetched_mono, price = hit
+            age = max(0.0, now - float(fetched_mono))
+            if age <= _ROBINHOOD_CHAIN_PRICE_TTL_S:
+                resolved[price_id] = float(price)
+            else:
+                missing.append(price_id)
+                if age <= _ROBINHOOD_CHAIN_PRICE_STALE_MAX_S:
+                    stale[price_id] = float(price)
+
+    if missing and not backoff_active:
+        try:
+            base_url = (
+                os.getenv("ROBINHOOD_CHAIN_COINGECKO_SIMPLE_PRICE_URL")
+                or "https://api.coingecko.com/api/v3/simple/price"
+            ).strip()
+            with httpx.Client(timeout=_ROBINHOOD_CHAIN_PRICE_TIMEOUT_S) as client:
+                response = client.get(
+                    base_url,
+                    params={"ids": ",".join(missing), "vs_currencies": "usd"},
+                    headers={"Accept": "application/json", "User-Agent": "UTT-RH-CHAIN/7"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+
+            fetched_mono = time.monotonic()
+            updates: Dict[str, float] = {}
+            for price_id in missing:
+                try:
+                    price = float(((payload or {}).get(price_id) or {}).get("usd"))
+                except Exception:
+                    continue
+                if price > 0:
+                    updates[price_id] = price
+
+            with _ROBINHOOD_CHAIN_PRICE_LOCK:
+                for price_id, price in updates.items():
+                    _ROBINHOOD_CHAIN_PRICE_CACHE[price_id] = (fetched_mono, float(price))
+                _ROBINHOOD_CHAIN_PRICE_BACKOFF_UNTIL = 0.0
+            resolved.update(updates)
+        except Exception:
+            with _ROBINHOOD_CHAIN_PRICE_LOCK:
+                _ROBINHOOD_CHAIN_PRICE_BACKOFF_UNTIL = (
+                    time.monotonic() + _ROBINHOOD_CHAIN_PRICE_ERROR_BACKOFF_S
+                )
+
+    # A bounded last-good value is safer than converting a transient provider
+    # failure into a fabricated zero-dollar portfolio value.
+    for price_id, price in stale.items():
+        resolved.setdefault(price_id, price)
+    return resolved
+
+
+def _robinhood_chain_registry_prices(
+    db: Session,
+    assets: List[str],
+) -> Tuple[Dict[str, float], Set[str]]:
+    metadata = _robinhood_chain_registry_price_metadata(db, assets)
+    mapped_symbols = set(metadata.keys())
+    coingecko_ids = [
+        str(meta.get("external_price_id") or "").strip().lower()
+        for meta in metadata.values()
+        if str(meta.get("external_price_source") or "").strip().lower() in {"coingecko", "coingecko_simple"}
+        and str(meta.get("external_price_id") or "").strip()
+    ]
+    coingecko_prices = _robinhood_chain_coingecko_prices(coingecko_ids)
+
+    prices: Dict[str, float] = {}
+    for symbol, meta in metadata.items():
+        source = str(meta.get("external_price_source") or "").strip().lower()
+        price_id = str(meta.get("external_price_id") or "").strip().lower()
+        if source == "stable":
+            prices[symbol] = 1.0
+        elif source in {"coingecko", "coingecko_simple"} and price_id:
+            price = coingecko_prices.get(price_id)
+            if price is not None and float(price) > 0:
+                prices[symbol] = float(price)
+        # Explicit none/derived/unresolved mappings remain unpriced here. They
+        # are not silently converted to ambiguous ticker-only matches.
+    return prices, mapped_symbols
 
 
 def _robinhood_chain_registered_erc20_rows(
@@ -918,15 +1109,29 @@ def wallet_balances_latest(
     db: Session = Depends(get_db),
     with_prices: int = Query(default=1, ge=0, le=1),
     limit: int = Query(default=2000, ge=1, le=5000),
+    network: Optional[str] = Query(default=None),
+    wallet_id: Optional[str] = Query(default=None),
+    owner_scope: Optional[str] = Query(default=None),
 ):
     # Keep the newest snapshot for each wallet-address + asset identity. One
     # account-level address may emit ETH and multiple registered ERC-20 rows.
     stmt = (
         select(WalletAddressSnapshot, WalletAddress)
         .join(WalletAddress, WalletAddress.id == WalletAddressSnapshot.wallet_address_id)
-        .order_by(WalletAddressSnapshot.fetched_at.desc())
-        .limit(limit)
     )
+    if network:
+        normalized_network = str(network or "").strip().lower()
+        stmt = stmt.where(
+            or_(
+                WalletAddress.network == normalized_network,
+                WalletAddressSnapshot.network == normalized_network,
+            )
+        )
+    if wallet_id:
+        stmt = stmt.where(WalletAddress.wallet_id == str(wallet_id or "").strip())
+    if owner_scope:
+        stmt = stmt.where(WalletAddress.owner_scope == str(owner_scope or "").strip())
+    stmt = stmt.order_by(WalletAddressSnapshot.fetched_at.desc()).limit(limit)
     rows = db.execute(stmt).all()
 
     latest: Dict[Tuple[str, str], Tuple[WalletAddressSnapshot, WalletAddress]] = {}
@@ -947,9 +1152,11 @@ def wallet_balances_latest(
         basis_keys.append((basis_venue, "wallet_address", snapshot_asset))
     basis_map = build_basis_summary_map(db, basis_keys)
 
-    # Build pricing map (optional). Snapshot asset is authoritative because an
+    # Build pricing maps (optional). Snapshot asset is authoritative because an
     # account-level ALL row may emit one or more asset-specific snapshots.
     prices_usd = {}
+    robinhood_chain_prices: Dict[str, float] = {}
+    robinhood_chain_mapped_symbols: Set[str] = set()
     if with_prices:
         assets = sorted({_norm_asset(snap.asset or addr.asset) for snap, addr in latest.values()})
         try:
@@ -957,12 +1164,47 @@ def wallet_balances_latest(
         except Exception:
             prices_usd = {}
 
+        robinhood_assets = sorted({
+            _norm_asset(snap.asset or addr.asset)
+            for snap, addr in latest.values()
+            if _is_robinhood_chain_wallet_row(addr)
+            or str(getattr(snap, "network", None) or "").strip().lower() == _ROBINHOOD_CHAIN_REGISTRY_CHAIN
+        })
+        if robinhood_assets:
+            (
+                robinhood_chain_prices,
+                robinhood_chain_mapped_symbols,
+            ) = _robinhood_chain_registry_prices(db, robinhood_assets)
+
     out: List[WalletAddressBalanceOut] = []
     for snap, addr in latest.values():
         snapshot_asset = _norm_asset(snap.asset or addr.asset)
         qty = float(snap.balance_qty)
-        usd_price = float(prices_usd.get(snapshot_asset) or 0.0)
-        usd_value = qty * usd_price
+        is_robinhood_chain = (
+            _is_robinhood_chain_wallet_row(addr)
+            or str(getattr(snap, "network", None) or "").strip().lower() == _ROBINHOOD_CHAIN_REGISTRY_CHAIN
+        )
+
+        usd_price: Optional[float]
+        if not with_prices:
+            usd_price = None
+        elif is_robinhood_chain and snapshot_asset in robinhood_chain_mapped_symbols:
+            # An explicit registry mapping is authoritative. If its bounded
+            # provider read is unavailable, preserve an explicit unpriced state
+            # instead of accepting an ambiguous symbol-only match.
+            mapped_price = robinhood_chain_prices.get(snapshot_asset)
+            usd_price = float(mapped_price) if mapped_price is not None else None
+        else:
+            fallback_price = prices_usd.get(snapshot_asset)
+            if fallback_price is None:
+                usd_price = None if is_robinhood_chain else 0.0
+            else:
+                try:
+                    usd_price = float(fallback_price)
+                except Exception:
+                    usd_price = None if is_robinhood_chain else 0.0
+
+        usd_value = qty * usd_price if usd_price is not None else None
 
         # IMPORTANT: make UUID-ish ids strings defensively + include fetched_at
         fetched_at = snap.fetched_at

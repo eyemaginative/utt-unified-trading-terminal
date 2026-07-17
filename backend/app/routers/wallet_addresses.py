@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import httpx
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -189,6 +189,57 @@ def _is_robinhood_chain_wallet_row(row) -> bool:
     wallet_id = str(getattr(row, "wallet_id", None) or "").strip().lower().replace("-", "_")
     network = str(getattr(row, "network", None) or "").strip().lower().replace("-", "_")
     return wallet_id == "robinhood_chain" or network == "robinhood_chain"
+
+
+_ROBINHOOD_CHAIN_REGISTRY_CHAIN = "robinhood_chain"
+_ROBINHOOD_CHAIN_REGISTRY_VENUE = "robinhood_chain"
+_ROBINHOOD_CHAIN_MAX_REGISTERED_ERC20 = 100
+_WALLET_SNAPSHOT_ASSET_MAX_LENGTH = 16
+
+
+def _robinhood_chain_registered_erc20_rows(
+    db: Session,
+    *,
+    symbol: Optional[str] = None,
+) -> List[TokenRegistry]:
+    symbol_filter = _norm_asset(symbol) if symbol else None
+
+    override_query = db.query(TokenRegistry).filter(
+        TokenRegistry.chain == _ROBINHOOD_CHAIN_REGISTRY_CHAIN,
+        TokenRegistry.venue == _ROBINHOOD_CHAIN_REGISTRY_VENUE,
+        TokenRegistry.symbol != "ETH",
+    )
+    global_query = db.query(TokenRegistry).filter(
+        TokenRegistry.chain == _ROBINHOOD_CHAIN_REGISTRY_CHAIN,
+        or_(TokenRegistry.venue.is_(None), TokenRegistry.venue == ""),
+        TokenRegistry.symbol != "ETH",
+    )
+    if symbol_filter:
+        override_query = override_query.filter(TokenRegistry.symbol == symbol_filter)
+        global_query = global_query.filter(TokenRegistry.symbol == symbol_filter)
+
+    overrides = (
+        override_query
+        .order_by(TokenRegistry.symbol.asc())
+        .limit(_ROBINHOOD_CHAIN_MAX_REGISTERED_ERC20)
+        .all()
+    )
+    globals_ = (
+        global_query
+        .order_by(TokenRegistry.symbol.asc())
+        .limit(_ROBINHOOD_CHAIN_MAX_REGISTERED_ERC20)
+        .all()
+    )
+
+    selected: Dict[str, TokenRegistry] = {}
+    for row in [*(overrides or []), *(globals_ or [])]:
+        normalized_symbol = _norm_asset(getattr(row, "symbol", None))
+        if not normalized_symbol or normalized_symbol == "ETH" or normalized_symbol in selected:
+            continue
+        selected[normalized_symbol] = row
+        if len(selected) >= _ROBINHOOD_CHAIN_MAX_REGISTERED_ERC20:
+            break
+    return list(selected.values())
 
 
 def _fetch_counterparty_asset_balance_atomic(address: str, asset: str) -> Tuple[int, int, Dict]:
@@ -868,7 +919,8 @@ def wallet_balances_latest(
     with_prices: int = Query(default=1, ge=0, le=1),
     limit: int = Query(default=2000, ge=1, le=5000),
 ):
-    # latest snapshot per address (simple approach: order and pick first per address_id)
+    # Keep the newest snapshot for each wallet-address + asset identity. One
+    # account-level address may emit ETH and multiple registered ERC-20 rows.
     stmt = (
         select(WalletAddressSnapshot, WalletAddress)
         .join(WalletAddress, WalletAddress.id == WalletAddressSnapshot.wallet_address_id)
@@ -877,12 +929,12 @@ def wallet_balances_latest(
     )
     rows = db.execute(stmt).all()
 
-    latest: Dict[str, Tuple[WalletAddressSnapshot, WalletAddress]] = {}
+    latest: Dict[Tuple[str, str], Tuple[WalletAddressSnapshot, WalletAddress]] = {}
     for snap, addr in rows:
-        # addr.id may be UUID-like; normalize key as str for stability
-        addr_key = str(addr.id)
-        if addr_key not in latest:
-            latest[addr_key] = (snap, addr)
+        snapshot_asset = _norm_asset(snap.asset or addr.asset)
+        addr_asset_key = (str(addr.id), snapshot_asset)
+        if addr_asset_key not in latest:
+            latest[addr_asset_key] = (snap, addr)
 
     # Read-only cost-basis enrichment.  Wallet-address ledger ingestion stores
     # self-custody rows as venue=(addr.wallet_id or "self_custody"),
@@ -979,62 +1031,153 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
     errors: List[Dict] = []
     counterparty_live_read_only_skipped = 0
     robinhood_chain_native_refreshed = 0
+    robinhood_chain_erc20_refreshed = 0
+    robinhood_chain_erc20_failed = 0
+    robinhood_chain_erc20_registered = 0
 
     for a in addrs:
         asset_norm = _norm_asset(a.asset)
         if _is_robinhood_chain_wallet_row(a):
-            # Robinhood Chain account rows use Asset=ALL as authoritative address
-            # metadata. RH-CHAIN.4 materializes the native ETH balance as an
-            # asset-specific snapshot after verifying chain ID 4663.
-            if asset_norm not in ("ALL", "*", "ETH"):
-                errors.append({
-                    "id": a.id,
-                    "asset": a.asset,
-                    "address": a.address,
-                    "error": f"Robinhood Chain ERC-20 balance reads are not enabled for asset {asset_norm}",
-                })
-                continue
             try:
                 if not bool(settings.robinhood_chain_effective_enabled()):
                     raise RuntimeError("Robinhood Chain is disabled or not configured for chain ID 4663")
                 normalized_address = validate_evm_address(a.address)
-                result = await get_robinhood_chain_client().get_native_balance(
-                    normalized_address,
-                    block_tag="latest",
-                    force_refresh=False,
-                )
-                if not result.get("ok"):
-                    raise RuntimeError(str(result.get("error") or result))
-
-                balance_wei = int(str(result.get("balance_wei") or "0"))
-                balance_eth = Decimal(str(result.get("balance_eth") or "0"))
-                snap = WalletAddressSnapshot(
-                    wallet_address_id=a.id,
-                    asset="ETH",
-                    network="robinhood_chain",
-                    address=normalized_address,
-                    balance_qty=float(balance_eth),
-                    balance_raw={
-                        "read_only": True,
-                        "chain_id": int(settings.robinhood_chain_chain_id),
-                        "chain_id_hex": hex(int(settings.robinhood_chain_chain_id)),
-                        "block_tag": result.get("block_tag") or "latest",
-                        "balance_wei": str(balance_wei),
-                        "balance_eth": str(result.get("balance_eth") or "0"),
-                        "cached": bool(result.get("cached")),
-                        "fetched_at": result.get("fetched_at"),
-                        "source": "robinhood_chain_rpc",
-                    },
-                    source="robinhood_chain_rpc",
-                    fetched_at=datetime.utcnow(),
-                )
-                db.add(snap)
-                db.commit()
-                refreshed += 1
-                robinhood_chain_native_refreshed += 1
             except Exception as e:
-                db.rollback()
                 errors.append({"id": a.id, "asset": a.asset, "address": a.address, "error": str(e)})
+                continue
+
+            include_native = asset_norm in ("ALL", "*", "ETH")
+            requested_token_symbol = None if asset_norm in ("ALL", "*", "ETH") else asset_norm
+            token_rows = (
+                _robinhood_chain_registered_erc20_rows(db, symbol=requested_token_symbol)
+                if asset_norm != "ETH"
+                else []
+            )
+            robinhood_chain_erc20_registered += len(token_rows)
+
+            if requested_token_symbol and not token_rows:
+                errors.append({
+                    "id": a.id,
+                    "asset": a.asset,
+                    "address": a.address,
+                    "error": f"Robinhood Chain token {requested_token_symbol} is not registered",
+                })
+
+            if include_native:
+                try:
+                    result = await get_robinhood_chain_client().get_native_balance(
+                        normalized_address,
+                        block_tag="latest",
+                        force_refresh=False,
+                    )
+                    if not result.get("ok"):
+                        raise RuntimeError(str(result.get("error") or result))
+
+                    balance_wei = int(str(result.get("balance_wei") or "0"))
+                    balance_eth = Decimal(str(result.get("balance_eth") or "0"))
+                    snap = WalletAddressSnapshot(
+                        wallet_address_id=a.id,
+                        asset="ETH",
+                        network="robinhood_chain",
+                        address=normalized_address,
+                        balance_qty=float(balance_eth),
+                        balance_raw={
+                            "read_only": True,
+                            "chain_id": int(settings.robinhood_chain_chain_id),
+                            "chain_id_hex": hex(int(settings.robinhood_chain_chain_id)),
+                            "block_tag": result.get("block_tag") or "latest",
+                            "balance_wei": str(balance_wei),
+                            "balance_eth": str(result.get("balance_eth") or "0"),
+                            "cached": bool(result.get("cached")),
+                            "fetched_at": result.get("fetched_at"),
+                            "source": "robinhood_chain_rpc",
+                        },
+                        source="robinhood_chain_rpc",
+                        fetched_at=datetime.utcnow(),
+                    )
+                    db.add(snap)
+                    db.commit()
+                    refreshed += 1
+                    robinhood_chain_native_refreshed += 1
+                except Exception as e:
+                    db.rollback()
+                    errors.append({
+                        "id": a.id,
+                        "asset": "ETH",
+                        "address": a.address,
+                        "error": str(e),
+                    })
+
+            for token_row in token_rows:
+                token_symbol = _norm_asset(getattr(token_row, "symbol", None))
+                try:
+                    if not token_symbol or token_symbol == "ETH":
+                        raise ValueError("invalid registered Robinhood Chain ERC-20 symbol")
+                    if len(token_symbol) > _WALLET_SNAPSHOT_ASSET_MAX_LENGTH:
+                        raise ValueError(
+                            f"registered token symbol exceeds WalletAddressSnapshot asset capacity: {token_symbol}"
+                        )
+                    contract_address = validate_evm_address(
+                        str(getattr(token_row, "address", None) or "").strip()
+                    )
+                    token_decimals = int(getattr(token_row, "decimals", 0))
+                    if token_decimals < 0 or token_decimals > 18:
+                        raise ValueError(
+                            f"registered token decimals must be between 0 and 18: {token_symbol}"
+                        )
+
+                    token_result = await get_robinhood_chain_client().get_erc20_balance(
+                        normalized_address,
+                        contract_address,
+                        token_decimals,
+                        block_tag="latest",
+                        force_refresh=False,
+                    )
+                    if not token_result.get("ok"):
+                        raise RuntimeError(str(token_result.get("error") or token_result))
+
+                    balance_atomic = int(str(token_result.get("balance_atomic") or "0"))
+                    balance_token = Decimal(str(token_result.get("balance_token") or "0"))
+                    token_snap = WalletAddressSnapshot(
+                        wallet_address_id=a.id,
+                        asset=token_symbol,
+                        network="robinhood_chain",
+                        address=normalized_address,
+                        balance_qty=float(balance_token),
+                        balance_raw={
+                            "read_only": True,
+                            "chain_id": int(settings.robinhood_chain_chain_id),
+                            "chain_id_hex": hex(int(settings.robinhood_chain_chain_id)),
+                            "block_tag": token_result.get("block_tag") or "latest",
+                            "contract_address": contract_address,
+                            "decimals": token_decimals,
+                            "balance_atomic": str(balance_atomic),
+                            "balance_token": str(token_result.get("balance_token") or "0"),
+                            "registry_id": int(token_row.id),
+                            "registry_venue": token_row.venue,
+                            "registry_label": token_row.label,
+                            "cached": bool(token_result.get("cached")),
+                            "fetched_at": token_result.get("fetched_at"),
+                            "source": "robinhood_chain_erc20_rpc",
+                        },
+                        source="robinhood_chain_erc20_rpc",
+                        fetched_at=datetime.utcnow(),
+                    )
+                    db.add(token_snap)
+                    db.commit()
+                    refreshed += 1
+                    robinhood_chain_erc20_refreshed += 1
+                except Exception as e:
+                    db.rollback()
+                    robinhood_chain_erc20_failed += 1
+                    errors.append({
+                        "id": a.id,
+                        "asset": token_symbol or getattr(token_row, "symbol", None),
+                        "address": a.address,
+                        "contract_address": getattr(token_row, "address", None),
+                        "registry_id": getattr(token_row, "id", None),
+                        "error": str(e),
+                    })
             continue
 
         if _is_counterparty_wallet_row(a):
@@ -1098,6 +1241,9 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
         "errors": errors,
         "counterparty_live_read_only_skipped": counterparty_live_read_only_skipped,
         "robinhood_chain_native_refreshed": robinhood_chain_native_refreshed,
+        "robinhood_chain_erc20_refreshed": robinhood_chain_erc20_refreshed,
+        "robinhood_chain_erc20_failed": robinhood_chain_erc20_failed,
+        "robinhood_chain_erc20_registered": robinhood_chain_erc20_registered,
     }
 
 

@@ -31,6 +31,8 @@ READ_ONLY_EVM_RPC_METHODS = frozenset(
 
 _EVM_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _WEI_PER_ETH = 10**18
+_ERC20_BALANCE_OF_SELECTOR = "70a08231"
+_MAX_UINT256 = (1 << 256) - 1
 
 
 def utc_now() -> datetime:
@@ -71,6 +73,48 @@ def format_wei_as_eth(wei: int) -> str:
     if remainder == 0:
         return str(whole)
     return f"{whole}.{remainder:018d}".rstrip("0")
+
+
+def format_atomic_units(atomic: int, decimals: int) -> str:
+    quantity = int(atomic)
+    if quantity < 0:
+        raise ValueError("atomic token amount cannot be negative")
+    try:
+        places = int(decimals)
+    except Exception as exc:
+        raise ValueError("token decimals must be an integer") from exc
+    if places < 0 or places > 18:
+        raise ValueError("token decimals must be between 0 and 18")
+    if places == 0:
+        return str(quantity)
+    scale = 10**places
+    whole, remainder = divmod(quantity, scale)
+    if remainder == 0:
+        return str(whole)
+    return f"{whole}.{remainder:0{places}d}".rstrip("0")
+
+
+def encode_erc20_balance_of(owner_address: str) -> str:
+    owner = validate_evm_address(owner_address)
+    owner_word = owner[2:].lower().rjust(64, "0")
+    return f"0x{_ERC20_BALANCE_OF_SELECTOR}{owner_word}"
+
+
+def decode_abi_uint256(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text.startswith("0x"):
+        raise ValueError("invalid ERC-20 balanceOf result: expected 0x-prefixed hexadecimal data")
+    body = text[2:]
+    if not body:
+        raise ValueError("invalid ERC-20 balanceOf result: empty return data")
+    if len(body) > 64:
+        raise ValueError("invalid ERC-20 balanceOf result: exceeds uint256 width")
+    if not re.fullmatch(r"[0-9a-fA-F]+", body):
+        raise ValueError("invalid ERC-20 balanceOf result: malformed hexadecimal data")
+    quantity = int(body, 16)
+    if quantity < 0 or quantity > _MAX_UINT256:
+        raise ValueError("invalid ERC-20 balanceOf result: outside uint256 range")
+    return quantity
 
 
 class EvmRpcClient:
@@ -406,6 +450,103 @@ class EvmRpcClient:
             "block_tag": tag,
             "balance_wei": str(balance_wei),
             "balance_eth": format_wei_as_eth(balance_wei),
+            "cached": bool(balance_record.get("cached")),
+            "fetched_at": balance_record.get("fetched_at") or utc_now().isoformat(),
+            "chain": identity,
+            "rpc": balance_record,
+            "read_only": True,
+        }
+
+    async def get_erc20_balance(
+        self,
+        owner_address: str,
+        contract_address: str,
+        decimals: int,
+        *,
+        block_tag: str = "latest",
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        owner = validate_evm_address(owner_address)
+        contract = validate_evm_address(contract_address)
+        try:
+            token_decimals = int(decimals)
+        except Exception:
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "error": "invalid_token_decimals",
+            }
+        if token_decimals < 0 or token_decimals > 18:
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "decimals": token_decimals,
+                "error": "invalid_token_decimals",
+            }
+
+        tag = str(block_tag or "latest").strip() or "latest"
+        if tag != "latest":
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "error": "unsupported_block_tag",
+            }
+
+        identity = await self.verify_expected_chain(force_refresh=force_refresh)
+        if not identity.get("ok"):
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "block_tag": tag,
+                "error": "chain_id_mismatch_or_unavailable",
+                "chain": identity,
+            }
+
+        call_data = encode_erc20_balance_of(owner)
+        balance_record = await self.rpc_read(
+            "eth_call",
+            [{"to": contract, "data": call_data}, tag],
+            cache_namespace=f"erc20_balance:{contract.lower()}:{owner.lower()}:{tag}",
+            force_refresh=force_refresh,
+        )
+        if not balance_record.get("ok"):
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "block_tag": tag,
+                "error": "erc20_balance_rpc_failed",
+                "chain": identity,
+                "rpc": balance_record,
+            }
+
+        try:
+            balance_atomic = decode_abi_uint256(balance_record.get("result"))
+            balance_token = format_atomic_units(balance_atomic, token_decimals)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "block_tag": tag,
+                "decimals": token_decimals,
+                "error": str(exc),
+                "chain": identity,
+                "rpc": balance_record,
+            }
+
+        return {
+            "ok": True,
+            "owner_address": owner,
+            "contract_address": contract,
+            "decimals": token_decimals,
+            "block_tag": tag,
+            "balance_atomic": str(balance_atomic),
+            "balance_token": balance_token,
             "cached": bool(balance_record.get("cached")),
             "fetched_at": balance_record.get("fetched_at") or utc_now().isoformat(),
             "chain": identity,

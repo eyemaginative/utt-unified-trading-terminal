@@ -7,10 +7,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from ..config import settings
+from ..db import get_db
+from ..models import TokenRegistry
 from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
 
 
@@ -20,6 +23,100 @@ _EXPECTED_CHAIN_ID_DECIMAL = 4663
 _EXPECTED_CHAIN_ID_HEX = hex(_EXPECTED_CHAIN_ID_DECIMAL)
 _NATIVE_CURRENCY = "ETH"
 _EXPLORER_URL = "https://robinhoodchain.blockscout.com"
+_TOKEN_REGISTRY_CHAIN = "robinhood_chain"
+_TOKEN_REGISTRY_VENUE = "robinhood_chain"
+
+
+def _normalize_registry_symbol(symbol: str) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="token symbol is required")
+    if len(normalized) > 32:
+        raise HTTPException(status_code=400, detail="token symbol exceeds Token Registry capacity")
+    return normalized
+
+
+def _resolve_registered_erc20(db: Session, symbol: str) -> Tuple[TokenRegistry, str, int]:
+    normalized_symbol = _normalize_registry_symbol(symbol)
+    if normalized_symbol == _NATIVE_CURRENCY:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "native_asset_not_erc20",
+                "message": "ETH is the native Robinhood Chain asset; use the native balance endpoint.",
+                "symbol": normalized_symbol,
+            },
+        )
+
+    override = (
+        db.query(TokenRegistry)
+        .filter(
+            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
+            TokenRegistry.venue == _TOKEN_REGISTRY_VENUE,
+            TokenRegistry.symbol == normalized_symbol,
+        )
+        .first()
+    )
+    global_row = (
+        db.query(TokenRegistry)
+        .filter(
+            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
+            ((TokenRegistry.venue.is_(None)) | (TokenRegistry.venue == "")),
+            TokenRegistry.symbol == normalized_symbol,
+        )
+        .first()
+    )
+    row = override or global_row
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "registered_erc20_not_found",
+                "chain": _TOKEN_REGISTRY_CHAIN,
+                "symbol": normalized_symbol,
+            },
+        )
+
+    try:
+        contract = validate_evm_address(str(row.address or "").strip())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_registered_erc20_contract",
+                "chain": _TOKEN_REGISTRY_CHAIN,
+                "symbol": normalized_symbol,
+                "registry_id": row.id,
+                "message": str(exc),
+            },
+        ) from exc
+
+    try:
+        decimals = int(row.decimals)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_registered_erc20_decimals",
+                "chain": _TOKEN_REGISTRY_CHAIN,
+                "symbol": normalized_symbol,
+                "registry_id": row.id,
+            },
+        ) from exc
+    if decimals < 0 or decimals > 18:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_registered_erc20_decimals",
+                "chain": _TOKEN_REGISTRY_CHAIN,
+                "symbol": normalized_symbol,
+                "registry_id": row.id,
+                "decimals": decimals,
+            },
+        )
+
+    return row, contract, decimals
+
 
 # Callers select stable check names, never arbitrary JSON-RPC methods or params.
 _PROBE_DEFINITIONS: Dict[str, Tuple[str, List[Any]]] = {
@@ -414,5 +511,65 @@ async def robinhood_chain_address_balance(
         "cached": bool(result.get("cached")),
         "fetched_at": result.get("fetched_at"),
         "source": "robinhood_chain_rpc",
+        "read_only": True,
+    }
+
+@router.get("/address/{address}/erc20/{symbol}/balance")
+async def robinhood_chain_erc20_balance(
+    address: str,
+    symbol: str,
+    force_refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return one registered ERC-20 balance through balanceOf(address).
+
+    The token contract and decimals must come from Token Registry. This endpoint
+    does not accept arbitrary contracts, calldata, block tags, or write methods.
+    """
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    if not _configured_rpc_http():
+        raise HTTPException(status_code=503, detail="ROBINHOOD_CHAIN_RPC_HTTP is not configured")
+
+    try:
+        normalized_address = validate_evm_address(address)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    registry_row, contract_address, decimals = _resolve_registered_erc20(db, symbol)
+    asset = str(registry_row.symbol or "").strip().upper()
+
+    result = await get_robinhood_chain_client().get_erc20_balance(
+        normalized_address,
+        contract_address,
+        decimals,
+        block_tag="latest",
+        force_refresh=bool(force_refresh),
+    )
+    if not result.get("ok"):
+        rpc_error = (result.get("rpc") or {}).get("error")
+        status_code = 503 if rpc_error == "rpc_backoff_active" else 502
+        raise HTTPException(status_code=status_code, detail=result)
+
+    return {
+        "ok": True,
+        "venue": "robinhood_chain",
+        "network": "robinhood_chain",
+        "chain_id": _EXPECTED_CHAIN_ID_DECIMAL,
+        "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+        "address": result.get("owner_address"),
+        "asset": asset,
+        "contract_address": result.get("contract_address"),
+        "decimals": int(result.get("decimals")),
+        "balance_atomic": result.get("balance_atomic"),
+        "balance_token": result.get("balance_token"),
+        "block_tag": result.get("block_tag"),
+        "cached": bool(result.get("cached")),
+        "fetched_at": result.get("fetched_at"),
+        "registry_id": int(registry_row.id),
+        "registry_venue": registry_row.venue,
+        "source": "robinhood_chain_erc20_rpc",
         "read_only": True,
     }

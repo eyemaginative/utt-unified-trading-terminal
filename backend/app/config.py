@@ -226,6 +226,48 @@ class Settings(BaseSettings):
         le=100,
     )
 
+    # RH-CHAIN.10A: mainnet-only, read-only execution discovery through 0x.
+    # The API key is intentionally read from Profile -> API Keys (venue=zerox),
+    # never from an environment variable or returned by any status endpoint.
+    robinhood_chain_swap_provider: str = Field(
+        default="0x",
+        alias="ROBINHOOD_CHAIN_SWAP_PROVIDER",
+    )
+    robinhood_chain_zerox_api_base: Optional[str] = Field(
+        default="https://api.0x.org",
+        alias="ROBINHOOD_CHAIN_ZEROX_API_BASE",
+    )
+    robinhood_chain_quote_timeout_s: float = Field(
+        default=10.0,
+        alias="ROBINHOOD_CHAIN_QUOTE_TIMEOUT_S",
+        ge=2.0,
+        le=30.0,
+    )
+    robinhood_chain_quote_cache_ttl_s: float = Field(
+        default=15.0,
+        alias="ROBINHOOD_CHAIN_QUOTE_CACHE_TTL_S",
+        ge=0.0,
+        le=300.0,
+    )
+    robinhood_chain_quote_error_backoff_s: float = Field(
+        default=120.0,
+        alias="ROBINHOOD_CHAIN_QUOTE_ERROR_BACKOFF_S",
+        ge=0.0,
+        le=3600.0,
+    )
+    robinhood_chain_quote_max_concurrent: int = Field(
+        default=1,
+        alias="ROBINHOOD_CHAIN_QUOTE_MAX_CONCURRENT",
+        ge=1,
+        le=4,
+    )
+    robinhood_chain_discovery_max_sell_usd: float = Field(
+        default=5.0,
+        alias="ROBINHOOD_CHAIN_DISCOVERY_MAX_SELL_USD",
+        gt=0.0,
+        le=25.0,
+    )
+
     # ─────────────────────────────────────────────────────────────
     # Dex-Trade integration — optional & guarded
     #
@@ -681,6 +723,41 @@ class Settings(BaseSettings):
             return None
         return (token, secret)
 
+    def robinhood_chain_zerox_api_credential(self) -> Optional[dict]:
+        """Return the backend-only 0x provider credential from the encrypted vault.
+
+        Canonical Profile -> API Keys row:
+          - venue='zerox'
+          - api_key='<0x Swap API key>'
+          - api_secret/passphrase blank
+
+        The compatibility aliases are read-only fallbacks.  No environment API
+        key is accepted for this provider, and callers must never serialize the
+        returned api_key into an HTTP response or log record.
+        """
+        for venue in ("zerox", "0x", "robinhood_chain_0x"):
+            bundle = self._vault_latest_bundle(venue)
+            if not bundle:
+                bundle = self._vault_latest_bundle_any_username(venue)
+            if not bundle:
+                continue
+            api_key = str(bundle.get("api_key") or "").strip()
+            if api_key:
+                return {
+                    "api_key": api_key,
+                    "source": "profile_vault",
+                    "venue": venue,
+                }
+        return None
+
+    def robinhood_chain_zerox_api_key(self) -> Optional[str]:
+        """Return only the 0x API key for backend request construction."""
+        credential = self.robinhood_chain_zerox_api_credential()
+        if not credential:
+            return None
+        api_key = str(credential.get("api_key") or "").strip()
+        return api_key or None
+
     def polkadot_hydration_rpc_api_key(self):
         """Optional callable for Hydration RPC: returns a Dwellir API key from DB vault.
 
@@ -715,6 +792,7 @@ class Settings(BaseSettings):
         "robinhood_chain_rpc_http",
         "robinhood_chain_rpc_ws",
         "robinhood_chain_explorer_api_base",
+        "robinhood_chain_zerox_api_base",
         # Dex-Trade fields
         "dex_trade_login_token",
         "dex_trade_secret",
@@ -812,6 +890,16 @@ class Settings(BaseSettings):
         if not value.startswith(("https://", "http://")):
             return ""
         return value
+
+    def robinhood_chain_effective_swap_provider(self) -> str:
+        """Return the normalized RH-CHAIN discovery provider identifier."""
+        value = str(getattr(self, "robinhood_chain_swap_provider", "0x") or "0x").strip().lower()
+        return "0x" if value in {"0x", "zerox"} else value
+
+    def robinhood_chain_effective_zerox_api_base(self) -> str:
+        """Return the fixed HTTPS base used for backend-only 0x requests."""
+        value = str(getattr(self, "robinhood_chain_zerox_api_base", None) or "").strip().rstrip("/")
+        return value if value.startswith("https://") else ""
 
     def robinhood_chain_effective_enabled(self) -> bool:
         """Fail-closed enable gate for the read-only Robinhood Chain foundation."""

@@ -20,6 +20,10 @@ from ..services.robinhood_chain_history import (
     get_robinhood_chain_history_service,
     validate_transaction_hash,
 )
+from ..services.robinhood_chain_execution_discovery import (
+    ROBINHOOD_CHAIN_DISCOVERY_TOKENS,
+    get_robinhood_chain_execution_discovery_service,
+)
 
 
 router = APIRouter(prefix="/api/robinhood_chain", tags=["robinhood_chain"])
@@ -178,6 +182,95 @@ def _registered_history_token_map(db: Session) -> Dict[str, Dict[str, Any]]:
     return selected
 
 
+def _resolve_execution_discovery_token(db: Session, symbol: str) -> Dict[str, Any]:
+    normalized = _normalize_registry_symbol(symbol)
+    candidate = ROBINHOOD_CHAIN_DISCOVERY_TOKENS.get(normalized)
+    if candidate is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "execution_discovery_symbol_not_allowlisted",
+                "symbol": normalized,
+                "allowed": sorted(ROBINHOOD_CHAIN_DISCOVERY_TOKENS.keys()),
+            },
+        )
+
+    override = (
+        db.query(TokenRegistry)
+        .filter(
+            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
+            TokenRegistry.venue == _TOKEN_REGISTRY_VENUE,
+            TokenRegistry.symbol == normalized,
+        )
+        .first()
+    )
+    global_row = (
+        db.query(TokenRegistry)
+        .filter(
+            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
+            ((TokenRegistry.venue.is_(None)) | (TokenRegistry.venue == "")),
+            TokenRegistry.symbol == normalized,
+        )
+        .first()
+    )
+    row = override or global_row
+
+    identity = dict(candidate)
+    identity["symbol"] = normalized
+    identity["registry_id"] = int(row.id) if row is not None else None
+    identity["registry_venue"] = row.venue if row is not None else None
+    identity["registry_status"] = "registered" if row is not None else "official_candidate"
+
+    if normalized == _NATIVE_CURRENCY:
+        if row is not None:
+            if str(row.address or "").strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "execution_discovery_native_registry_mismatch", "symbol": normalized},
+                )
+            if int(row.decimals) != int(candidate["decimals"]):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "execution_discovery_decimals_mismatch", "symbol": normalized},
+                )
+        return identity
+
+    expected_contract = validate_evm_address(str(candidate["contract_address"]))
+    identity["contract_address"] = expected_contract
+    if row is not None:
+        try:
+            registered_contract = validate_evm_address(str(row.address or "").strip())
+            registered_decimals = int(row.decimals)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_execution_discovery_registry_identity", "symbol": normalized},
+            ) from exc
+        if registered_contract.lower() != expected_contract.lower():
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "execution_discovery_contract_mismatch",
+                    "symbol": normalized,
+                    "registry_id": int(row.id),
+                    "expected_contract": expected_contract,
+                    "registered_contract": registered_contract,
+                },
+            )
+        if registered_decimals != int(candidate["decimals"]):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "execution_discovery_decimals_mismatch",
+                    "symbol": normalized,
+                    "registry_id": int(row.id),
+                    "expected_decimals": int(candidate["decimals"]),
+                    "registered_decimals": registered_decimals,
+                },
+            )
+    return identity
+
+
 # Callers select stable check names, never arbitrary JSON-RPC methods or params.
 _PROBE_DEFINITIONS: Dict[str, Tuple[str, List[Any]]] = {
     "chain_id": ("eth_chainId", []),
@@ -210,6 +303,33 @@ class RobinhoodChainAccountingPreviewRequest(BaseModel):
         default=False,
         description="Bypass the bounded transaction-detail cache for this explicit preview request.",
     )
+
+
+class RobinhoodChainExecutionDiscoveryRequest(BaseModel):
+    provider: str = Field(
+        default="0x",
+        min_length=1,
+        max_length=16,
+        description="Fixed discovery provider identifier; only 0x is accepted in RH-CHAIN.10A.",
+    )
+    sell_symbol: str = Field(min_length=1, max_length=32)
+    buy_symbol: str = Field(min_length=1, max_length=32)
+    sell_amount: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        description="Exact-input amount in display units. Mutually exclusive with buy_amount.",
+    )
+    buy_amount: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        description="Exact-output amount in display units. Mutually exclusive with sell_amount.",
+    )
+    taker_address: str = Field(
+        min_length=42,
+        max_length=42,
+        description="Saved Robinhood Chain public address used only for provider diagnostics.",
+    )
+    force_refresh: bool = False
 
 
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -756,3 +876,73 @@ async def robinhood_chain_transaction_accounting_preview(
     # Defensive session reset: the preview service performs SELECTs only.
     db.rollback()
     return preview
+
+@router.get("/execution-discovery/status")
+async def robinhood_chain_execution_discovery_status() -> Dict[str, Any]:
+    """Return secret-free, mainnet-only 0x discovery readiness."""
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    return get_robinhood_chain_execution_discovery_service().status()
+
+
+@router.post("/execution-discovery/probe")
+async def robinhood_chain_execution_discovery_probe(
+    request: RobinhoodChainExecutionDiscoveryRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Run one bounded indicative-price probe without constructing a trade."""
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+
+    try:
+        taker_address = validate_evm_address(request.taker_address)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    provider = str(request.provider or "").strip().lower()
+    if provider not in {"0x", "zerox"}:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unsupported_execution_discovery_provider", "provider": request.provider, "allowed": ["0x"]},
+        )
+
+    sell_token = _resolve_execution_discovery_token(db, request.sell_symbol)
+    buy_token = _resolve_execution_discovery_token(db, request.buy_symbol)
+    if sell_token["symbol"] == buy_token["symbol"]:
+        raise HTTPException(status_code=400, detail={"error": "identical_execution_discovery_assets"})
+
+    result = await get_robinhood_chain_execution_discovery_service().probe(
+        sell_token=sell_token,
+        buy_token=buy_token,
+        sell_amount=request.sell_amount,
+        buy_amount=request.buy_amount,
+        taker_address=taker_address,
+        force_refresh=bool(request.force_refresh),
+    )
+    if result.get("ok"):
+        return result
+
+    error = str(result.get("error") or "execution_discovery_probe_failed")
+    if error in {
+        "invalid_discovery_amount",
+        "discovery_amount_mode_required",
+        "discovery_amount_modes_mutually_exclusive",
+        "discovery_amount_exceeds_cap",
+        "unsupported_discovery_pair",
+    }:
+        status_code = 400
+    elif error in {
+        "execution_discovery_not_configured",
+        "execution_discovery_backoff_active",
+        "chain_id_mismatch_or_unavailable",
+    }:
+        status_code = 503
+    elif error in {"contract_code_unavailable", "provider_authentication_failed"}:
+        status_code = 502
+    else:
+        status_code = 502
+    raise HTTPException(status_code=status_code, detail=result)

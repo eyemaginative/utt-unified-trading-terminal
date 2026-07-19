@@ -12,6 +12,7 @@ const LS_OB_COUNTERPARTY_LIQUIDITY_FILTER = "utt_ob_counterparty_liquidity_filte
 const LS_OT_COUNTERPARTY_EXECUTION_MODE = "utt_counterparty_execution_mode_v1";
 const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
 const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
+const ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT = "utt:robinhood-chain-orderbook-pick";
 const MARKET_METRICS_BROWSER_CACHE_KEY = "utt.market_metrics.summary.v10";
 const MARKET_METRICS_BROWSER_CACHE_EVENT = "utt:market-metrics-summary-v10";
 const ORDERBOOK_QUOTE_USD_STALE_MS = 15 * 60 * 1000;
@@ -21,7 +22,7 @@ const COUNTERPARTY_RATE_LIMIT_JITTER_RATIO = 0.20;
 
 const USD_VALUE_QUOTES = new Set([
   "USD", "USDT", "USDC", "DAI", "FDUSD", "PYUSD", "GUSD", "TUSD",
-  "USDP", "USD1", "HOLLAR", "BUSD", "USDD", "USDE", "RLUSD",
+  "USDP", "USD1", "USDG", "HOLLAR", "BUSD", "USDD", "USDE", "RLUSD",
 ]);
 
 function safeNum(v) {
@@ -333,6 +334,10 @@ function isPolkadotHydrationVenueKey(v) {
 function isCounterpartyVenueKey(v) {
   const key = String(v || "").toLowerCase().trim();
   return key === "counterparty" || key === "counterparty_unisat" || key === "bitcoin_counterparty";
+}
+
+function isRobinhoodChainVenueKey(v) {
+  return String(v || "").toLowerCase().trim() === "robinhood_chain";
 }
 
 function counterpartyPairParts(symbol) {
@@ -866,6 +871,7 @@ export default function OrderBookWidget({
 
   const isPolkadotDexVenue = useMemo(() => isPolkadotHydrationVenueKey(effectiveVenue), [effectiveVenue]);
   const isCounterpartyVenue = useMemo(() => isCounterpartyVenueKey(effectiveVenue), [effectiveVenue]);
+  const isRobinhoodChainVenue = useMemo(() => isRobinhoodChainVenueKey(effectiveVenue), [effectiveVenue]);
 
   // Reset gating when venue changes
   useEffect(() => {
@@ -883,8 +889,8 @@ export default function OrderBookWidget({
     setQuoteUsdContext(null);
 
     // Prevent DEX-specific decimals from leaking into regular CEX venues.
-    if (!isSolJupVenue && !isPolkadotDexVenue && !isCounterpartyVenue) setSizeDecimals(null);
-  }, [effectiveVenue, isSolJupVenue, isPolkadotDexVenue, isCounterpartyVenue]);
+    if (!isSolJupVenue && !isPolkadotDexVenue && !isCounterpartyVenue && !isRobinhoodChainVenue) setSizeDecimals(null);
+  }, [effectiveVenue, isSolJupVenue, isPolkadotDexVenue, isCounterpartyVenue, isRobinhoodChainVenue]);
 
   useEffect(() => {
     if (!isSolJupVenue) return;
@@ -1276,6 +1282,13 @@ function clampBox(next) {
       return;
     }
 
+    if (isRobinhoodChainVenueKey(v)) {
+      setPriceDecimals(6);
+      setPriceIncrement(0.000001);
+      setSizeDecimals(8);
+      return;
+    }
+
     try {
       const url = `${apiBase}/api/rules/order?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
         sym
@@ -1377,7 +1390,7 @@ function clampBox(next) {
     const v = Number(sz);
     if (!Number.isFinite(v)) return "—";
     // IMPORTANT: sizeDecimals is a DEX-only hint. Never apply it to regular CEX venues.
-    if ((isSolJupVenue || isPolkadotDexVenue || isCounterpartyVenue) && Number.isFinite(Number(sizeDecimals))) {
+    if ((isSolJupVenue || isPolkadotDexVenue || isCounterpartyVenue || isRobinhoodChainVenue) && Number.isFinite(Number(sizeDecimals))) {
       const d = clamp(Number(sizeDecimals), 0, 18);
       return v.toFixed(d);
     }
@@ -1485,6 +1498,9 @@ function clampBox(next) {
       const counterpartyOrderbookUrl = `${apiBase}/api/counterparty/orderbook?symbol=${encodeURIComponent(counterpartySymbol)}&depth=${encodeURIComponent(
         String(depth)
       )}&open_only=true${forceQ}&_ts=${Date.now()}`;
+      const robinhoodChainOrderbookUrl = `${apiBase}/api/robinhood_chain/orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
+        String(Math.min(depth, 5))
+      )}&force_refresh=${opts.force ? "true" : "false"}&_ts=${Date.now()}`;
 
       if (isPolkadotHydration) {
         const sr = await fetch(hydrationStatusUrl, { signal: ac.signal, cache: "no-store" });
@@ -1514,7 +1530,9 @@ function clampBox(next) {
             ? hydrationOrderbookUrl
             : isCounterpartyVenueKey(v)
               ? counterpartyOrderbookUrl
-              : `${apiBase}/api/market/orderbook?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
+              : isRobinhoodChainVenueKey(v)
+                ? robinhoodChainOrderbookUrl
+                : `${apiBase}/api/market/orderbook?venue=${encodeURIComponent(v)}&symbol=${encodeURIComponent(
                   sym
                 )}&depth=${encodeURIComponent(String(depth))}${forceQ}&_ts=${Date.now()}`;
 
@@ -1549,11 +1567,11 @@ function clampBox(next) {
         throw new Error(txt || "HTTP 429 Too Many Requests");
       };
 
-      if (isPolkadotHydration) {
+      if (isPolkadotHydration || isRobinhoodChainVenueKey(v)) {
         requestTimeoutId = window.setTimeout(() => {
           requestTimedOut = true;
           try { ac.abort(); } catch { /* ignore */ }
-        }, 45000);
+        }, isRobinhoodChainVenueKey(v) ? 30000 : 45000);
       }
 
       let r = await fetch(url, { signal: ac.signal });
@@ -1566,7 +1584,9 @@ function clampBox(next) {
         ? (routerMode === "raydium" ? "raydium" : (routerMode === "jupiter" ? "jupiter" : "ultra"))
         : isCounterpartyVenueKey(v)
           ? "counterparty"
-          : (isSolRay ? "raydium" : v || null);
+          : isRobinhoodChainVenueKey(v)
+            ? "0x"
+            : (isSolRay ? "raydium" : v || null);
 
       // handle 429 explicitly (cooldown)
       if (r.status === 429) await throwRateLimit(r);
@@ -1666,7 +1686,7 @@ function clampBox(next) {
       }
 
       // DEX-only formatting hints (opt-in by venue)
-      if (isSolJup || usedVenue === "solana_raydium" || isSolRay || isPolkadotHydration || isCounterpartyVenueKey(usedVenue)) {
+      if (isSolJup || usedVenue === "solana_raydium" || isSolRay || isPolkadotHydration || isCounterpartyVenueKey(usedVenue) || isRobinhoodChainVenueKey(usedVenue)) {
         const inferLevelDecimals = (levels) => {
           try {
             let best = 0;
@@ -1701,10 +1721,21 @@ function clampBox(next) {
         baseAsset: data?.base_asset || data?.baseAsset || orderBookPairParts(sym).base,
         quoteAsset: data?.quote_asset || data?.quoteAsset || orderBookPairParts(sym).quote,
         liquidityCounts: data?.liquidity_counts || data?.counts || null,
-        sources: data?.sources || null,
-        stale: false,
+        sources: data?.sources || data?.route_sources || null,
+        synthetic: data?.synthetic === true,
+        quoteOnly: data?.quote_only === true,
+        restingOrder: data?.resting_order === true,
+        provider: data?.provider || null,
+        cached: data?.cached === true,
+        cacheMixed: data?.cache_mixed === true,
+        fetchedAt: data?.fetched_at || null,
+        bestBid: data?.best_bid ?? null,
+        bestAsk: data?.best_ask ?? null,
+        spreadBps: data?.spread_bps ?? null,
+        warningCount: Number(data?.warning_count || 0),
+        stale: data?.stale === true,
         snapshotAgeS: 0,
-        snapshotSource: "live",
+        snapshotSource: data?.snapshot_source || "live",
       };
       setOrderBookMeta(nextMeta);
       setObAsks(nextAsks);
@@ -1769,7 +1800,9 @@ function clampBox(next) {
 
       setObActiveRouter(null);
       const raw = requestTimedOut
-        ? "Hydration orderbook request timed out after 45s. The backend may still be probing slow quote samples; try Refresh once, then test depth=1 from PowerShell if this repeats."
+        ? (isRobinhoodChainVenueKey(v)
+            ? "Robinhood Chain synthetic quote sampling timed out after 30s. Retry once after the provider backoff window."
+            : "Hydration orderbook request timed out after 45s. The backend may still be probing slow quote samples; try Refresh once, then test depth=1 from PowerShell if this repeats.")
         : (e?.message || "Failed to load order book");
       const pretty = formatOrderBookError(raw, venueLabel || effectiveVenue);
       setObError(pretty);
@@ -1912,6 +1945,24 @@ function clampBox(next) {
     }
   }
 
+  function dispatchRobinhoodChainBookPick(row, pick) {
+    if (!isRobinhoodChainVenue || typeof window === "undefined" || !row || typeof row !== "object") return;
+    try {
+      window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT, {
+        detail: {
+          symbol: orderBookMeta?.symbol || obSymbol,
+          row,
+          pick: String(pick || "price"),
+          book_side: String(row?.side || "").trim().toLowerCase(),
+          synthetic: row?.synthetic === true,
+          quote_only: row?.quote_only === true,
+        },
+      }));
+    } catch {
+      // The regular App callbacks still receive price/qty if the event bridge is unavailable.
+    }
+  }
+
   function handlePickPrice(px, row = null) {
     if (isCounterpartyVenue) {
       const exact = counterpartyRowExactPriceText(row || { price: px });
@@ -1946,11 +1997,13 @@ function clampBox(next) {
       onPickPrice(n, pxStr, { priceDecimals: d, priceIncrement });
     }
     dispatchCounterpartyBookPick(row, "price");
+    dispatchRobinhoodChainBookPick(row, "price");
   }
 
   function handlePickQty(q, row = null, pick = "size") {
     if (typeof onPickQty === "function" && Number.isFinite(Number(q))) onPickQty(Number(q));
     dispatchCounterpartyBookPick(row, pick);
+    dispatchRobinhoodChainBookPick(row, pick);
   }
 
   const depthN = Math.max(1, Math.min(200, Number(obDepth) || 25));
@@ -2192,7 +2245,9 @@ function clampBox(next) {
     : { border: "1px solid rgba(241,196,15,0.20)", background: "rgba(241,196,15,0.06)", color: "#f7e8b0" };
 
   const displayedQuoteAsset = orderBookQuoteAsset();
-  const displayedBaseAsset = normalizeOrderBookAsset(orderBookMeta?.baseAsset) || orderBookPairParts(obSymbol).base;
+  const displayedBaseAsset = isRobinhoodChainVenue
+    ? String(orderBookMeta?.baseAsset || "WETH").trim().toUpperCase()
+    : normalizeOrderBookAsset(orderBookMeta?.baseAsset) || orderBookPairParts(obSymbol).base;
   const showDerivedUsd = Boolean(
     displayedQuoteAsset &&
     !isUsdValueQuote(displayedQuoteAsset) &&
@@ -2220,6 +2275,14 @@ function clampBox(next) {
         <span style={{ flex: "0 0 auto" }}>
           {fmtPriceCell(row?.price, row)}
           {displayedQuoteAsset ? <span style={{ opacity: 0.72, marginLeft: 4 }}>{displayedQuoteAsset}</span> : null}
+          {isRobinhoodChainVenue && row?.synthetic ? (
+            <span
+              title="Synthetic 0x indicative quote sample; not a resting order"
+              style={{ marginLeft: 5, padding: "1px 4px", borderRadius: 999, border: "1px solid rgba(34,211,238,0.55)", background: "rgba(34,211,238,0.10)", color: "#a5f3fc", fontSize: 8, fontWeight: 900, letterSpacing: 0.5 }}
+            >
+              SYNTH
+            </span>
+          ) : null}
         </span>
         {showDerivedUsd ? (
           <span
@@ -2256,6 +2319,21 @@ function clampBox(next) {
     if (type === "unknown") lines.push("Unknown rows are display-only and are not executable as dispenser selections.");
     else if (type === "dispenser") lines.push("Execution: immediate purchase in complete lots. Exact payment is lot count × satoshirate; the rounded displayed price is informational only.");
     else lines.push("Execution: protocol limit-order context; clicking copies price for a new limit order.");
+    return lines.join("\n");
+  }
+
+  function robinhoodChainRowTitle(row) {
+    const routes = Array.isArray(row?.route_sources) ? row.route_sources.filter(Boolean).join(", ") : String(row?.route_source || "0x");
+    const lines = [
+      "Synthetic 0x indicative quote sample — not a resting order.",
+      `Price: ${fmtPriceCell(row?.price, row)} ${displayedQuoteAsset || "USDG"}`.trim(),
+      `Sample size: ${fmtSizeCell(row?.size)} ${displayedBaseAsset || "WETH"}`.trim(),
+      `Direction: ${String(row?.input_amount || "—")} ${String(row?.input_asset || "—")} → ${String(row?.output_amount || "—")} ${String(row?.output_asset || "—")}`,
+      `Route: ${routes || "0x"}`,
+      `Cache: ${row?.cached ? "cached" : "fresh"}`,
+      `Allowance: ${row?.allowance_required ? "required for later execution planning" : "not reported as required"}`,
+      "RH-CHAIN.10B cannot sign, approve, construct, submit, or record a transaction.",
+    ];
     return lines.join("\n");
   }
 
@@ -2370,6 +2448,11 @@ function clampBox(next) {
                 {" "}• Asks: <b>{counterpartyLiquidityCounts.askDispensers} DISP / {counterpartyLiquidityCounts.askLimitOrders} LIMIT</b>
                 {" "}• Bids: <b>{counterpartyLiquidityCounts.bidLimitOrders} LIMIT</b>
               </>
+            ) : isRobinhoodChainVenue ? (
+              <>
+                {" "}• Provider: <b>0x</b>
+                {" "}• Market: <b>quote-only synthetic</b>
+              </>
             ) : null}
           </span>
         </div>
@@ -2424,6 +2507,14 @@ function clampBox(next) {
                 {counterpartyResilience?.stale || orderBookMeta?.stale ? <> • Book <b>STALE</b></> : null}
                 {counterpartyCooldownActive ? <> • Retry <b>{counterpartyCooldownLabel}</b></> : null}
                 {!counterpartyCooldownActive && (counterpartyResilience?.stale || orderBookMeta?.stale) ? <> • <b>Refresh available</b></> : null}
+              </>
+            ) : null}
+            {isRobinhoodChainVenue ? (
+              <>
+                {" "}• <b>SYNTHETIC</b>
+                {" "}• <b>NOT RESTING ORDERS</b>
+                {" "}• {orderBookMeta?.cached ? <b>CACHED</b> : orderBookMeta?.cacheMixed ? <b>MIXED CACHE</b> : <b>FRESH</b>}
+                {orderBookMeta?.spreadBps !== null && orderBookMeta?.spreadBps !== undefined ? <> • Spread <b>{Number(orderBookMeta.spreadBps).toFixed(2)} bps</b></> : null}
               </>
             ) : null}
             {showDerivedUsd ? (
@@ -2571,6 +2662,36 @@ function clampBox(next) {
 
 
 
+        {isRobinhoodChainVenue ? (
+          <div
+            style={{
+              marginTop: 6,
+              padding: "8px 10px",
+              borderRadius: 10,
+              border: "1px solid rgba(34,211,238,0.42)",
+              background: "linear-gradient(135deg, rgba(6,25,35,0.96), rgba(26,10,46,0.92))",
+              boxShadow: "0 0 18px rgba(34,211,238,0.08), inset 0 0 18px rgba(168,85,247,0.05)",
+              color: "#d8fbff",
+              fontSize: 10,
+              lineHeight: 1.35,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontWeight: 900, letterSpacing: 0.45 }}>
+              <span style={{ color: "#67e8f9" }}>RH-EVM</span>
+              <span style={{ color: "#c084fc" }}>QUOTE-ONLY</span>
+              <span style={{ color: "#facc15" }}>SYNTHETIC LIQUIDITY</span>
+            </div>
+            <div style={{ marginTop: 3, opacity: 0.86 }}>
+              Each row is a bounded 0x indicative-price sample on mainnet chain 4663. These rows are not resting orders and cannot be submitted from RH-CHAIN.10B.
+            </div>
+            <div style={{ marginTop: 3, opacity: 0.76 }}>
+              Route: <b>{Array.isArray(orderBookMeta?.sources) && orderBookMeta.sources.length ? orderBookMeta.sources.join(", ") : "0x provider"}</b>
+              {" "}• Snapshot: <b>{orderBookMeta?.cached ? "cached" : orderBookMeta?.cacheMixed ? "mixed cache" : "fresh"}</b>
+              {Number(orderBookMeta?.warningCount || 0) > 0 ? <> • Partial warnings: <b>{Number(orderBookMeta.warningCount)}</b></> : null}
+            </div>
+          </div>
+        ) : null}
+
         {obError && <div style={{ ...styles.codeError, marginTop: 6, padding: 8 }}>{obError}</div>}
 
         <div style={obBodyWrapStyle}>
@@ -2598,7 +2719,7 @@ function clampBox(next) {
                     {asksView.map((x, idx) => {
                       const liquidityType = counterpartyLiquidityType(x);
                       const lotSize = counterpartyLotSize(x);
-                      const rowTitle = isCounterpartyVenue ? counterpartyRowTitle(x) : "";
+                      const rowTitle = isCounterpartyVenue ? counterpartyRowTitle(x) : isRobinhoodChainVenue ? robinhoodChainRowTitle(x) : "";
                       const remainingClickable = !isCounterpartyVenue || liquidityType === "limit_order";
                       return (
                         <tr key={`a-${idx}-${x?.tx_hash || x?.source || ""}`} title={rowTitle || undefined}>
@@ -2681,7 +2802,7 @@ function clampBox(next) {
                   </thead>
                   <tbody>
                     {bidsView.map((x, idx) => {
-                      const rowTitle = isCounterpartyVenue ? counterpartyRowTitle(x) : "";
+                      const rowTitle = isCounterpartyVenue ? counterpartyRowTitle(x) : isRobinhoodChainVenue ? robinhoodChainRowTitle(x) : "";
                       return (
                         <tr key={`b-${idx}-${x?.tx_hash || x?.source || ""}`} title={rowTitle || undefined}>
                           <td

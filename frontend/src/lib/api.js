@@ -65,6 +65,239 @@ function singleFlight(key, fn, { minIntervalMs = 0 } = {}) {
   return p;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Startup retry + cross-tab heavy-work coordination
+// ─────────────────────────────────────────────────────────────
+
+const DEFAULT_RETRY_DELAYS_MS = Object.freeze([1000, 2000, 5000]);
+const HEAVY_TASK_CHANNEL_NAME = "utt:heavy-task-coordinator:v1";
+const HEAVY_TASK_LEASE_PREFIX = "utt_heavy_task_lease_v1:";
+
+function delayMs(ms) {
+  const wait = Math.max(0, Number(ms) || 0);
+  return new Promise((resolve) => setTimeout(resolve, wait));
+}
+
+function defaultRetryableRequestError(error) {
+  const status = Number(error?.response?.status ?? error?.status);
+  if (!Number.isFinite(status)) return true;
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+/**
+ * Run a request with bounded retries. The default schedule is 1s, 2s, then 5s.
+ * Client/validation errors fail immediately; network, 408/425/429, and 5xx errors retry.
+ */
+export async function withBoundedRetry(
+  fn,
+  { delaysMs = DEFAULT_RETRY_DELAYS_MS, shouldRetry = defaultRetryableRequestError } = {}
+) {
+  if (typeof fn !== "function") throw new Error("withBoundedRetry requires a function");
+  const delays = Array.isArray(delaysMs) ? delaysMs : DEFAULT_RETRY_DELAYS_MS;
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+    try {
+      return await fn({ attempt, maxAttempts: delays.length + 1 });
+    } catch (error) {
+      lastError = error;
+      const canRetry = attempt < delays.length && (typeof shouldRetry !== "function" || shouldRetry(error, attempt));
+      if (!canRetry) throw error;
+      await delayMs(delays[attempt]);
+    }
+  }
+
+  throw lastError || new Error("bounded retry failed");
+}
+
+const HEAVY_TASK_TAB_ID = (() => {
+  const fallback = `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    if (typeof window === "undefined" || !window.sessionStorage) return fallback;
+    const key = "utt_heavy_task_tab_id_v1";
+    const current = String(window.sessionStorage.getItem(key) || "").trim();
+    if (current) return current;
+    const next = typeof globalThis.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : fallback;
+    window.sessionStorage.setItem(key, next);
+    return next;
+  } catch {
+    return fallback;
+  }
+})();
+
+let _heavyTaskChannel = null;
+function getHeavyTaskChannel() {
+  try {
+    if (typeof BroadcastChannel === "undefined") return null;
+    if (!_heavyTaskChannel) _heavyTaskChannel = new BroadcastChannel(HEAVY_TASK_CHANNEL_NAME);
+    return _heavyTaskChannel;
+  } catch {
+    return null;
+  }
+}
+
+function broadcastHeavyTask(message) {
+  try {
+    getHeavyTaskChannel()?.postMessage?.({ ...message, tabId: HEAVY_TASK_TAB_ID, at: Date.now() });
+  } catch {
+    // coordination is best-effort; localStorage/navigator.locks remain available
+  }
+}
+
+function heavyTaskLeaseKey(taskKey) {
+  return `${HEAVY_TASK_LEASE_PREFIX}${String(taskKey || "default").trim().toLowerCase()}`;
+}
+
+function readHeavyTaskLease(taskKey) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(heavyTaskLeaseKey(taskKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const expiresAt = Number(parsed?.expiresAt || 0);
+    if (!parsed?.owner || !Number.isFinite(expiresAt)) return null;
+    return { owner: String(parsed.owner), expiresAt };
+  } catch {
+    return null;
+  }
+}
+
+function tryAcquireHeavyTaskLease(taskKey, leaseMs) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+    const now = Date.now();
+    const current = readHeavyTaskLease(taskKey);
+    if (current && current.owner !== HEAVY_TASK_TAB_ID && current.expiresAt > now) return false;
+    const candidate = { owner: HEAVY_TASK_TAB_ID, expiresAt: now + Math.max(5000, Number(leaseMs) || 120000) };
+    window.localStorage.setItem(heavyTaskLeaseKey(taskKey), JSON.stringify(candidate));
+    const confirmed = readHeavyTaskLease(taskKey);
+    return confirmed?.owner === HEAVY_TASK_TAB_ID;
+  } catch {
+    return false;
+  }
+}
+
+function releaseHeavyTaskLease(taskKey) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    const current = readHeavyTaskLease(taskKey);
+    if (current?.owner === HEAVY_TASK_TAB_ID) window.localStorage.removeItem(heavyTaskLeaseKey(taskKey));
+  } catch {
+    // ignore lease cleanup failures; expiry remains the final guard
+  }
+}
+
+async function waitForHeavyTaskCompletion(taskKey, waitMs) {
+  const normalized = String(taskKey || "default").trim().toLowerCase();
+  const timeoutMs = Math.max(0, Number(waitMs) || 0);
+  if (timeoutMs <= 0) return;
+
+  await new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    let poll = null;
+    const channel = getHeavyTaskChannel();
+
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (poll) clearInterval(poll);
+      try { channel?.removeEventListener?.("message", onMessage); } catch {}
+      try { if (typeof window !== "undefined") window.removeEventListener("storage", onStorage); } catch {}
+      resolve();
+    };
+
+    const onMessage = (event) => {
+      const data = event?.data || {};
+      if (String(data?.taskKey || "").trim().toLowerCase() !== normalized) return;
+      if (data?.state === "complete" || data?.state === "failed") done();
+    };
+
+    const onStorage = (event) => {
+      if (event?.key === heavyTaskLeaseKey(normalized) && !event?.newValue) done();
+    };
+
+    try { channel?.addEventListener?.("message", onMessage); } catch {}
+    try { if (typeof window !== "undefined") window.addEventListener("storage", onStorage); } catch {}
+    poll = setInterval(() => {
+      const lease = readHeavyTaskLease(normalized);
+      if (!lease || lease.expiresAt <= Date.now()) done();
+    }, 250);
+    timer = setTimeout(done, timeoutMs);
+  });
+}
+
+/**
+ * Run expensive refresh work in only one browser tab at a time.
+ * Followers wait for the leader's completion signal, then continue by reading snapshots.
+ */
+export async function runCrossTabHeavyTask(
+  taskKey,
+  fn,
+  { leaseMs = 180000, waitMs = 180000 } = {}
+) {
+  if (typeof fn !== "function") throw new Error("runCrossTabHeavyTask requires a function");
+  const normalized = String(taskKey || "default").trim().toLowerCase();
+  const startedAt = Date.now();
+  const lockName = `utt-heavy:${normalized}`;
+
+  try {
+    if (typeof navigator !== "undefined" && navigator?.locks?.request) {
+      let acquired = false;
+      let value = null;
+      await navigator.locks.request(lockName, { mode: "exclusive", ifAvailable: true }, async (lock) => {
+        if (!lock) return;
+        acquired = true;
+        tryAcquireHeavyTaskLease(normalized, leaseMs);
+        const renewEveryMs = Math.max(2000, Math.floor(Math.max(5000, Number(leaseMs) || 180000) / 3));
+        const renew = setInterval(() => tryAcquireHeavyTaskLease(normalized, leaseMs), renewEveryMs);
+        broadcastHeavyTask({ taskKey: normalized, state: "started" });
+        try {
+          value = await fn();
+          broadcastHeavyTask({ taskKey: normalized, state: "complete" });
+        } catch (error) {
+          broadcastHeavyTask({ taskKey: normalized, state: "failed" });
+          throw error;
+        } finally {
+          clearInterval(renew);
+          releaseHeavyTaskLease(normalized);
+        }
+      });
+      if (acquired) return { acquired: true, value, waitedMs: Date.now() - startedAt };
+      await waitForHeavyTaskCompletion(normalized, waitMs);
+      return { acquired: false, value: null, waitedMs: Date.now() - startedAt };
+    }
+  } catch (error) {
+    // A task error from the leader must remain visible. Lock API availability errors fall through.
+    if (error && !String(error?.name || "").toLowerCase().includes("notsupported")) throw error;
+  }
+
+  const acquired = tryAcquireHeavyTaskLease(normalized, leaseMs);
+  if (!acquired) {
+    await waitForHeavyTaskCompletion(normalized, waitMs);
+    return { acquired: false, value: null, waitedMs: Date.now() - startedAt };
+  }
+
+  const renewEveryMs = Math.max(2000, Math.floor(Math.max(5000, Number(leaseMs) || 180000) / 3));
+  const renew = setInterval(() => {
+    tryAcquireHeavyTaskLease(normalized, leaseMs);
+  }, renewEveryMs);
+  broadcastHeavyTask({ taskKey: normalized, state: "started" });
+
+  try {
+    const value = await fn();
+    broadcastHeavyTask({ taskKey: normalized, state: "complete" });
+    return { acquired: true, value, waitedMs: Date.now() - startedAt };
+  } catch (error) {
+    broadcastHeavyTask({ taskKey: normalized, state: "failed" });
+    throw error;
+  } finally {
+    clearInterval(renew);
+    releaseHeavyTaskLease(normalized);
+  }
+}
+
 function normVenueId(v) {
   return String(v ?? "")
     .trim()
@@ -241,6 +474,54 @@ export async function getOrderbook({ venue, symbol, depth = 25, force = false } 
  * assets: array like ["USD","USDT","BTC","ETH","ALI"]
  * sent as CSV to keep query simple
  */
+export async function getRobinhoodChainQuoteStatus({ timeout_ms = 30000 } = {}) {
+  const res = await http.get(`/api/robinhood_chain/quotes/status`, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function getRobinhoodChainSyntheticOrderbook({
+  symbol = "WETH-USDG",
+  depth = 5,
+  force_refresh = false,
+  timeout_ms = 45000,
+} = {}) {
+  const res = await http.get(`/api/robinhood_chain/orderbook`, {
+    params: cleanParams({ symbol, depth, force_refresh }),
+    timeout: timeout_ms,
+  });
+  return res.data;
+}
+
+export async function getRobinhoodChainIndicativeQuote(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
+  const body = {
+    provider: "0x",
+    symbol: "WETH-USDG",
+    ...payload,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/quotes/indicative`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/quotes/indicative`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function getRobinhoodChainFirmQuotePlan(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
+  const body = {
+    provider: "0x",
+    symbol: "WETH-USDG",
+    slippage_bps: 100,
+    ...payload,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/quotes/firm-plan`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/quotes/firm-plan`, body, { timeout: timeout_ms });
+  return res.data;
+}
 export async function getPricesUSD({ venue, assets } = {}) {
   const assetsCsv = Array.isArray(assets) ? assets.filter(Boolean).join(",") : assets;
   const res = await http.get(`/api/market/prices_usd`, {

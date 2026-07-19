@@ -176,6 +176,41 @@ def order_rules_for_symbol(
             "warnings": [],
         }
 
+    if v == "robinhood_chain":
+        symbol_norm = canonicalize_symbol(sym_in)
+        supported = symbol_norm == "WETH-USDG"
+        return {
+            "venue": v,
+            "symbol_canon": symbol_norm,
+            "symbol_venue": symbol_norm,
+            "base_increment": "0.00000001",
+            "price_increment": "0.000001",
+            "qty_decimals": 8,
+            "price_decimals": 6,
+            "min_qty": "0.00000001",
+            "max_qty": "0.002",
+            "min_notional": "0.01",
+            "max_notional": "5.0",
+            "supports_post_only": False,
+            "supported_tifs": [],
+            "supported_order_types": ["quote"],
+            "suggested_symbol": None if supported else "WETH-USDG",
+            "quote_only": True,
+            "synthetic_orderbook": True,
+            "resting_orders": False,
+            "execution_enabled": False,
+            "signing_enabled": False,
+            "broadcast_enabled": False,
+            "firm_quote_planning_enabled": True,
+            "unsigned_transaction_plan": True,
+            "approval_transaction_enabled": False,
+            "errors": [] if supported else ["RH-CHAIN.10C supports WETH-USDG only"],
+            "warnings": [
+                "Robinhood Chain levels are bounded 0x indicative quote samples, not resting limit orders.",
+                "RH-CHAIN.10C may fetch a firm quote and expose a validated unsigned transaction plan for review only.",
+                "Approval construction, wallet prompts, signing, broadcast, and order recording remain disabled.",
+            ],
+        }
     side_n = (side or "").strip().lower() or None
     ot_n = (order_type or "").strip().lower() or "limit"
     tif_n = (tif or "").strip().lower() or None

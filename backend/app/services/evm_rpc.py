@@ -32,6 +32,7 @@ READ_ONLY_EVM_RPC_METHODS = frozenset(
 _EVM_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _WEI_PER_ETH = 10**18
 _ERC20_BALANCE_OF_SELECTOR = "70a08231"
+_ERC20_ALLOWANCE_SELECTOR = "dd62ed3e"
 _MAX_UINT256 = (1 << 256) - 1
 
 
@@ -98,6 +99,14 @@ def encode_erc20_balance_of(owner_address: str) -> str:
     owner = validate_evm_address(owner_address)
     owner_word = owner[2:].lower().rjust(64, "0")
     return f"0x{_ERC20_BALANCE_OF_SELECTOR}{owner_word}"
+
+
+def encode_erc20_allowance(owner_address: str, spender_address: str) -> str:
+    owner = validate_evm_address(owner_address)
+    spender = validate_evm_address(spender_address)
+    owner_word = owner[2:].lower().rjust(64, "0")
+    spender_word = spender[2:].lower().rjust(64, "0")
+    return f"0x{_ERC20_ALLOWANCE_SELECTOR}{owner_word}{spender_word}"
 
 
 def decode_abi_uint256(value: Any) -> int:
@@ -456,6 +465,113 @@ class EvmRpcClient:
             "rpc": balance_record,
             "read_only": True,
         }
+
+    async def get_erc20_allowance(
+        self,
+        owner_address: str,
+        contract_address: str,
+        spender_address: str,
+        decimals: int,
+        *,
+        block_tag: str = "latest",
+        force_refresh: bool = True,
+    ) -> Dict[str, Any]:
+        owner = validate_evm_address(owner_address)
+        contract = validate_evm_address(contract_address)
+        spender = validate_evm_address(spender_address)
+        try:
+            token_decimals = int(decimals)
+        except Exception:
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "spender_address": spender,
+                "error": "invalid_token_decimals",
+            }
+        if token_decimals < 0 or token_decimals > 18:
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "spender_address": spender,
+                "decimals": token_decimals,
+                "error": "invalid_token_decimals",
+            }
+
+        tag = str(block_tag or "latest").strip() or "latest"
+        if tag != "latest":
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "spender_address": spender,
+                "error": "unsupported_block_tag",
+            }
+
+        identity = await self.verify_expected_chain(force_refresh=force_refresh)
+        if not identity.get("ok"):
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "spender_address": spender,
+                "block_tag": tag,
+                "error": "chain_id_mismatch_or_unavailable",
+                "chain": identity,
+            }
+
+        call_data = encode_erc20_allowance(owner, spender)
+        allowance_record = await self.rpc_read(
+            "eth_call",
+            [{"to": contract, "data": call_data}, tag],
+            cache_namespace=f"erc20_allowance:{contract.lower()}:{owner.lower()}:{spender.lower()}:{tag}",
+            force_refresh=force_refresh,
+        )
+        if not allowance_record.get("ok"):
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "spender_address": spender,
+                "block_tag": tag,
+                "error": "erc20_allowance_rpc_failed",
+                "chain": identity,
+                "rpc": allowance_record,
+            }
+
+        try:
+            allowance_atomic = decode_abi_uint256(allowance_record.get("result"))
+            allowance_token = format_atomic_units(allowance_atomic, token_decimals)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "owner_address": owner,
+                "contract_address": contract,
+                "spender_address": spender,
+                "block_tag": tag,
+                "decimals": token_decimals,
+                "error": str(exc),
+                "chain": identity,
+                "rpc": allowance_record,
+            }
+
+        return {
+            "ok": True,
+            "owner_address": owner,
+            "contract_address": contract,
+            "spender_address": spender,
+            "decimals": token_decimals,
+            "block_tag": tag,
+            "allowance_atomic": str(allowance_atomic),
+            "allowance_token": allowance_token,
+            "cached": bool(allowance_record.get("cached")),
+            "fetched_at": allowance_record.get("fetched_at") or utc_now().isoformat(),
+            "chain": identity,
+            "rpc": allowance_record,
+            "read_only": True,
+        }
+
 
     async def get_erc20_balance(
         self,

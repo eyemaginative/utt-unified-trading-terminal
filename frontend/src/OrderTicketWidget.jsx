@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Connection, clusterApiUrl } from "@solana/web3.js";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { UnifiedWalletButton } from "@jup-ag/wallet-adapter";
-import { getOrderRules } from "./lib/api";
+import { getOrderRules, getRobinhoodChainFirmQuotePlan, getRobinhoodChainIndicativeQuote } from "./lib/api";
 import { expandExponential } from "./lib/format";
 
 // Auth (local token) — used to gate funds actions.
@@ -28,6 +28,7 @@ const LS_OT_COUNTERPARTY_EXPIRATION_PRESET = "utt_counterparty_expiration_preset
 const LS_OT_COUNTERPARTY_EXPIRATION_CUSTOM = "utt_counterparty_expiration_custom_v1";
 const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
 const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
+const ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT = "utt:robinhood-chain-orderbook-pick";
 
 const COUNTERPARTY_FEE_TIERS = {
   slow: { label: "Slow", blocks: 18, eta: "~3 hours" },
@@ -108,6 +109,65 @@ function isCounterpartyVenueKey(value) {
     v === "bitcoin_counterparty" ||
     v.includes("counterparty")
   );
+}
+
+function isRobinhoodChainVenueKey(value) {
+  return String(value || "").toLowerCase().trim() === "robinhood_chain";
+}
+
+function normalizeRobinhoodChainQuoteSymbol(value) {
+  return String(value || "").trim().toUpperCase().replace(/[\\/_]/g, "-");
+}
+
+function normalizeRobinhoodChainAmountText(value) {
+  const expanded = String(expandExponential(String(value ?? "").trim())).trim().replace(/^\+/, "");
+  const match = /^(\d+)(?:\.(\d*))?$/.exec(expanded);
+  if (!match) return expanded;
+  const whole = String(match[1] || "0").replace(/^0+(?=\d)/, "") || "0";
+  const fraction = String(match[2] || "").replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole;
+}
+
+function robinhoodChainQuoteRules(symbol) {
+  const normalized = normalizeRobinhoodChainQuoteSymbol(symbol);
+  const supported = normalized === "WETH-USDG";
+  return {
+    venue: "robinhood_chain",
+    symbol_canon: normalized,
+    symbol_venue: normalized,
+    type: "quote",
+    base_increment: "0.00000001",
+    price_increment: "0.000001",
+    qty_decimals: 8,
+    price_decimals: 6,
+    min_qty: "0.00000001",
+    max_qty: "0.002",
+    min_notional: "0.01",
+    max_notional: "5.0",
+    supports_post_only: false,
+    supported_tifs: [],
+    supported_order_types: ["quote"],
+    suggested_symbol: supported ? null : "WETH-USDG",
+    quote_only: true,
+    synthetic_orderbook: true,
+    execution_enabled: false,
+    errors: supported ? [] : ["RH-CHAIN.10C supports WETH-USDG only"],
+    warnings: [
+      "Synthetic 0x indicative quote samples; not resting orders.",
+      "RH-CHAIN.10C may fetch a bounded firm quote and expose a validated unsigned transaction plan for review only.",
+      "No approval transaction, wallet prompt, signing, broadcast, or order recording.",
+    ],
+  };
+}
+
+function robinhoodChainQuoteError(error) {
+  const body = error?.response?.data;
+  const detail = body?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail.trim();
+  if (detail && typeof detail === "object") {
+    return String(detail?.message || detail?.error || JSON.stringify(detail));
+  }
+  return String(body?.message || body?.error || error?.message || "Robinhood Chain quote failed.");
 }
 
 function normalizeCounterpartyAsset(asset) {
@@ -2898,6 +2958,16 @@ export default function OrderTicketWidget({
   const [submitResultPayload, setSubmitResultPayload] = useState(null); // object|string
   const [submitResultText, setSubmitResultText] = useState(""); // preformatted string for display/copy
   const [submitResultTitle, setSubmitResultTitle] = useState(""); // heading for modal
+  const [robinhoodChainQuote, setRobinhoodChainQuote] = useState(null);
+  const [robinhoodChainQuoteLoading, setRobinhoodChainQuoteLoading] = useState(false);
+  const [robinhoodChainQuoteErrorText, setRobinhoodChainQuoteErrorText] = useState("");
+  const robinhoodChainQuoteReqRef = useRef(0);
+  const [robinhoodChainFirmPlan, setRobinhoodChainFirmPlan] = useState(null);
+  const [robinhoodChainFirmPlanLoading, setRobinhoodChainFirmPlanLoading] = useState(false);
+  const [robinhoodChainFirmPlanErrorText, setRobinhoodChainFirmPlanErrorText] = useState("");
+  const [robinhoodChainSlippageBps, setRobinhoodChainSlippageBps] = useState(100);
+  const [robinhoodChainFirmPlanClock, setRobinhoodChainFirmPlanClock] = useState(0);
+  const robinhoodChainFirmPlanReqRef = useRef(0);
 
   const venueLabel = hideVenueNames ? "••••" : String(effectiveVenue || "");
   const tradeGate = venueTradeGate && typeof venueTradeGate === "object" ? venueTradeGate : null;
@@ -2948,9 +3018,12 @@ export default function OrderTicketWidget({
     }
 
     const counterpartyReadOnly = venueId.includes("counterparty");
+    const robinhoodChainReadOnly = venueId === "robinhood_chain";
     const inlineText = counterpartyReadOnly
       ? "Counterparty: compose preview · explicit UniSat PSBT signing · separately gated broadcast"
-      : `${title} · ${inlineParts.join(" · ")}`;
+      : robinhoodChainReadOnly
+        ? "Robinhood Chain: indicative quote + unsigned firm-plan review · signing/broadcast disabled"
+        : `${title} · ${inlineParts.join(" · ")}`;
 
     return {
       ok,
@@ -2975,6 +3048,49 @@ export default function OrderTicketWidget({
     return v === "polkadot_hydration" || v === "hydration" || v === "polkadot_dex" || v.startsWith("polkadot_");
   }, [effectiveVenue]);
   const isCounterpartyVenue = useMemo(() => isCounterpartyVenueKey(effectiveVenue), [effectiveVenue]);
+  const isRobinhoodChainVenue = useMemo(() => isRobinhoodChainVenueKey(effectiveVenue), [effectiveVenue]);
+  useEffect(() => {
+    robinhoodChainQuoteReqRef.current += 1;
+    robinhoodChainFirmPlanReqRef.current += 1;
+    setRobinhoodChainQuote(null);
+    setRobinhoodChainQuoteErrorText("");
+    setRobinhoodChainQuoteLoading(false);
+    setRobinhoodChainFirmPlan(null);
+    setRobinhoodChainFirmPlanErrorText("");
+    setRobinhoodChainFirmPlanLoading(false);
+    setSubmitOk((current) => (current?.quote_only ? null : current));
+  }, [isRobinhoodChainVenue, otSymbol, side]);
+
+  useEffect(() => {
+    if (!isRobinhoodChainVenue || typeof window === "undefined") return undefined;
+    const onBookPick = (event) => {
+      const detail = event?.detail && typeof event.detail === "object" ? event.detail : {};
+      const row = detail?.row && typeof detail.row === "object" ? detail.row : null;
+      if (!row || row?.synthetic !== true || row?.quote_only !== true) return;
+      const eventSymbol = normalizeRobinhoodChainQuoteSymbol(detail?.symbol || otSymbol);
+      if (eventSymbol !== "WETH-USDG") return;
+
+      const bookSide = String(detail?.book_side || row?.side || "").trim().toLowerCase();
+      const nextSide = bookSide === "ask" ? "buy" : bookSide === "bid" ? "sell" : null;
+      if (!nextSide) return;
+
+      setSide(nextSide);
+      const exactPrice = String(row?.price || "").trim();
+      const exactBase = String(row?.size || row?.base_quantity || "").trim();
+      const exactInput = String(row?.input_amount || "").trim();
+      const exactOutput = String(row?.output_amount || "").trim();
+      if (exactPrice) {
+        limitSourceRef.current = "robinhood_chain_orderbook";
+        setLimitPrice(exactPrice);
+      }
+      if (exactBase) setQty(exactBase);
+      if (nextSide === "buy" && exactInput) setTotalQuote(exactInput);
+      if (nextSide === "sell" && exactOutput) setTotalQuote(exactOutput);
+    };
+    window.addEventListener(ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT, onBookPick);
+    return () => window.removeEventListener(ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT, onBookPick);
+  }, [isRobinhoodChainVenue, otSymbol, setLimitPrice, setQty]);
+
   const isDexSwapVenue = isSolanaDexVenue || isPolkadotDexVenue;
   const isSolanaLimitMode = isSolanaJupiterVenue && solanaOrderMode === "limit";
   const [preferredSolanaWallet, setPreferredSolanaWallet] = useState(() => getPreferredSolanaWalletKey());
@@ -3477,7 +3593,7 @@ export default function OrderTicketWidget({
 
   const quoteIsUsdLike = useMemo(() => {
     const q = String(quoteAsset || "").toUpperCase().trim();
-    return q === "USD" || q === "USDT" || q === "USDC";
+    return q === "USD" || q === "USDT" || q === "USDC" || q === "USDG";
   }, [quoteAsset]);
 
   const totalQuoteDecimals = useMemo(() => (quoteIsUsdLike ? 2 : 8), [quoteIsUsdLike]);
@@ -3797,6 +3913,13 @@ export default function OrderTicketWidget({
       return;
     }
 
+    if (isRobinhoodChainVenue || isRobinhoodChainVenueKey(v)) {
+      setRules(robinhoodChainQuoteRules(s));
+      setRulesErr(null);
+      setRulesLoading(false);
+      return;
+    }
+
     const reqId = ++rulesReqIdRef.current;
     let cancelled = false;
 
@@ -3968,7 +4091,7 @@ export default function OrderTicketWidget({
       cancelled = true;
       clearTimeout(t);
     };
-  }, [effectiveVenue, otSymbol, side, tif, postOnly, apiBase, isCounterpartyVenue]);
+  }, [effectiveVenue, otSymbol, side, tif, postOnly, apiBase, isCounterpartyVenue, isRobinhoodChainVenue]);
 
   useEffect(() => {
     if (!isCounterpartyVenue) {
@@ -4505,11 +4628,11 @@ export default function OrderTicketWidget({
   const [balNotice, setBalNotice] = useState(null);
 
   useEffect(() => {
-    if (!isDexSwapVenue) {
+    if (!isDexSwapVenue && !isRobinhoodChainVenue) {
       setBalErr(null);
       setBalNotice(null);
     }
-  }, [isDexSwapVenue]);
+  }, [isDexSwapVenue, isRobinhoodChainVenue]);
 
   useEffect(() => {
     if (!isSolanaJupiterVenue) setSolanaOrderMode("swap");
@@ -4850,6 +4973,52 @@ export default function OrderTicketWidget({
         return { avail: nextAvail, hash: nextHash, focusHash: nextFocusHash };
       }
 
+      if (isRobinhoodChainVenue) {
+        const url = new URL(`${apiBase}/api/wallet_addresses/balances/latest`);
+        url.searchParams.set("network", "robinhood_chain");
+        url.searchParams.set("wallet_id", "robinhood_chain");
+        url.searchParams.set("with_prices", "1");
+        url.searchParams.set("limit", "100");
+        url.searchParams.set("_ts", String(Date.now()));
+
+        const r = await fetch(url.toString(), { method: "GET", cache: "no-store" });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const detail = body?.detail || body?.error || `HTTP ${r.status}`;
+          throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        }
+        const items = Array.isArray(body)
+          ? body
+          : Array.isArray(body?.items)
+            ? body.items
+            : Array.isArray(body?.rows)
+              ? body.rows
+              : Array.isArray(body?.balances)
+                ? body.balances
+                : [];
+        const nextAvail = {};
+        for (const row of items) {
+          const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+          if (!asset) continue;
+          const network = String(row?.network || row?.chain || "").trim().toLowerCase();
+          if (network && network !== "robinhood_chain") continue;
+          const total = toFiniteOrNull(row?.balance_qty ?? row?.total ?? row?.balance ?? row?.quantity);
+          const available = toFiniteOrNull(row?.available ?? row?.spendable ?? row?.balance_qty ?? row?.total ?? row?.balance);
+          const hold = toFiniteOrNull(row?.hold ?? row?.reserved ?? row?.locked) ?? 0;
+          if (total === null && available === null) continue;
+          nextAvail[asset] = {
+            available: available !== null ? available : total,
+            total: total !== null ? total : available,
+            hold,
+          };
+        }
+        setBalNotice("Robinhood Chain balances are read-only Wallet Addresses snapshots. Quotes do not request MetaMask.");
+        const nextHash = computeBalHash(nextAvail);
+        const nextFocusHash = focusAssets ? computeFocusHash(nextAvail, focusAssets) : "";
+        setBalAvail(nextAvail);
+        return { avail: nextAvail, hash: nextHash, focusHash: nextFocusHash };
+      }
+
       // DEX-only: Solana venues do not have adapter-backed /api/balances/latest.
       if (isSolanaDexVenue) {
         let address = getInjectedSolanaPubkeyBase58();
@@ -5056,7 +5225,7 @@ export default function OrderTicketWidget({
     if (!v) return false;
 
     // DEX/browser-wallet venues don't have a CEX adapter refresh path; just re-load wallet balances.
-    if (isDexSwapVenue || isCounterpartyVenue) {
+    if (isDexSwapVenue || isCounterpartyVenue || isRobinhoodChainVenue) {
       const beforeFullHash = computeBalHash(balAvail);
       const beforeFocusHash = focusAssets ? computeFocusHash(balAvail, focusAssets) : "";
 
@@ -5073,7 +5242,14 @@ export default function OrderTicketWidget({
         if (focusAssets) return !!afterFocusHash && afterFocusHash !== beforeFocusHash;
         return !!afterFullHash && afterFullHash !== beforeFullHash;
       } catch (e) {
-        setBalErr(e?.message || (isPolkadotDexVenue ? "Failed loading Polkadot balances" : "Failed loading Solana balances"));
+        setBalErr(
+          e?.message ||
+          (isRobinhoodChainVenue
+            ? "Failed loading Robinhood Chain balances"
+            : isPolkadotDexVenue
+              ? "Failed loading Polkadot balances"
+              : "Failed loading Solana balances")
+        );
         return false;
       } finally {
         setBalLoading(false);
@@ -5164,13 +5340,13 @@ export default function OrderTicketWidget({
   }
 
   useEffect(() => {
-    if (isDexSwapVenue || isCounterpartyVenue) {
+    if (isDexSwapVenue || isCounterpartyVenue || isRobinhoodChainVenue) {
       setBalAvail({});
       setBalErr(null);
     }
     loadAvailBalances();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveVenue, apiBase, baseAsset, quoteAsset, isSolanaDexVenue, isPolkadotDexVenue, isDexSwapVenue, isCounterpartyVenue, walletKitConnected, walletKitSelectedKey, solanaWalletState?.address, polkadotWalletState?.address]);
+  }, [effectiveVenue, apiBase, baseAsset, quoteAsset, isSolanaDexVenue, isPolkadotDexVenue, isDexSwapVenue, isCounterpartyVenue, isRobinhoodChainVenue, walletKitConnected, walletKitSelectedKey, solanaWalletState?.address, polkadotWalletState?.address]);
 
   const baseBal = useMemo(() => (baseAsset ? (balAvail?.[baseAsset] ?? null) : null), [balAvail, baseAsset]);
   const quoteBal = useMemo(() => (quoteAsset ? (balAvail?.[quoteAsset] ?? null) : null), [balAvail, quoteAsset]);
@@ -5590,6 +5766,47 @@ export default function OrderTicketWidget({
       };
     }
 
+    if (isRobinhoodChainVenue) {
+      const symbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
+      lines.push("Robinhood Chain RH-CHAIN.10C can request bounded 0x indicative prices and a validated unsigned firm-quote plan for review. It cannot construct an approval transaction, prompt a wallet, sign, broadcast, or record an order.");
+      lines.push("BUY uses Total (USDG) as exact input. SELL uses Qty (WETH) as exact input.");
+      if (symbol !== "WETH-USDG") {
+        lines.push("RH-CHAIN.10C supports WETH-USDG only.");
+        fails.push("robinhood_chain_symbol_unsupported");
+      }
+      if (side === "buy" && totalQuoteNum === null) {
+        lines.push("Enter Total (USDG) for a BUY quote.");
+        fails.push("robinhood_chain_buy_total_missing");
+      }
+      if (side === "sell" && qtyNum === null) {
+        lines.push("Enter Qty (WETH) for a SELL quote.");
+        fails.push("robinhood_chain_sell_qty_missing");
+      }
+      if (side === "buy" && totalQuoteNum !== null && totalQuoteNum > 5 + 1e-12) {
+        lines.push("RH-CHAIN.10C BUY inputs are capped at 5 USDG.");
+        fails.push("robinhood_chain_quote_cap");
+      }
+      if (side === "sell" && qtyNum !== null && qtyNum > 0.002 + 1e-12) {
+        lines.push("RH-CHAIN.10C SELL inputs are capped at 0.002 WETH.");
+        fails.push("robinhood_chain_quote_cap");
+      }
+      if (robinhoodChainQuoteErrorText) {
+        lines.push(hideTableData ? "Latest quote request failed." : `Latest quote request failed: ${robinhoodChainQuoteErrorText}`);
+      }
+      if (robinhoodChainQuote?.ok) {
+        lines.push(
+          `Latest quote: ${robinhoodChainQuote.input_amount} ${robinhoodChainQuote.input_asset} → ${robinhoodChainQuote.output_amount} ${robinhoodChainQuote.output_asset} at ${robinhoodChainQuote.effective_price} USDG/WETH.`
+        );
+      }
+      return {
+        status: fails.length ? "fail" : "warn",
+        title: fails.length ? "Robinhood Chain quote: blocked" : "Robinhood Chain quote-only: ready",
+        lines,
+        block: fails.length > 0,
+        message: lines.join(" "),
+      };
+    }
+
     if (isSolanaLimitMode) {
       if (qtyNum === null) {
         lines.push("Qty missing/invalid.");
@@ -5870,6 +6087,9 @@ export default function OrderTicketWidget({
     sellCapacity,
     baseAsset,
     otSymbol,
+    isRobinhoodChainVenue,
+    robinhoodChainQuote,
+    robinhoodChainQuoteErrorText,
   ]);
 
   const preTradeStyle = useMemo(() => {
@@ -5887,6 +6107,10 @@ export default function OrderTicketWidget({
     if (!(side === "buy" || side === "sell")) return false;
 
     if (isCounterpartyVenue) return qtyNum !== null && pxNum !== null;
+    if (isRobinhoodChainVenue) {
+      if (normalizeRobinhoodChainQuoteSymbol(otSymbol) !== "WETH-USDG") return false;
+      return side === "buy" ? totalQuoteNum !== null : qtyNum !== null;
+    }
 
     // Solana DEX venues are swap-style:
     // - BUY uses Total (quote spend)
@@ -5900,7 +6124,7 @@ export default function OrderTicketWidget({
 
     // CEX-style limit order
     return qtyNum !== null && pxNum !== null;
-  }, [effectiveVenue, otSymbol, side, isDexSwapVenue, isSolanaLimitMode, isCounterpartyVenue, qtyNum, pxNum, totalQuoteNum]);
+  }, [effectiveVenue, otSymbol, side, isDexSwapVenue, isSolanaLimitMode, isCounterpartyVenue, isRobinhoodChainVenue, qtyNum, pxNum, totalQuoteNum]);
 
   const canSubmit = useMemo(() => {
     if (!canSubmitBase) return false;
@@ -5921,7 +6145,47 @@ export default function OrderTicketWidget({
   return qtyNum !== null && pxNum !== null;
   }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum, counterpartyExecutionMode, counterpartyExpirationBlocks, counterpartyDispenserLot, counterpartyDispenserPriceWithinLimit]);
 
-  const primaryActionDisabled = submitting || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
+  const primaryActionDisabled = submitting || robinhoodChainQuoteLoading || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
+
+  const robinhoodChainQuoteStale = useMemo(() => {
+    if (!isRobinhoodChainVenue || !robinhoodChainQuote?.ok) return false;
+    const currentInput = String(side === "buy" ? totalQuote || "" : qty || "").trim();
+    return (
+      String(robinhoodChainQuote?.side || "").trim().toLowerCase() !== String(side || "").trim().toLowerCase() ||
+      normalizeRobinhoodChainAmountText(robinhoodChainQuote?.input_amount) !== normalizeRobinhoodChainAmountText(currentInput) ||
+      normalizeRobinhoodChainQuoteSymbol(robinhoodChainQuote?.symbol) !== normalizeRobinhoodChainQuoteSymbol(otSymbol)
+    );
+  }, [isRobinhoodChainVenue, robinhoodChainQuote, side, totalQuote, qty, otSymbol]);
+
+  useEffect(() => {
+    const expiresAt = Date.parse(String(robinhoodChainFirmPlan?.plan_expires_at || ""));
+    if (!Number.isFinite(expiresAt)) return undefined;
+    const delay = Math.max(0, expiresAt - Date.now()) + 25;
+    const timer = window.setTimeout(() => setRobinhoodChainFirmPlanClock((value) => value + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [robinhoodChainFirmPlan?.plan_expires_at]);
+
+  const robinhoodChainFirmPlanStale = useMemo(() => {
+    if (!isRobinhoodChainVenue || !robinhoodChainFirmPlan?.ok) return false;
+    const currentInput = String(side === "buy" ? totalQuote || "" : qty || "").trim();
+    const expiresAt = Date.parse(String(robinhoodChainFirmPlan?.plan_expires_at || ""));
+    return (
+      String(robinhoodChainFirmPlan?.side || "").trim().toLowerCase() !== String(side || "").trim().toLowerCase() ||
+      normalizeRobinhoodChainAmountText(robinhoodChainFirmPlan?.input_amount) !== normalizeRobinhoodChainAmountText(currentInput) ||
+      normalizeRobinhoodChainQuoteSymbol(robinhoodChainFirmPlan?.symbol) !== normalizeRobinhoodChainQuoteSymbol(otSymbol) ||
+      Number(robinhoodChainFirmPlan?.slippage_bps) !== Number(robinhoodChainSlippageBps) ||
+      (Number.isFinite(expiresAt) && Date.now() >= expiresAt)
+    );
+  }, [isRobinhoodChainVenue, robinhoodChainFirmPlan, side, totalQuote, qty, otSymbol, robinhoodChainSlippageBps, robinhoodChainFirmPlanClock]);
+
+  const canBuildRobinhoodChainFirmPlan = Boolean(
+    isRobinhoodChainVenue &&
+    canSubmit &&
+    robinhoodChainQuote?.ok &&
+    !robinhoodChainQuoteStale &&
+    !robinhoodChainQuoteLoading &&
+    !robinhoodChainFirmPlanLoading
+  );
 
 
   const balanceWarning = useMemo(() => {
@@ -6938,7 +7202,133 @@ async function submitLimitOrder() {
     }
   }
 
+  async function requestRobinhoodChainQuote(forceRefresh = true) {
+    if (!isRobinhoodChainVenue || robinhoodChainQuoteLoading) return;
+    const symbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
+    if (symbol !== "WETH-USDG") {
+      const msg = "RH-CHAIN.10C supports WETH-USDG only.";
+      setRobinhoodChainQuoteErrorText(msg);
+      onToast?.({ kind: "warn", msg });
+      return;
+    }
+
+    const inputAmount = side === "buy" ? totalQuote : qty;
+    if (!String(inputAmount || "").trim()) {
+      const msg = side === "buy"
+        ? "Enter Total (USDG) before requesting a BUY quote."
+        : "Enter Qty (WETH) before requesting a SELL quote.";
+      setRobinhoodChainQuoteErrorText(msg);
+      onToast?.({ kind: "warn", msg });
+      return;
+    }
+
+    const reqId = ++robinhoodChainQuoteReqRef.current;
+    setRobinhoodChainQuoteLoading(true);
+    setRobinhoodChainQuoteErrorText("");
+    robinhoodChainFirmPlanReqRef.current += 1;
+    setRobinhoodChainFirmPlan(null);
+    setRobinhoodChainFirmPlanErrorText("");
+    setRobinhoodChainFirmPlanLoading(false);
+    setSubmitError(null);
+    setSubmitOk(null);
+
+    try {
+      const data = await getRobinhoodChainIndicativeQuote(
+        {
+          provider: "0x",
+          symbol,
+          side,
+          quantity: side === "sell" ? String(qty || "").trim() : null,
+          total_quote: side === "buy" ? String(totalQuote || "").trim() : null,
+          force_refresh: !!forceRefresh,
+        },
+        { apiBase, timeout_ms: 30000 }
+      );
+      if (robinhoodChainQuoteReqRef.current !== reqId) return;
+      if (!data?.ok) throw new Error(data?.error || "Robinhood Chain quote returned ok=false.");
+
+      setRobinhoodChainQuote(data);
+      const price = String(data?.effective_price || "").trim();
+      const baseQuantity = String(data?.base_quantity || "").trim();
+      const quoteQuantity = String(data?.quote_quantity || "").trim();
+      if (price) {
+        limitSourceRef.current = "robinhood_chain_quote";
+        setLimitPrice(price);
+      }
+      if (side === "buy" && baseQuantity) setQty(baseQuantity);
+      if (side === "sell" && quoteQuantity) setTotalQuote(quoteQuantity);
+      setSubmitOk({
+        quote_only: true,
+        provider: data?.provider || "0x",
+        symbol: data?.symbol || symbol,
+        side,
+        fetched_at: data?.fetched_at || null,
+      });
+    } catch (error) {
+      if (robinhoodChainQuoteReqRef.current !== reqId) return;
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainQuote(null);
+      setRobinhoodChainQuoteErrorText(msg);
+      setSubmitError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      if (robinhoodChainQuoteReqRef.current === reqId) {
+        setRobinhoodChainQuoteLoading(false);
+      }
+    }
+  }
+
+  async function requestRobinhoodChainFirmPlan() {
+    if (!isRobinhoodChainVenue || robinhoodChainFirmPlanLoading) return;
+    if (!canBuildRobinhoodChainFirmPlan) {
+      const msg = "Request a fresh indicative quote for the current WETH-USDG input before building an unsigned firm plan.";
+      setRobinhoodChainFirmPlanErrorText(msg);
+      onToast?.({ kind: "warn", msg });
+      return;
+    }
+
+    const reqId = ++robinhoodChainFirmPlanReqRef.current;
+    setRobinhoodChainFirmPlanLoading(true);
+    setRobinhoodChainFirmPlanErrorText("");
+    try {
+      const data = await getRobinhoodChainFirmQuotePlan(
+        {
+          provider: "0x",
+          symbol: "WETH-USDG",
+          side,
+          quantity: side === "sell" ? String(qty || "").trim() : null,
+          total_quote: side === "buy" ? String(totalQuote || "").trim() : null,
+          slippage_bps: Number(robinhoodChainSlippageBps),
+        },
+        { apiBase, timeout_ms: 30000 }
+      );
+      if (robinhoodChainFirmPlanReqRef.current !== reqId) return;
+      if (!data?.ok) throw new Error(data?.error || "Robinhood Chain firm plan returned ok=false.");
+      setRobinhoodChainFirmPlan(data);
+      onToast?.({
+        kind: data?.approval_required ? "warn" : "ok",
+        msg: data?.approval_required
+          ? "Unsigned Robinhood Chain plan ready for review; token approval is required before any later execution tranche."
+          : "Unsigned Robinhood Chain plan ready for review. No wallet prompt, signature, or broadcast occurred.",
+      });
+    } catch (error) {
+      if (robinhoodChainFirmPlanReqRef.current !== reqId) return;
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainFirmPlan(null);
+      setRobinhoodChainFirmPlanErrorText(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      if (robinhoodChainFirmPlanReqRef.current === reqId) {
+        setRobinhoodChainFirmPlanLoading(false);
+      }
+    }
+  }
+
   function openConfirm() {
+    if (isRobinhoodChainVenue) {
+      void requestRobinhoodChainQuote(true);
+      return;
+    }
     if (submitting) return;
     if (!canSubmit) {
       // Restore prior UX expectation: give an explicit reason instead of "nothing happens".
@@ -6953,6 +7343,11 @@ async function submitLimitOrder() {
   }
 
   function confirmAndSubmit() {
+    if (isRobinhoodChainVenue) {
+      setShowConfirm(false);
+      void requestRobinhoodChainQuote(true);
+      return;
+    }
     if (submitting) return;
     if (!canSubmit) {
       const reason =
@@ -7373,6 +7768,9 @@ async function submitLimitOrder() {
   }, [submitResultPayload, counterpartyBtcBalanceMeta, balAvail, balNotice]);
 
   const submitEndpointLabel = useMemo(() => {
+    if (isRobinhoodChainVenue) {
+      return "/api/robinhood_chain/quotes/indicative → /api/robinhood_chain/quotes/firm-plan (unsigned review only)";
+    }
     if (isPolkadotDexVenue) {
       if (polkadotManualRouterFallbackAvailable) return `/api/polkadot_dex/hydration/swap_tx (manual Router ${side === "buy" ? "BUY" : "SELL"} fallback) → SubWallet sign/send`;
       if (polkadotSyntheticPriceOnly) return "/api/polkadot_dex/hydration/orderbook (synthetic price only; no executable route)";
@@ -7393,7 +7791,7 @@ async function submitLimitOrder() {
     if (routerMode === "ultra") return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute";
     if (routerMode === "metis") return "/api/solana_dex/jupiter/swap_tx";
     return "/api/solana_dex/jupiter/ultra_order → /api/solana_dex/jupiter/ultra_execute → fallback /api/solana_dex/jupiter/swap_tx → fallback /api/solana_dex/raydium/swap_tx";
-  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, isCounterpartyVenue, isCounterpartyLimitOrderMode, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotManualRouterFallbackAvailable, polkadotSyntheticPriceOnly, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
+  }, [isSolanaDexVenue, isSolanaLimitMode, isPolkadotDexVenue, isCounterpartyVenue, isRobinhoodChainVenue, isCounterpartyLimitOrderMode, effectiveVenue, preferredSolanaRouterMode, preferredHydrationRouteMode, polkadotManualRouterFallbackAvailable, polkadotSyntheticPriceOnly, polkadotEffectiveQuotesAvailable, polkadotEffectiveLiveSwapsRecommended, side, polkadotEffectiveExactBuyEnabled]);
 
   async function signCounterpartyComposeWithUniSat() {
     const preview = submitResultPayload;
@@ -7911,6 +8309,201 @@ async function submitLimitOrder() {
           </div>
         )}
 
+        {isRobinhoodChainVenue && (
+          <div
+            style={{
+              marginTop: 7,
+              padding: "10px 11px",
+              borderRadius: 12,
+              border: (robinhoodChainQuoteErrorText || robinhoodChainFirmPlanErrorText)
+                ? "1px solid rgba(251, 113, 133, 0.58)"
+                : "1px solid rgba(34, 211, 238, 0.52)",
+              background: "linear-gradient(135deg, rgba(8, 47, 73, 0.48), rgba(76, 29, 149, 0.24) 58%, rgba(112, 26, 117, 0.20))",
+              color: "#dff9ff",
+              boxShadow: "0 0 0 1px rgba(168, 85, 247, 0.12) inset, 0 0 22px rgba(34, 211, 238, 0.10)",
+            }}
+            title="Robinhood Chain RH-CHAIN.10C supports bounded indicative prices plus a validated firm quote and unsigned transaction plan for review. It does not build approvals, prompt MetaMask, sign, broadcast, or write an order."
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <div style={{ fontSize: 12, fontWeight: 950, letterSpacing: 0.65, color: "#67e8f9" }}>
+                RH-EVM · 0x QUOTE + UNSIGNED PLAN
+              </div>
+              <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                <span style={{ padding: "2px 7px", borderRadius: 999, border: "1px solid rgba(217, 70, 239, 0.55)", color: "#f5d0fe", fontSize: 10, fontWeight: 900 }}>
+                  REVIEW ONLY
+                </span>
+                <span style={{ padding: "2px 7px", borderRadius: 999, border: "1px solid rgba(34, 211, 238, 0.55)", color: "#a5f3fc", fontSize: 10, fontWeight: 900 }}>
+                  NO SIGN / NO SEND
+                </span>
+                {robinhoodChainQuote?.ok && (
+                  <span style={{ padding: "2px 7px", borderRadius: 999, border: robinhoodChainQuoteStale ? "1px solid rgba(251, 191, 36, 0.65)" : "1px solid rgba(74, 222, 128, 0.55)", color: robinhoodChainQuoteStale ? "#fde68a" : "#bbf7d0", fontSize: 10, fontWeight: 900 }}>
+                    {robinhoodChainQuoteStale ? "STALE INPUT" : robinhoodChainQuote.cached ? "CACHED" : "FRESH"}
+                  </span>
+                )}
+                {robinhoodChainFirmPlan?.ok && (
+                  <span style={{ padding: "2px 7px", borderRadius: 999, border: robinhoodChainFirmPlanStale ? "1px solid rgba(251, 191, 36, 0.65)" : robinhoodChainFirmPlan?.approval_required ? "1px solid rgba(251, 191, 36, 0.65)" : "1px solid rgba(74, 222, 128, 0.55)", color: robinhoodChainFirmPlanStale || robinhoodChainFirmPlan?.approval_required ? "#fde68a" : "#bbf7d0", fontSize: 10, fontWeight: 900 }}>
+                    {robinhoodChainFirmPlanStale ? "PLAN STALE" : robinhoodChainFirmPlan?.approval_required ? "APPROVAL REQUIRED" : "PLAN READY"}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {robinhoodChainQuoteErrorText && (
+              <div style={{ marginTop: 7, padding: "6px 8px", borderRadius: 8, background: "rgba(127, 29, 29, 0.28)", border: "1px solid rgba(251, 113, 133, 0.35)", color: "#fecdd3", fontSize: 11 }}>
+                {hideTableData ? "Latest indicative quote request failed." : robinhoodChainQuoteErrorText}
+              </div>
+            )}
+
+            {robinhoodChainQuote?.ok ? (
+              <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 7 }}>
+                {[
+                  ["Direction", `${String(robinhoodChainQuote.side || side).toUpperCase()} WETH`],
+                  ["Input", `${robinhoodChainQuote.input_amount || "—"} ${robinhoodChainQuote.input_asset || ""}`.trim()],
+                  ["Indicative output", `${robinhoodChainQuote.output_amount || "—"} ${robinhoodChainQuote.output_asset || ""}`.trim()],
+                  ["USDG / WETH", robinhoodChainQuote.effective_price || "—"],
+                  ["Minimum received", robinhoodChainQuote.minimum_received ? `${robinhoodChainQuote.minimum_received} ${robinhoodChainQuote.minimum_received_asset || ""}`.trim() : "—"],
+                  ["Price impact", robinhoodChainQuote.price_impact_bps !== null && robinhoodChainQuote.price_impact_bps !== undefined ? `${robinhoodChainQuote.price_impact_bps} bps` : "—"],
+                  ["Route", Array.isArray(robinhoodChainQuote.route_sources) && robinhoodChainQuote.route_sources.length ? robinhoodChainQuote.route_sources.join(" + ") : robinhoodChainQuote.route_source || "—"],
+                  ["Network fee", robinhoodChainQuote.total_network_fee_eth ? `${robinhoodChainQuote.total_network_fee_eth} ETH` : "—"],
+                  ["0x fee", robinhoodChainQuote.zero_x_fee?.amount ? `${robinhoodChainQuote.zero_x_fee.amount} ${robinhoodChainQuote.zero_x_fee.asset || ""}`.trim() : "—"],
+                  ["Allowance", robinhoodChainQuote.allowance_required ? "REQUIRED" : "Not required"],
+                  ["Spender", robinhoodChainQuote.allowance_spender ? shortenWalletAddress(robinhoodChainQuote.allowance_spender, 8, 6) : "—"],
+                  ["Fetched", robinhoodChainQuote.fetched_at ? String(robinhoodChainQuote.fetched_at) : "—"],
+                ].map(([label, value]) => (
+                  <div key={label} style={{ padding: "6px 7px", borderRadius: 8, background: "rgba(2, 6, 23, 0.42)", border: "1px solid rgba(125, 211, 252, 0.16)", minWidth: 0 }}>
+                    <div style={{ fontSize: 9, letterSpacing: 0.55, textTransform: "uppercase", color: "#94a3b8", fontWeight: 850 }}>{label}</div>
+                    <div style={{ marginTop: 2, fontSize: 11, fontWeight: 800, color: label === "Allowance" && robinhoodChainQuote.allowance_required ? "#fde68a" : "#e0f2fe", overflowWrap: "anywhere" }}>
+                      {hideTableData ? "••••" : value}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ marginTop: 7, fontSize: 11, lineHeight: 1.35, color: "#bae6fd" }}>
+                Enter {side === "buy" ? "Total (USDG)" : "Qty (WETH)"}, then request a bounded indicative quote. The result remains read-only and is never inserted into All Orders.
+              </div>
+            )}
+
+            <div style={{ marginTop: 9, paddingTop: 8, borderTop: "1px solid rgba(34, 211, 238, 0.18)", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 10, fontWeight: 900, color: "#c4b5fd", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                Firm-plan slippage
+              </span>
+              <select
+                value={String(robinhoodChainSlippageBps)}
+                onChange={(event) => {
+                  setRobinhoodChainSlippageBps(Number(event.target.value));
+                  robinhoodChainFirmPlanReqRef.current += 1;
+                  setRobinhoodChainFirmPlan(null);
+                  setRobinhoodChainFirmPlanErrorText("");
+                  setRobinhoodChainFirmPlanLoading(false);
+                }}
+                style={{ ...darkSelectStyle, minWidth: 92 }}
+                title="Bounded slippage protection sent to the 0x firm-quote endpoint."
+              >
+                <option style={darkOptionStyle} value="50">0.50%</option>
+                <option style={darkOptionStyle} value="100">1.00%</option>
+                <option style={darkOptionStyle} value="200">2.00%</option>
+                <option style={darkOptionStyle} value="300">3.00%</option>
+              </select>
+              <button
+                type="button"
+                style={{
+                  ...safeButton,
+                  ...(!canBuildRobinhoodChainFirmPlan ? safeButtonDisabled : {}),
+                  padding: "7px 10px",
+                  fontWeight: 900,
+                  border: "1px solid rgba(192, 132, 252, 0.55)",
+                  color: "#f3e8ff",
+                  background: "rgba(88, 28, 135, 0.28)",
+                }}
+                disabled={!canBuildRobinhoodChainFirmPlan}
+                onClick={requestRobinhoodChainFirmPlan}
+                title="Fetch a fresh 0x AllowanceHolder quote, read current allowance with eth_call, and display a validated unsigned plan. No wallet action occurs."
+              >
+                {robinhoodChainFirmPlanLoading
+                  ? "Building Plan…"
+                  : robinhoodChainFirmPlan?.ok
+                    ? "Refresh Unsigned Plan"
+                    : "Build Unsigned Plan"}
+              </button>
+              <span style={{ fontSize: 10.5, color: "#a5b4fc" }}>
+                Fresh indicative quote required · local review window 30s
+              </span>
+            </div>
+
+            {robinhoodChainFirmPlanErrorText && (
+              <div style={{ marginTop: 7, padding: "6px 8px", borderRadius: 8, background: "rgba(127, 29, 29, 0.28)", border: "1px solid rgba(251, 113, 133, 0.35)", color: "#fecdd3", fontSize: 11 }}>
+                {hideTableData ? "Latest unsigned firm-plan request failed." : robinhoodChainFirmPlanErrorText}
+              </div>
+            )}
+
+            {robinhoodChainFirmPlan?.ok && (
+              <div style={{ marginTop: 9, padding: 9, borderRadius: 10, border: robinhoodChainFirmPlanStale ? "1px solid rgba(251, 191, 36, 0.48)" : "1px solid rgba(192, 132, 252, 0.42)", background: "rgba(30, 12, 58, 0.38)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <div style={{ fontSize: 11, fontWeight: 950, color: "#d8b4fe", letterSpacing: 0.5 }}>
+                    UNSIGNED TRANSACTION PLAN · REVIEW ONLY
+                  </div>
+                  <div style={{ fontSize: 10.5, fontWeight: 900, color: robinhoodChainFirmPlan?.approval_required ? "#fde68a" : "#bbf7d0" }}>
+                    {robinhoodChainFirmPlanStale
+                      ? "STALE — rebuild before any later execution tranche"
+                      : robinhoodChainFirmPlan?.approval_required
+                        ? "APPROVAL SHORTFALL DETECTED"
+                        : "ALLOWANCE SUFFICIENT"}
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 7 }}>
+                  {[
+                    ["Input", `${robinhoodChainFirmPlan.input_amount || "—"} ${robinhoodChainFirmPlan.input_asset || ""}`.trim()],
+                    ["Firm output", `${robinhoodChainFirmPlan.output_amount || "—"} ${robinhoodChainFirmPlan.output_asset || ""}`.trim()],
+                    ["Minimum received", `${robinhoodChainFirmPlan.minimum_received || "—"} ${robinhoodChainFirmPlan.minimum_received_asset || ""}`.trim()],
+                    ["Maximum spent", `${robinhoodChainFirmPlan.maximum_spent || "—"} ${robinhoodChainFirmPlan.maximum_spent_asset || ""}`.trim()],
+                    ["Slippage", `${Number(robinhoodChainFirmPlan.slippage_bps || 0) / 100}%`],
+                    ["Route", Array.isArray(robinhoodChainFirmPlan.route_sources) && robinhoodChainFirmPlan.route_sources.length ? robinhoodChainFirmPlan.route_sources.join(" + ") : "—"],
+                    ["Network fee", robinhoodChainFirmPlan.total_network_fee_eth ? `${robinhoodChainFirmPlan.total_network_fee_eth} ETH` : "—"],
+                    ["0x fee", robinhoodChainFirmPlan.zero_x_fee?.amount_display ? `${robinhoodChainFirmPlan.zero_x_fee.amount_display} ${robinhoodChainFirmPlan.zero_x_fee.asset || ""}`.trim() : "—"],
+                    ["Current allowance", `${robinhoodChainFirmPlan.allowance?.current || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}`.trim()],
+                    ["Required allowance", `${robinhoodChainFirmPlan.allowance?.required || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}`.trim()],
+                    ["Allowance shortfall", `${robinhoodChainFirmPlan.allowance?.shortfall || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}`.trim()],
+                    ["Spender", robinhoodChainFirmPlan.allowance?.spender ? shortenWalletAddress(robinhoodChainFirmPlan.allowance.spender, 8, 6) : "—"],
+                    ["Destination", robinhoodChainFirmPlan.unsigned_transaction_plan?.to ? shortenWalletAddress(robinhoodChainFirmPlan.unsigned_transaction_plan.to, 8, 6) : "—"],
+                    ["Tx value", `${robinhoodChainFirmPlan.unsigned_transaction_plan?.value_wei ?? "—"} wei`],
+                    ["Gas limit", robinhoodChainFirmPlan.unsigned_transaction_plan?.gas_limit || "—"],
+                    ["Calldata", robinhoodChainFirmPlan.unsigned_transaction_plan?.calldata_bytes !== undefined ? `${robinhoodChainFirmPlan.unsigned_transaction_plan.calldata_bytes} bytes` : "—"],
+                    ["Expires", robinhoodChainFirmPlan.plan_expires_at || "—"],
+                  ].map(([label, value]) => (
+                    <div key={label} style={{ padding: "6px 7px", borderRadius: 8, background: "rgba(2, 6, 23, 0.48)", border: "1px solid rgba(192, 132, 252, 0.16)", minWidth: 0 }}>
+                      <div style={{ fontSize: 9, letterSpacing: 0.55, textTransform: "uppercase", color: "#a78bfa", fontWeight: 850 }}>{label}</div>
+                      <div style={{ marginTop: 2, fontSize: 11, fontWeight: 800, color: label === "Allowance shortfall" && robinhoodChainFirmPlan?.approval_required ? "#fde68a" : "#e9d5ff", overflowWrap: "anywhere" }}>
+                        {hideTableData ? "••••" : value}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {Array.isArray(robinhoodChainFirmPlan.warnings) && robinhoodChainFirmPlan.warnings.length > 0 && (
+                  <div style={{ marginTop: 7, padding: "6px 8px", borderRadius: 8, border: "1px solid rgba(251, 191, 36, 0.32)", background: "rgba(120, 72, 16, 0.16)", color: "#fde68a", fontSize: 10.5 }}>
+                    {robinhoodChainFirmPlan.warnings.join(" · ")}
+                  </div>
+                )}
+
+                <details style={{ marginTop: 8 }}>
+                  <summary style={{ cursor: "pointer", color: "#c4b5fd", fontSize: 10.5, fontWeight: 900 }}>
+                    Unsigned calldata — explicit review only
+                  </summary>
+                  <pre style={{ margin: "7px 0 0", maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", padding: 8, borderRadius: 8, background: "rgba(0,0,0,0.38)", border: "1px solid rgba(192,132,252,0.18)", color: "#e9d5ff", fontSize: 10 }}>
+                    {hideTableData ? "••••••••" : robinhoodChainFirmPlan.unsigned_transaction_plan?.calldata || "—"}
+                  </pre>
+                </details>
+              </div>
+            )}
+
+            <div style={{ marginTop: 8, paddingTop: 7, borderTop: "1px solid rgba(34, 211, 238, 0.18)", fontSize: 10.5, lineHeight: 1.35, color: "#c4b5fd" }}>
+              Firm quote + unsigned calldata preview only · no MetaMask prompt · no approval transaction · no signature · no broadcast · no order record
+            </div>
+          </div>
+        )}
+
         {hydrationManualRouterPriceGuard?.show && (
           <div
             style={{
@@ -8020,7 +8613,7 @@ async function submitLimitOrder() {
                 const cleaned = sanitizeDecimalInput(e.target.value);
 
                 // DEX / Counterparty preview venues: keep the user-picked decimal price as-is; do not CEX-normalize.
-                if (isDexSwapVenue || isCounterpartyVenue) {
+                if (isDexSwapVenue || isCounterpartyVenue || isRobinhoodChainVenue) {
                   setLimitPrice(cleaned);
                   return;
                 }
@@ -8048,7 +8641,7 @@ async function submitLimitOrder() {
                 if (!limitPrice) return;
 
                 // DEX / Counterparty preview venues: do not clamp/round limit price on blur.
-                if (isDexSwapVenue || isCounterpartyVenue) return;
+                if (isDexSwapVenue || isCounterpartyVenue || isRobinhoodChainVenue) return;
 
                 const normalized = normalizeLimitPriceStr(limitPrice, rules, side);
                 if (normalized && normalized !== String(limitPrice)) setLimitPrice(normalized);
@@ -8067,8 +8660,8 @@ async function submitLimitOrder() {
                 const cleaned = sanitizeDecimalInput(e.target.value);
                 setTotalQuote(cleaned);
 
-                // DEX-only: ensure Total→Qty auto-calc works even when venue rules are unavailable.
-                if (isDexSwapVenue && autoCalc) {
+                // DEX / Robinhood Chain quote-only: keep Total→Qty responsive when rules are local.
+                if ((isDexSwapVenue || isRobinhoodChainVenue) && autoCalc) {
                   const t = Number(cleaned);
                   const p = Number(expandExponential(limitPrice));
                   if (Number.isFinite(t) && t > 0 && Number.isFinite(p) && p > 0) {
@@ -8625,7 +9218,7 @@ async function submitLimitOrder() {
                 </div>
               )}
             </>
-          ) : isCounterpartyVenue ? null : (
+          ) : (isCounterpartyVenue || isRobinhoodChainVenue) ? null : (
             <>
               <div style={safePill}>
                 <span>TIF</span>
@@ -8655,10 +9248,10 @@ async function submitLimitOrder() {
         </div>
 
         <div style={{ marginTop: 6, ...safeMuted, fontSize: 12, lineHeight: 1.15 }}>
-          Type: <b>{isCounterpartyVenue ? (isCounterpartyLimitOrderMode ? "Limit Order" : "Dispenser Purchase") : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
+          Type: <b>{isRobinhoodChainVenue ? "Quote Only" : isCounterpartyVenue ? (isCounterpartyLimitOrderMode ? "Limit Order" : "Dispenser Purchase") : isSolanaJupiterVenue ? (solanaOrderMode === "limit" ? "Limit" : "Swap") : isPolkadotDexVenue ? "Swap" : "Limit"}</b>
           {isSolanaLimitMode ? <> • Expiry: <b>{hideTableData ? "••••" : solanaExpiryLabel}</b></> : null}
           {isCounterpartyLimitOrderMode ? <> • Expiration: <b>{hideTableData ? "••••" : counterpartyExpirationLabel}</b></> : null}
-          {" "}• {isCounterpartyDispenserMode ? "Exact Payment" : isCounterpartyLimitOrderMode ? "Trade Commitment" : "Est. Total"} ({totalLabel}): <b>{
+          {" "}• {isRobinhoodChainVenue ? "Quote Input / Estimate" : isCounterpartyDispenserMode ? "Exact Payment" : isCounterpartyLimitOrderMode ? "Trade Commitment" : "Est. Total"} ({totalLabel}): <b>{
             isCounterpartyDispenserMode
               ? counterpartyExactDispenserTotalBtc === null
                 ? "—"
@@ -8683,9 +9276,19 @@ async function submitLimitOrder() {
               fontWeight: 900,
             }}
             disabled={primaryActionDisabled}
-            onClick={isCounterpartyVenue ? previewCounterpartyCompose : openConfirm}
+            onClick={
+              isRobinhoodChainVenue
+                ? () => requestRobinhoodChainQuote(true)
+                : isCounterpartyVenue
+                  ? previewCounterpartyCompose
+                  : openConfirm
+            }
             title={
-              isCounterpartyVenue
+              isRobinhoodChainVenue
+                ? canSubmit
+                  ? "Request a bounded read-only 0x indicative price. No MetaMask prompt, approval, signature, transaction, or order record."
+                  : "Enter a valid WETH-USDG quote amount within the RH-CHAIN.10B safety cap."
+                : isCounterpartyVenue
                 ? canCounterpartyComposePreview
                   ? isCounterpartyLimitOrderMode
                     ? "Preview unsigned Counterparty limit order. Signing and any enabled broadcast are separate explicit actions."
@@ -8700,7 +9303,15 @@ async function submitLimitOrder() {
                     : "Review and confirm order"
             }
           >
-            {submitting
+            {isRobinhoodChainVenue
+              ? robinhoodChainQuoteLoading
+                ? "Fetching Quote…"
+                : robinhoodChainQuote?.ok
+                  ? "Refresh Quote"
+                  : side === "buy"
+                    ? "Get Buy Quote"
+                    : "Get Sell Quote"
+              : submitting
               ? "Submitting…"
               : isCounterpartyVenue
                 ? isCounterpartyLimitOrderMode

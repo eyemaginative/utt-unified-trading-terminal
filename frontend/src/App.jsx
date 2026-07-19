@@ -18,6 +18,8 @@ import {
   // safety + order views
   getSafetyStatus,
   setArmed as apiSetArmed,
+  withBoundedRetry,
+  runCrossTabHeavyTask,
   confirmOrderView,
 
   // discovery endpoints
@@ -34,7 +36,7 @@ import {
   getArbSnapshot,
 
   // venues registry (single source of truth)
-  getVenuesRawSafe,
+  getVenuesRaw,
 } from "./lib/api";
 import { fmtNum, fmtTime, isCancelableStatus } from "./lib/format";
 import TradingViewChartWidget from "./TradingViewChartWidget";
@@ -331,7 +333,7 @@ const ARB_VENUES = ["coinbase", "kraken", "gemini", "robinhood", "dex_trade", "o
 
 // Venues that should mount OrderTicketWidget for read-only pretrade/rules inspection,
 // but must remain submit-blocked inside the ticket until trading is explicitly enabled.
-const READ_ONLY_ORDER_TICKET_VENUES = new Set(["counterparty"]);
+const READ_ONLY_ORDER_TICKET_VENUES = new Set(["counterparty", ROBINHOOD_CHAIN_VENUE]);
 
 const LS_VISIBLE_WIDGETS = "utt_visible_widgets_v1";
 const LS_RIGHT_RAIL_SPLIT = "utt_right_rail_split_v1";
@@ -2836,6 +2838,7 @@ export default function App() {
 
   const [supportedVenues, setSupportedVenues] = useState(() => [...DEFAULT_SUPPORTED_VENUES]);
   const [loadingSupportedVenues, setLoadingSupportedVenues] = useState(false);
+  const [venuesReloadNonce, setVenuesReloadNonce] = useState(0);
 
   const venuesEnabled = useMemo(() => {
     const raw = Array.isArray(venuesRaw) ? venuesRaw : [];
@@ -2889,7 +2892,10 @@ export default function App() {
       try {
         setLoadingSupportedVenues(true);
 
-        const res = await getVenuesRawSafe({ include_disabled: true });
+        const res = await withBoundedRetry(
+          () => getVenuesRaw({ include_disabled: true }),
+          { delaysMs: [1000, 2000, 5000] }
+        );
         if (!alive) return;
 
         const raw =
@@ -2905,6 +2911,7 @@ export default function App() {
 
         setVenuesRaw(raw);
         setVenuesLoaded(true);
+        setError((prev) => String(prev || "").startsWith("Venue registry reconnect pending:") ? null : prev);
 
         const getId = (row) =>
 
@@ -2939,8 +2946,10 @@ export default function App() {
         const merged = normalizeVenueList([...(DEFAULT_SUPPORTED_VENUES || []), ...(ARB_VENUES || []), ...(FRONTEND_LOCAL_DEX_VENUES || []), ...(enabledIds || [])]);
 
         if (merged.length > 0) setSupportedVenues(merged);
-      } catch {
-        setVenuesLoaded(true);
+      } catch (e) {
+        const msg = e?.response?.data?.detail || e?.message || "Venue registry unavailable";
+        if (alive) setError((prev) => prev || `Venue registry reconnect pending: ${msg}`);
+        // Preserve the last-known venue rows and keep API status in CONNECTING state.
       } finally {
         if (alive) setLoadingSupportedVenues(false);
       }
@@ -2949,7 +2958,7 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [venuesReloadNonce]);
 
   // When UI venue overrides change, recompute supportedVenues without refetching the registry.
   useEffect(() => {
@@ -3027,6 +3036,9 @@ export default function App() {
       if (v === "counterparty" && c === "balances") return true;
       if (v === ROBINHOOD_CHAIN_VENUE && c === "balances") return true;
       if (v === "counterparty" && c === "orderbook") return true;
+      // RH-CHAIN.10B mounts a dedicated quote-only synthetic book without
+      // advertising generic adapter orderbook/trading capabilities.
+      if (v === ROBINHOOD_CHAIN_VENUE && c === "orderbook") return true;
 
       // DEX venues are swap/status based, but we still surface them as trade/orderbook-capable
       // so the widgets mount. Routing/status behavior is handled inside each widget.
@@ -4045,18 +4057,28 @@ export default function App() {
     return String(value || "");
   }
 
-  async function loadArmStatus() {
+  async function loadArmStatus({ retry = true } = {}) {
     try {
-      const j = await getSafetyStatus();
+      const j = retry
+        ? await withBoundedRetry(() => getSafetyStatus(), { delaysMs: [1000, 2000, 5000] })
+        : await getSafetyStatus();
       setArmStatus({
         dry_run: !!j?.dry_run,
         armed: !!j?.armed,
       });
+      setError((prev) => String(prev || "").startsWith("Safety status reconnect pending:") ? null : prev);
+      return true;
     } catch (e) {
       const msg = e?.response?.data?.detail || e?.message || "Unknown error loading /api/arm";
-      setError(String(msg));
-      setArmStatus({ dry_run: null, armed: null });
+      setError((prev) => prev || `Safety status reconnect pending: ${msg}`);
+      // Preserve the last-known ARM / DRY_RUN state instead of replacing it with unknown.
+      return false;
     }
+  }
+
+  async function reloadStartupStatus() {
+    setVenuesReloadNonce((x) => x + 1);
+    await loadArmStatus({ retry: true });
   }
 
   async function doSetArmed(nextArmed) {
@@ -4086,6 +4108,20 @@ export default function App() {
     loadArmStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const retryUnresolvedStartup = () => {
+      if (venuesLoaded && armStatus?.dry_run !== null && armStatus?.armed !== null) return;
+      reloadStartupStatus();
+    };
+    window.addEventListener("online", retryUnresolvedStartup);
+    window.addEventListener("focus", retryUnresolvedStartup);
+    return () => {
+      window.removeEventListener("online", retryUnresolvedStartup);
+      window.removeEventListener("focus", retryUnresolvedStartup);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [venuesLoaded, armStatus?.dry_run, armStatus?.armed]);
 
   // ─────────────────────────────────────────────────────────────
   // Full-UI Screenshot Capture (tab/screen capture)
@@ -4289,7 +4325,7 @@ export default function App() {
     }
   }
 
-  async function doRefreshBalances({ forceAllVenuesTotal = true, refreshRobinhoodChain = false } = {}) {
+  async function doRefreshBalances({ forceAllVenuesTotal = true, refreshRobinhoodChain = false, liveRefresh = true } = {}) {
     if (balancesRefreshInFlightRef.current) return;
     balancesRefreshInFlightRef.current = true;
 
@@ -4329,9 +4365,14 @@ export default function App() {
       setLoadingBalances(true);
       setError(null);
 
+      const readLatestBalances = (opts) =>
+        liveRefresh
+          ? getLatestBalances(opts)
+          : withBoundedRetry(() => getLatestBalances(opts), { delaysMs: [1000, 2000, 5000] });
+
       if (isRobinhoodChainView) {
         let refreshResult = null;
-        if (refreshRobinhoodChain) {
+        if (liveRefresh && refreshRobinhoodChain) {
           refreshResult = await appRefreshRobinhoodChainWalletBalances();
           appRobinhoodChainRegistryCache = { fetchedAt: 0, bySymbol: {} };
         }
@@ -4367,7 +4408,7 @@ export default function App() {
       }
 
       if (isCounterpartyView) {
-        const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows({ forceRefresh: true, allowPrompt: false });
+        const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows({ forceRefresh: !!liveRefresh, allowPrompt: false });
         if (balancesReqIdRef.current !== reqId) return;
         setBalances(counterpartyRows);
         const cpTotalUsd = appCounterpartyRowsTotalUsd(counterpartyRows);
@@ -4382,25 +4423,41 @@ export default function App() {
       }
 
       let robinhoodChainRefreshWarning = "";
-      if (isAllVenuesView && refreshRobinhoodChain) {
-        try {
-          const refreshResult = await appRefreshRobinhoodChainWalletBalances();
-          appRobinhoodChainRegistryCache = { fetchedAt: 0, bySymbol: {} };
-          const refreshErrors = Array.isArray(refreshResult?.errors) ? refreshResult.errors : [];
-          if (refreshErrors.length) {
-            robinhoodChainRefreshWarning = `Robinhood Chain refresh preserved successful snapshots but reported ${refreshErrors.length} error${refreshErrors.length === 1 ? "" : "s"}.`;
-          }
-        } catch (e) {
-          robinhoodChainRefreshWarning = `Robinhood Chain refresh was unavailable: ${e?.message || e}`;
-        }
-      }
 
-      if (isAllVenuesView) {
-        for (const v of venuesToUse) {
-          await refreshBalances(v);
+      const performLiveBalanceRefresh = async () => {
+        if (isAllVenuesView && refreshRobinhoodChain) {
+          try {
+            const refreshResult = await appRefreshRobinhoodChainWalletBalances();
+            appRobinhoodChainRegistryCache = { fetchedAt: 0, bySymbol: {} };
+            const refreshErrors = Array.isArray(refreshResult?.errors) ? refreshResult.errors : [];
+            if (refreshErrors.length) {
+              robinhoodChainRefreshWarning = `Robinhood Chain refresh preserved successful snapshots but reported ${refreshErrors.length} error${refreshErrors.length === 1 ? "" : "s"}.`;
+            }
+          } catch (e) {
+            robinhoodChainRefreshWarning = `Robinhood Chain refresh was unavailable: ${e?.message || e}`;
+          }
         }
-      } else {
-        await refreshBalances(venue);
+
+        if (isAllVenuesView) {
+          for (const v of venuesToUse) {
+            // eslint-disable-next-line no-await-in-loop
+            await refreshBalances(v);
+          }
+        } else {
+          await refreshBalances(venue);
+        }
+      };
+
+      if (liveRefresh) {
+        if (isAllVenuesView) {
+          await runCrossTabHeavyTask(
+            "balances:all-venues",
+            performLiveBalanceRefresh,
+            { leaseMs: 180000, waitMs: 45000 }
+          );
+        } else {
+          await performLiveBalanceRefresh();
+        }
       }
 
       let baseItems = [];
@@ -4408,7 +4465,7 @@ export default function App() {
       if (isAllVenuesView) {
         const perVenue = await Promise.all(
           venuesToUse.map(async (v) => {
-            const res = await getLatestBalances({ venue: v, sort: "asset:asc" });
+            const res = await readLatestBalances({ venue: v, sort: "asset:asc" });
             const items = (res.items || []).map((b) => {
               const asset = String(b.asset || "").toUpperCase().trim();
               const total = Number(b.total ?? 0) || 0;
@@ -4435,7 +4492,7 @@ export default function App() {
 
         baseItems = perVenue.flat();
       } else {
-        const res = await getLatestBalances({ venue, sort: "asset:asc" });
+        const res = await readLatestBalances({ venue, sort: "asset:asc" });
 
         baseItems = (res.items || []).map((b) => {
           const asset = String(b.asset || "").toUpperCase().trim();
@@ -4573,7 +4630,7 @@ export default function App() {
       const allVenueItemsNested = await Promise.all(
         balancesVenueCandidates.map(async (v) => {
           try {
-            const res = await getLatestBalances({
+            const res = await readLatestBalances({
               venue: v,
               sort: "asset:asc",
               with_prices: true,
@@ -4979,7 +5036,7 @@ export default function App() {
     if (venueVal) params.venue = venueVal;
     if (symbolVal) params.symbol = symbolVal;
     if (bucket === "open" || bucket === "terminal") params.status_bucket = bucket;
-    return await getAllOrders(params);
+    return await withBoundedRetry(() => getAllOrders(params), { delaysMs: [1000, 2000, 5000] });
   }
 
   async function doLoadAllOrders() {
@@ -5078,7 +5135,7 @@ export default function App() {
   // UPDATED: “attempt all venues even if one fails” + coinbase backoff + no overlap
   async function doSyncAndLoadAllOrders(opts = {}) {
     // avoid overlapping syncs (button spam / poll overlap)
-    if (syncInFlightRef.current) return;
+    if (syncInFlightRef.current) return { performedSync: false, skippedInFlight: true };
     syncInFlightRef.current = true;
 
     try {
@@ -5100,86 +5157,92 @@ export default function App() {
       // If a specific venue was requested and is valid, refresh only that one. Otherwise refresh all candidates.
       const venuesToRefresh = wantsAllVenues ? refreshCandidates : refreshCandidates.includes(v) ? [v] : refreshCandidates;
 
-      // Solana DEX (two-stage): always run on All Orders Sync+Load before loading all_orders.
-      // Do not gate this on venuesToRefresh; manual console tests already proved the backend path works,
-      // and runtime venue filtering was causing the UI path to skip discovery/materialization entirely.
-      try {
-        await fetch(
-          `${API_BASE}/api/wallet_addresses/solana/tx/ingest?limit_per_address=200&write_ledger=false`,
-          { method: "POST" }
-        );
-        await fetch(
-          `${API_BASE}/api/wallet_addresses/solana/ingest_swap_orders?max_rows=10000&venue=solana_jupiter`,
-          { method: "POST" }
-        );
-      } catch (e) {
-        console.warn("Solana two-stage ingest failed:", e);
-      }
-
-      // LOCAL scope does not require venue refresh.
-      if (scopeNorm === "LOCAL") {
-        await doLoadAllOrders();
-        return;
-      }
-
-      const now = Date.now();
-      const errors = [];
-
-      const isBackedOff = (vv) => {
-        const b = venueBackoffRef.current?.[vv];
-        return b && Number.isFinite(b.until) && b.until > now;
-      };
-
-      const setBackoff = (vv, ms, reason) => {
-        venueBackoffRef.current = {
-          ...(venueBackoffRef.current || {}),
-          [vv]: { until: Date.now() + ms, reason: String(reason || "") },
-        };
-      };
-
-      // Call refreshVenueOrders in a signature-tolerant way (boolean vs object vs no-arg force).
-      const refreshOne = async (vv) => {
-        if (!force) return await refreshVenueOrders(vv);
-
-        // If force=true was requested, try compatible call patterns.
+      const performHeavyOrderSync = async () => {
+        // Solana DEX (two-stage): preserve the existing ingestion/materialization path,
+        // but allow only one browser tab to run it at a time.
         try {
-          return await refreshVenueOrders(vv, true);
-        } catch (e1) {
-          try {
-            return await refreshVenueOrders(vv, { force: true });
-          } catch (e2) {
-            return await refreshVenueOrders(vv);
-          }
-        }
-      };
-
-      const safeRefreshOne = async (vv) => {
-        if (isBackedOff(vv)) return;
-
-        try {
-          await refreshOne(vv);
+          await fetch(
+            `${API_BASE}/api/wallet_addresses/solana/tx/ingest?limit_per_address=200&write_ledger=false`,
+            { method: "POST" }
+          );
+          await fetch(
+            `${API_BASE}/api/wallet_addresses/solana/ingest_swap_orders?max_rows=10000&venue=solana_jupiter`,
+            { method: "POST" }
+          );
         } catch (e) {
-          const msg = e?.response?.data?.detail || e?.message || String(e || "unknown error");
-          errors.push({ venue: vv, msg });
-
-          // Recommended: if Coinbase is in “Too many errors” mode, back off for 15m
-          if (vv === "coinbase" && String(msg).toLowerCase().includes("too many errors")) {
-            setBackoff("coinbase", 15 * 60 * 1000, msg);
-          }
+          console.warn("Solana two-stage ingest failed:", e);
         }
+
+        if (scopeNorm === "LOCAL") return [];
+
+        const now = Date.now();
+        const errors = [];
+
+        const isBackedOff = (vv) => {
+          const b = venueBackoffRef.current?.[vv];
+          return b && Number.isFinite(b.until) && b.until > now;
+        };
+
+        const setBackoff = (vv, ms, reason) => {
+          venueBackoffRef.current = {
+            ...(venueBackoffRef.current || {}),
+            [vv]: { until: Date.now() + ms, reason: String(reason || "") },
+          };
+        };
+
+        const refreshOne = async (vv) => {
+          if (!force) return await refreshVenueOrders(vv);
+          try {
+            return await refreshVenueOrders(vv, true);
+          } catch (e1) {
+            try {
+              return await refreshVenueOrders(vv, { force: true });
+            } catch (e2) {
+              return await refreshVenueOrders(vv);
+            }
+          }
+        };
+
+        const safeRefreshOne = async (vv) => {
+          if (isBackedOff(vv)) return;
+          try {
+            await refreshOne(vv);
+          } catch (e) {
+            const msg = e?.response?.data?.detail || e?.message || String(e || "unknown error");
+            errors.push({ venue: vv, msg });
+            if (vv === "coinbase" && String(msg).toLowerCase().includes("too many errors")) {
+              setBackoff("coinbase", 15 * 60 * 1000, msg);
+            }
+          }
+        };
+
+        for (const vv of venuesToRefresh) {
+          // eslint-disable-next-line no-await-in-loop
+          await safeRefreshOne(vv);
+        }
+        return errors;
       };
 
-      for (const vv of venuesToRefresh) {
-        // eslint-disable-next-line no-await-in-loop
-        await safeRefreshOne(vv);
-      }
+      const syncKey = `all-orders:${wantsAllVenues ? "all" : v || "all"}`;
+      const syncResult = await runCrossTabHeavyTask(
+        syncKey,
+        performHeavyOrderSync,
+        { leaseMs: 180000, waitMs: 45000 }
+      );
 
       await doLoadAllOrders();
 
+      const errors = syncResult?.acquired && Array.isArray(syncResult?.value) ? syncResult.value : [];
       if (errors.length > 0) {
         const summary = errors.map((x) => `${x.venue}: ${x.msg}`).join("\n");
         setError(`Some venues failed to refresh:\n${summary}`);
       }
+
+      return {
+        performedSync: !!syncResult?.acquired,
+        followedAnotherTab: !syncResult?.acquired,
+        errors,
+      };
     } catch (e) {
       const msg = e?.response?.data?.detail || e?.message || "Unknown error syncing venue orders";
       setError(String(msg));
@@ -5188,6 +5251,7 @@ export default function App() {
       } catch {
         // ignore
       }
+      return { performedSync: false, error: String(msg) };
     } finally {
       setLoadingAll(false);
       syncInFlightRef.current = false;
@@ -5585,6 +5649,12 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     setOtSymbol(String(obSymbol || "").trim());
   }, [obSymbol]);
 
+  useEffect(() => {
+    if (selectedVenueNorm !== ROBINHOOD_CHAIN_VENUE) return;
+    if (String(obSymbol || "").trim().toUpperCase() === "WETH-USDG") return;
+    setObSymbol("WETH-USDG");
+  }, [selectedVenueNorm, obSymbol]);
+
   // ─────────────────────────────────────────────────────────────
   // Market/Venue selection unification
   // ─────────────────────────────────────────────────────────────
@@ -5723,7 +5793,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
   }
 
   useEffect(() => {
-    if (tab === "balances") doRefreshBalancesSafe();
+    if (tab === "balances") doRefreshBalancesSafe({ liveRefresh: false });
     if (tab === "localOrders") doLoadOrders();
     if (tab === "allOrders") {
       if (suppressAllOrdersReloadOnceRef.current) {
@@ -5750,9 +5820,9 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
           if (venue !== ALL_VENUES_VALUE) await doLoadOrders();
         } else if (tab === "allOrders") {
           const alreadySyncing = !!syncInFlightRef.current;
-          await doSyncAndLoadAllOrders();
-          // Only run ledger sync when we actually performed a sync (avoid racing an in-flight manual click/poll).
-          if (!alreadySyncing) {
+          const syncResult = await doSyncAndLoadAllOrders();
+          // Only the tab that performed the heavy venue sync may run the follow-up ledger sync.
+          if (!alreadySyncing && syncResult?.performedSync !== false) {
             await doLedgerSyncFromLocalStorage({ silent: true });
           }
         }
@@ -5791,15 +5861,22 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
           .filter((v) => !POISON_BALANCES_REFRESH_VENUES.has(v))
           .filter((v) => venueSupports(v, "balances"));
 
-        // Best-effort refresh snapshots for all balances-capable venues.
-        for (const v of balancesVenueCandidates) {
-          try {
-            // eslint-disable-next-line no-await-in-loop
-            await refreshBalances(v);
-          } catch {
-            // ignore per-venue
-          }
-        }
+        // Best-effort refresh snapshots for all balances-capable venues. Only one
+        // browser tab performs the heavy fan-out; followers read the resulting snapshots.
+        await runCrossTabHeavyTask(
+          "balances:all-venues",
+          async () => {
+            for (const v of balancesVenueCandidates) {
+              try {
+                // eslint-disable-next-line no-await-in-loop
+                await refreshBalances(v);
+              } catch {
+                // ignore per-venue
+              }
+            }
+          },
+          { leaseMs: 180000, waitMs: 45000 }
+        );
 
         await refreshAllVenuesTotalOnlySafe();
       } finally {
@@ -5807,7 +5884,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
       }
     };
 
-    tick();
+    // Snapshot-first startup: do not launch a live all-venue fan-out on mount.
     const t = setInterval(tick, ms);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5939,7 +6016,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
             armDisabled={armDisabled}
             disarmDisabled={disarmDisabled}
             doSetArmed={doSetArmed}
-            loadArmStatus={loadArmStatus}
+            loadArmStatus={reloadStartupStatus}
             btnHeader={btnHeader}
             pollEnabled={pollEnabled}
             setPollEnabled={setPollEnabled}

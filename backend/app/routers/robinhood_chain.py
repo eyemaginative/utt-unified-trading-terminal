@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..models import TokenRegistry
+from ..models import TokenRegistry, WalletAddress
 from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
 from ..services.robinhood_chain_accounting_preview import build_robinhood_chain_accounting_preview
 from ..services.robinhood_chain_history import (
@@ -23,6 +23,18 @@ from ..services.robinhood_chain_history import (
 from ..services.robinhood_chain_execution_discovery import (
     ROBINHOOD_CHAIN_DISCOVERY_TOKENS,
     get_robinhood_chain_execution_discovery_service,
+)
+from ..services.robinhood_chain_quotes import (
+    ROBINHOOD_CHAIN_QUOTE_PROVIDER,
+    ROBINHOOD_CHAIN_QUOTE_SYMBOL,
+    get_robinhood_chain_quote_service,
+)
+from ..services.robinhood_chain_transaction_planning import (
+    ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
+    ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL,
+    ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
+    ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
+    get_robinhood_chain_transaction_planning_service,
 )
 
 
@@ -330,6 +342,149 @@ class RobinhoodChainExecutionDiscoveryRequest(BaseModel):
         description="Saved Robinhood Chain public address used only for provider diagnostics.",
     )
     force_refresh: bool = False
+
+
+class RobinhoodChainIndicativeQuoteRequest(BaseModel):
+    provider: str = Field(
+        default="0x",
+        min_length=1,
+        max_length=16,
+        description="Fixed quote provider identifier; only 0x is accepted in RH-CHAIN.10B.",
+    )
+    symbol: str = Field(
+        default=ROBINHOOD_CHAIN_QUOTE_SYMBOL,
+        min_length=1,
+        max_length=32,
+        description="Canonical quote-only market symbol. RH-CHAIN.10B supports WETH-USDG only.",
+    )
+    side: str = Field(min_length=3, max_length=4, description="buy or sell")
+    quantity: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        description="Exact WETH input for sell quotes.",
+    )
+    total_quote: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        description="Exact USDG input for buy quotes.",
+    )
+    taker_address: Optional[str] = Field(
+        default=None,
+        min_length=42,
+        max_length=42,
+        description="Optional public address override. When omitted, UTT uses the saved ALL / robinhood_chain wallet.",
+    )
+    force_refresh: bool = False
+
+
+class RobinhoodChainFirmQuotePlanRequest(BaseModel):
+    provider: str = Field(
+        default="0x",
+        min_length=1,
+        max_length=16,
+        description="Fixed provider identifier; only 0x AllowanceHolder is accepted in RH-CHAIN.10C.",
+    )
+    symbol: str = Field(
+        default=ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL,
+        min_length=1,
+        max_length=32,
+        description="Canonical market symbol. RH-CHAIN.10C supports WETH-USDG only.",
+    )
+    side: str = Field(min_length=3, max_length=4, description="buy or sell")
+    quantity: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        description="Exact WETH input for sell plans.",
+    )
+    total_quote: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        description="Exact USDG input for buy plans.",
+    )
+    slippage_bps: int = Field(
+        default=ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
+        ge=ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
+        le=ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
+        description="Bounded exact-input slippage protection in basis points.",
+    )
+    taker_address: Optional[str] = Field(
+        default=None,
+        min_length=42,
+        max_length=42,
+        description="Optional public address override. When omitted, UTT uses the saved ALL / robinhood_chain wallet.",
+    )
+
+
+def _resolve_robinhood_chain_quote_taker(
+    db: Session,
+    requested_address: Optional[str] = None,
+) -> str:
+    requested = str(requested_address or "").strip()
+    if requested:
+        try:
+            return validate_evm_address(requested)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    row = (
+        db.query(WalletAddress)
+        .filter(
+            WalletAddress.network == _TOKEN_REGISTRY_CHAIN,
+            WalletAddress.wallet_id == _TOKEN_REGISTRY_VENUE,
+            WalletAddress.asset.in_(["ALL", "*"]),
+        )
+        .order_by(WalletAddress.created_at.desc())
+        .first()
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "robinhood_chain_quote_wallet_required",
+                "message": "Save an ALL / robinhood_chain Wallet Addresses row before requesting quote-only market data.",
+                "read_only": True,
+                "will_mutate": False,
+            },
+        )
+    try:
+        return validate_evm_address(str(row.address or "").strip())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_saved_robinhood_chain_quote_wallet",
+                "wallet_address_id": row.id,
+                "message": str(exc),
+                "read_only": True,
+                "will_mutate": False,
+            },
+        ) from exc
+
+
+def _quote_failure_status(result: Dict[str, Any]) -> int:
+    error = str(result.get("error") or "robinhood_chain_quote_failed")
+    if error in {
+        "unsupported_robinhood_chain_quote_symbol",
+        "invalid_quote_side",
+        "invalid_quantity",
+        "invalid_quote_amount",
+        "invalid_discovery_amount",
+        "discovery_amount_exceeds_cap",
+        "unsupported_discovery_pair",
+        "invalid_firm_quote_amount",
+        "firm_quote_amount_exceeds_cap",
+        "invalid_slippage_bps",
+    }:
+        return 400
+    if error in {
+        "execution_discovery_not_configured",
+        "execution_discovery_backoff_active",
+        "chain_id_mismatch_or_unavailable",
+        "firm_quote_planning_not_configured",
+        "firm_quote_provider_transient_error",
+    }:
+        return 503
+    return 502
 
 
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -946,3 +1101,153 @@ async def robinhood_chain_execution_discovery_probe(
     else:
         status_code = 502
     raise HTTPException(status_code=status_code, detail=result)
+
+
+@router.get("/quotes/status")
+async def robinhood_chain_quotes_status(
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return secret-free quote-only readiness and canonical token identities."""
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+
+    weth = _resolve_execution_discovery_token(db, "WETH")
+    usdg = _resolve_execution_discovery_token(db, "USDG")
+    payload = get_robinhood_chain_quote_service().status()
+    payload["firm_planning"] = get_robinhood_chain_transaction_planning_service().status()
+    payload["tokens"] = {
+        "WETH": weth,
+        "USDG": usdg,
+    }
+    payload["wallet_configured"] = (
+        db.query(WalletAddress)
+        .filter(
+            WalletAddress.network == _TOKEN_REGISTRY_CHAIN,
+            WalletAddress.wallet_id == _TOKEN_REGISTRY_VENUE,
+            WalletAddress.asset.in_(["ALL", "*"]),
+        )
+        .first()
+        is not None
+    )
+    db.rollback()
+    return payload
+
+
+@router.post("/quotes/indicative")
+async def robinhood_chain_indicative_quote(
+    request: RobinhoodChainIndicativeQuoteRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return one bounded exact-input quote without constructing or submitting a trade."""
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+
+    provider = str(request.provider or "").strip().lower()
+    if provider not in {"0x", "zerox"}:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unsupported_robinhood_chain_quote_provider",
+                "provider": request.provider,
+                "allowed": [ROBINHOOD_CHAIN_QUOTE_PROVIDER],
+            },
+        )
+
+    taker_address = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
+    weth = _resolve_execution_discovery_token(db, "WETH")
+    usdg = _resolve_execution_discovery_token(db, "USDG")
+    result = await get_robinhood_chain_quote_service().indicative_quote(
+        symbol=request.symbol,
+        side=request.side,
+        quantity=request.quantity,
+        total_quote=request.total_quote,
+        taker_address=taker_address,
+        weth_token=weth,
+        usdg_token=usdg,
+        force_refresh=bool(request.force_refresh),
+    )
+    db.rollback()
+    if result.get("ok"):
+        return result
+    raise HTTPException(status_code=_quote_failure_status(result), detail=result)
+
+
+@router.post("/quotes/firm-plan")
+async def robinhood_chain_firm_quote_plan(
+    request: RobinhoodChainFirmQuotePlanRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return a bounded firm 0x quote and validated unsigned transaction plan.
+
+    The endpoint reads current ERC-20 allowance with eth_call, but never builds
+    an approval transaction, prompts a wallet, signs, broadcasts, records an
+    order, or mutates ledger/FIFO/basis state.
+    """
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+
+    provider = str(request.provider or "").strip().lower()
+    if provider not in {"0x", "zerox"}:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unsupported_robinhood_chain_quote_provider",
+                "provider": request.provider,
+                "allowed": [ROBINHOOD_CHAIN_QUOTE_PROVIDER],
+            },
+        )
+
+    taker_address = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
+    weth = _resolve_execution_discovery_token(db, "WETH")
+    usdg = _resolve_execution_discovery_token(db, "USDG")
+    result = await get_robinhood_chain_transaction_planning_service().firm_quote_plan(
+        symbol=request.symbol,
+        side=request.side,
+        quantity=request.quantity,
+        total_quote=request.total_quote,
+        taker_address=taker_address,
+        weth_token=weth,
+        usdg_token=usdg,
+        slippage_bps=int(request.slippage_bps),
+    )
+    db.rollback()
+    if result.get("ok"):
+        return result
+    raise HTTPException(status_code=_quote_failure_status(result), detail=result)
+
+
+@router.get("/orderbook")
+async def robinhood_chain_synthetic_orderbook(
+    symbol: str = Query(default=ROBINHOOD_CHAIN_QUOTE_SYMBOL, min_length=1, max_length=32),
+    depth: int = Query(default=5, ge=1, le=5),
+    taker_address: Optional[str] = Query(default=None, min_length=42, max_length=42),
+    force_refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return bounded synthetic bid/ask samples; these are not resting orders."""
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+
+    taker = _resolve_robinhood_chain_quote_taker(db, taker_address)
+    weth = _resolve_execution_discovery_token(db, "WETH")
+    usdg = _resolve_execution_discovery_token(db, "USDG")
+    result = await get_robinhood_chain_quote_service().synthetic_orderbook(
+        symbol=symbol,
+        depth=depth,
+        taker_address=taker,
+        weth_token=weth,
+        usdg_token=usdg,
+        force_refresh=bool(force_refresh),
+    )
+    db.rollback()
+    if result.get("ok"):
+        return result
+    raise HTTPException(status_code=_quote_failure_status(result), detail=result)

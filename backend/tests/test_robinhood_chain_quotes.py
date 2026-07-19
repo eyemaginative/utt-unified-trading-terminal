@@ -18,11 +18,11 @@ from app.services.robinhood_chain_quotes import (  # noqa: E402
 )
 
 
-WETH = {
-    "symbol": "WETH",
-    "contract_address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+ETH = {
+    "symbol": "ETH",
+    "contract_address": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     "decimals": 18,
-    "native": False,
+    "native": True,
 }
 USDG = {
     "symbol": "USDG",
@@ -83,7 +83,7 @@ class FakeDiscoveryService:
             }
 
         amount = Decimal(amount_text)
-        if sell_token["symbol"] == "WETH":
+        if sell_token["symbol"] == "ETH":
             price = Decimal("1800") - amount * Decimal("100")
             output = amount * price
             fee_token = USDG["contract_address"].lower()
@@ -91,7 +91,7 @@ class FakeDiscoveryService:
         else:
             price = Decimal("1820") + amount * Decimal("0.1")
             output = amount / price
-            fee_token = WETH["contract_address"].lower()
+            fee_token = ETH["contract_address"].lower()
             fee_atomic = "100000000000"
 
         min_output = output * Decimal("0.99")
@@ -143,22 +143,25 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_sell_quote_is_safe_exact_input(self) -> None:
         service, discovery = self.make_service()
         quote = await service.indicative_quote(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             force_refresh=True,
         )
 
         self.assertTrue(quote["ok"])
-        self.assertEqual(quote["input_asset"], "WETH")
+        self.assertEqual(quote["input_asset"], "ETH")
         self.assertEqual(quote["output_asset"], "USDG")
         self.assertEqual(quote["amount_mode"], "exact_input")
         self.assertEqual(quote["route_source"], "Uniswap_V3")
         self.assertEqual(quote["zero_x_fee"]["asset"], "USDG")
+        self.assertFalse(quote["allowance_required"])
+        self.assertIsNone(quote["allowance_spender"])
+        self.assertNotIn("allowance_required", quote["provider_warnings"])
         self.assertEqual(quote["transaction_calldata"], None)
         self.assertEqual(quote["transaction_destination"], None)
         self.assertFalse(quote["transaction_data_present"])
@@ -170,15 +173,15 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(quote["will_mutate"])
         self.assertGreaterEqual(len(discovery.calls), 1)
 
-    async def test_buy_quote_maps_total_usdg_to_weth(self) -> None:
+    async def test_buy_quote_maps_total_usdg_to_eth(self) -> None:
         service, _ = self.make_service()
         quote = await service.indicative_quote(
-            symbol="weth/usdg",
+            symbol="eth/usdg",
             side="buy",
             quantity=None,
             total_quote="1.25",
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             force_refresh=False,
         )
@@ -186,20 +189,22 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(quote["ok"])
         self.assertEqual(quote["input_asset"], "USDG")
         self.assertEqual(quote["input_amount"], "1.25")
-        self.assertEqual(quote["output_asset"], "WETH")
-        self.assertEqual(quote["minimum_received_asset"], "WETH")
-        self.assertEqual(quote["zero_x_fee"]["asset"], "WETH")
+        self.assertEqual(quote["output_asset"], "ETH")
+        self.assertEqual(quote["minimum_received_asset"], "ETH")
+        self.assertEqual(quote["zero_x_fee"]["asset"], "ETH")
+        self.assertTrue(quote["allowance_required"])
+        self.assertIsNotNone(quote["allowance_spender"])
         self.assertIsNotNone(quote["price_impact_bps"])
 
     async def test_unsupported_symbol_fails_closed_without_provider_call(self) -> None:
         service, discovery = self.make_service()
         quote = await service.indicative_quote(
-            symbol="ETH-USDG",
+            symbol="WETH-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
         )
 
@@ -211,10 +216,10 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_synthetic_orderbook_labels_sorting_and_cache(self) -> None:
         service, discovery = self.make_service()
         book = await service.synthetic_orderbook(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             depth=3,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             force_refresh=True,
         )
@@ -244,10 +249,10 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
 
         provider_call_count = len(discovery.calls)
         cached = await service.synthetic_orderbook(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             depth=3,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             force_refresh=False,
         )
@@ -260,10 +265,10 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_level_failure_does_not_erase_other_levels(self) -> None:
         service, _ = self.make_service(fail_inputs={ROBINHOOD_CHAIN_BID_INPUT_AMOUNTS[1]})
         book = await service.synthetic_orderbook(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             depth=3,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             force_refresh=True,
         )
@@ -277,10 +282,10 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_book_depth_is_bounded_to_five(self) -> None:
         service, discovery = self.make_service()
         book = await service.synthetic_orderbook(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             depth=200,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             force_refresh=True,
         )
@@ -291,12 +296,12 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_safe_json_contains_no_provider_calldata(self) -> None:
         service, _ = self.make_service()
         quote = await service.indicative_quote(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
         )
         encoded = json.dumps(quote, sort_keys=True)

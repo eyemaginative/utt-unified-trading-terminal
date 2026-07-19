@@ -12,7 +12,7 @@ from .robinhood_chain_execution_discovery import (
 )
 
 
-ROBINHOOD_CHAIN_QUOTE_SYMBOL = "WETH-USDG"
+ROBINHOOD_CHAIN_QUOTE_SYMBOL = "ETH-USDG"
 ROBINHOOD_CHAIN_QUOTE_PROVIDER = "0x"
 ROBINHOOD_CHAIN_MAX_BOOK_LEVELS = 5
 ROBINHOOD_CHAIN_BID_INPUT_AMOUNTS: Tuple[str, ...] = (
@@ -97,7 +97,7 @@ def _network_fee_eth(result: Dict[str, Any]) -> Optional[str]:
 def _normalize_zero_x_fee(
     result: Dict[str, Any],
     *,
-    weth_token: Dict[str, Any],
+    eth_token: Dict[str, Any],
     usdg_token: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     fees = result.get("fees") if isinstance(result.get("fees"), dict) else {}
@@ -117,7 +117,7 @@ def _normalize_zero_x_fee(
         }
 
     token_map = {
-        _address_key(weth_token.get("contract_address")): weth_token,
+        _address_key(eth_token.get("contract_address")): eth_token,
         _address_key(usdg_token.get("contract_address")): usdg_token,
     }
     token = token_map.get(_address_key(token_address))
@@ -188,7 +188,7 @@ class RobinhoodChainQuoteService:
             "credential_source": discovery.get("credential_source"),
             "supported_symbols": [ROBINHOOD_CHAIN_QUOTE_SYMBOL],
             "max_book_levels_per_side": ROBINHOOD_CHAIN_MAX_BOOK_LEVELS,
-            "bid_input_amounts_weth": list(ROBINHOOD_CHAIN_BID_INPUT_AMOUNTS),
+            "bid_input_amounts_eth": list(ROBINHOOD_CHAIN_BID_INPUT_AMOUNTS),
             "ask_input_amounts_usdg": list(ROBINHOOD_CHAIN_ASK_INPUT_AMOUNTS),
             "cache_ttl_s": float(discovery.get("cache_ttl_s") or 0.0),
             "error_backoff_s": float(discovery.get("error_backoff_s") or 0.0),
@@ -210,7 +210,7 @@ class RobinhoodChainQuoteService:
         *,
         side: str,
         symbol: str,
-        weth_token: Dict[str, Any],
+        eth_token: Dict[str, Any],
         usdg_token: Dict[str, Any],
     ) -> Dict[str, Any]:
         normalized_side = _normalize_side(side)
@@ -226,7 +226,7 @@ class RobinhoodChainQuoteService:
         if normalized_side == "sell":
             base_quantity = sell_amount
             quote_quantity = buy_amount
-            input_asset = "WETH"
+            input_asset = "ETH"
             output_asset = "USDG"
             input_amount = sell_amount
             output_amount = buy_amount
@@ -236,11 +236,11 @@ class RobinhoodChainQuoteService:
             base_quantity = buy_amount
             quote_quantity = sell_amount
             input_asset = "USDG"
-            output_asset = "WETH"
+            output_asset = "ETH"
             input_amount = sell_amount
             output_amount = buy_amount
             minimum_received = min_buy_amount
-            minimum_received_asset = "WETH"
+            minimum_received_asset = "ETH"
 
         if base_quantity <= 0 or quote_quantity <= 0:
             return _safe_failure(
@@ -250,6 +250,10 @@ class RobinhoodChainQuoteService:
 
         effective_price = quote_quantity / base_quantity
         sources = _route_sources(result)
+        allowance_required = normalized_side == "buy" and bool(result.get("allowance_required"))
+        provider_warnings = list(result.get("provider_warnings") or [])[:20]
+        if normalized_side == "sell":
+            provider_warnings = [warning for warning in provider_warnings if str(warning) != "allowance_required"]
         return {
             "ok": True,
             "venue": "robinhood_chain",
@@ -265,7 +269,7 @@ class RobinhoodChainQuoteService:
             "input_amount": _decimal_text(input_amount),
             "output_asset": output_asset,
             "output_amount": _decimal_text(output_amount),
-            "base_asset": "WETH",
+            "base_asset": "ETH",
             "quote_asset": "USDG",
             "base_quantity": _decimal_text(base_quantity),
             "quote_quantity": _decimal_text(quote_quantity),
@@ -285,12 +289,12 @@ class RobinhoodChainQuoteService:
             "total_network_fee_eth": _network_fee_eth(result),
             "zero_x_fee": _normalize_zero_x_fee(
                 result,
-                weth_token=weth_token,
+                eth_token=eth_token,
                 usdg_token=usdg_token,
             ),
-            "allowance_required": bool(result.get("allowance_required")),
-            "allowance_spender": result.get("allowance_spender"),
-            "provider_warnings": list(result.get("provider_warnings") or [])[:20],
+            "allowance_required": allowance_required,
+            "allowance_spender": result.get("allowance_spender") if allowance_required else None,
+            "provider_warnings": provider_warnings,
             "liquidity_available": bool(result.get("liquidity_available")),
             "cached": bool(result.get("cached")),
             "elapsed_ms": result.get("elapsed_ms"),
@@ -316,14 +320,14 @@ class RobinhoodChainQuoteService:
         side: str,
         input_amount: str,
         taker_address: str,
-        weth_token: Dict[str, Any],
+        eth_token: Dict[str, Any],
         usdg_token: Dict[str, Any],
         force_refresh: bool,
     ) -> Dict[str, Any]:
         normalized_side = _normalize_side(side)
         if normalized_side == "sell":
             result = await self.discovery_service.probe(
-                sell_token=weth_token,
+                sell_token=eth_token,
                 buy_token=usdg_token,
                 sell_amount=input_amount,
                 buy_amount=None,
@@ -333,7 +337,7 @@ class RobinhoodChainQuoteService:
         else:
             result = await self.discovery_service.probe(
                 sell_token=usdg_token,
-                buy_token=weth_token,
+                buy_token=eth_token,
                 sell_amount=input_amount,
                 buy_amount=None,
                 taker_address=taker_address,
@@ -345,7 +349,7 @@ class RobinhoodChainQuoteService:
             result,
             side=normalized_side,
             symbol=ROBINHOOD_CHAIN_QUOTE_SYMBOL,
-            weth_token=weth_token,
+            eth_token=eth_token,
             usdg_token=usdg_token,
         )
 
@@ -357,7 +361,7 @@ class RobinhoodChainQuoteService:
         quantity: Optional[str],
         total_quote: Optional[str],
         taker_address: str,
-        weth_token: Dict[str, Any],
+        eth_token: Dict[str, Any],
         usdg_token: Dict[str, Any],
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
@@ -386,7 +390,7 @@ class RobinhoodChainQuoteService:
             side=normalized_side,
             input_amount=_decimal_text(requested),
             taker_address=taker_address,
-            weth_token=weth_token,
+            eth_token=eth_token,
             usdg_token=usdg_token,
             force_refresh=force_refresh,
         )
@@ -406,7 +410,7 @@ class RobinhoodChainQuoteService:
                 side=normalized_side,
                 input_amount=reference_amount,
                 taker_address=taker_address,
-                weth_token=weth_token,
+                eth_token=eth_token,
                 usdg_token=usdg_token,
                 force_refresh=False,
             )
@@ -500,7 +504,7 @@ class RobinhoodChainQuoteService:
         symbol: str,
         depth: int,
         taker_address: str,
-        weth_token: Dict[str, Any],
+        eth_token: Dict[str, Any],
         usdg_token: Dict[str, Any],
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
@@ -526,7 +530,7 @@ class RobinhoodChainQuoteService:
                 side="sell",
                 input_amount=amount,
                 taker_address=taker_address,
-                weth_token=weth_token,
+                eth_token=eth_token,
                 usdg_token=usdg_token,
                 force_refresh=force_refresh,
             )
@@ -545,7 +549,7 @@ class RobinhoodChainQuoteService:
                 side="buy",
                 input_amount=amount,
                 taker_address=taker_address,
-                weth_token=weth_token,
+                eth_token=eth_token,
                 usdg_token=usdg_token,
                 force_refresh=force_refresh,
             )
@@ -588,7 +592,7 @@ class RobinhoodChainQuoteService:
             "router": ROBINHOOD_CHAIN_QUOTE_PROVIDER,
             "symbol": normalized_symbol,
             "resolvedSymbol": normalized_symbol,
-            "base_asset": "WETH",
+            "base_asset": "ETH",
             "quote_asset": "USDG",
             "depth_requested": int(depth),
             "depth_returned": min(len(bids), len(asks)),

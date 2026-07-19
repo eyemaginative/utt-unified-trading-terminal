@@ -19,11 +19,11 @@ from app.services.robinhood_chain_transaction_planning import (  # noqa: E402
 )
 
 
-WETH = {
-    "symbol": "WETH",
-    "contract_address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+ETH = {
+    "symbol": "ETH",
+    "contract_address": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     "decimals": 18,
-    "native": False,
+    "native": True,
 }
 USDG = {
     "symbol": "USDG",
@@ -88,19 +88,24 @@ class FakeRpcClient:
         }
 
 
-def firm_body(request: httpx.Request, *, destination: str = ALLOWANCE_HOLDER, value: str = "0") -> dict:
+def firm_body(request: httpx.Request, *, destination: str = ALLOWANCE_HOLDER, value: str | None = None) -> dict:
     params = request.url.params
     sell_token = params["sellToken"]
     buy_token = params["buyToken"]
     sell_amount = params["sellAmount"]
-    if sell_token.lower() == WETH["contract_address"].lower():
+    native_sell = sell_token.lower() == ETH["contract_address"].lower()
+    if native_sell:
         buy_amount = "183402"
         min_buy_amount = "181567"
         fee_token = USDG["contract_address"]
+        allowance_issue = None
+        transaction_value = sell_amount if value is None else value
     else:
-        buy_amount = "54525000000000"
-        min_buy_amount = "53979750000000"
-        fee_token = WETH["contract_address"]
+        buy_amount = "545250000000000"
+        min_buy_amount = "539797500000000"
+        fee_token = ETH["contract_address"]
+        allowance_issue = {"actual": "0", "spender": ALLOWANCE_HOLDER}
+        transaction_value = "0" if value is None else value
     return {
         "allowanceTarget": ALLOWANCE_HOLDER,
         "blockNumber": "12345678",
@@ -112,7 +117,7 @@ def firm_body(request: httpx.Request, *, destination: str = ALLOWANCE_HOLDER, va
             "gasFee": None,
         },
         "issues": {
-            "allowance": {"actual": "0", "spender": ALLOWANCE_HOLDER},
+            "allowance": allowance_issue,
             "balance": None,
             "simulationIncomplete": False,
             "invalidSourcesPassed": [],
@@ -138,9 +143,10 @@ def firm_body(request: httpx.Request, *, destination: str = ALLOWANCE_HOLDER, va
             "data": "0x1234abcdef",
             "gas": "300000",
             "gasPrice": "80000000",
-            "value": value,
+            "value": transaction_value,
         },
     }
+
 
 
 class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
@@ -170,15 +176,15 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(TAKER[2:].lower(), encoded)
         self.assertIn(ALLOWANCE_HOLDER[2:].lower(), encoded)
 
-    async def test_sell_plan_is_unsigned_review_only_and_reads_allowance(self) -> None:
+    async def test_native_eth_sell_plan_uses_value_and_skips_allowance(self) -> None:
         service, rpc = self.make_service(allowance_atomic=0)
         result = await service.firm_quote_plan(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             slippage_bps=100,
         )
@@ -193,25 +199,26 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         plan = result["unsigned_transaction_plan"]
         self.assertEqual(plan["chain_id"], 4663)
         self.assertEqual(plan["to"].lower(), ALLOWANCE_HOLDER.lower())
-        self.assertEqual(plan["value_wei"], "0")
+        self.assertEqual(plan["value_wei"], "100000000000000")
+        self.assertEqual(plan["value_eth"], "0.0001")
+        self.assertTrue(plan["native_input"])
         self.assertEqual(plan["calldata"], "0x1234abcdef")
         self.assertTrue(plan["destination_allowlisted"])
-        self.assertTrue(result["allowance"]["approval_required"])
-        self.assertEqual(result["allowance"]["shortfall_atomic"], "100000000000000")
-        self.assertEqual(len(rpc.allowance_calls), 1)
-        self.assertEqual(rpc.allowance_calls[0]["contract"].lower(), WETH["contract_address"].lower())
-        self.assertEqual(rpc.allowance_calls[0]["spender"].lower(), ALLOWANCE_HOLDER.lower())
-        self.assertTrue(rpc.allowance_calls[0]["force_refresh"])
+        self.assertFalse(result["allowance"]["applicable"])
+        self.assertEqual(result["allowance"]["read_method"], "not_applicable_native_input")
+        self.assertFalse(result["allowance"]["approval_required"])
+        self.assertEqual(result["allowance"]["shortfall_atomic"], "0")
+        self.assertEqual(rpc.allowance_calls, [])
 
     async def test_buy_plan_uses_usdg_allowance_and_can_be_ready(self) -> None:
         service, rpc = self.make_service(allowance_atomic=10_000_000)
         result = await service.firm_quote_plan(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             side="buy",
             quantity=None,
             total_quote="1",
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             slippage_bps=100,
         )
@@ -225,12 +232,12 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
     async def test_unsupported_symbol_fails_before_provider(self) -> None:
         service, rpc = self.make_service()
         result = await service.firm_quote_plan(
-            symbol="ETH-USDG",
+            symbol="WETH-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             slippage_bps=100,
         )
@@ -241,12 +248,12 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
     async def test_amount_caps_fail_closed(self) -> None:
         service, _ = self.make_service()
         result = await service.firm_quote_plan(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             side="sell",
             quantity="0.00200001",
             total_quote=None,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             slippage_bps=100,
         )
@@ -256,12 +263,12 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
     async def test_slippage_bounds_fail_closed(self) -> None:
         service, _ = self.make_service()
         result = await service.firm_quote_plan(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             slippage_bps=301,
         )
@@ -274,12 +281,12 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
 
         service, _ = self.make_service(body_mutator=mutate)
         result = await service.firm_quote_plan(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             slippage_bps=100,
         )
@@ -294,17 +301,37 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
 
         service, _ = self.make_service(body_mutator=mutate)
         result = await service.firm_quote_plan(
-            symbol="WETH-USDG",
+            symbol="ETH-USDG",
             side="buy",
             quantity=None,
             total_quote="1",
             taker_address=TAKER,
-            weth_token=WETH,
+            eth_token=ETH,
             usdg_token=USDG,
             slippage_bps=100,
         )
         self.assertFalse(result["ok"])
-        self.assertEqual(result["error"], "firm_quote_nonzero_transaction_value")
+        self.assertEqual(result["error"], "firm_quote_transaction_value_mismatch")
+        self.assertNotIn("unsigned_transaction_plan", result)
+
+    async def test_native_eth_value_mismatch_fails_closed(self) -> None:
+        def mutate(body):
+            body["transaction"]["value"] = "0"
+
+        service, _ = self.make_service(body_mutator=mutate)
+        result = await service.firm_quote_plan(
+            symbol="ETH-USDG",
+            side="sell",
+            quantity="0.0001",
+            total_quote=None,
+            taker_address=TAKER,
+            eth_token=ETH,
+            usdg_token=USDG,
+            slippage_bps=100,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "firm_quote_transaction_value_mismatch")
+        self.assertEqual(result["expected_transaction_value_wei"], "100000000000000")
         self.assertNotIn("unsigned_transaction_plan", result)
 
     async def test_status_is_secret_free_and_fail_closed(self) -> None:

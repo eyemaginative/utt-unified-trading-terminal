@@ -355,13 +355,13 @@ class RobinhoodChainIndicativeQuoteRequest(BaseModel):
         default=ROBINHOOD_CHAIN_QUOTE_SYMBOL,
         min_length=1,
         max_length=32,
-        description="Canonical quote-only market symbol. RH-CHAIN.10B supports WETH-USDG only.",
+        description="Canonical quote-only market symbol. RH-CHAIN.10D.0 supports ETH-USDG only.",
     )
     side: str = Field(min_length=3, max_length=4, description="buy or sell")
     quantity: Optional[str] = Field(
         default=None,
         max_length=80,
-        description="Exact WETH input for sell quotes.",
+        description="Exact ETH input for sell quotes.",
     )
     total_quote: Optional[str] = Field(
         default=None,
@@ -388,13 +388,13 @@ class RobinhoodChainFirmQuotePlanRequest(BaseModel):
         default=ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL,
         min_length=1,
         max_length=32,
-        description="Canonical market symbol. RH-CHAIN.10C supports WETH-USDG only.",
+        description="Canonical market symbol. RH-CHAIN.10D.0 supports ETH-USDG only.",
     )
     side: str = Field(min_length=3, max_length=4, description="buy or sell")
     quantity: Optional[str] = Field(
         default=None,
         max_length=80,
-        description="Exact WETH input for sell plans.",
+        description="Exact ETH input for sell plans.",
     )
     total_quote: Optional[str] = Field(
         default=None,
@@ -1113,23 +1113,38 @@ async def robinhood_chain_quotes_status(
     if not bool(settings.robinhood_chain_effective_enabled()):
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
 
-    weth = _resolve_execution_discovery_token(db, "WETH")
+    eth = _resolve_execution_discovery_token(db, "ETH")
     usdg = _resolve_execution_discovery_token(db, "USDG")
     payload = get_robinhood_chain_quote_service().status()
     payload["firm_planning"] = get_robinhood_chain_transaction_planning_service().status()
     payload["tokens"] = {
-        "WETH": weth,
+        "ETH": eth,
         "USDG": usdg,
     }
-    payload["wallet_configured"] = (
+    wallet_row = (
         db.query(WalletAddress)
         .filter(
             WalletAddress.network == _TOKEN_REGISTRY_CHAIN,
             WalletAddress.wallet_id == _TOKEN_REGISTRY_VENUE,
             WalletAddress.asset.in_(["ALL", "*"]),
         )
+        .order_by(WalletAddress.created_at.desc())
         .first()
-        is not None
+    )
+    payload["wallet_configured"] = wallet_row is not None
+    payload["wallet"] = (
+        {
+            "id": str(wallet_row.id),
+            "wallet_id": wallet_row.wallet_id,
+            "network": wallet_row.network,
+            "asset": wallet_row.asset,
+            "address": validate_evm_address(str(wallet_row.address or "").strip()),
+            "label": wallet_row.label,
+            "owner_scope": wallet_row.owner_scope,
+            "wallet_type": "MetaMask",
+        }
+        if wallet_row is not None
+        else None
     )
     db.rollback()
     return payload
@@ -1158,7 +1173,7 @@ async def robinhood_chain_indicative_quote(
         )
 
     taker_address = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
-    weth = _resolve_execution_discovery_token(db, "WETH")
+    eth = _resolve_execution_discovery_token(db, "ETH")
     usdg = _resolve_execution_discovery_token(db, "USDG")
     result = await get_robinhood_chain_quote_service().indicative_quote(
         symbol=request.symbol,
@@ -1166,7 +1181,7 @@ async def robinhood_chain_indicative_quote(
         quantity=request.quantity,
         total_quote=request.total_quote,
         taker_address=taker_address,
-        weth_token=weth,
+        eth_token=eth,
         usdg_token=usdg,
         force_refresh=bool(request.force_refresh),
     )
@@ -1183,9 +1198,10 @@ async def robinhood_chain_firm_quote_plan(
 ) -> Dict[str, Any]:
     """Return a bounded firm 0x quote and validated unsigned transaction plan.
 
-    The endpoint reads current ERC-20 allowance with eth_call, but never builds
-    an approval transaction, prompts a wallet, signs, broadcasts, records an
-    order, or mutates ledger/FIFO/basis state.
+    Native ETH input requires no allowance and must carry the exact input in
+    transaction.value. ERC-20 input reads current allowance with eth_call. The
+    endpoint never builds an approval transaction, prompts a wallet, signs,
+    broadcasts, records an order, or mutates ledger/FIFO/basis state.
     """
     if not bool(settings.robinhood_chain_enabled):
         raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
@@ -1204,7 +1220,7 @@ async def robinhood_chain_firm_quote_plan(
         )
 
     taker_address = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
-    weth = _resolve_execution_discovery_token(db, "WETH")
+    eth = _resolve_execution_discovery_token(db, "ETH")
     usdg = _resolve_execution_discovery_token(db, "USDG")
     result = await get_robinhood_chain_transaction_planning_service().firm_quote_plan(
         symbol=request.symbol,
@@ -1212,7 +1228,7 @@ async def robinhood_chain_firm_quote_plan(
         quantity=request.quantity,
         total_quote=request.total_quote,
         taker_address=taker_address,
-        weth_token=weth,
+        eth_token=eth,
         usdg_token=usdg,
         slippage_bps=int(request.slippage_bps),
     )
@@ -1237,13 +1253,13 @@ async def robinhood_chain_synthetic_orderbook(
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
 
     taker = _resolve_robinhood_chain_quote_taker(db, taker_address)
-    weth = _resolve_execution_discovery_token(db, "WETH")
+    eth = _resolve_execution_discovery_token(db, "ETH")
     usdg = _resolve_execution_discovery_token(db, "USDG")
     result = await get_robinhood_chain_quote_service().synthetic_orderbook(
         symbol=symbol,
         depth=depth,
         taker_address=taker,
-        weth_token=weth,
+        eth_token=eth,
         usdg_token=usdg,
         force_refresh=bool(force_refresh),
     )

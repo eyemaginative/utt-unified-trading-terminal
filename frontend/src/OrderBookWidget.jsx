@@ -2246,7 +2246,7 @@ function clampBox(next) {
 
   const displayedQuoteAsset = orderBookQuoteAsset();
   const displayedBaseAsset = isRobinhoodChainVenue
-    ? String(orderBookMeta?.baseAsset || "WETH").trim().toUpperCase()
+    ? String(orderBookMeta?.baseAsset || "ETH").trim().toUpperCase()
     : normalizeOrderBookAsset(orderBookMeta?.baseAsset) || orderBookPairParts(obSymbol).base;
   const showDerivedUsd = Boolean(
     displayedQuoteAsset &&
@@ -2327,12 +2327,12 @@ function clampBox(next) {
     const lines = [
       "Synthetic 0x indicative quote sample — not a resting order.",
       `Price: ${fmtPriceCell(row?.price, row)} ${displayedQuoteAsset || "USDG"}`.trim(),
-      `Sample size: ${fmtSizeCell(row?.size)} ${displayedBaseAsset || "WETH"}`.trim(),
+      `Sample size: ${fmtSizeCell(row?.size)} ${displayedBaseAsset || "ETH"}`.trim(),
       `Direction: ${String(row?.input_amount || "—")} ${String(row?.input_asset || "—")} → ${String(row?.output_amount || "—")} ${String(row?.output_asset || "—")}`,
       `Route: ${routes || "0x"}`,
       `Cache: ${row?.cached ? "cached" : "fresh"}`,
       `Allowance: ${row?.allowance_required ? "required for later execution planning" : "not reported as required"}`,
-      "RH-CHAIN.10B cannot sign, approve, construct, submit, or record a transaction.",
+      "RH-CHAIN.10D.0 remains review-only: no signing, submission, or order recording.",
     ];
     return lines.join("\n");
   }
@@ -2511,9 +2511,13 @@ function clampBox(next) {
             ) : null}
             {isRobinhoodChainVenue ? (
               <>
-                {" "}• <b>SYNTHETIC</b>
-                {" "}• <b>NOT RESTING ORDERS</b>
+                {" "}• <b>RH-EVM</b>
+                {" "}• <b>0x</b>
+                {" "}• <b>SYNTH</b>
+                {" "}• <b>NOT RESTING</b>
                 {" "}• {orderBookMeta?.cached ? <b>CACHED</b> : orderBookMeta?.cacheMixed ? <b>MIXED CACHE</b> : <b>FRESH</b>}
+                {Array.isArray(orderBookMeta?.sources) && orderBookMeta.sources.length ? <> • Route <b>{orderBookMeta.sources.join(", ")}</b></> : null}
+                {Number(orderBookMeta?.warningCount || 0) > 0 ? <> • Warnings <b>{Number(orderBookMeta.warningCount)}</b></> : null}
                 {orderBookMeta?.spreadBps !== null && orderBookMeta?.spreadBps !== undefined ? <> • Spread <b>{Number(orderBookMeta.spreadBps).toFixed(2)} bps</b></> : null}
               </>
             ) : null}
@@ -2661,36 +2665,6 @@ function clampBox(next) {
         ) : null}
 
 
-
-        {isRobinhoodChainVenue ? (
-          <div
-            style={{
-              marginTop: 6,
-              padding: "8px 10px",
-              borderRadius: 10,
-              border: "1px solid rgba(34,211,238,0.42)",
-              background: "linear-gradient(135deg, rgba(6,25,35,0.96), rgba(26,10,46,0.92))",
-              boxShadow: "0 0 18px rgba(34,211,238,0.08), inset 0 0 18px rgba(168,85,247,0.05)",
-              color: "#d8fbff",
-              fontSize: 10,
-              lineHeight: 1.35,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontWeight: 900, letterSpacing: 0.45 }}>
-              <span style={{ color: "#67e8f9" }}>RH-EVM</span>
-              <span style={{ color: "#c084fc" }}>QUOTE-ONLY</span>
-              <span style={{ color: "#facc15" }}>SYNTHETIC LIQUIDITY</span>
-            </div>
-            <div style={{ marginTop: 3, opacity: 0.86 }}>
-              Each row is a bounded 0x indicative-price sample on mainnet chain 4663. These rows are not resting orders and cannot be submitted from RH-CHAIN.10B.
-            </div>
-            <div style={{ marginTop: 3, opacity: 0.76 }}>
-              Route: <b>{Array.isArray(orderBookMeta?.sources) && orderBookMeta.sources.length ? orderBookMeta.sources.join(", ") : "0x provider"}</b>
-              {" "}• Snapshot: <b>{orderBookMeta?.cached ? "cached" : orderBookMeta?.cacheMixed ? "mixed cache" : "fresh"}</b>
-              {Number(orderBookMeta?.warningCount || 0) > 0 ? <> • Partial warnings: <b>{Number(orderBookMeta.warningCount)}</b></> : null}
-            </div>
-          </div>
-        ) : null}
 
         {obError && <div style={{ ...styles.codeError, marginTop: 6, padding: 8 }}>{obError}</div>}
 

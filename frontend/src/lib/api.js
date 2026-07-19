@@ -474,13 +474,18 @@ export async function getOrderbook({ venue, symbol, depth = 25, force = false } 
  * assets: array like ["USD","USDT","BTC","ETH","ALI"]
  * sent as CSV to keep query simple
  */
-export async function getRobinhoodChainQuoteStatus({ timeout_ms = 30000 } = {}) {
-  const res = await http.get(`/api/robinhood_chain/quotes/status`, { timeout: timeout_ms });
+export async function getRobinhoodChainQuoteStatus({ apiBase, timeout_ms = 30000 } = {}) {
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.get(`/api/robinhood_chain/quotes/status`, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}/api/robinhood_chain/quotes/status`, { timeout: timeout_ms });
   return res.data;
 }
 
 export async function getRobinhoodChainSyntheticOrderbook({
-  symbol = "WETH-USDG",
+  symbol = "ETH-USDG",
   depth = 5,
   force_refresh = false,
   timeout_ms = 45000,
@@ -495,7 +500,7 @@ export async function getRobinhoodChainSyntheticOrderbook({
 export async function getRobinhoodChainIndicativeQuote(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
   const body = {
     provider: "0x",
-    symbol: "WETH-USDG",
+    symbol: "ETH-USDG",
     ...payload,
   };
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
@@ -510,7 +515,7 @@ export async function getRobinhoodChainIndicativeQuote(payload = {}, { apiBase, 
 export async function getRobinhoodChainFirmQuotePlan(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
   const body = {
     provider: "0x",
-    symbol: "WETH-USDG",
+    symbol: "ETH-USDG",
     slippage_bps: 100,
     ...payload,
   };

@@ -19,12 +19,12 @@ EXPECTED_CHAIN_ID = 4663
 EXPECTED_CHAIN_ID_HEX = hex(EXPECTED_CHAIN_ID)
 ZEROX_PROVIDER = "0x"
 ZEROX_FIRM_QUOTE_PATH = "/swap/allowance-holder/quote"
-ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL = "WETH-USDG"
+ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL = "ETH-USDG"
 ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS = 100
 ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS = 10
 ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS = 300
 ROBINHOOD_CHAIN_PLAN_TTL_S = 30
-ROBINHOOD_CHAIN_MAX_WETH_INPUT = Decimal("0.002")
+ROBINHOOD_CHAIN_MAX_ETH_INPUT = Decimal("0.002")
 ROBINHOOD_CHAIN_MAX_USDG_INPUT = Decimal("5")
 ROBINHOOD_CHAIN_MAX_GAS_LIMIT = 2_000_000
 ROBINHOOD_CHAIN_MAX_CALLDATA_BYTES = 131_072
@@ -214,6 +214,8 @@ class RobinhoodChainTransactionPlanningService:
 
     This service never asks a wallet to connect, never constructs an approval
     transaction, never signs, never broadcasts, and never writes UTT state.
+    Native ETH input is validated by requiring transaction.value to equal the
+    exact sell amount; ERC-20 input continues to use a fresh eth_call allowance.
     """
 
     def __init__(
@@ -269,7 +271,7 @@ class RobinhoodChainTransactionPlanningService:
             "credential_source": credential.get("source") if credential else None,
             "supported_symbols": [ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL],
             "exact_input_only": True,
-            "max_weth_input": _decimal_text(ROBINHOOD_CHAIN_MAX_WETH_INPUT),
+            "max_eth_input": _decimal_text(ROBINHOOD_CHAIN_MAX_ETH_INPUT),
             "max_usdg_input": _decimal_text(ROBINHOOD_CHAIN_MAX_USDG_INPUT),
             "default_slippage_bps": ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
             "minimum_slippage_bps": ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
@@ -277,6 +279,8 @@ class RobinhoodChainTransactionPlanningService:
             "plan_ttl_s": ROBINHOOD_CHAIN_PLAN_TTL_S,
             "allowance_holder_allowlist": sorted(ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST),
             "allowance_read_method": "eth_call",
+            "allowance_read_scope": "erc20_inputs_only",
+            "native_input_supported": True,
             "approval_transaction_enabled": False,
             "signing_enabled": False,
             "broadcast_enabled": False,
@@ -293,6 +297,8 @@ class RobinhoodChainTransactionPlanningService:
         if identity["symbol"] != symbol:
             raise ValueError("firm_quote_token_identity_mismatch")
         if int(identity["decimals"]) != int(expected["decimals"]):
+            raise ValueError("firm_quote_token_identity_mismatch")
+        if bool(identity.get("native")) != bool(expected.get("native")):
             raise ValueError("firm_quote_token_identity_mismatch")
         try:
             actual_contract = validate_evm_address(identity["contract_address"])
@@ -323,23 +329,23 @@ class RobinhoodChainTransactionPlanningService:
         side: str,
         quantity: Optional[str],
         total_quote: Optional[str],
-        weth_token: Dict[str, Any],
+        eth_token: Dict[str, Any],
         usdg_token: Dict[str, Any],
     ) -> Dict[str, Any]:
         normalized_symbol = self._normalize_symbol(symbol)
         if normalized_symbol != ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL:
             raise ValueError("unsupported_robinhood_chain_quote_symbol")
         normalized_side = self._normalize_side(side)
-        weth = self._validate_canonical_token(weth_token, "WETH")
+        eth = self._validate_canonical_token(eth_token, "ETH")
         usdg = self._validate_canonical_token(usdg_token, "USDG")
 
         if normalized_side == "sell":
-            sell_token, buy_token = weth, usdg
-            requested_atomic, requested_display = _display_amount_to_atomic(quantity, weth["decimals"])
-            if Decimal(requested_display) > ROBINHOOD_CHAIN_MAX_WETH_INPUT:
+            sell_token, buy_token = eth, usdg
+            requested_atomic, requested_display = _display_amount_to_atomic(quantity, eth["decimals"])
+            if Decimal(requested_display) > ROBINHOOD_CHAIN_MAX_ETH_INPUT:
                 raise ValueError("firm_quote_amount_exceeds_cap")
         else:
-            sell_token, buy_token = usdg, weth
+            sell_token, buy_token = usdg, eth
             requested_atomic, requested_display = _display_amount_to_atomic(total_quote, usdg["decimals"])
             if Decimal(requested_display) > ROBINHOOD_CHAIN_MAX_USDG_INPUT:
                 raise ValueError("firm_quote_amount_exceeds_cap")
@@ -361,7 +367,7 @@ class RobinhoodChainTransactionPlanningService:
         quantity: Optional[str],
         total_quote: Optional[str],
         taker_address: str,
-        weth_token: Dict[str, Any],
+        eth_token: Dict[str, Any],
         usdg_token: Dict[str, Any],
         slippage_bps: int = ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
     ) -> Dict[str, Any]:
@@ -380,7 +386,7 @@ class RobinhoodChainTransactionPlanningService:
                 side=side,
                 quantity=quantity,
                 total_quote=total_quote,
-                weth_token=weth_token,
+                eth_token=eth_token,
                 usdg_token=usdg_token,
             )
         except (ValueError, TypeError) as exc:
@@ -392,6 +398,8 @@ class RobinhoodChainTransactionPlanningService:
 
         for key in ("sell_token", "buy_token"):
             token = trade[key]
+            if bool(token.get("native")):
+                continue
             code_record = await self.rpc_client.rpc_read(
                 "eth_getCode",
                 [token["contract_address"], "latest"],
@@ -499,51 +507,89 @@ class RobinhoodChainTransactionPlanningService:
         gas_limit = _safe_int_string(transaction.get("gas") or body.get("gas"))
         gas_price = _safe_int_string(transaction.get("gasPrice") or body.get("gasPrice"))
 
-        if allowance_target is None or spender is None or transaction_to is None:
-            return _safe_failure("firm_quote_missing_verified_addresses")
+        sell_is_native = bool(trade["sell_token"].get("native"))
         allowed = ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST
-        if _address_key(allowance_target) not in allowed or _address_key(spender) not in allowed:
-            return _safe_failure(
-                "firm_quote_allowance_spender_not_allowlisted",
-                allowance_target=allowance_target,
-                allowance_spender=spender,
-            )
-        if _address_key(transaction_to) not in allowed or _address_key(transaction_to) != _address_key(allowance_target):
+        if transaction_to is None:
+            return _safe_failure("firm_quote_missing_verified_addresses")
+        if _address_key(transaction_to) not in allowed:
             return _safe_failure(
                 "firm_quote_destination_not_allowlisted",
                 transaction_destination=transaction_to,
                 allowance_target=allowance_target,
             )
+        if allowance_target is not None and _address_key(allowance_target) not in allowed:
+            return _safe_failure(
+                "firm_quote_allowance_spender_not_allowlisted",
+                allowance_target=allowance_target,
+                allowance_spender=spender,
+            )
+        if not sell_is_native:
+            if allowance_target is None or spender is None:
+                return _safe_failure("firm_quote_missing_verified_addresses")
+            if _address_key(spender) not in allowed:
+                return _safe_failure(
+                    "firm_quote_allowance_spender_not_allowlisted",
+                    allowance_target=allowance_target,
+                    allowance_spender=spender,
+                )
+            if _address_key(transaction_to) != _address_key(allowance_target):
+                return _safe_failure(
+                    "firm_quote_destination_not_allowlisted",
+                    transaction_destination=transaction_to,
+                    allowance_target=allowance_target,
+                )
+        elif allowance_issue is not None:
+            return _safe_failure("firm_quote_unexpected_native_allowance_issue")
         if not _HEX_DATA_RE.fullmatch(calldata) or calldata == "0x" or len(calldata[2:]) % 2 != 0:
             return _safe_failure("firm_quote_invalid_calldata")
         calldata_bytes = len(calldata[2:]) // 2
         if calldata_bytes <= 0 or calldata_bytes > ROBINHOOD_CHAIN_MAX_CALLDATA_BYTES:
             return _safe_failure("firm_quote_calldata_exceeds_cap", calldata_bytes=calldata_bytes)
-        if value_wei is None or int(value_wei) != 0:
-            return _safe_failure("firm_quote_nonzero_transaction_value", transaction_value_wei=value_wei)
+        expected_value_wei = int(sell_atomic) if sell_is_native else 0
+        if value_wei is None or int(value_wei) != expected_value_wei:
+            return _safe_failure(
+                "firm_quote_transaction_value_mismatch",
+                transaction_value_wei=value_wei,
+                expected_transaction_value_wei=str(expected_value_wei),
+                native_input=sell_is_native,
+            )
         if gas_limit is None or int(gas_limit) <= 0 or int(gas_limit) > ROBINHOOD_CHAIN_MAX_GAS_LIMIT:
             return _safe_failure("firm_quote_gas_limit_exceeds_cap", gas_limit=gas_limit)
 
-        allowance = await self.rpc_client.get_erc20_allowance(
-            owner_address=taker,
-            contract_address=trade["sell_token"]["contract_address"],
-            spender_address=spender,
-            decimals=int(trade["sell_token"]["decimals"]),
-            force_refresh=True,
-        )
-        if not allowance.get("ok"):
-            return _safe_failure("allowance_read_failed", allowance_read=allowance)
-
-        current_allowance_atomic = int(str(allowance.get("allowance_atomic") or "0"))
-        required_allowance_atomic = int(sell_atomic)
-        shortfall_atomic = max(0, required_allowance_atomic - current_allowance_atomic)
-        approval_required = shortfall_atomic > 0
-        provider_actual_atomic = _safe_int_string(allowance_issue.get("actual")) if allowance_issue else None
         warnings: List[str] = []
-        if provider_actual_atomic is not None and int(provider_actual_atomic) != current_allowance_atomic:
-            warnings.append("provider_allowance_actual_differs_from_fresh_rpc_read")
-        if bool(allowance_issue) != approval_required:
-            warnings.append("provider_allowance_issue_differs_from_fresh_rpc_read")
+        if sell_is_native:
+            current_allowance_atomic = 0
+            required_allowance_atomic = 0
+            shortfall_atomic = 0
+            approval_required = False
+            allowance_read_method = "not_applicable_native_input"
+            allowance_fetched_at = None
+            allowance_cached = False
+            allowance_spender = None
+        else:
+            allowance = await self.rpc_client.get_erc20_allowance(
+                owner_address=taker,
+                contract_address=trade["sell_token"]["contract_address"],
+                spender_address=spender,
+                decimals=int(trade["sell_token"]["decimals"]),
+                force_refresh=True,
+            )
+            if not allowance.get("ok"):
+                return _safe_failure("allowance_read_failed", allowance_read=allowance)
+
+            current_allowance_atomic = int(str(allowance.get("allowance_atomic") or "0"))
+            required_allowance_atomic = int(sell_atomic)
+            shortfall_atomic = max(0, required_allowance_atomic - current_allowance_atomic)
+            approval_required = shortfall_atomic > 0
+            allowance_read_method = "eth_call"
+            allowance_fetched_at = allowance.get("fetched_at")
+            allowance_cached = bool(allowance.get("cached"))
+            allowance_spender = spender
+            provider_actual_atomic = _safe_int_string(allowance_issue.get("actual")) if allowance_issue else None
+            if provider_actual_atomic is not None and int(provider_actual_atomic) != current_allowance_atomic:
+                warnings.append("provider_allowance_actual_differs_from_fresh_rpc_read")
+            if bool(allowance_issue) != approval_required:
+                warnings.append("provider_allowance_issue_differs_from_fresh_rpc_read")
         if isinstance(issues.get("balance"), dict):
             warnings.append("insufficient_sell_token_balance")
         if bool(issues.get("simulationIncomplete")):
@@ -647,11 +693,12 @@ class RobinhoodChainTransactionPlanningService:
             "total_network_fee_wei": total_network_fee,
             "total_network_fee_eth": _network_fee_eth(total_network_fee),
             "allowance": {
-                "read_method": "eth_call",
+                "applicable": not sell_is_native,
+                "read_method": allowance_read_method,
                 "owner": taker,
                 "token": trade["sell_token"],
-                "spender": spender,
-                "spender_allowlisted": True,
+                "spender": allowance_spender,
+                "spender_allowlisted": True if allowance_spender else None,
                 "current_atomic": str(current_allowance_atomic),
                 "current": current_allowance_display,
                 "required_atomic": str(required_allowance_atomic),
@@ -660,8 +707,8 @@ class RobinhoodChainTransactionPlanningService:
                 "shortfall": shortfall_display,
                 "approval_required": approval_required,
                 "approval_transaction_included": False,
-                "fetched_at": allowance.get("fetched_at"),
-                "cached": bool(allowance.get("cached")),
+                "fetched_at": allowance_fetched_at,
+                "cached": allowance_cached,
             },
             "approval_required": approval_required,
             "approval_transaction_included": False,
@@ -676,6 +723,9 @@ class RobinhoodChainTransactionPlanningService:
                 "destination_allowlisted": True,
                 "destination_allowlist": sorted(allowed),
                 "value_wei": value_wei,
+                "value_eth": _format_atomic_units(value_wei, 18),
+                "expected_value_wei": str(expected_value_wei),
+                "native_input": sell_is_native,
                 "gas_limit": gas_limit,
                 "gas_price_wei": gas_price,
                 "calldata": calldata,

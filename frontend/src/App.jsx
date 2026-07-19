@@ -5651,8 +5651,8 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
 
   useEffect(() => {
     if (selectedVenueNorm !== ROBINHOOD_CHAIN_VENUE) return;
-    if (String(obSymbol || "").trim().toUpperCase() === "WETH-USDG") return;
-    setObSymbol("WETH-USDG");
+    if (String(obSymbol || "").trim().toUpperCase() === "ETH-USDG") return;
+    setObSymbol("ETH-USDG");
   }, [selectedVenueNorm, obSymbol]);
 
   // ─────────────────────────────────────────────────────────────

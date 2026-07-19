@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Connection, clusterApiUrl } from "@solana/web3.js";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { UnifiedWalletButton } from "@jup-ag/wallet-adapter";
-import { getOrderRules, getRobinhoodChainFirmQuotePlan, getRobinhoodChainIndicativeQuote } from "./lib/api";
+import { getOrderRules, getRobinhoodChainFirmQuotePlan, getRobinhoodChainIndicativeQuote, getRobinhoodChainQuoteStatus } from "./lib/api";
 import { expandExponential } from "./lib/format";
 
 // Auth (local token) — used to gate funds actions.
@@ -29,6 +29,15 @@ const LS_OT_COUNTERPARTY_EXPIRATION_CUSTOM = "utt_counterparty_expiration_custom
 const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
 const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
 const ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT = "utt:robinhood-chain-orderbook-pick";
+const ROBINHOOD_CHAIN_NETWORK = Object.freeze({
+  chainIdHex: "0x1237",
+  chainIdDecimal: 4663,
+  chainName: "Robinhood Chain",
+  nativeCurrency: Object.freeze({ name: "Ether", symbol: "ETH", decimals: 18 }),
+  rpcUrls: Object.freeze(["https://rpc.mainnet.chain.robinhood.com/"]),
+  blockExplorerUrls: Object.freeze(["https://robinhoodchain.blockscout.com"]),
+});
+const ROBINHOOD_CHAIN_USDG_CONTRACT = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
 
 const COUNTERPARTY_FEE_TIERS = {
   slow: { label: "Slow", blocks: 18, eta: "~3 hours" },
@@ -128,9 +137,72 @@ function normalizeRobinhoodChainAmountText(value) {
   return fraction ? `${whole}.${fraction}` : whole;
 }
 
+function getRobinhoodChainMetaMaskProvider() {
+  if (typeof window === "undefined") return null;
+  const injected = window.ethereum;
+  if (!injected) return null;
+  if (Array.isArray(injected.providers)) {
+    const exact = injected.providers.find((provider) => provider?.isMetaMask);
+    if (exact) return exact;
+  }
+  return injected?.isMetaMask ? injected : null;
+}
+
+function hasInjectedRobinhoodChainEvmProvider() {
+  return typeof window !== "undefined" && !!window.ethereum;
+}
+
+function normalizeRobinhoodChainEvmAddress(value) {
+  const address = String(value || "").trim();
+  return /^0x[0-9a-fA-F]{40}$/.test(address) ? address.toLowerCase() : "";
+}
+
+function normalizeRobinhoodChainEvmChainId(value) {
+  try {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "";
+    return `0x${BigInt(raw).toString(16)}`;
+  } catch {
+    return "";
+  }
+}
+
+function robinhoodChainRpcBigInt(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw === "0x") return 0n;
+  return BigInt(raw);
+}
+
+function robinhoodChainFormatAtomicUnits(value, decimals) {
+  try {
+    const atomic = typeof value === "bigint" ? value : BigInt(String(value || "0"));
+    const places = Math.max(0, Math.min(18, Number(decimals) || 0));
+    if (places === 0) return atomic.toString();
+    const scale = 10n ** BigInt(places);
+    const whole = atomic / scale;
+    const fraction = (atomic % scale).toString().padStart(places, "0").replace(/0+$/, "");
+    return fraction ? `${whole}.${fraction}` : whole.toString();
+  } catch {
+    return "";
+  }
+}
+
+function robinhoodChainBalanceOfCalldata(address) {
+  const normalized = normalizeRobinhoodChainEvmAddress(address);
+  if (!normalized) return "";
+  return `0x70a08231${normalized.slice(2).padStart(64, "0")}`;
+}
+
+function robinhoodChainWalletErrorMessage(error, fallback) {
+  const code = Number(error?.code);
+  if (code === 4001) return "MetaMask request was declined.";
+  if (code === 4902) return "Robinhood Chain is not installed in MetaMask. Use Switch / Add Chain.";
+  return String(error?.message || error || fallback || "MetaMask request failed.");
+}
+
 function robinhoodChainQuoteRules(symbol) {
   const normalized = normalizeRobinhoodChainQuoteSymbol(symbol);
-  const supported = normalized === "WETH-USDG";
+  const supported = normalized === "ETH-USDG";
   return {
     venue: "robinhood_chain",
     symbol_canon: normalized,
@@ -147,14 +219,14 @@ function robinhoodChainQuoteRules(symbol) {
     supports_post_only: false,
     supported_tifs: [],
     supported_order_types: ["quote"],
-    suggested_symbol: supported ? null : "WETH-USDG",
+    suggested_symbol: supported ? null : "ETH-USDG",
     quote_only: true,
     synthetic_orderbook: true,
     execution_enabled: false,
-    errors: supported ? [] : ["RH-CHAIN.10C supports WETH-USDG only"],
+    errors: supported ? [] : ["RH-CHAIN.10D.0 supports ETH-USDG only"],
     warnings: [
       "Synthetic 0x indicative quote samples; not resting orders.",
-      "RH-CHAIN.10C may fetch a bounded firm quote and expose a validated unsigned transaction plan for review only.",
+      "RH-CHAIN.10D.0 may fetch a bounded firm quote and expose a validated unsigned transaction plan for review only.",
       "No approval transaction, wallet prompt, signing, broadcast, or order recording.",
     ],
   };
@@ -2968,6 +3040,25 @@ export default function OrderTicketWidget({
   const [robinhoodChainSlippageBps, setRobinhoodChainSlippageBps] = useState(100);
   const [robinhoodChainFirmPlanClock, setRobinhoodChainFirmPlanClock] = useState(0);
   const robinhoodChainFirmPlanReqRef = useRef(0);
+  const robinhoodChainWalletReqRef = useRef(0);
+  const robinhoodChainMetaMaskProviderRef = useRef(null);
+  const [robinhoodChainWalletBusy, setRobinhoodChainWalletBusy] = useState(false);
+  const [robinhoodChainWalletError, setRobinhoodChainWalletError] = useState("");
+  const [robinhoodChainWalletNotice, setRobinhoodChainWalletNotice] = useState("");
+  const [robinhoodChainWalletState, setRobinhoodChainWalletState] = useState(() => ({
+    checked: false,
+    providerAvailable: false,
+    injectedAvailable: false,
+    connectedAddress: "",
+    chainId: "",
+    savedAddress: "",
+    savedWalletType: "MetaMask",
+    savedWalletLabel: "",
+    ethBalance: null,
+    usdgBalance: null,
+    balancesFetchedAt: null,
+    lastEvent: "init",
+  }));
 
   const venueLabel = hideVenueNames ? "••••" : String(effectiveVenue || "");
   const tradeGate = venueTradeGate && typeof venueTradeGate === "object" ? venueTradeGate : null;
@@ -3049,6 +3140,226 @@ export default function OrderTicketWidget({
   }, [effectiveVenue]);
   const isCounterpartyVenue = useMemo(() => isCounterpartyVenueKey(effectiveVenue), [effectiveVenue]);
   const isRobinhoodChainVenue = useMemo(() => isRobinhoodChainVenueKey(effectiveVenue), [effectiveVenue]);
+
+  async function readRobinhoodChainWalletState({ requestAccounts = false, reason = "refresh", showBusy = false } = {}) {
+    const reqId = ++robinhoodChainWalletReqRef.current;
+    if (showBusy) setRobinhoodChainWalletBusy(true);
+    setRobinhoodChainWalletError("");
+    if (requestAccounts) setRobinhoodChainWalletNotice("");
+
+    let status = null;
+    let statusError = "";
+    try {
+      status = await getRobinhoodChainQuoteStatus({ apiBase, timeout_ms: 30000 });
+    } catch (error) {
+      statusError = robinhoodChainQuoteError(error);
+    }
+
+    const savedAddress = normalizeRobinhoodChainEvmAddress(status?.wallet?.address);
+    const savedWalletType = String(status?.wallet?.wallet_type || "MetaMask").trim() || "MetaMask";
+    const savedWalletLabel = String(status?.wallet?.label || "").trim();
+    const provider = robinhoodChainMetaMaskProviderRef.current || getRobinhoodChainMetaMaskProvider();
+    robinhoodChainMetaMaskProviderRef.current = provider;
+
+    if (!provider) {
+      if (robinhoodChainWalletReqRef.current === reqId) {
+        setRobinhoodChainWalletState((current) => ({
+          ...current,
+          checked: true,
+          providerAvailable: false,
+          injectedAvailable: hasInjectedRobinhoodChainEvmProvider(),
+          connectedAddress: "",
+          chainId: "",
+          savedAddress,
+          savedWalletType,
+          savedWalletLabel,
+          ethBalance: null,
+          usdgBalance: null,
+          balancesFetchedAt: null,
+          lastEvent: reason,
+        }));
+        if (statusError) setRobinhoodChainWalletError(statusError);
+      }
+      if (showBusy && robinhoodChainWalletReqRef.current === reqId) setRobinhoodChainWalletBusy(false);
+      return { provider: null, connectedAddress: "", chainId: "", status };
+    }
+
+    try {
+      const accounts = requestAccounts
+        ? await provider.request({ method: "eth_requestAccounts" })
+        : await provider.request({ method: "eth_accounts" });
+      const chainId = normalizeRobinhoodChainEvmChainId(
+        await provider.request({ method: "eth_chainId" })
+      );
+      const connectedAddress = normalizeRobinhoodChainEvmAddress(
+        Array.isArray(accounts) ? accounts[0] : ""
+      );
+
+      let ethBalance = null;
+      let usdgBalance = null;
+      let balancesFetchedAt = null;
+      if (connectedAddress && chainId === ROBINHOOD_CHAIN_NETWORK.chainIdHex) {
+        const balanceOfData = robinhoodChainBalanceOfCalldata(connectedAddress);
+        const [ethResult, usdgResult] = await Promise.allSettled([
+          provider.request({ method: "eth_getBalance", params: [connectedAddress, "latest"] }),
+          provider.request({
+            method: "eth_call",
+            params: [{ to: ROBINHOOD_CHAIN_USDG_CONTRACT, data: balanceOfData }, "latest"],
+          }),
+        ]);
+        if (ethResult.status === "fulfilled") {
+          ethBalance = robinhoodChainFormatAtomicUnits(robinhoodChainRpcBigInt(ethResult.value), 18) || null;
+        }
+        if (usdgResult.status === "fulfilled") {
+          usdgBalance = robinhoodChainFormatAtomicUnits(robinhoodChainRpcBigInt(usdgResult.value), 6) || null;
+        }
+        balancesFetchedAt = new Date().toISOString();
+      }
+
+      if (robinhoodChainWalletReqRef.current === reqId) {
+        setRobinhoodChainWalletState({
+          checked: true,
+          providerAvailable: true,
+          injectedAvailable: true,
+          connectedAddress,
+          chainId,
+          savedAddress,
+          savedWalletType,
+          savedWalletLabel,
+          ethBalance,
+          usdgBalance,
+          balancesFetchedAt,
+          lastEvent: reason,
+        });
+        if (statusError) setRobinhoodChainWalletError(statusError);
+        if (requestAccounts && connectedAddress) {
+          setRobinhoodChainWalletNotice("MetaMask connected to UTT. No signature or transaction was requested.");
+        }
+      }
+      return { provider, connectedAddress, chainId, status };
+    } catch (error) {
+      if (robinhoodChainWalletReqRef.current === reqId) {
+        setRobinhoodChainWalletError(robinhoodChainWalletErrorMessage(error, "Unable to read MetaMask state."));
+      }
+      return { provider, connectedAddress: "", chainId: "", status, error };
+    } finally {
+      if (showBusy && robinhoodChainWalletReqRef.current === reqId) setRobinhoodChainWalletBusy(false);
+    }
+  }
+
+  async function connectRobinhoodChainMetaMask() {
+    await readRobinhoodChainWalletState({ requestAccounts: true, reason: "connect", showBusy: true });
+  }
+
+  async function refreshRobinhoodChainMetaMask() {
+    await readRobinhoodChainWalletState({ requestAccounts: false, reason: "refresh", showBusy: true });
+  }
+
+  async function switchRobinhoodChainMetaMaskNetwork() {
+    const provider = robinhoodChainMetaMaskProviderRef.current || getRobinhoodChainMetaMaskProvider();
+    if (!provider) {
+      setRobinhoodChainWalletError("MetaMask was not detected.");
+      return;
+    }
+    setRobinhoodChainWalletBusy(true);
+    setRobinhoodChainWalletError("");
+    setRobinhoodChainWalletNotice("");
+    try {
+      try {
+        await provider.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: ROBINHOOD_CHAIN_NETWORK.chainIdHex }],
+        });
+      } catch (error) {
+        if (Number(error?.code) !== 4902) throw error;
+        await provider.request({
+          method: "wallet_addEthereumChain",
+          params: [{
+            chainId: ROBINHOOD_CHAIN_NETWORK.chainIdHex,
+            chainName: ROBINHOOD_CHAIN_NETWORK.chainName,
+            nativeCurrency: ROBINHOOD_CHAIN_NETWORK.nativeCurrency,
+            rpcUrls: [...ROBINHOOD_CHAIN_NETWORK.rpcUrls],
+            blockExplorerUrls: [...ROBINHOOD_CHAIN_NETWORK.blockExplorerUrls],
+          }],
+        });
+        await provider.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: ROBINHOOD_CHAIN_NETWORK.chainIdHex }],
+        });
+      }
+      setRobinhoodChainWalletNotice("MetaMask is set to Robinhood Chain mainnet.");
+      await readRobinhoodChainWalletState({ requestAccounts: false, reason: "network_switch" });
+    } catch (error) {
+      setRobinhoodChainWalletError(robinhoodChainWalletErrorMessage(error, "Unable to switch MetaMask network."));
+    } finally {
+      setRobinhoodChainWalletBusy(false);
+    }
+  }
+
+  function disconnectRobinhoodChainWalletFromUtt() {
+    robinhoodChainWalletReqRef.current += 1;
+    setRobinhoodChainWalletState((current) => ({
+      ...current,
+      connectedAddress: "",
+      ethBalance: null,
+      usdgBalance: null,
+      balancesFetchedAt: null,
+      lastEvent: "local_disconnect",
+    }));
+    setRobinhoodChainWalletError("");
+    setRobinhoodChainWalletNotice("UTT local connection state cleared. MetaMask itself was not locked or disconnected.");
+  }
+
+  useEffect(() => {
+    if (!isRobinhoodChainVenue || typeof window === "undefined") return undefined;
+    let active = true;
+    const provider = getRobinhoodChainMetaMaskProvider();
+    robinhoodChainMetaMaskProviderRef.current = provider;
+
+    const onAccountsChanged = () => {
+      if (!active) return;
+      void readRobinhoodChainWalletState({ requestAccounts: false, reason: "accountsChanged" });
+    };
+    const onChainChanged = () => {
+      if (!active) return;
+      void readRobinhoodChainWalletState({ requestAccounts: false, reason: "chainChanged" });
+    };
+
+    try {
+      provider?.on?.("accountsChanged", onAccountsChanged);
+      provider?.on?.("chainChanged", onChainChanged);
+    } catch {
+      // EIP-1193 events are optional; explicit controls remain available.
+    }
+    void readRobinhoodChainWalletState({ requestAccounts: false, reason: "initial_silent_read" });
+
+    return () => {
+      active = false;
+      try {
+        provider?.removeListener?.("accountsChanged", onAccountsChanged);
+        provider?.removeListener?.("chainChanged", onChainChanged);
+      } catch {
+        // ignore provider cleanup failures
+      }
+    };
+  }, [isRobinhoodChainVenue, apiBase]);
+
+  const robinhoodChainConnectedAddress = normalizeRobinhoodChainEvmAddress(robinhoodChainWalletState.connectedAddress);
+  const robinhoodChainSavedAddress = normalizeRobinhoodChainEvmAddress(robinhoodChainWalletState.savedAddress);
+  const robinhoodChainWalletConnected = !!robinhoodChainConnectedAddress;
+  const robinhoodChainWalletOnExpectedChain = normalizeRobinhoodChainEvmChainId(robinhoodChainWalletState.chainId) === ROBINHOOD_CHAIN_NETWORK.chainIdHex;
+  const robinhoodChainWalletMatchesSaved = Boolean(
+    robinhoodChainConnectedAddress &&
+    robinhoodChainSavedAddress &&
+    robinhoodChainConnectedAddress === robinhoodChainSavedAddress
+  );
+  const robinhoodChainWalletReady = Boolean(
+    robinhoodChainWalletState.providerAvailable &&
+    robinhoodChainWalletConnected &&
+    robinhoodChainWalletOnExpectedChain &&
+    robinhoodChainWalletMatchesSaved
+  );
+
   useEffect(() => {
     robinhoodChainQuoteReqRef.current += 1;
     robinhoodChainFirmPlanReqRef.current += 1;
@@ -3068,7 +3379,7 @@ export default function OrderTicketWidget({
       const row = detail?.row && typeof detail.row === "object" ? detail.row : null;
       if (!row || row?.synthetic !== true || row?.quote_only !== true) return;
       const eventSymbol = normalizeRobinhoodChainQuoteSymbol(detail?.symbol || otSymbol);
-      if (eventSymbol !== "WETH-USDG") return;
+      if (eventSymbol !== "ETH-USDG") return;
 
       const bookSide = String(detail?.book_side || row?.side || "").trim().toLowerCase();
       const nextSide = bookSide === "ask" ? "buy" : bookSide === "bid" ? "sell" : null;
@@ -5351,8 +5662,18 @@ export default function OrderTicketWidget({
   const baseBal = useMemo(() => (baseAsset ? (balAvail?.[baseAsset] ?? null) : null), [balAvail, baseAsset]);
   const quoteBal = useMemo(() => (quoteAsset ? (balAvail?.[quoteAsset] ?? null) : null), [balAvail, quoteAsset]);
 
-  const baseAvail = useMemo(() => toFiniteOrNull(baseBal?.available), [baseBal]);
-  const quoteAvail = useMemo(() => toFiniteOrNull(quoteBal?.available), [quoteBal]);
+  const baseAvail = useMemo(
+    () => isRobinhoodChainVenue
+      ? toFiniteOrNull(robinhoodChainWalletState.ethBalance)
+      : toFiniteOrNull(baseBal?.available),
+    [isRobinhoodChainVenue, robinhoodChainWalletState.ethBalance, baseBal]
+  );
+  const quoteAvail = useMemo(
+    () => isRobinhoodChainVenue
+      ? toFiniteOrNull(robinhoodChainWalletState.usdgBalance)
+      : toFiniteOrNull(quoteBal?.available),
+    [isRobinhoodChainVenue, robinhoodChainWalletState.usdgBalance, quoteBal]
+  );
 
   const relevantAvailLabel = useMemo(() => {
     if (side === "sell") return baseAsset ? `${baseAsset} available` : "Base available";
@@ -5768,10 +6089,10 @@ export default function OrderTicketWidget({
 
     if (isRobinhoodChainVenue) {
       const symbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
-      lines.push("Robinhood Chain RH-CHAIN.10C can request bounded 0x indicative prices and a validated unsigned firm-quote plan for review. It cannot construct an approval transaction, prompt a wallet, sign, broadcast, or record an order.");
-      lines.push("BUY uses Total (USDG) as exact input. SELL uses Qty (WETH) as exact input.");
-      if (symbol !== "WETH-USDG") {
-        lines.push("RH-CHAIN.10C supports WETH-USDG only.");
+      lines.push("Robinhood Chain RH-CHAIN.10D.0 can request bounded 0x indicative prices and a validated unsigned firm-quote plan for review. It cannot construct an approval transaction, prompt a wallet, sign, broadcast, or record an order.");
+      lines.push("BUY uses Total (USDG) as exact input. SELL uses Qty (ETH) as exact input.");
+      if (symbol !== "ETH-USDG") {
+        lines.push("RH-CHAIN.10D.0 supports ETH-USDG only.");
         fails.push("robinhood_chain_symbol_unsupported");
       }
       if (side === "buy" && totalQuoteNum === null) {
@@ -5779,15 +6100,15 @@ export default function OrderTicketWidget({
         fails.push("robinhood_chain_buy_total_missing");
       }
       if (side === "sell" && qtyNum === null) {
-        lines.push("Enter Qty (WETH) for a SELL quote.");
+        lines.push("Enter Qty (ETH) for a SELL quote.");
         fails.push("robinhood_chain_sell_qty_missing");
       }
       if (side === "buy" && totalQuoteNum !== null && totalQuoteNum > 5 + 1e-12) {
-        lines.push("RH-CHAIN.10C BUY inputs are capped at 5 USDG.");
+        lines.push("RH-CHAIN.10D.0 BUY inputs are capped at 5 USDG.");
         fails.push("robinhood_chain_quote_cap");
       }
       if (side === "sell" && qtyNum !== null && qtyNum > 0.002 + 1e-12) {
-        lines.push("RH-CHAIN.10C SELL inputs are capped at 0.002 WETH.");
+        lines.push("RH-CHAIN.10D.0 SELL inputs are capped at 0.002 ETH.");
         fails.push("robinhood_chain_quote_cap");
       }
       if (robinhoodChainQuoteErrorText) {
@@ -5795,7 +6116,7 @@ export default function OrderTicketWidget({
       }
       if (robinhoodChainQuote?.ok) {
         lines.push(
-          `Latest quote: ${robinhoodChainQuote.input_amount} ${robinhoodChainQuote.input_asset} → ${robinhoodChainQuote.output_amount} ${robinhoodChainQuote.output_asset} at ${robinhoodChainQuote.effective_price} USDG/WETH.`
+          `Latest quote: ${robinhoodChainQuote.input_amount} ${robinhoodChainQuote.input_asset} → ${robinhoodChainQuote.output_amount} ${robinhoodChainQuote.output_asset} at ${robinhoodChainQuote.effective_price} USDG/ETH.`
         );
       }
       return {
@@ -6108,7 +6429,7 @@ export default function OrderTicketWidget({
 
     if (isCounterpartyVenue) return qtyNum !== null && pxNum !== null;
     if (isRobinhoodChainVenue) {
-      if (normalizeRobinhoodChainQuoteSymbol(otSymbol) !== "WETH-USDG") return false;
+      if (normalizeRobinhoodChainQuoteSymbol(otSymbol) !== "ETH-USDG") return false;
       return side === "buy" ? totalQuoteNum !== null : qtyNum !== null;
     }
 
@@ -6174,13 +6495,15 @@ export default function OrderTicketWidget({
       normalizeRobinhoodChainAmountText(robinhoodChainFirmPlan?.input_amount) !== normalizeRobinhoodChainAmountText(currentInput) ||
       normalizeRobinhoodChainQuoteSymbol(robinhoodChainFirmPlan?.symbol) !== normalizeRobinhoodChainQuoteSymbol(otSymbol) ||
       Number(robinhoodChainFirmPlan?.slippage_bps) !== Number(robinhoodChainSlippageBps) ||
+      normalizeRobinhoodChainEvmAddress(robinhoodChainFirmPlan?.unsigned_transaction_plan?.from) !== robinhoodChainConnectedAddress ||
       (Number.isFinite(expiresAt) && Date.now() >= expiresAt)
     );
-  }, [isRobinhoodChainVenue, robinhoodChainFirmPlan, side, totalQuote, qty, otSymbol, robinhoodChainSlippageBps, robinhoodChainFirmPlanClock]);
+  }, [isRobinhoodChainVenue, robinhoodChainFirmPlan, side, totalQuote, qty, otSymbol, robinhoodChainSlippageBps, robinhoodChainFirmPlanClock, robinhoodChainConnectedAddress]);
 
   const canBuildRobinhoodChainFirmPlan = Boolean(
     isRobinhoodChainVenue &&
     canSubmit &&
+    robinhoodChainWalletReady &&
     robinhoodChainQuote?.ok &&
     !robinhoodChainQuoteStale &&
     !robinhoodChainQuoteLoading &&
@@ -7205,8 +7528,8 @@ async function submitLimitOrder() {
   async function requestRobinhoodChainQuote(forceRefresh = true) {
     if (!isRobinhoodChainVenue || robinhoodChainQuoteLoading) return;
     const symbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
-    if (symbol !== "WETH-USDG") {
-      const msg = "RH-CHAIN.10C supports WETH-USDG only.";
+    if (symbol !== "ETH-USDG") {
+      const msg = "RH-CHAIN.10D.0 supports ETH-USDG only.";
       setRobinhoodChainQuoteErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -7216,7 +7539,7 @@ async function submitLimitOrder() {
     if (!String(inputAmount || "").trim()) {
       const msg = side === "buy"
         ? "Enter Total (USDG) before requesting a BUY quote."
-        : "Enter Qty (WETH) before requesting a SELL quote.";
+        : "Enter Qty (ETH) before requesting a SELL quote.";
       setRobinhoodChainQuoteErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -7240,6 +7563,7 @@ async function submitLimitOrder() {
           side,
           quantity: side === "sell" ? String(qty || "").trim() : null,
           total_quote: side === "buy" ? String(totalQuote || "").trim() : null,
+          taker_address: robinhoodChainWalletReady ? robinhoodChainConnectedAddress : null,
           force_refresh: !!forceRefresh,
         },
         { apiBase, timeout_ms: 30000 }
@@ -7281,7 +7605,15 @@ async function submitLimitOrder() {
   async function requestRobinhoodChainFirmPlan() {
     if (!isRobinhoodChainVenue || robinhoodChainFirmPlanLoading) return;
     if (!canBuildRobinhoodChainFirmPlan) {
-      const msg = "Request a fresh indicative quote for the current WETH-USDG input before building an unsigned firm plan.";
+      const msg = !robinhoodChainWalletState.providerAvailable
+        ? "MetaMask is required before building an unsigned plan."
+        : !robinhoodChainWalletConnected
+          ? "Connect MetaMask before building an unsigned plan."
+          : !robinhoodChainWalletOnExpectedChain
+            ? "Switch MetaMask to Robinhood Chain mainnet (chain ID 4663)."
+            : !robinhoodChainWalletMatchesSaved
+              ? "The connected MetaMask account must match the saved Robinhood Chain wallet."
+              : "Request a fresh indicative quote for the current ETH-USDG input before building an unsigned firm plan.";
       setRobinhoodChainFirmPlanErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -7294,11 +7626,12 @@ async function submitLimitOrder() {
       const data = await getRobinhoodChainFirmQuotePlan(
         {
           provider: "0x",
-          symbol: "WETH-USDG",
+          symbol: "ETH-USDG",
           side,
           quantity: side === "sell" ? String(qty || "").trim() : null,
           total_quote: side === "buy" ? String(totalQuote || "").trim() : null,
           slippage_bps: Number(robinhoodChainSlippageBps),
+          taker_address: robinhoodChainConnectedAddress,
         },
         { apiBase, timeout_ms: 30000 }
       );
@@ -8259,7 +8592,7 @@ async function submitLimitOrder() {
 
         </div>
 
-        {showTradeGateStatus && tradeGateDisplay && (
+        {!isRobinhoodChainVenue && showTradeGateStatus && tradeGateDisplay && (
           <div
             style={{
               ...noticeBoxBaseStyle,
@@ -8276,7 +8609,7 @@ async function submitLimitOrder() {
           </div>
         )}
 
-        {rulesBanner && (
+        {!isRobinhoodChainVenue && rulesBanner && (
           <div
             style={{
               ...noticeBoxBaseStyle,
@@ -8290,7 +8623,7 @@ async function submitLimitOrder() {
           </div>
         )}
 
-        {preTrade && (
+        {!isRobinhoodChainVenue && preTrade && (
           <div
             style={{
               ...noticeBoxBaseStyle,
@@ -8312,195 +8645,132 @@ async function submitLimitOrder() {
         {isRobinhoodChainVenue && (
           <div
             style={{
-              marginTop: 7,
-              padding: "10px 11px",
-              borderRadius: 12,
-              border: (robinhoodChainQuoteErrorText || robinhoodChainFirmPlanErrorText)
+              marginTop: 6,
+              padding: "7px 8px",
+              borderRadius: 10,
+              border: (robinhoodChainQuoteErrorText || robinhoodChainFirmPlanErrorText || robinhoodChainWalletError)
                 ? "1px solid rgba(251, 113, 133, 0.58)"
-                : "1px solid rgba(34, 211, 238, 0.52)",
-              background: "linear-gradient(135deg, rgba(8, 47, 73, 0.48), rgba(76, 29, 149, 0.24) 58%, rgba(112, 26, 117, 0.20))",
+                : robinhoodChainWalletReady
+                  ? "1px solid rgba(74, 222, 128, 0.44)"
+                  : "1px solid rgba(34, 211, 238, 0.42)",
+              background: "linear-gradient(135deg, rgba(8, 47, 73, 0.30), rgba(30, 12, 58, 0.24))",
               color: "#dff9ff",
-              boxShadow: "0 0 0 1px rgba(168, 85, 247, 0.12) inset, 0 0 22px rgba(34, 211, 238, 0.10)",
             }}
-            title="Robinhood Chain RH-CHAIN.10C supports bounded indicative prices plus a validated firm quote and unsigned transaction plan for review. It does not build approvals, prompt MetaMask, sign, broadcast, or write an order."
+            title="RH-CHAIN.10D.0: native ETH-USDG quote and unsigned-plan review. No signing, broadcast, approval construction, or order recording."
           >
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <div style={{ fontSize: 12, fontWeight: 950, letterSpacing: 0.65, color: "#67e8f9" }}>
-                RH-EVM · 0x QUOTE + UNSIGNED PLAN
-              </div>
-              <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-                <span style={{ padding: "2px 7px", borderRadius: 999, border: "1px solid rgba(217, 70, 239, 0.55)", color: "#f5d0fe", fontSize: 10, fontWeight: 900 }}>
-                  REVIEW ONLY
-                </span>
-                <span style={{ padding: "2px 7px", borderRadius: 999, border: "1px solid rgba(34, 211, 238, 0.55)", color: "#a5f3fc", fontSize: 10, fontWeight: 900 }}>
-                  NO SIGN / NO SEND
-                </span>
-                {robinhoodChainQuote?.ok && (
-                  <span style={{ padding: "2px 7px", borderRadius: 999, border: robinhoodChainQuoteStale ? "1px solid rgba(251, 191, 36, 0.65)" : "1px solid rgba(74, 222, 128, 0.55)", color: robinhoodChainQuoteStale ? "#fde68a" : "#bbf7d0", fontSize: 10, fontWeight: 900 }}>
-                    {robinhoodChainQuoteStale ? "STALE INPUT" : robinhoodChainQuote.cached ? "CACHED" : "FRESH"}
-                  </span>
-                )}
-                {robinhoodChainFirmPlan?.ok && (
-                  <span style={{ padding: "2px 7px", borderRadius: 999, border: robinhoodChainFirmPlanStale ? "1px solid rgba(251, 191, 36, 0.65)" : robinhoodChainFirmPlan?.approval_required ? "1px solid rgba(251, 191, 36, 0.65)" : "1px solid rgba(74, 222, 128, 0.55)", color: robinhoodChainFirmPlanStale || robinhoodChainFirmPlan?.approval_required ? "#fde68a" : "#bbf7d0", fontSize: 10, fontWeight: 900 }}>
-                    {robinhoodChainFirmPlanStale ? "PLAN STALE" : robinhoodChainFirmPlan?.approval_required ? "APPROVAL REQUIRED" : "PLAN READY"}
-                  </span>
-                )}
-              </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10.5, fontWeight: 900 }}>
+              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-EVM · 0x · ETH-USDG · 10D.0</span>
+              <span style={{ color: robinhoodChainWalletState.providerAvailable ? "#bbf7d0" : "#fde68a" }}>
+                MetaMask {robinhoodChainWalletState.providerAvailable ? "detected" : "unavailable"}
+              </span>
+              <span style={{ color: robinhoodChainWalletConnected ? "#bbf7d0" : "#fde68a" }}>
+                {robinhoodChainWalletConnected ? "connected" : "disconnected"}
+              </span>
+              <span style={{ color: robinhoodChainWalletOnExpectedChain ? "#bbf7d0" : "#fde68a" }}>
+                Chain {robinhoodChainWalletOnExpectedChain ? "4663" : robinhoodChainWalletState.chainId || "—"}
+              </span>
+              <span style={{ color: robinhoodChainWalletMatchesSaved ? "#bbf7d0" : "#fde68a" }}>
+                Saved match {robinhoodChainWalletMatchesSaved ? "YES" : "NO"}
+              </span>
+              <span style={{ color: "#c4b5fd" }}>REVIEW ONLY · NO SIGN / NO SEND</span>
             </div>
 
+            <div style={{ marginTop: 5, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 10.5, color: "#bae6fd" }}>
+              <span>Wallet: <b>{robinhoodChainWalletState.savedWalletType || "MetaMask"}</b></span>
+              <span>Account: <b>{hideTableData ? "••••" : robinhoodChainConnectedAddress ? shortenWalletAddress(robinhoodChainConnectedAddress, 8, 6) : "—"}</b></span>
+              <span>Saved: <b>{hideTableData ? "••••" : robinhoodChainSavedAddress ? shortenWalletAddress(robinhoodChainSavedAddress, 8, 6) : "—"}</b></span>
+              <span>ETH: <b>{hideTableData ? "••••" : robinhoodChainWalletState.ethBalance ?? "—"}</b></span>
+              <span>USDG: <b>{hideTableData ? "••••" : robinhoodChainWalletState.usdgBalance ?? "—"}</b></span>
+              <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={connectRobinhoodChainMetaMask}>
+                {robinhoodChainWalletConnected ? "Reconnect" : "Connect"}
+              </button>
+              <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={refreshRobinhoodChainMetaMask}>
+                Refresh
+              </button>
+              {!robinhoodChainWalletOnExpectedChain && (
+                <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={switchRobinhoodChainMetaMaskNetwork}>
+                  Switch / Add Chain
+                </button>
+              )}
+              {robinhoodChainWalletConnected && (
+                <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={disconnectRobinhoodChainWalletFromUtt} title="Clear UTT local state only; MetaMask itself remains unlocked and authorized according to its own settings.">
+                  Disconnect UTT
+                </button>
+              )}
+            </div>
+
+            {robinhoodChainWalletError && (
+              <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>{hideTableData ? "Robinhood Chain wallet status unavailable." : robinhoodChainWalletError}</div>
+            )}
+            {!robinhoodChainWalletError && robinhoodChainWalletNotice && (
+              <div style={{ marginTop: 5, color: "#a5f3fc", fontSize: 10.5 }}>{robinhoodChainWalletNotice}</div>
+            )}
+            {!robinhoodChainWalletMatchesSaved && robinhoodChainWalletConnected && robinhoodChainSavedAddress && (
+              <div style={{ marginTop: 5, color: "#fde68a", fontSize: 10.5 }}>Connected MetaMask account does not match the saved Robinhood Chain wallet. Unsigned-plan building is blocked.</div>
+            )}
+
             {robinhoodChainQuoteErrorText && (
-              <div style={{ marginTop: 7, padding: "6px 8px", borderRadius: 8, background: "rgba(127, 29, 29, 0.28)", border: "1px solid rgba(251, 113, 133, 0.35)", color: "#fecdd3", fontSize: 11 }}>
-                {hideTableData ? "Latest indicative quote request failed." : robinhoodChainQuoteErrorText}
-              </div>
+              <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>{hideTableData ? "Latest indicative quote request failed." : robinhoodChainQuoteErrorText}</div>
             )}
 
             {robinhoodChainQuote?.ok ? (
-              <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 7 }}>
-                {[
-                  ["Direction", `${String(robinhoodChainQuote.side || side).toUpperCase()} WETH`],
-                  ["Input", `${robinhoodChainQuote.input_amount || "—"} ${robinhoodChainQuote.input_asset || ""}`.trim()],
-                  ["Indicative output", `${robinhoodChainQuote.output_amount || "—"} ${robinhoodChainQuote.output_asset || ""}`.trim()],
-                  ["USDG / WETH", robinhoodChainQuote.effective_price || "—"],
-                  ["Minimum received", robinhoodChainQuote.minimum_received ? `${robinhoodChainQuote.minimum_received} ${robinhoodChainQuote.minimum_received_asset || ""}`.trim() : "—"],
-                  ["Price impact", robinhoodChainQuote.price_impact_bps !== null && robinhoodChainQuote.price_impact_bps !== undefined ? `${robinhoodChainQuote.price_impact_bps} bps` : "—"],
-                  ["Route", Array.isArray(robinhoodChainQuote.route_sources) && robinhoodChainQuote.route_sources.length ? robinhoodChainQuote.route_sources.join(" + ") : robinhoodChainQuote.route_source || "—"],
-                  ["Network fee", robinhoodChainQuote.total_network_fee_eth ? `${robinhoodChainQuote.total_network_fee_eth} ETH` : "—"],
-                  ["0x fee", robinhoodChainQuote.zero_x_fee?.amount ? `${robinhoodChainQuote.zero_x_fee.amount} ${robinhoodChainQuote.zero_x_fee.asset || ""}`.trim() : "—"],
-                  ["Allowance", robinhoodChainQuote.allowance_required ? "REQUIRED" : "Not required"],
-                  ["Spender", robinhoodChainQuote.allowance_spender ? shortenWalletAddress(robinhoodChainQuote.allowance_spender, 8, 6) : "—"],
-                  ["Fetched", robinhoodChainQuote.fetched_at ? String(robinhoodChainQuote.fetched_at) : "—"],
-                ].map(([label, value]) => (
-                  <div key={label} style={{ padding: "6px 7px", borderRadius: 8, background: "rgba(2, 6, 23, 0.42)", border: "1px solid rgba(125, 211, 252, 0.16)", minWidth: 0 }}>
-                    <div style={{ fontSize: 9, letterSpacing: 0.55, textTransform: "uppercase", color: "#94a3b8", fontWeight: 850 }}>{label}</div>
-                    <div style={{ marginTop: 2, fontSize: 11, fontWeight: 800, color: label === "Allowance" && robinhoodChainQuote.allowance_required ? "#fde68a" : "#e0f2fe", overflowWrap: "anywhere" }}>
-                      {hideTableData ? "••••" : value}
-                    </div>
-                  </div>
-                ))}
+              <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(34, 211, 238, 0.16)", display: "flex", gap: 10, flexWrap: "wrap", fontSize: 10.5, lineHeight: 1.3 }}>
+                <span style={{ color: robinhoodChainQuoteStale ? "#fde68a" : "#bbf7d0", fontWeight: 900 }}>{robinhoodChainQuoteStale ? "QUOTE STALE" : robinhoodChainQuote.cached ? "QUOTE CACHED" : "QUOTE FRESH"}</span>
+                <span>{String(robinhoodChainQuote.side || side).toUpperCase()}: <b>{hideTableData ? "••••" : `${robinhoodChainQuote.input_amount || "—"} ${robinhoodChainQuote.input_asset || ""} → ${robinhoodChainQuote.output_amount || "—"} ${robinhoodChainQuote.output_asset || ""}`}</b></span>
+                <span>USDG/ETH: <b>{hideTableData ? "••••" : robinhoodChainQuote.effective_price || "—"}</b></span>
+                <span>Min: <b>{hideTableData ? "••••" : `${robinhoodChainQuote.minimum_received || "—"} ${robinhoodChainQuote.minimum_received_asset || ""}`}</b></span>
+                <span>Impact: <b>{robinhoodChainQuote.price_impact_bps ?? "—"} bps</b></span>
+                <span>Route: <b>{Array.isArray(robinhoodChainQuote.route_sources) && robinhoodChainQuote.route_sources.length ? robinhoodChainQuote.route_sources.join(" + ") : robinhoodChainQuote.route_source || "—"}</b></span>
+                <span>Network fee: <b>{hideTableData ? "••••" : robinhoodChainQuote.total_network_fee_eth ? `${robinhoodChainQuote.total_network_fee_eth} ETH` : "—"}</b></span>
+                <span>Allowance: <b>{robinhoodChainQuote.allowance_required ? "REQUIRED" : "not required"}</b></span>
               </div>
             ) : (
-              <div style={{ marginTop: 7, fontSize: 11, lineHeight: 1.35, color: "#bae6fd" }}>
-                Enter {side === "buy" ? "Total (USDG)" : "Qty (WETH)"}, then request a bounded indicative quote. The result remains read-only and is never inserted into All Orders.
+              <div style={{ marginTop: 5, fontSize: 10.5, color: "#bae6fd" }}>
+                Enter {side === "buy" ? "Total (USDG)" : "Qty (ETH)"}, then request an indicative quote. Slippage and Build Unsigned Plan remain visible beside the quote button below.
               </div>
             )}
 
-            <div style={{ marginTop: 9, paddingTop: 8, borderTop: "1px solid rgba(34, 211, 238, 0.18)", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ fontSize: 10, fontWeight: 900, color: "#c4b5fd", textTransform: "uppercase", letterSpacing: 0.5 }}>
-                Firm-plan slippage
-              </span>
-              <select
-                value={String(robinhoodChainSlippageBps)}
-                onChange={(event) => {
-                  setRobinhoodChainSlippageBps(Number(event.target.value));
-                  robinhoodChainFirmPlanReqRef.current += 1;
-                  setRobinhoodChainFirmPlan(null);
-                  setRobinhoodChainFirmPlanErrorText("");
-                  setRobinhoodChainFirmPlanLoading(false);
-                }}
-                style={{ ...darkSelectStyle, minWidth: 92 }}
-                title="Bounded slippage protection sent to the 0x firm-quote endpoint."
-              >
-                <option style={darkOptionStyle} value="50">0.50%</option>
-                <option style={darkOptionStyle} value="100">1.00%</option>
-                <option style={darkOptionStyle} value="200">2.00%</option>
-                <option style={darkOptionStyle} value="300">3.00%</option>
-              </select>
-              <button
-                type="button"
-                style={{
-                  ...safeButton,
-                  ...(!canBuildRobinhoodChainFirmPlan ? safeButtonDisabled : {}),
-                  padding: "7px 10px",
-                  fontWeight: 900,
-                  border: "1px solid rgba(192, 132, 252, 0.55)",
-                  color: "#f3e8ff",
-                  background: "rgba(88, 28, 135, 0.28)",
-                }}
-                disabled={!canBuildRobinhoodChainFirmPlan}
-                onClick={requestRobinhoodChainFirmPlan}
-                title="Fetch a fresh 0x AllowanceHolder quote, read current allowance with eth_call, and display a validated unsigned plan. No wallet action occurs."
-              >
-                {robinhoodChainFirmPlanLoading
-                  ? "Building Plan…"
-                  : robinhoodChainFirmPlan?.ok
-                    ? "Refresh Unsigned Plan"
-                    : "Build Unsigned Plan"}
-              </button>
-              <span style={{ fontSize: 10.5, color: "#a5b4fc" }}>
-                Fresh indicative quote required · local review window 30s
-              </span>
-            </div>
-
             {robinhoodChainFirmPlanErrorText && (
-              <div style={{ marginTop: 7, padding: "6px 8px", borderRadius: 8, background: "rgba(127, 29, 29, 0.28)", border: "1px solid rgba(251, 113, 133, 0.35)", color: "#fecdd3", fontSize: 11 }}>
-                {hideTableData ? "Latest unsigned firm-plan request failed." : robinhoodChainFirmPlanErrorText}
-              </div>
+              <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>{hideTableData ? "Latest unsigned-plan request failed." : robinhoodChainFirmPlanErrorText}</div>
             )}
 
             {robinhoodChainFirmPlan?.ok && (
-              <div style={{ marginTop: 9, padding: 9, borderRadius: 10, border: robinhoodChainFirmPlanStale ? "1px solid rgba(251, 191, 36, 0.48)" : "1px solid rgba(192, 132, 252, 0.42)", background: "rgba(30, 12, 58, 0.38)" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                  <div style={{ fontSize: 11, fontWeight: 950, color: "#d8b4fe", letterSpacing: 0.5 }}>
-                    UNSIGNED TRANSACTION PLAN · REVIEW ONLY
-                  </div>
-                  <div style={{ fontSize: 10.5, fontWeight: 900, color: robinhoodChainFirmPlan?.approval_required ? "#fde68a" : "#bbf7d0" }}>
-                    {robinhoodChainFirmPlanStale
-                      ? "STALE — rebuild before any later execution tranche"
-                      : robinhoodChainFirmPlan?.approval_required
-                        ? "APPROVAL SHORTFALL DETECTED"
-                        : "ALLOWANCE SUFFICIENT"}
-                  </div>
-                </div>
-
-                <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 7 }}>
+              <details style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(192, 132, 252, 0.18)" }}>
+                <summary style={{ cursor: "pointer", color: robinhoodChainFirmPlanStale ? "#fde68a" : robinhoodChainFirmPlan?.approval_required ? "#fde68a" : "#bbf7d0", fontSize: 10.5, fontWeight: 900 }}>
+                  Unsigned plan · {robinhoodChainFirmPlanStale ? "STALE — rebuild before later execution" : robinhoodChainFirmPlan?.approval_required ? "APPROVAL REQUIRED" : "READY"} · expires {robinhoodChainFirmPlan.plan_expires_at || "—"}
+                </summary>
+                <div style={{ marginTop: 7, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
                   {[
+                    ["From", robinhoodChainFirmPlan.unsigned_transaction_plan?.from ? shortenWalletAddress(robinhoodChainFirmPlan.unsigned_transaction_plan.from, 8, 6) : "—"],
                     ["Input", `${robinhoodChainFirmPlan.input_amount || "—"} ${robinhoodChainFirmPlan.input_asset || ""}`.trim()],
                     ["Firm output", `${robinhoodChainFirmPlan.output_amount || "—"} ${robinhoodChainFirmPlan.output_asset || ""}`.trim()],
                     ["Minimum received", `${robinhoodChainFirmPlan.minimum_received || "—"} ${robinhoodChainFirmPlan.minimum_received_asset || ""}`.trim()],
                     ["Maximum spent", `${robinhoodChainFirmPlan.maximum_spent || "—"} ${robinhoodChainFirmPlan.maximum_spent_asset || ""}`.trim()],
                     ["Slippage", `${Number(robinhoodChainFirmPlan.slippage_bps || 0) / 100}%`],
-                    ["Route", Array.isArray(robinhoodChainFirmPlan.route_sources) && robinhoodChainFirmPlan.route_sources.length ? robinhoodChainFirmPlan.route_sources.join(" + ") : "—"],
-                    ["Network fee", robinhoodChainFirmPlan.total_network_fee_eth ? `${robinhoodChainFirmPlan.total_network_fee_eth} ETH` : "—"],
-                    ["0x fee", robinhoodChainFirmPlan.zero_x_fee?.amount_display ? `${robinhoodChainFirmPlan.zero_x_fee.amount_display} ${robinhoodChainFirmPlan.zero_x_fee.asset || ""}`.trim() : "—"],
-                    ["Current allowance", `${robinhoodChainFirmPlan.allowance?.current || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}`.trim()],
-                    ["Required allowance", `${robinhoodChainFirmPlan.allowance?.required || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}`.trim()],
-                    ["Allowance shortfall", `${robinhoodChainFirmPlan.allowance?.shortfall || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}`.trim()],
+                    ["Allowance", robinhoodChainFirmPlan.allowance?.applicable === false ? "Not applicable — native ETH input" : robinhoodChainFirmPlan.approval_required ? `Shortfall ${robinhoodChainFirmPlan.allowance?.shortfall || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}` : "Sufficient"],
                     ["Spender", robinhoodChainFirmPlan.allowance?.spender ? shortenWalletAddress(robinhoodChainFirmPlan.allowance.spender, 8, 6) : "—"],
                     ["Destination", robinhoodChainFirmPlan.unsigned_transaction_plan?.to ? shortenWalletAddress(robinhoodChainFirmPlan.unsigned_transaction_plan.to, 8, 6) : "—"],
-                    ["Tx value", `${robinhoodChainFirmPlan.unsigned_transaction_plan?.value_wei ?? "—"} wei`],
+                    ["Tx value", robinhoodChainFirmPlan.unsigned_transaction_plan?.value_eth ? `${robinhoodChainFirmPlan.unsigned_transaction_plan.value_eth} ETH (${robinhoodChainFirmPlan.unsigned_transaction_plan.value_wei} wei)` : `${robinhoodChainFirmPlan.unsigned_transaction_plan?.value_wei ?? "—"} wei`],
                     ["Gas limit", robinhoodChainFirmPlan.unsigned_transaction_plan?.gas_limit || "—"],
                     ["Calldata", robinhoodChainFirmPlan.unsigned_transaction_plan?.calldata_bytes !== undefined ? `${robinhoodChainFirmPlan.unsigned_transaction_plan.calldata_bytes} bytes` : "—"],
-                    ["Expires", robinhoodChainFirmPlan.plan_expires_at || "—"],
                   ].map(([label, value]) => (
-                    <div key={label} style={{ padding: "6px 7px", borderRadius: 8, background: "rgba(2, 6, 23, 0.48)", border: "1px solid rgba(192, 132, 252, 0.16)", minWidth: 0 }}>
-                      <div style={{ fontSize: 9, letterSpacing: 0.55, textTransform: "uppercase", color: "#a78bfa", fontWeight: 850 }}>{label}</div>
-                      <div style={{ marginTop: 2, fontSize: 11, fontWeight: 800, color: label === "Allowance shortfall" && robinhoodChainFirmPlan?.approval_required ? "#fde68a" : "#e9d5ff", overflowWrap: "anywhere" }}>
-                        {hideTableData ? "••••" : value}
-                      </div>
+                    <div key={label} style={{ padding: "5px 6px", borderRadius: 7, background: "rgba(2, 6, 23, 0.42)", border: "1px solid rgba(192, 132, 252, 0.14)", minWidth: 0 }}>
+                      <div style={{ fontSize: 8.5, textTransform: "uppercase", color: "#a78bfa", fontWeight: 850 }}>{label}</div>
+                      <div style={{ marginTop: 2, fontSize: 10.5, fontWeight: 800, overflowWrap: "anywhere" }}>{hideTableData ? "••••" : value}</div>
                     </div>
                   ))}
                 </div>
-
                 {Array.isArray(robinhoodChainFirmPlan.warnings) && robinhoodChainFirmPlan.warnings.length > 0 && (
-                  <div style={{ marginTop: 7, padding: "6px 8px", borderRadius: 8, border: "1px solid rgba(251, 191, 36, 0.32)", background: "rgba(120, 72, 16, 0.16)", color: "#fde68a", fontSize: 10.5 }}>
-                    {robinhoodChainFirmPlan.warnings.join(" · ")}
-                  </div>
+                  <div style={{ marginTop: 6, color: "#fde68a", fontSize: 10 }}>{robinhoodChainFirmPlan.warnings.join(" · ")}</div>
                 )}
-
-                <details style={{ marginTop: 8 }}>
-                  <summary style={{ cursor: "pointer", color: "#c4b5fd", fontSize: 10.5, fontWeight: 900 }}>
-                    Unsigned calldata — explicit review only
-                  </summary>
-                  <pre style={{ margin: "7px 0 0", maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", padding: 8, borderRadius: 8, background: "rgba(0,0,0,0.38)", border: "1px solid rgba(192,132,252,0.18)", color: "#e9d5ff", fontSize: 10 }}>
+                <details style={{ marginTop: 6 }}>
+                  <summary style={{ cursor: "pointer", color: "#c4b5fd", fontSize: 10, fontWeight: 900 }}>Unsigned calldata — explicit review only</summary>
+                  <pre style={{ margin: "6px 0 0", maxHeight: 160, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", padding: 7, borderRadius: 7, background: "rgba(0,0,0,0.38)", fontSize: 9.5 }}>
                     {hideTableData ? "••••••••" : robinhoodChainFirmPlan.unsigned_transaction_plan?.calldata || "—"}
                   </pre>
                 </details>
-              </div>
+              </details>
             )}
-
-            <div style={{ marginTop: 8, paddingTop: 7, borderTop: "1px solid rgba(34, 211, 238, 0.18)", fontSize: 10.5, lineHeight: 1.35, color: "#c4b5fd" }}>
-              Firm quote + unsigned calldata preview only · no MetaMask prompt · no approval transaction · no signature · no broadcast · no order record
-            </div>
           </div>
         )}
 
@@ -9287,7 +9557,7 @@ async function submitLimitOrder() {
               isRobinhoodChainVenue
                 ? canSubmit
                   ? "Request a bounded read-only 0x indicative price. No MetaMask prompt, approval, signature, transaction, or order record."
-                  : "Enter a valid WETH-USDG quote amount within the RH-CHAIN.10B safety cap."
+                  : "Enter a valid ETH-USDG quote amount within the RH-CHAIN.10D.0 safety cap."
                 : isCounterpartyVenue
                 ? canCounterpartyComposePreview
                   ? isCounterpartyLimitOrderMode
@@ -9325,6 +9595,53 @@ async function submitLimitOrder() {
                     : side === "buy" ? "Swap Buy" : "Swap Sell"
                   : side === "buy" ? "Place Buy Limit" : "Place Sell Limit"}
           </button>
+
+          {isRobinhoodChainVenue && (
+            <>
+              <label style={{ ...safePill, padding: "5px 7px", gap: 6 }} title="Bounded slippage protection sent to the 0x firm-quote endpoint.">
+                <span style={{ fontSize: 10.5, fontWeight: 900 }}>Slippage</span>
+                <select
+                  value={String(robinhoodChainSlippageBps)}
+                  onChange={(event) => {
+                    setRobinhoodChainSlippageBps(Number(event.target.value));
+                    robinhoodChainFirmPlanReqRef.current += 1;
+                    setRobinhoodChainFirmPlan(null);
+                    setRobinhoodChainFirmPlanErrorText("");
+                    setRobinhoodChainFirmPlanLoading(false);
+                  }}
+                  style={{ ...darkSelectStyle, minWidth: 82, padding: "4px 6px" }}
+                >
+                  <option style={darkOptionStyle} value="50">0.50%</option>
+                  <option style={darkOptionStyle} value="100">1.00%</option>
+                  <option style={darkOptionStyle} value="200">2.00%</option>
+                  <option style={darkOptionStyle} value="300">3.00%</option>
+                </select>
+              </label>
+              <button
+                type="button"
+                style={{
+                  ...safeButton,
+                  ...(!canBuildRobinhoodChainFirmPlan ? safeButtonDisabled : {}),
+                  padding: "9px 12px",
+                  fontWeight: 900,
+                  border: "1px solid rgba(192, 132, 252, 0.55)",
+                  color: "#f3e8ff",
+                  background: "rgba(88, 28, 135, 0.28)",
+                }}
+                disabled={!canBuildRobinhoodChainFirmPlan}
+                onClick={requestRobinhoodChainFirmPlan}
+                title={canBuildRobinhoodChainFirmPlan
+                  ? "Fetch a fresh 0x firm quote and display a validated unsigned plan. No signature or transaction occurs."
+                  : "Connect the saved MetaMask wallet on chain 4663 and request a fresh matching indicative quote first."}
+              >
+                {robinhoodChainFirmPlanLoading
+                  ? "Building Plan…"
+                  : robinhoodChainFirmPlan?.ok
+                    ? "Refresh Unsigned Plan"
+                    : "Build Unsigned Plan"}
+              </button>
+            </>
+          )}
 
           <span style={{ ...safeMuted, fontSize: 11, lineHeight: 1.1 }}>
             Endpoint: <code>{submitEndpointLabel}</code>

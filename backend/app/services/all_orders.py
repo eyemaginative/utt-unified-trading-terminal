@@ -8,7 +8,15 @@ from typing import Optional, Tuple, Any, Dict, List
 from sqlalchemy.orm import Session
 from sqlalchemy import select, false, func, or_, Table, MetaData
 
-from ..models import Order, VenueOrderRow, OrderView, RuntimeSetting, TokenRegistry, RobinhoodChainExecution
+from ..models import (
+    Order,
+    VenueOrderRow,
+    OrderView,
+    RuntimeSetting,
+    TokenRegistry,
+    RobinhoodChainExecution,
+    RobinhoodChainBuyExecution,
+)
 
 # NEW (3.5): realized sourcing from lot_journal
 from ..models_lot_journal import LotJournal
@@ -522,6 +530,108 @@ def _to_unified_robinhood_chain_execution(row: RobinhoodChainExecution) -> Dict[
         "actual_network_fee_asset": fee_asset,
         "actual_network_fee_wei": reconciliation.get("network_fee_wei") if confirmed_reconciled else None,
         "execution_reconciled": confirmed_reconciled,
+    }
+
+
+def _view_key_robinhood_chain_buy_execution(execution_id: str) -> str:
+    return f"RHCHAINBUY:{execution_id or ''}"
+
+
+def _to_unified_robinhood_chain_buy_execution(row: RobinhoodChainBuyExecution) -> Dict[str, Any]:
+    raw_status = str(row.status or "").strip().lower()
+    status_map = {
+        "swap_pending": "pending",
+        "confirmed": "confirmed",
+        "swap_reverted": "reverted",
+        "verification_failed": "verification_failed",
+        "swap_wallet_rejected": "wallet_rejected",
+        "swap_submission_failed": "submission_failed",
+    }
+    status = status_map.get(raw_status, raw_status or "pending")
+    created_at = row.swap_submitted_at or row.created_at
+    terminal_at = row.swap_confirmed_at or row.swap_reverted_at
+    if terminal_at is None and status in _TERMINAL:
+        terminal_at = row.updated_at
+
+    route = row.route if isinstance(row.route, dict) else {}
+    reconciliation = route.get("execution_reconciliation")
+    if not isinstance(reconciliation, dict):
+        reconciliation = {}
+    confirmed_reconciled = status == "confirmed" and reconciliation.get("reconciled") is True
+
+    def _float_or_none(value):
+        try:
+            if value is None or value == "":
+                return None
+            parsed = float(value)
+            return parsed if parsed >= 0 else None
+        except Exception:
+            return None
+
+    qty = _float_or_none(row.exact_output_amount)
+    actual_input = _float_or_none(reconciliation.get("input_amount")) if confirmed_reconciled else None
+    actual_output = _float_or_none(reconciliation.get("output_amount")) if confirmed_reconciled else None
+    avg_price = _float_or_none(reconciliation.get("average_fill_price")) if confirmed_reconciled else None
+    swap_fee = _float_or_none(reconciliation.get("swap_network_fee")) if confirmed_reconciled else None
+    maximum_limit = None
+    try:
+        maximum_limit = float(row.maximum_input_amount) / float(row.exact_output_amount)
+    except Exception:
+        maximum_limit = None
+
+    return {
+        "source": "RHCHAIN",
+        "venue": "robinhood_chain",
+        "id": str(row.id),
+        "venue_order_id": str(row.swap_tx_hash or ""),
+        "client_order_id": str(row.swap_quote_id or ""),
+        "symbol": row.symbol,
+        "symbol_canon": row.symbol,
+        "symbol_venue": row.symbol,
+        "side": "buy",
+        "type": "swap",
+        "status": status,
+        "status_bucket": _status_bucket(status),
+        "qty": qty,
+        "filled_qty": qty if status == "confirmed" else 0.0,
+        "limit_price": maximum_limit,
+        "avg_fill_price": avg_price,
+        "fee": swap_fee,
+        "fee_asset": "ETH" if swap_fee is not None else None,
+        # For this cross-asset BUY the Net cell is the confirmed ETH received.
+        # Gross remains qty * avg_fill_price in USDG. TerminalTables adds explicit
+        # asset labels so the two units are never presented as subtractable.
+        "total_after_fee": actual_output,
+        "reject_reason": row.error_message,
+        "created_at": created_at,
+        "updated_at": row.updated_at,
+        "captured_at": row.swap_last_receipt_check_at or row.updated_at,
+        "closed_at": terminal_at,
+        "closed_at_inferred": False,
+        "view_key": _view_key_robinhood_chain_buy_execution(str(row.id)),
+        "viewed_confirmed": False,
+        "viewed_at": None,
+        "can_cancel": False,
+        "cancel_ref": None,
+        "transaction_id": row.swap_tx_hash,
+        "txid": row.swap_tx_hash,
+        "approval_transaction_id": row.approval_tx_hash,
+        "approval_txid": row.approval_tx_hash,
+        "execution_plan_hash": row.swap_plan_hash,
+        "execution_quote_id": row.swap_quote_id,
+        "expected_output_asset": "ETH",
+        "expected_output_amount": row.exact_output_amount,
+        "maximum_input_asset": "USDG",
+        "maximum_input_amount": row.maximum_input_amount,
+        "actual_input_asset": "USDG" if confirmed_reconciled else None,
+        "actual_input_amount": reconciliation.get("input_amount") if confirmed_reconciled else None,
+        "actual_output_asset": "ETH" if confirmed_reconciled else None,
+        "actual_output_amount": reconciliation.get("output_amount") if confirmed_reconciled else None,
+        "actual_network_fee_asset": "ETH" if confirmed_reconciled else None,
+        "actual_network_fee_wei": reconciliation.get("swap_network_fee_wei") if confirmed_reconciled else None,
+        "approval_network_fee": reconciliation.get("approval_network_fee") if confirmed_reconciled else None,
+        "execution_reconciled": confirmed_reconciled,
+        "cross_asset_buy": True,
     }
 
 def _to_unified_local(o: Order) -> Dict[str, Any]:
@@ -1697,8 +1807,53 @@ def list_all_orders(
                     if str(unified.get("status_bucket") or "").lower() != requested_bucket:
                         continue
                 robinhood_chain_execution_items.append(unified)
+
         except Exception:
             robinhood_chain_execution_items = []
+
+        try:
+            buy_rows = (
+                db.query(RobinhoodChainBuyExecution)
+                .filter(
+                    RobinhoodChainBuyExecution.swap_tx_hash.is_not(None),
+                    RobinhoodChainBuyExecution.status.in_(
+                        [
+                            "swap_pending",
+                            "confirmed",
+                            "swap_reverted",
+                            "verification_failed",
+                            "swap_wallet_rejected",
+                            "swap_submission_failed",
+                        ]
+                    ),
+                )
+                .all()
+            )
+            for row in buy_rows:
+                unified = _to_unified_robinhood_chain_buy_execution(row)
+                if symbol:
+                    requested_symbol = str(symbol or "").strip()
+                    if requested_symbol not in {
+                        str(unified.get("symbol") or ""),
+                        str(unified.get("symbol_canon") or ""),
+                        str(unified.get("symbol_venue") or ""),
+                    }:
+                        continue
+                if status and str(unified.get("status") or "") != str(status):
+                    continue
+                created_value = unified.get("created_at")
+                if dt_from and created_value and created_value < dt_from:
+                    continue
+                if dt_to and created_value and created_value > dt_to:
+                    continue
+                if status_bucket:
+                    requested_bucket = str(status_bucket).strip().lower()
+                    if str(unified.get("status_bucket") or "").lower() != requested_bucket:
+                        continue
+                robinhood_chain_execution_items.append(unified)
+        except Exception:
+            # A missing/new BUY table must never hide the established SELL rows.
+            pass
 
     combined: List[Dict[str, Any]] = []
     for o in local_items:

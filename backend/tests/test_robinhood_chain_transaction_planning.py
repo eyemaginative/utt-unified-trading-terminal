@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import unittest
 from pathlib import Path
@@ -92,7 +94,9 @@ def firm_body(request: httpx.Request, *, destination: str = ALLOWANCE_HOLDER, va
     params = request.url.params
     sell_token = params["sellToken"]
     buy_token = params["buyToken"]
-    sell_amount = params["sellAmount"]
+    exact_output = "buyAmount" in params
+    requested_buy_amount = params.get("buyAmount")
+    sell_amount = params.get("sellAmount")
     native_sell = sell_token.lower() == ETH["contract_address"].lower()
     if native_sell:
         buy_amount = "183402"
@@ -100,6 +104,13 @@ def firm_body(request: httpx.Request, *, destination: str = ALLOWANCE_HOLDER, va
         fee_token = USDG["contract_address"]
         allowance_issue = None
         transaction_value = sell_amount if value is None else value
+    elif exact_output:
+        sell_amount = "1850000"
+        buy_amount = str(requested_buy_amount)
+        min_buy_amount = str(requested_buy_amount)
+        fee_token = ETH["contract_address"]
+        allowance_issue = {"actual": "0", "spender": ALLOWANCE_HOLDER}
+        transaction_value = "0" if value is None else value
     else:
         buy_amount = "545250000000000"
         min_buy_amount = "539797500000000"
@@ -150,6 +161,31 @@ def firm_body(request: httpx.Request, *, destination: str = ALLOWANCE_HOLDER, va
 
 
 class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
+    def test_router_firm_plan_keywords_match_service_signature(self) -> None:
+        router_path = BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py"
+        tree = ast.parse(router_path.read_text(encoding="utf-8"), filename=str(router_path))
+        endpoint = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "robinhood_chain_firm_quote_plan"
+        )
+        call = next(
+            node
+            for node in ast.walk(endpoint)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "firm_quote_plan"
+        )
+        endpoint_keywords = {keyword.arg for keyword in call.keywords if keyword.arg}
+        service_keywords = set(
+            inspect.signature(RobinhoodChainTransactionPlanningService.firm_quote_plan).parameters
+        ) - {"self"}
+
+        self.assertTrue(endpoint_keywords <= service_keywords)
+        self.assertIn("exact_output_quantity", endpoint_keywords)
+        self.assertIn("maximum_total_quote", endpoint_keywords)
+
     def make_service(self, *, allowance_atomic: int = 0, body_mutator=None):
         rpc = FakeRpcClient(allowance_atomic=allowance_atomic)
 
@@ -228,6 +264,44 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["approval_required"])
         self.assertEqual(result["unsigned_transaction_plan"]["status"], "ready_for_wallet_review")
         self.assertEqual(rpc.allowance_calls[0]["contract"].lower(), USDG["contract_address"].lower())
+
+    async def test_exact_output_buy_plan_is_blocked_before_provider_contact(self) -> None:
+        service, rpc = self.make_service(allowance_atomic=0)
+        result = await service.firm_quote_plan(
+            symbol="ETH-USDG",
+            side="buy",
+            quantity=None,
+            total_quote=None,
+            exact_output_quantity="0.001",
+            maximum_total_quote="2",
+            taker_address=TAKER,
+            eth_token=ETH,
+            usdg_token=USDG,
+            slippage_bps=100,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "firm_quote_route_mode_not_live_verified")
+        self.assertEqual(result["amount_mode"], "exact_output")
+        self.assertEqual(result["display_mode"], "exact_receive")
+        self.assertEqual(result["input_asset"], "USDG")
+        self.assertEqual(result["output_asset"], "ETH")
+        self.assertFalse(result["provider_contacted"])
+        self.assertEqual(result["route_capability"]["firm_plan_status"], "provider_failure")
+        self.assertEqual(rpc.rpc_calls, [])
+        self.assertEqual(rpc.allowance_calls, [])
+
+    def test_status_exposes_live_verified_route_matrix(self) -> None:
+        service, _ = self.make_service()
+        status = service.status()
+        self.assertTrue(status["exact_input_enabled"])
+        self.assertFalse(status["exact_output_enabled"])
+        self.assertTrue(status["provider_declared_exact_output_supported"])
+        rows = status["route_capabilities"]
+        exact_spend = next(row for row in rows if row["from_asset"] == "USDG" and row["to_asset"] == "ETH" and row["display_mode"] == "exact_spend")
+        exact_receive = next(row for row in rows if row["from_asset"] == "USDG" and row["to_asset"] == "ETH" and row["display_mode"] == "exact_receive")
+        self.assertTrue(exact_spend["enabled"])
+        self.assertFalse(exact_receive["enabled"])
+        self.assertEqual(exact_receive["firm_plan_status"], "provider_failure")
 
     async def test_unsupported_symbol_fails_before_provider(self) -> None:
         service, rpc = self.make_service()

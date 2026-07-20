@@ -23,6 +23,7 @@ from ..services.robinhood_chain_history import (
 )
 from ..services.robinhood_chain_execution_discovery import (
     ROBINHOOD_CHAIN_DISCOVERY_TOKENS,
+    ROBINHOOD_CHAIN_ROUTE_CAPABILITIES,
     get_robinhood_chain_execution_discovery_service,
 )
 from ..services.robinhood_chain_quotes import (
@@ -44,6 +45,16 @@ from ..services.robinhood_chain_execution import (
     ROBINHOOD_CHAIN_SUBMISSION_FAILURE_REASONS,
     get_robinhood_chain_execution_service,
     validate_execution_saved_wallet,
+)
+from ..services.robinhood_chain_buy_execution import (
+    ROBINHOOD_CHAIN_BUY_APPROVAL_USDG,
+    ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH,
+    ROBINHOOD_CHAIN_BUY_MAXIMUM_USDG,
+    ROBINHOOD_CHAIN_BUY_SIDE,
+    ROBINHOOD_CHAIN_BUY_SLIPPAGE_BPS,
+    ROBINHOOD_CHAIN_BUY_SUBMISSION_FAILURE_REASONS,
+    ROBINHOOD_CHAIN_BUY_SYMBOL,
+    get_robinhood_chain_buy_execution_service,
 )
 
 
@@ -408,7 +419,17 @@ class RobinhoodChainFirmQuotePlanRequest(BaseModel):
     total_quote: Optional[str] = Field(
         default=None,
         max_length=80,
-        description="Exact USDG input for buy plans.",
+        description="Exact USDG input for exact-input buy plans.",
+    )
+    exact_output_quantity: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        description="Exact ETH output for the RH-CHAIN.10D.2 reverse BUY.",
+    )
+    maximum_total_quote: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        description="Strict maximum USDG spend for an exact-output BUY.",
     )
     slippage_bps: int = Field(
         default=ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
@@ -469,6 +490,22 @@ class RobinhoodChainExecutionSubmissionFailureRequest(BaseModel):
         default=False,
         description="Must be true to terminate a claimed send after MetaMask returned no transaction hash.",
     )
+
+
+class RobinhoodChainBuyApprovalPrepareRequest(BaseModel):
+    symbol: str = Field(default=ROBINHOOD_CHAIN_BUY_SYMBOL, min_length=1, max_length=32)
+    side: str = Field(default=ROBINHOOD_CHAIN_BUY_SIDE, min_length=3, max_length=4)
+    exact_output_quantity: str = Field(default=str(ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH), min_length=1, max_length=80)
+    maximum_total_quote: str = Field(default=str(ROBINHOOD_CHAIN_BUY_MAXIMUM_USDG), min_length=1, max_length=80)
+    approval_amount: str = Field(default=str(ROBINHOOD_CHAIN_BUY_APPROVAL_USDG), min_length=1, max_length=80)
+    slippage_bps: int = Field(default=ROBINHOOD_CHAIN_BUY_SLIPPAGE_BPS, ge=ROBINHOOD_CHAIN_BUY_SLIPPAGE_BPS, le=ROBINHOOD_CHAIN_BUY_SLIPPAGE_BPS)
+    taker_address: Optional[str] = Field(default=None, min_length=42, max_length=42)
+    confirm_prepare: bool = False
+
+
+class RobinhoodChainBuySwapPrepareRequest(BaseModel):
+    wallet_address: str = Field(min_length=42, max_length=42)
+    confirm_prepare: bool = False
 
 
 def _resolve_robinhood_chain_quote_taker(
@@ -705,6 +742,12 @@ def _quote_failure_status(result: Dict[str, Any]) -> int:
         "invalid_slippage_bps",
     }:
         return 400
+    if error in {
+        "execution_discovery_route_mode_not_live_verified",
+        "robinhood_chain_exact_receive_route_unavailable",
+        "firm_quote_route_mode_not_live_verified",
+    }:
+        return 409
     if error in {
         "execution_discovery_not_configured",
         "execution_discovery_backoff_active",
@@ -1319,6 +1362,8 @@ async def robinhood_chain_execution_discovery_probe(
         "unsupported_discovery_pair",
     }:
         status_code = 400
+    elif error == "execution_discovery_route_mode_not_live_verified":
+        status_code = 409
     elif error in {
         "execution_discovery_not_configured",
         "execution_discovery_backoff_active",
@@ -1343,13 +1388,19 @@ async def robinhood_chain_quotes_status(
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
 
     eth = _resolve_execution_discovery_token(db, "ETH")
+    weth = _resolve_execution_discovery_token(db, "WETH")
     usdg = _resolve_execution_discovery_token(db, "USDG")
     payload = get_robinhood_chain_quote_service().status()
     payload["firm_planning"] = get_robinhood_chain_transaction_planning_service().status()
     payload["tokens"] = {
         "ETH": eth,
+        "WETH": weth,
         "USDG": usdg,
     }
+    payload["route_capabilities"] = [dict(item) for item in ROBINHOOD_CHAIN_ROUTE_CAPABILITIES]
+    payload["swap_oriented"] = True
+    payload["amount_modes"] = ["exact_spend", "exact_receive"]
+    payload["exact_receive_provider"] = "direct_router_required"
     wallet_row = (
         db.query(WalletAddress)
         .filter(
@@ -1384,7 +1435,11 @@ async def robinhood_chain_indicative_quote(
     request: RobinhoodChainIndicativeQuoteRequest,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Return one bounded exact-input quote without constructing or submitting a trade."""
+    """Return a bounded indicative quote without constructing or submitting a trade.
+
+    RH-CHAIN.10D.2 uses BUY quantity=0.001 with total_quote omitted to request
+    exact output under the fixed 2.00 USDG ceiling.
+    """
     if not bool(settings.robinhood_chain_enabled):
         raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
     if not bool(settings.robinhood_chain_effective_enabled()):
@@ -1456,6 +1511,8 @@ async def robinhood_chain_firm_quote_plan(
         side=request.side,
         quantity=request.quantity,
         total_quote=request.total_quote,
+        exact_output_quantity=request.exact_output_quantity,
+        maximum_total_quote=request.maximum_total_quote,
         taker_address=taker_address,
         eth_token=eth,
         usdg_token=usdg,
@@ -1645,6 +1702,227 @@ async def robinhood_chain_execution_refresh(
         else:
             status_code = 502
         raise HTTPException(status_code=status_code, detail={"error": error}) from exc
+
+
+@router.get("/buy-execution/status")
+async def robinhood_chain_buy_execution_status() -> Dict[str, Any]:
+    """Return the RH-CHAIN.10D.2 bounded approval + exact-output BUY gate."""
+    return get_robinhood_chain_buy_execution_service().status()
+
+
+@router.post("/buy-execution/prepare-approval")
+async def robinhood_chain_buy_prepare_approval(
+    request: RobinhoodChainBuyApprovalPrepareRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    if str(request.symbol).strip().upper() != ROBINHOOD_CHAIN_BUY_SYMBOL or str(request.side).strip().lower() != ROBINHOOD_CHAIN_BUY_SIDE:
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_buy_identity_locked"})
+    if str(request.exact_output_quantity).strip() != str(ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH):
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_buy_output_locked"})
+    if str(request.maximum_total_quote).strip() != str(ROBINHOOD_CHAIN_BUY_MAXIMUM_USDG):
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_buy_maximum_locked"})
+    if str(request.approval_amount).strip() != str(ROBINHOOD_CHAIN_BUY_APPROVAL_USDG):
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_buy_approval_locked"})
+    taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
+    try:
+        return await get_robinhood_chain_buy_execution_service().prepare_approval(
+            db,
+            taker_address=taker,
+            eth_token=_resolve_execution_discovery_token(db, "ETH"),
+            usdg_token=_resolve_execution_discovery_token(db, "USDG"),
+            confirm_prepare=bool(request.confirm_prepare),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+
+@router.get("/buy-execution/{execution_id}")
+async def robinhood_chain_buy_execution_get(execution_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    try:
+        payload = get_robinhood_chain_buy_execution_service().get(db, execution_id)
+        db.rollback()
+        return payload
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=404 if "not_found" in str(exc) else 400, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/approval/claim-send")
+async def robinhood_chain_buy_approval_claim_send(
+    execution_id: str,
+    request: RobinhoodChainExecutionSendClaimRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_buy_execution_service().claim_approval_send(
+            db,
+            execution_id=execution_id,
+            wallet_address=request.wallet_address,
+            plan_hash=request.plan_hash,
+            claim_id=request.claim_id,
+            confirm_send_claim=bool(request.confirm_send_claim),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/approval/submission")
+async def robinhood_chain_buy_approval_submission(
+    execution_id: str,
+    request: RobinhoodChainExecutionSubmissionRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_buy_execution_service().record_approval_submission(
+            db,
+            execution_id=execution_id,
+            tx_hash=request.tx_hash,
+            wallet_address=request.wallet_address,
+            claim_id=request.claim_id,
+            confirm_record=bool(request.confirm_record),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/approval/submission-failure")
+async def robinhood_chain_buy_approval_submission_failure(
+    execution_id: str,
+    request: RobinhoodChainExecutionSubmissionFailureRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    reason = str(request.reason or "").strip().lower()
+    if reason not in ROBINHOOD_CHAIN_BUY_SUBMISSION_FAILURE_REASONS:
+        raise HTTPException(status_code=400, detail={"error": "invalid_robinhood_chain_buy_failure_reason"})
+    try:
+        return get_robinhood_chain_buy_execution_service().record_submission_failure(
+            db,
+            execution_id=execution_id,
+            stage="approval",
+            wallet_address=request.wallet_address,
+            claim_id=request.claim_id,
+            reason=reason,
+            message=request.message,
+            confirm_failure=bool(request.confirm_failure),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/approval/refresh")
+async def robinhood_chain_buy_approval_refresh(execution_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    try:
+        return await get_robinhood_chain_buy_execution_service().refresh_approval(db, execution_id=execution_id)
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/prepare-swap")
+async def robinhood_chain_buy_prepare_swap(
+    execution_id: str,
+    request: RobinhoodChainBuySwapPrepareRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return await get_robinhood_chain_buy_execution_service().prepare_swap(
+            db,
+            execution_id=execution_id,
+            wallet_address=request.wallet_address,
+            eth_token=_resolve_execution_discovery_token(db, "ETH"),
+            usdg_token=_resolve_execution_discovery_token(db, "USDG"),
+            confirm_prepare=bool(request.confirm_prepare),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/swap/claim-send")
+async def robinhood_chain_buy_swap_claim_send(
+    execution_id: str,
+    request: RobinhoodChainExecutionSendClaimRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_buy_execution_service().claim_swap_send(
+            db,
+            execution_id=execution_id,
+            wallet_address=request.wallet_address,
+            plan_hash=request.plan_hash,
+            claim_id=request.claim_id,
+            confirm_send_claim=bool(request.confirm_send_claim),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/swap/submission")
+async def robinhood_chain_buy_swap_submission(
+    execution_id: str,
+    request: RobinhoodChainExecutionSubmissionRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_buy_execution_service().record_swap_submission(
+            db,
+            execution_id=execution_id,
+            tx_hash=request.tx_hash,
+            wallet_address=request.wallet_address,
+            claim_id=request.claim_id,
+            confirm_record=bool(request.confirm_record),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/swap/submission-failure")
+async def robinhood_chain_buy_swap_submission_failure(
+    execution_id: str,
+    request: RobinhoodChainExecutionSubmissionFailureRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    reason = str(request.reason or "").strip().lower()
+    if reason not in ROBINHOOD_CHAIN_BUY_SUBMISSION_FAILURE_REASONS:
+        raise HTTPException(status_code=400, detail={"error": "invalid_robinhood_chain_buy_failure_reason"})
+    try:
+        return get_robinhood_chain_buy_execution_service().record_submission_failure(
+            db,
+            execution_id=execution_id,
+            stage="swap",
+            wallet_address=request.wallet_address,
+            claim_id=request.claim_id,
+            reason=reason,
+            message=request.message,
+            confirm_failure=bool(request.confirm_failure),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@router.post("/buy-execution/{execution_id}/swap/refresh")
+async def robinhood_chain_buy_swap_refresh(execution_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    try:
+        result = await get_robinhood_chain_buy_execution_service().refresh_swap(db, execution_id=execution_id)
+        execution = result.get("execution") if isinstance(result, dict) else None
+        if isinstance(execution, dict) and str(execution.get("status") or "").lower() == "confirmed":
+            result["balance_refresh"] = await _refresh_robinhood_chain_execution_balance_snapshots(
+                db,
+                str(execution.get("wallet_address") or ""),
+            )
+        return result
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
 
 @router.get("/orderbook")

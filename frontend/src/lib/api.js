@@ -635,6 +635,200 @@ export async function getRobinhoodChainExecution(
   const res = await axios.get(`${base}/api/robinhood_chain/execution/${id}`, { timeout: timeout_ms });
   return res.data;
 }
+export async function getRobinhoodChainBuyExecutionStatus({ apiBase, timeout_ms = 30000 } = {}) {
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.get(`/api/robinhood_chain/buy-execution/status`, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}/api/robinhood_chain/buy-execution/status`, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function prepareRobinhoodChainBuyApproval(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
+  const body = {
+    symbol: "ETH-USDG",
+    side: "buy",
+    exact_output_quantity: "0.001",
+    maximum_total_quote: "2",
+    approval_amount: "2",
+    slippage_bps: 100,
+    confirm_prepare: true,
+    ...payload,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/prepare-approval`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/prepare-approval`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function getRobinhoodChainBuyExecution(
+  executionId,
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.get(`/api/robinhood_chain/buy-execution/${id}`, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}/api/robinhood_chain/buy-execution/${id}`, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function claimRobinhoodChainBuyApprovalSend(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_send_claim: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/approval/claim-send`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/approval/claim-send`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function recordRobinhoodChainBuyApprovalSubmission(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_record: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/approval/submission`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/approval/submission`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function recordRobinhoodChainBuyApprovalSubmissionFailure(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_failure: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/approval/submission-failure`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/approval/submission-failure`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function refreshRobinhoodChainBuyApproval(
+  executionId,
+  { apiBase, timeout_ms = 45000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/approval/refresh`, null, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/approval/refresh`, null, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function prepareRobinhoodChainBuySwap(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 60000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_prepare: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/prepare-swap`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/prepare-swap`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function claimRobinhoodChainBuySwapSend(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_send_claim: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/swap/claim-send`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/swap/claim-send`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function recordRobinhoodChainBuySwapSubmission(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_record: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/swap/submission`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/swap/submission`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function recordRobinhoodChainBuySwapSubmissionFailure(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_failure: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/swap/submission-failure`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/swap/submission-failure`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function refreshRobinhoodChainBuySwap(
+  executionId,
+  { apiBase, timeout_ms = 45000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/buy-execution/${id}/swap/refresh`, null, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/buy-execution/${id}/swap/refresh`, null, { timeout: timeout_ms });
+  return res.data;
+}
+
 export async function getPricesUSD({ venue, assets } = {}) {
   const assetsCsv = Array.isArray(assets) ? assets.filter(Boolean).join(",") : assets;
   const res = await http.get(`/api/market/prices_usd`, {

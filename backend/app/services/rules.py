@@ -178,7 +178,7 @@ def order_rules_for_symbol(
 
     if v == "robinhood_chain":
         symbol_norm = canonicalize_symbol(sym_in)
-        supported = symbol_norm == "WETH-USDG"
+        supported = symbol_norm in {"ETH-USDG", "WETH-USDG"}
         return {
             "venue": v,
             "symbol_canon": symbol_norm,
@@ -194,21 +194,40 @@ def order_rules_for_symbol(
             "supports_post_only": False,
             "supported_tifs": [],
             "supported_order_types": ["quote"],
-            "suggested_symbol": None if supported else "WETH-USDG",
+            "suggested_symbol": None if supported else "ETH-USDG",
             "quote_only": True,
             "synthetic_orderbook": True,
             "resting_orders": False,
-            "execution_enabled": False,
+            "execution_enabled": bool(str(side or "").strip().lower() == "sell"),
             "signing_enabled": False,
             "broadcast_enabled": False,
             "firm_quote_planning_enabled": True,
             "unsigned_transaction_plan": True,
+            "swap_oriented": True,
+            "amount_modes": ["exact_spend", "exact_receive"],
+            "exact_spend_enabled": True,
+            "exact_receive_enabled": False,
+            "exact_output_buy_enabled": False,
+            "exact_output_buy_eth": "0.001",
+            "maximum_buy_usdg": "2",
             "approval_transaction_enabled": False,
-            "errors": [] if supported else ["RH-CHAIN.10C supports WETH-USDG only"],
+            "approval_amount_usdg": "2",
+            "unlimited_approval_enabled": False,
+            "automatic_second_transaction": False,
+            "capability_policy": "live_verified_pair_direction_amount_mode",
+            "route_capabilities": [
+                {"from_asset": "ETH", "to_asset": "USDG", "amount_mode": "exact_input", "display_mode": "exact_spend", "enabled": True, "status": "live_verified"},
+                {"from_asset": "USDG", "to_asset": "ETH", "amount_mode": "exact_input", "display_mode": "exact_spend", "enabled": True, "status": "live_verified"},
+                {"from_asset": "USDG", "to_asset": "WETH", "amount_mode": "exact_input", "display_mode": "exact_spend", "enabled": True, "status": "discovery_verified"},
+                {"from_asset": "USDG", "to_asset": "ETH", "amount_mode": "exact_output", "display_mode": "exact_receive", "enabled": False, "status": "provider_failure"},
+                {"from_asset": "USDG", "to_asset": "WETH", "amount_mode": "exact_output", "display_mode": "exact_receive", "enabled": False, "status": "provider_failure"},
+            ],
+            "errors": [] if supported else ["RH-CHAIN.10D.2-R4 supports ETH-USDG ticket review; WETH remains discovery-only"],
             "warnings": [
-                "Robinhood Chain levels are bounded 0x indicative quote samples, not resting limit orders.",
-                "RH-CHAIN.10C may fetch a firm quote and expose a validated unsigned transaction plan for review only.",
-                "Approval construction, wallet prompts, signing, broadcast, and order recording remain disabled.",
+                "Robinhood Chain is swap-oriented: From asset, To asset, and amount mode determine the provider request.",
+                "Exact-spend ETH→USDG and USDG→ETH are live verified through 0x; USDG→WETH is discovery verified.",
+                "Exact-receive USDG→ETH and USDG→WETH are blocked before provider contact after repeated live 0x HTTP 500 responses.",
+                "The original exact-receive target remains held for direct-router research; no approval, automatic second transaction, backend sender, ledger, FIFO, or basis mutation is enabled.",
             ],
         }
     side_n = (side or "").strip().lower() or None

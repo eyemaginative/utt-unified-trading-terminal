@@ -50,6 +50,93 @@ ROBINHOOD_CHAIN_DISCOVERY_TOKENS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+ROBINHOOD_CHAIN_ROUTE_CAPABILITIES: Tuple[Dict[str, Any], ...] = (
+    {
+        "from_asset": "ETH",
+        "to_asset": "USDG",
+        "amount_mode": "exact_input",
+        "display_mode": "exact_spend",
+        "provider": ZEROX_PROVIDER,
+        "indicative_status": "live_verified",
+        "firm_plan_status": "live_verified",
+        "execution_status": "live_verified",
+        "enabled": True,
+        "evidence": "RH-CHAIN.10D.1B live acceptance",
+        "reason": None,
+    },
+    {
+        "from_asset": "USDG",
+        "to_asset": "ETH",
+        "amount_mode": "exact_input",
+        "display_mode": "exact_spend",
+        "provider": ZEROX_PROVIDER,
+        "indicative_status": "live_verified",
+        "firm_plan_status": "live_verified",
+        "execution_status": "review_only",
+        "enabled": True,
+        "evidence": "RH-CHAIN.10D.2-R3 live diagnostic",
+        "reason": "Quote and unsigned firm-plan review are verified; a generalized live execution lifecycle is not enabled yet.",
+    },
+    {
+        "from_asset": "USDG",
+        "to_asset": "WETH",
+        "amount_mode": "exact_input",
+        "display_mode": "exact_spend",
+        "provider": ZEROX_PROVIDER,
+        "indicative_status": "live_verified",
+        "firm_plan_status": "not_verified",
+        "execution_status": "disabled",
+        "enabled": True,
+        "evidence": "RH-CHAIN.10D.2-R3 live diagnostic",
+        "reason": "Read-only discovery is verified; firm planning and execution remain disabled pending a dedicated tranche.",
+    },
+    {
+        "from_asset": "USDG",
+        "to_asset": "ETH",
+        "amount_mode": "exact_output",
+        "display_mode": "exact_receive",
+        "provider": ZEROX_PROVIDER,
+        "indicative_status": "provider_failure",
+        "firm_plan_status": "provider_failure",
+        "execution_status": "held",
+        "enabled": False,
+        "evidence": "RH-CHAIN.10D.2-R3 live diagnostic",
+        "reason": "0x returned HTTP 500 for both indicative and firm exact-output native-ETH requests. Direct-router research is required.",
+    },
+    {
+        "from_asset": "USDG",
+        "to_asset": "WETH",
+        "amount_mode": "exact_output",
+        "display_mode": "exact_receive",
+        "provider": ZEROX_PROVIDER,
+        "indicative_status": "provider_failure",
+        "firm_plan_status": "provider_failure",
+        "execution_status": "disabled",
+        "enabled": False,
+        "evidence": "RH-CHAIN.10D.2-R3 live diagnostic",
+        "reason": "0x returned HTTP 500 for exact-output WETH discovery. The route is blocked before provider contact.",
+    },
+)
+
+
+def robinhood_chain_route_capability(
+    sell_symbol: Any,
+    buy_symbol: Any,
+    amount_mode: Any,
+) -> Optional[Dict[str, Any]]:
+    sell = str(sell_symbol or "").strip().upper()
+    buy = str(buy_symbol or "").strip().upper()
+    mode = str(amount_mode or "").strip().lower()
+    for item in ROBINHOOD_CHAIN_ROUTE_CAPABILITIES:
+        if (
+            item["from_asset"] == sell
+            and item["to_asset"] == buy
+            and item["amount_mode"] == mode
+        ):
+            return copy.deepcopy(item)
+    return None
+
+
 _DECIMAL_RE = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d+)?$")
 _HEX_DATA_RE = re.compile(r"^0x[0-9a-fA-F]*$")
 _MAX_ROUTE_FILLS = 25
@@ -216,7 +303,10 @@ class RobinhoodChainExecutionDiscoveryService:
             "permit2_supported_by_provider": True,
             "permit2_enabled": False,
             "exact_input_supported": True,
-            "exact_output_supported": True,
+            "exact_output_supported": False,
+            "provider_declared_exact_output_supported": True,
+            "capability_policy": "live_verified_pair_direction_amount_mode",
+            "route_capabilities": copy.deepcopy(list(ROBINHOOD_CHAIN_ROUTE_CAPABILITIES)),
             "timeout_s": self.timeout_s,
             "cache_ttl_s": self.cache_ttl_s,
             "error_backoff_s": self.error_backoff_s,
@@ -652,6 +742,22 @@ class RobinhoodChainExecutionDiscoveryService:
             )
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "read_only": True, "will_mutate": False}
+
+        capability = robinhood_chain_route_capability(sell_symbol, buy_symbol, amount_mode)
+        if capability is None or capability.get("enabled") is not True:
+            return {
+                "ok": False,
+                "error": "execution_discovery_route_mode_not_live_verified",
+                "provider": ZEROX_PROVIDER,
+                "sell_symbol": sell_symbol,
+                "buy_symbol": buy_symbol,
+                "amount_mode": amount_mode,
+                "route_capability": capability,
+                "provider_contacted": False,
+                "backoff_activated": False,
+                "read_only": True,
+                "will_mutate": False,
+            }
 
         chain = await self.rpc_client.verify_expected_chain(force_refresh=force_refresh)
         if not chain.get("ok"):

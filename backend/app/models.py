@@ -680,3 +680,102 @@ class RobinhoodChainExecution(Base):
         Index("ix_rh_chain_exec_wallet_created", "wallet_address", "created_at"),
         Index("ix_rh_chain_exec_tx_hash", "tx_hash"),
     )
+
+
+# =============================================================================
+# Robinhood Chain exact-output BUY lifecycle (bounded approval + swap)
+# =============================================================================
+
+class RobinhoodChainBuyExecution(Base):
+    """Dedicated two-transaction lifecycle for RH-CHAIN.10D.2 exact-output BUY.
+
+    Approval and swap hashes are retained separately. The browser wallet remains
+    the only transaction sender; this record does not mutate ledger, FIFO, or
+    basis state.
+    """
+    __tablename__ = "robinhood_chain_buy_executions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663)
+    wallet_address: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
+
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, default="ETH-USDG")
+    side: Mapped[str] = mapped_column(String(8), nullable=False, default="buy")
+    exact_output_asset: Mapped[str] = mapped_column(String(16), nullable=False, default="ETH")
+    exact_output_amount: Mapped[str] = mapped_column(String(64), nullable=False, default="0.001")
+    exact_output_amount_atomic: Mapped[str] = mapped_column(String(80), nullable=False, default="1000000000000000")
+    maximum_input_asset: Mapped[str] = mapped_column(String(16), nullable=False, default="USDG")
+    maximum_input_amount: Mapped[str] = mapped_column(String(64), nullable=False, default="2")
+    maximum_input_amount_atomic: Mapped[str] = mapped_column(String(80), nullable=False, default="2000000")
+    slippage_bps: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+
+    approval_token_address: Mapped[str] = mapped_column(String(42), nullable=False)
+    approval_spender: Mapped[str] = mapped_column(String(42), nullable=False)
+    approval_amount: Mapped[str] = mapped_column(String(64), nullable=False, default="2")
+    approval_amount_atomic: Mapped[str] = mapped_column(String(80), nullable=False, default="2000000")
+    allowance_before_atomic: Mapped[str] = mapped_column(String(80), nullable=False, default="0")
+    allowance_confirmed_atomic: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    allowance_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    approval_plan_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    approval_transaction_to: Mapped[str] = mapped_column(String(42), nullable=False)
+    approval_transaction_value_wei: Mapped[str] = mapped_column(String(80), nullable=False, default="0")
+    approval_calldata_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    approval_calldata_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    approval_gas_limit: Mapped[str] = mapped_column(String(80), nullable=False)
+    approval_gas_price_wei: Mapped[str] = mapped_column(String(80), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="approval_prepared", index=True)
+    approval_send_claim_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    approval_send_claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approval_submission_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    approval_submission_failure_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approval_tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True, unique=True)
+    approval_submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approval_last_receipt_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approval_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approval_reverted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approval_block_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approval_gas_used: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    approval_effective_gas_price_wei: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    approval_receipt_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    swap_quote_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    expected_input_amount: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expected_input_amount_atomic: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    swap_plan_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    swap_plan_fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    swap_plan_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    swap_transaction_to: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    swap_transaction_value_wei: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    swap_calldata_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    swap_calldata_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    swap_gas_limit: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    swap_gas_price_wei: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    route: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    swap_send_claim_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    swap_send_claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    swap_submission_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    swap_submission_failure_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    swap_tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True, unique=True)
+    swap_submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    swap_last_receipt_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    swap_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    swap_reverted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    swap_block_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    swap_gas_used: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    swap_effective_gas_price_wei: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    swap_receipt_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_rh_chain_buy_status_created", "status", "created_at"),
+        Index("ix_rh_chain_buy_wallet_created", "wallet_address", "created_at"),
+        Index("ix_rh_chain_buy_approval_hash", "approval_tx_hash"),
+        Index("ix_rh_chain_buy_swap_hash", "swap_tx_hash"),
+    )

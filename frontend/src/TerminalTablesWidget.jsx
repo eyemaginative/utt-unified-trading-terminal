@@ -5120,6 +5120,10 @@ function renderAllOrdersHeader(col) {
     const isRobinhoodChainExecutionRow =
       String(o?.venue || "").trim().toLowerCase() === "robinhood_chain" &&
       String(o?.source || "").trim().toUpperCase() === "RHCHAIN";
+    const isRobinhoodChainCrossAssetBuy =
+      isRobinhoodChainExecutionRow &&
+      String(o?.side || "").trim().toLowerCase() === "buy" &&
+      o?.cross_asset_buy === true;
 
     
 const backendTax = pickOrderTaxUsdMaybe(o);
@@ -5529,8 +5533,22 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
 
     // UPDATED: use high-precision formatter
     if (col === COLS.qty) return <td style={td}>{mask?.(fmtQty?.(o.qty ?? o.filled_qty))}</td>;
-    if (col === COLS.gross) return <td style={td}>{maskMaybe?.(gross === null ? "—" : fmtMoney?.(gross))}</td>;
-    if (col === COLS.net)   return <td style={td}>{maskMaybe?.(net === null ? "—" : fmtMoney?.(net))}</td>;
+    if (col === COLS.gross) {
+      const grossText = gross === null
+        ? "—"
+        : isRobinhoodChainCrossAssetBuy
+          ? `${fmtMoney?.(gross)} USDG`
+          : fmtMoney?.(gross);
+      return <td style={td} title={isRobinhoodChainCrossAssetBuy ? "Actual USDG spent for the exact-output BUY" : undefined}>{maskMaybe?.(grossText)}</td>;
+    }
+    if (col === COLS.net) {
+      const netText = net === null
+        ? "—"
+        : isRobinhoodChainCrossAssetBuy
+          ? `${fmtQty?.(net)} ETH`
+          : fmtMoney?.(net);
+      return <td style={td} title={isRobinhoodChainCrossAssetBuy ? "Actual ETH received; this is not Gross minus Fee because the assets differ" : undefined}>{maskMaybe?.(netText)}</td>;
+    }
     // Tax (backend if present; else Mode A fallback on USD FILLED SELL when eligible)
     if (col === COLS.tax) {
       const isInventoryError =

@@ -33,6 +33,7 @@ _EVM_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _WEI_PER_ETH = 10**18
 _ERC20_BALANCE_OF_SELECTOR = "70a08231"
 _ERC20_ALLOWANCE_SELECTOR = "dd62ed3e"
+_ERC20_APPROVE_SELECTOR = "095ea7b3"
 _MAX_UINT256 = (1 << 256) - 1
 
 
@@ -107,6 +108,24 @@ def encode_erc20_allowance(owner_address: str, spender_address: str) -> str:
     owner_word = owner[2:].lower().rjust(64, "0")
     spender_word = spender[2:].lower().rjust(64, "0")
     return f"0x{_ERC20_ALLOWANCE_SELECTOR}{owner_word}{spender_word}"
+
+
+def encode_erc20_approve(spender_address: str, amount_atomic: Any) -> str:
+    """Encode a finite ERC-20 approve(spender, amount) call.
+
+    The caller supplies the exact bounded atomic amount. This helper never uses
+    uint256 max and intentionally has no unlimited-approval mode.
+    """
+    spender = validate_evm_address(spender_address)
+    try:
+        amount = int(str(amount_atomic).strip())
+    except Exception as exc:
+        raise ValueError("invalid ERC-20 approval amount") from exc
+    if amount < 0 or amount > _MAX_UINT256:
+        raise ValueError("invalid ERC-20 approval amount")
+    spender_word = spender[2:].lower().rjust(64, "0")
+    amount_word = f"{amount:064x}"
+    return f"0x{_ERC20_APPROVE_SELECTOR}{spender_word}{amount_word}"
 
 
 def decode_abi_uint256(value: Any) -> int:

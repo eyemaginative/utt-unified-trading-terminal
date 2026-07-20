@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import unittest
 from decimal import Decimal
@@ -11,6 +13,9 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.services.robinhood_chain_execution_discovery import (  # noqa: E402
+    robinhood_chain_route_capability,
+)
 from app.services.robinhood_chain_quotes import (  # noqa: E402
     ROBINHOOD_CHAIN_ASK_INPUT_AMOUNTS,
     ROBINHOOD_CHAIN_BID_INPUT_AMOUNTS,
@@ -63,13 +68,14 @@ class FakeDiscoveryService:
         taker_address: str,
         force_refresh: bool,
     ) -> dict:
-        assert buy_amount is None
-        amount_text = str(sell_amount or "")
+        amount_mode = "exact_output" if buy_amount is not None else "exact_input"
+        amount_text = str(buy_amount if buy_amount is not None else sell_amount or "")
         self.calls.append(
             {
                 "sell": sell_token["symbol"],
                 "buy": buy_token["symbol"],
                 "amount": amount_text,
+                "amount_mode": amount_mode,
                 "taker": taker_address,
                 "force_refresh": force_refresh,
             }
@@ -85,21 +91,29 @@ class FakeDiscoveryService:
         amount = Decimal(amount_text)
         if sell_token["symbol"] == "ETH":
             price = Decimal("1800") - amount * Decimal("100")
-            output = amount * price
+            sell_value = amount
+            buy_value = amount * price
             fee_token = USDG["contract_address"].lower()
             fee_atomic = "275"
+        elif amount_mode == "exact_output":
+            price = Decimal("1850")
+            sell_value = amount * price
+            buy_value = amount
+            fee_token = ETH["contract_address"].lower()
+            fee_atomic = "100000000000"
         else:
             price = Decimal("1820") + amount * Decimal("0.1")
-            output = amount / price
+            sell_value = amount
+            buy_value = amount / price
             fee_token = ETH["contract_address"].lower()
             fee_atomic = "100000000000"
 
-        min_output = output * Decimal("0.99")
+        min_output = buy_value * Decimal("0.99")
         return {
             "ok": True,
             "provider": "0x",
-            "sell_amount": decimal_text(amount),
-            "buy_amount": decimal_text(output),
+            "sell_amount": decimal_text(sell_value),
+            "buy_amount": decimal_text(buy_value),
             "min_buy_amount": decimal_text(min_output),
             "liquidity_available": True,
             "block_number": "12345678",
@@ -136,6 +150,31 @@ class FakeDiscoveryService:
 
 
 class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_router_indicative_quote_keywords_match_service_signature(self) -> None:
+        router_path = BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py"
+        tree = ast.parse(router_path.read_text(encoding="utf-8"), filename=str(router_path))
+        endpoint = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "robinhood_chain_indicative_quote"
+        )
+        call = next(
+            node
+            for node in ast.walk(endpoint)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "indicative_quote"
+        )
+        endpoint_keywords = {keyword.arg for keyword in call.keywords if keyword.arg}
+        service_keywords = set(
+            inspect.signature(RobinhoodChainQuoteService.indicative_quote).parameters
+        ) - {"self"}
+
+        self.assertTrue(endpoint_keywords <= service_keywords)
+        self.assertNotIn("exact_output_quantity", endpoint_keywords)
+        self.assertNotIn("maximum_total_quote", endpoint_keywords)
+
     def make_service(self, *, fail_inputs: set[str] | None = None):
         discovery = FakeDiscoveryService(fail_inputs=fail_inputs)
         return RobinhoodChainQuoteService(discovery_service=discovery), discovery
@@ -195,6 +234,44 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(quote["allowance_required"])
         self.assertIsNotNone(quote["allowance_spender"])
         self.assertIsNotNone(quote["price_impact_bps"])
+
+    async def test_exact_output_buy_is_blocked_before_provider_contact(self) -> None:
+        service, discovery = self.make_service()
+        quote = await service.indicative_quote(
+            symbol="ETH-USDG",
+            side="buy",
+            quantity="0.001",
+            total_quote=None,
+            taker_address=TAKER,
+            eth_token=ETH,
+            usdg_token=USDG,
+            force_refresh=True,
+        )
+
+        self.assertFalse(quote["ok"])
+        self.assertEqual(quote["error"], "robinhood_chain_exact_receive_route_unavailable")
+        self.assertEqual(quote["amount_mode"], "exact_output")
+        self.assertEqual(quote["requested_output"], "0.001")
+        self.assertEqual(quote["maximum_input_ceiling"], "2")
+        self.assertEqual(quote["maximum_input_ceiling_atomic"], "2000000")
+        self.assertFalse(quote["provider_contacted"])
+        self.assertFalse(quote["backoff_activated"])
+        self.assertEqual(quote["route_capability"]["indicative_status"], "provider_failure")
+        self.assertEqual(discovery.calls, [])
+
+    def test_route_capability_matrix_separates_exact_spend_and_exact_receive(self) -> None:
+        exact_spend = robinhood_chain_route_capability("USDG", "ETH", "exact_input")
+        exact_receive = robinhood_chain_route_capability("USDG", "ETH", "exact_output")
+        wrapped_spend = robinhood_chain_route_capability("USDG", "WETH", "exact_input")
+
+        self.assertTrue(exact_spend["enabled"])
+        self.assertEqual(exact_spend["display_mode"], "exact_spend")
+        self.assertEqual(exact_spend["firm_plan_status"], "live_verified")
+        self.assertFalse(exact_receive["enabled"])
+        self.assertEqual(exact_receive["display_mode"], "exact_receive")
+        self.assertEqual(exact_receive["indicative_status"], "provider_failure")
+        self.assertTrue(wrapped_spend["enabled"])
+        self.assertEqual(wrapped_spend["firm_plan_status"], "not_verified")
 
     async def test_unsupported_symbol_fails_closed_without_provider_call(self) -> None:
         service, discovery = self.make_service()

@@ -428,11 +428,13 @@ class EvmRpcClient:
         normalized_address = validate_evm_address(address)
         tag = str(block_tag or "latest").strip() or "latest"
         if tag != "latest":
-            return {
-                "ok": False,
-                "address": normalized_address,
-                "error": "unsupported_block_tag",
-            }
+            if not re.fullmatch(r"0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)", tag):
+                return {
+                    "ok": False,
+                    "address": normalized_address,
+                    "error": "unsupported_block_tag",
+                }
+            tag = tag.lower()
 
         identity = await self.verify_expected_chain(force_refresh=force_refresh)
         if not identity.get("ok"):
@@ -623,12 +625,14 @@ class EvmRpcClient:
 
         tag = str(block_tag or "latest").strip() or "latest"
         if tag != "latest":
-            return {
-                "ok": False,
-                "owner_address": owner,
-                "contract_address": contract,
-                "error": "unsupported_block_tag",
-            }
+            if not re.fullmatch(r"0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)", tag):
+                return {
+                    "ok": False,
+                    "owner_address": owner,
+                    "contract_address": contract,
+                    "error": "unsupported_block_tag",
+                }
+            tag = tag.lower()
 
         identity = await self.verify_expected_chain(force_refresh=force_refresh)
         if not identity.get("ok"):

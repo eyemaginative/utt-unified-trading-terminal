@@ -5539,7 +5539,7 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
         : isRobinhoodChainCrossAssetBuy
           ? `${fmtMoney?.(gross)} USDG`
           : fmtMoney?.(gross);
-      return <td style={td} title={isRobinhoodChainCrossAssetBuy ? "Actual USDG spent for the exact-output BUY" : undefined}>{maskMaybe?.(grossText)}</td>;
+      return <td style={td} title={isRobinhoodChainCrossAssetBuy ? "Actual USDG spent for the Robinhood Chain cross-asset swap" : undefined}>{maskMaybe?.(grossText)}</td>;
     }
     if (col === COLS.net) {
       const netText = net === null
@@ -5547,7 +5547,7 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
         : isRobinhoodChainCrossAssetBuy
           ? `${fmtQty?.(net)} ETH`
           : fmtMoney?.(net);
-      return <td style={td} title={isRobinhoodChainCrossAssetBuy ? "Actual ETH received; this is not Gross minus Fee because the assets differ" : undefined}>{maskMaybe?.(netText)}</td>;
+      return <td style={td} title={isRobinhoodChainCrossAssetBuy ? "Actual native ETH received; Gross and Net use different assets" : undefined}>{maskMaybe?.(netText)}</td>;
     }
     // Tax (backend if present; else Mode A fallback on USD FILLED SELL when eligible)
     if (col === COLS.tax) {
@@ -5585,7 +5585,29 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
     }
 
     if (col === COLS.status) return <td style={td}>{hideTableDataGlobal ? "••••" : st || "—"}</td>;
-    if (col === COLS.type) return <td style={td}>{hideTableDataGlobal ? "••••" : o.type || "—"}</td>;
+    if (col === COLS.type) {
+      if (isRobinhoodChainCrossAssetBuy && !hideTableDataGlobal) {
+        return (
+          <td style={td}>
+            <span style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              padding: "2px 6px",
+              borderRadius: 999,
+              border: "1px solid rgba(34, 211, 238, 0.55)",
+              background: "linear-gradient(135deg, rgba(8,145,178,0.20), rgba(109,40,217,0.18))",
+              color: "#a5f3fc",
+              fontWeight: 800,
+              boxShadow: "0 0 10px rgba(34,211,238,0.10)",
+            }} title="Robinhood Chain exact-spend cross-asset swap">
+              SWAP · EXACT SPEND
+            </span>
+          </td>
+        );
+      }
+      return <td style={td}>{hideTableDataGlobal ? "••••" : o.type || "—"}</td>;
+    }
     if (col === COLS.source) return <td style={td}>{hideTableDataGlobal ? "••••" : o.source || "—"}</td>;
     if (col === COLS.venue) return <td style={td}>{hideTableDataGlobal ? "••••" : o.venue || "—"}</td>;
     if (col === COLS.bucket) return <td style={td}>{hideTableDataGlobal ? "••••" : bucket}</td>;

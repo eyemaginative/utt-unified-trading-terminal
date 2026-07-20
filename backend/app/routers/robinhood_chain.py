@@ -530,7 +530,15 @@ class RobinhoodChainSwapExecutionPrepareRequest(BaseModel):
     taker_address: Optional[str] = Field(default=None, min_length=42, max_length=42)
     confirm_prepare: bool = Field(
         default=False,
-        description="Must be true to persist the R5A review-only exact-spend lifecycle record.",
+        description="Must be true to persist the generalized exact-spend lifecycle record.",
+    )
+
+
+class RobinhoodChainSwapFreshPrepareRequest(BaseModel):
+    wallet_address: str = Field(min_length=42, max_length=42)
+    confirm_prepare: bool = Field(
+        default=False,
+        description="Must be true to request and persist a fresh post-approval exact-spend swap plan.",
     )
 
 
@@ -1732,7 +1740,7 @@ async def robinhood_chain_execution_refresh(
 
 @router.get("/swap-execution/status")
 async def robinhood_chain_swap_execution_status() -> Dict[str, Any]:
-    """Return the review-only RH-CHAIN.10D.2-R5A exact-spend preparation gate."""
+    """Return the RH-CHAIN.10D.2-R5B two-stage exact-spend execution gate."""
     return get_robinhood_chain_swap_execution_service().status()
 
 
@@ -1774,6 +1782,153 @@ async def robinhood_chain_swap_execution_get(execution_id: str, db: Session = De
     except (ValueError, KeyError) as exc:
         db.rollback()
         raise HTTPException(status_code=404 if "not_found" in str(exc) else 400, detail={"error": str(exc)}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/approval/claim-send")
+async def robinhood_chain_swap_execution_claim_approval_send(
+    execution_id: str, request: RobinhoodChainExecutionSendClaimRequest, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_swap_execution_service().claim_approval_send(
+            db, execution_id=execution_id, wallet_address=request.wallet_address,
+            plan_hash=request.plan_hash, claim_id=request.claim_id,
+            confirm_send_claim=bool(request.confirm_send_claim),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/approval/submission")
+async def robinhood_chain_swap_execution_record_approval_submission(
+    execution_id: str, request: RobinhoodChainExecutionSubmissionRequest, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_swap_execution_service().record_approval_submission(
+            db, execution_id=execution_id, tx_hash=request.tx_hash,
+            wallet_address=request.wallet_address, claim_id=request.claim_id,
+            confirm_record=bool(request.confirm_record),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/approval/submission-failure")
+async def robinhood_chain_swap_execution_record_approval_failure(
+    execution_id: str, request: RobinhoodChainExecutionSubmissionFailureRequest, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_swap_execution_service().record_submission_failure(
+            db, execution_id=execution_id, stage="approval", wallet_address=request.wallet_address,
+            claim_id=request.claim_id, reason=request.reason, message=request.message,
+            confirm_failure=bool(request.confirm_failure),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/approval/refresh")
+async def robinhood_chain_swap_execution_refresh_approval(
+    execution_id: str, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return await get_robinhood_chain_swap_execution_service().refresh_approval(db, execution_id=execution_id)
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        status_code = 404 if "not_found" in error else 409 if "not_pending" in error else 502
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/prepare-swap")
+async def robinhood_chain_swap_execution_prepare_fresh_swap(
+    execution_id: str, request: RobinhoodChainSwapFreshPrepareRequest, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    try:
+        return await get_robinhood_chain_swap_execution_service().prepare_swap(
+            db, execution_id=execution_id, wallet_address=request.wallet_address,
+            eth_token=_resolve_execution_discovery_token(db, "ETH"),
+            usdg_token=_resolve_execution_discovery_token(db, "USDG"),
+            confirm_prepare=bool(request.confirm_prepare),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/swap/claim-send")
+async def robinhood_chain_swap_execution_claim_swap_send(
+    execution_id: str, request: RobinhoodChainExecutionSendClaimRequest, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return await get_robinhood_chain_swap_execution_service().claim_swap_send(
+            db, execution_id=execution_id, wallet_address=request.wallet_address,
+            plan_hash=request.plan_hash, claim_id=request.claim_id,
+            confirm_send_claim=bool(request.confirm_send_claim),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/swap/submission")
+async def robinhood_chain_swap_execution_record_swap_submission(
+    execution_id: str, request: RobinhoodChainExecutionSubmissionRequest, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_swap_execution_service().record_swap_submission(
+            db, execution_id=execution_id, tx_hash=request.tx_hash,
+            wallet_address=request.wallet_address, claim_id=request.claim_id,
+            confirm_record=bool(request.confirm_record),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/swap/submission-failure")
+async def robinhood_chain_swap_execution_record_swap_failure(
+    execution_id: str, request: RobinhoodChainExecutionSubmissionFailureRequest, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_swap_execution_service().record_submission_failure(
+            db, execution_id=execution_id, stage="swap", wallet_address=request.wallet_address,
+            claim_id=request.claim_id, reason=request.reason, message=request.message,
+            confirm_failure=bool(request.confirm_failure),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.post("/swap-execution/{execution_id}/swap/refresh")
+async def robinhood_chain_swap_execution_refresh_swap(
+    execution_id: str, db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        result = await get_robinhood_chain_swap_execution_service().refresh_swap(db, execution_id=execution_id)
+        execution = result.get("execution") if isinstance(result, dict) else None
+        if isinstance(execution, dict) and str(execution.get("status") or "").lower() == "confirmed":
+            result["balance_refresh"] = await _refresh_robinhood_chain_execution_balance_snapshots(
+                db, str(execution.get("wallet_address") or ""),
+            )
+        return result
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        status_code = 404 if "not_found" in error else 409 if "not_pending" in error else 502
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
 
 
 @router.get("/buy-execution/status")

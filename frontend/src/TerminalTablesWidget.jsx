@@ -452,12 +452,20 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
 
   // Strong signals first
   if (st.includes("cancel")) return "canceled";
-  if (st.includes("reject") || st.includes("fail") || st.includes("expire") || st.includes("error")) return "rejected";
+  if (
+    st.includes("reject") ||
+    st.includes("revert") ||
+    st.includes("verification_failed") ||
+    st.includes("submission_failed") ||
+    st.includes("fail") ||
+    st.includes("expire") ||
+    st.includes("error")
+  ) return "rejected";
 
   // Partial before fill
   if (st.includes("partial") || st.includes("partially_filled") || st.includes("partially filled")) return "partial";
 
-  if (st.includes("fill") || st === "done" || st === "filled") return "filled";
+  if (st.includes("fill") || st === "done" || st === "filled" || st === "confirmed") return "filled";
 
   // Ack/pending states
   if (st.includes("ack") || st.includes("accept") || st.includes("accepted")) return "acked";
@@ -5108,6 +5116,10 @@ function renderAllOrdersHeader(col) {
     const gross = calcGrossTotal?.(o);
     const fee = calcFee?.(o);
     const net = calcNetTotal?.(o);
+    const feeAsset = String(o?.fee_asset || o?.feeAsset || "").trim().toUpperCase();
+    const isRobinhoodChainExecutionRow =
+      String(o?.venue || "").trim().toLowerCase() === "robinhood_chain" &&
+      String(o?.source || "").trim().toUpperCase() === "RHCHAIN";
 
     
 const backendTax = pickOrderTaxUsdMaybe(o);
@@ -5124,6 +5136,7 @@ const isUsdQuote = isUsdQuotedSymbol(symForTax);
 const gainUsd = pickOrderGainUsdMaybe(o);
 
 const shouldFallbackTax =
+  !isRobinhoodChainExecutionRow &&
   !!aoTaxWithholdEnabled &&
   backendTax === null &&
   isUsdQuote &&
@@ -5149,7 +5162,10 @@ const fallbackTax =
 // Use backend tax if present, otherwise fallback tax if applicable, otherwise 0 for net-a/tx math.
 const taxUsed = backendTax !== null ? backendTax : fallbackTax !== null ? fallbackTax : 0;
 
-const netAfterTax = net === null || net === undefined ? null : Number(net) - Number(taxUsed);
+const netAfterTax =
+  isRobinhoodChainExecutionRow || net === null || net === undefined
+    ? null
+    : Number(net) - Number(taxUsed);
 const bucket = orderBucket(o);
     const st = normalizeStatus(pickOrderStatus(o));
 
@@ -5520,7 +5536,11 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
       const isInventoryError =
         String(o?.realized_status || "").trim().toLowerCase() === "unapplied" &&
         String(o?.realized_error || "").trim().toLowerCase() === "insufficient_inventory";
-      const displayTax = backendTax !== null ? backendTax : fallbackTax;
+      const displayTax = isRobinhoodChainExecutionRow
+        ? null
+        : backendTax !== null
+          ? backendTax
+          : fallbackTax;
       const displayText =
         displayTax === null
           ? (isInventoryError ? "I/E" : "—")
@@ -5535,7 +5555,12 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
       );
     }
     if (col === COLS.netAfterTax) return <td style={td}>{maskMaybe?.(netAfterTax === null ? "—" : fmtMoney?.(netAfterTax))}</td>;
-    if (col === COLS.fee)   return <td style={td}>{maskMaybe?.(fee === null ? "—" : fmtFee?.(fee))}</td>;
+    if (col === COLS.fee) {
+      const feeText = fee === null
+        ? "—"
+        : `${fmtFee?.(fee)}${feeAsset ? ` ${feeAsset}` : ""}`;
+      return <td style={td}>{maskMaybe?.(feeText)}</td>;
+    }
 
     if (col === COLS.limit) {
       return <td style={td}>{hideTableDataGlobal ? "••••" : o.limit_price != null ? fmtPrice?.(o.limit_price) : "—"}</td>;

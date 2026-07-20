@@ -527,6 +527,114 @@ export async function getRobinhoodChainFirmQuotePlan(payload = {}, { apiBase, ti
   const res = await axios.post(`${base}/api/robinhood_chain/quotes/firm-plan`, body, { timeout: timeout_ms });
   return res.data;
 }
+
+export async function getRobinhoodChainExecutionStatus({ apiBase, timeout_ms = 30000 } = {}) {
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.get(`/api/robinhood_chain/execution/status`, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}/api/robinhood_chain/execution/status`, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function prepareRobinhoodChainExecution(payload = {}, { apiBase, timeout_ms = 45000 } = {}) {
+  const body = {
+    symbol: "ETH-USDG",
+    side: "sell",
+    quantity: "0.002",
+    confirm_prepare: true,
+    ...payload,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/execution/prepare`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/execution/prepare`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function claimRobinhoodChainExecutionSend(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_send_claim: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/execution/${id}/claim-send`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/execution/${id}/claim-send`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function recordRobinhoodChainExecutionSubmission(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_record: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/execution/${id}/submission`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/execution/${id}/submission`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function recordRobinhoodChainExecutionSubmissionFailure(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const body = { confirm_failure: true, ...payload };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/execution/${id}/submission-failure`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/execution/${id}/submission-failure`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function refreshRobinhoodChainExecution(
+  executionId,
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/execution/${id}/refresh`, null, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/execution/${id}/refresh`, null, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function getRobinhoodChainExecution(
+  executionId,
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.get(`/api/robinhood_chain/execution/${id}`, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}/api/robinhood_chain/execution/${id}`, { timeout: timeout_ms });
+  return res.data;
+}
 export async function getPricesUSD({ venue, assets } = {}) {
   const assetsCsv = Array.isArray(assets) ? assets.filter(Boolean).join(",") : assets;
   const res = await http.get(`/api/market/prices_usd`, {

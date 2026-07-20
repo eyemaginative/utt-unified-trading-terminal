@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Any, Dict, List
 from sqlalchemy.orm import Session
 from sqlalchemy import select, false, func, or_, Table, MetaData
 
-from ..models import Order, VenueOrderRow, OrderView, RuntimeSetting, TokenRegistry
+from ..models import Order, VenueOrderRow, OrderView, RuntimeSetting, TokenRegistry, RobinhoodChainExecution
 
 # NEW (3.5): realized sourcing from lot_journal
 from ..models_lot_journal import LotJournal
@@ -54,7 +54,7 @@ ALLOWED_SORT_FIELDS = {
 # Include DEX swap terminal statuses here too.  The All Orders loader fetches
 # open and terminal buckets separately, so a confirmed swap must be selected by
 # the terminal SQL filter before _to_unified_swap can normalize it.
-_TERMINAL = {"filled", "canceled", "cancelled", "rejected", "done", "closed", "expired", "failed", "confirmed"}
+_TERMINAL = {"filled", "canceled", "cancelled", "rejected", "done", "closed", "expired", "failed", "confirmed", "reverted", "verification_failed", "wallet_rejected", "submission_failed"}
 _OPENISH = {"new", "open", "routed", "acked", "partial", "live", "pending"}
 
 
@@ -432,6 +432,97 @@ def _view_key_swap(venue: str, signature: str) -> str:
     # Stable key for swap (Solana/Jupiter etc) rows so they can participate in OrderView hydration.
     # Signature is the most stable identifier for swap-derived orders.
     return f"SWAP:{venue}:{signature or ''}"
+
+def _view_key_robinhood_chain_execution(execution_id: str) -> str:
+    return f"RHCHAIN:{execution_id or ''}"
+
+
+def _to_unified_robinhood_chain_execution(row: RobinhoodChainExecution) -> Dict[str, Any]:
+    status = str(row.status or "").strip().lower() or "pending"
+    created_at = row.submitted_at or row.created_at
+    terminal_at = row.confirmed_at or row.reverted_at
+    if terminal_at is None and status in _TERMINAL:
+        terminal_at = row.updated_at
+
+    qty = None
+    try:
+        qty = float(row.input_amount)
+    except Exception:
+        qty = None
+
+    route = row.route if isinstance(row.route, dict) else {}
+    reconciliation = route.get("execution_reconciliation")
+    if not isinstance(reconciliation, dict):
+        reconciliation = {}
+
+    def _float_or_none(value):
+        try:
+            if value is None or value == "":
+                return None
+            parsed = float(value)
+            return parsed if parsed >= 0 else None
+        except Exception:
+            return None
+
+    confirmed_reconciled = status == "confirmed" and reconciliation.get("reconciled") is True
+    actual_output = _float_or_none(reconciliation.get("output_amount")) if confirmed_reconciled else None
+    actual_avg_price = _float_or_none(reconciliation.get("average_fill_price")) if confirmed_reconciled else None
+    minimum_limit_price = _float_or_none(reconciliation.get("minimum_limit_price")) if confirmed_reconciled else None
+    actual_network_fee = _float_or_none(reconciliation.get("network_fee")) if confirmed_reconciled else None
+    fee_asset = str(reconciliation.get("fee_asset") or "").strip().upper() or None
+
+    return {
+        "source": "RHCHAIN",
+        "venue": "robinhood_chain",
+        "id": str(row.id),
+        # Full 66-character EVM hash is intentionally retained here. It is not
+        # forced into the 64-character Order/VenueOrderRow columns.
+        "venue_order_id": str(row.tx_hash or ""),
+        "client_order_id": str(row.quote_id or ""),
+        "symbol": row.symbol,
+        "symbol_canon": row.symbol,
+        "symbol_venue": row.symbol,
+        "side": row.side,
+        "type": "swap",
+        "status": status,
+        "status_bucket": _status_bucket(status),
+        "qty": qty,
+        "filled_qty": qty if status == "confirmed" else 0.0,
+        # RH-CHAIN.10D.1B exposes only receipt-verified realized values. The
+        # output is USDG while the network fee is ETH, so total_after_fee keeps
+        # the actual USDG received rather than subtracting a different asset.
+        "limit_price": minimum_limit_price,
+        "avg_fill_price": actual_avg_price,
+        "fee": actual_network_fee,
+        "fee_asset": fee_asset,
+        "total_after_fee": actual_output,
+        "reject_reason": row.error_message,
+        "created_at": created_at,
+        "updated_at": row.updated_at,
+        "captured_at": row.last_receipt_check_at or row.updated_at,
+        "closed_at": terminal_at,
+        "closed_at_inferred": False,
+        "view_key": _view_key_robinhood_chain_execution(str(row.id)),
+        "viewed_confirmed": False,
+        "viewed_at": None,
+        "can_cancel": False,
+        "cancel_ref": None,
+        # Extra context is harmless for internal consumers; the existing
+        # AllOrderRow schema ignores fields it does not expose.
+        "transaction_id": row.tx_hash,
+        "txid": row.tx_hash,
+        "execution_plan_hash": row.plan_hash,
+        "execution_quote_id": row.quote_id,
+        "expected_output_asset": row.expected_output_asset,
+        "expected_output_amount": row.expected_output_amount,
+        "minimum_output_amount": row.minimum_output_amount,
+        "actual_output_asset": reconciliation.get("output_asset") if confirmed_reconciled else None,
+        "actual_output_amount": reconciliation.get("output_amount") if confirmed_reconciled else None,
+        "actual_output_amount_atomic": reconciliation.get("output_amount_atomic") if confirmed_reconciled else None,
+        "actual_network_fee_asset": fee_asset,
+        "actual_network_fee_wei": reconciliation.get("network_fee_wei") if confirmed_reconciled else None,
+        "execution_reconciled": confirmed_reconciled,
+    }
 
 def _to_unified_local(o: Order) -> Dict[str, Any]:
     closed_at, closed_at_inferred = _closed_at_local(o.status, o.created_at, o.updated_at)
@@ -1561,6 +1652,54 @@ def list_all_orders(
         except Exception:
             swap_items = []
 
+    # Dedicated Robinhood Chain MetaMask execution lifecycle rows.
+    # Prepared intents are excluded; only submitted transaction hashes appear.
+    robinhood_chain_execution_items: List[Dict[str, Any]] = []
+    include_rh_chain = scope_norm in ("ALL", "VENUES")
+    if source and str(source).strip().upper() == "LOCAL":
+        include_rh_chain = False
+    if source and str(source).strip().upper() != "LOCAL":
+        include_rh_chain = _norm_venue(source) == "robinhood_chain"
+    if venue:
+        include_rh_chain = include_rh_chain and _norm_venue(venue) == "robinhood_chain"
+
+    if include_rh_chain:
+        try:
+            rows = (
+                db.query(RobinhoodChainExecution)
+                .filter(
+                    RobinhoodChainExecution.tx_hash.is_not(None),
+                    RobinhoodChainExecution.status.in_(
+                        ["pending", "confirmed", "reverted", "verification_failed"]
+                    ),
+                )
+                .all()
+            )
+            for row in rows:
+                unified = _to_unified_robinhood_chain_execution(row)
+                if symbol:
+                    requested_symbol = str(symbol or "").strip()
+                    if requested_symbol not in {
+                        str(unified.get("symbol") or ""),
+                        str(unified.get("symbol_canon") or ""),
+                        str(unified.get("symbol_venue") or ""),
+                    }:
+                        continue
+                if status and str(unified.get("status") or "") != str(status):
+                    continue
+                created_value = unified.get("created_at")
+                if dt_from and created_value and created_value < dt_from:
+                    continue
+                if dt_to and created_value and created_value > dt_to:
+                    continue
+                if status_bucket:
+                    requested_bucket = str(status_bucket).strip().lower()
+                    if str(unified.get("status_bucket") or "").lower() != requested_bucket:
+                        continue
+                robinhood_chain_execution_items.append(unified)
+        except Exception:
+            robinhood_chain_execution_items = []
+
     combined: List[Dict[str, Any]] = []
     for o in local_items:
         combined.append(_to_unified_local(o))
@@ -1569,6 +1708,8 @@ def list_all_orders(
 
     for sw in swap_items:
         combined.append(sw)
+    for execution_row in robinhood_chain_execution_items:
+        combined.append(execution_row)
 
     if status_bucket:
         sb = str(status_bucket).lower().strip()

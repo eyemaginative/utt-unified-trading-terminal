@@ -4,6 +4,7 @@ import asyncio
 import copy
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..models import TokenRegistry, WalletAddress
+from ..models import TokenRegistry, WalletAddress, WalletAddressSnapshot
 from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
 from ..services.robinhood_chain_accounting_preview import build_robinhood_chain_accounting_preview
 from ..services.robinhood_chain_history import (
@@ -35,6 +36,14 @@ from ..services.robinhood_chain_transaction_planning import (
     ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
     ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
     get_robinhood_chain_transaction_planning_service,
+)
+from ..services.robinhood_chain_execution import (
+    ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH,
+    ROBINHOOD_CHAIN_EXECUTION_SIDE,
+    ROBINHOOD_CHAIN_EXECUTION_SYMBOL,
+    ROBINHOOD_CHAIN_SUBMISSION_FAILURE_REASONS,
+    get_robinhood_chain_execution_service,
+    validate_execution_saved_wallet,
 )
 
 
@@ -415,6 +424,53 @@ class RobinhoodChainFirmQuotePlanRequest(BaseModel):
     )
 
 
+class RobinhoodChainExecutionPrepareRequest(BaseModel):
+    symbol: str = Field(default=ROBINHOOD_CHAIN_EXECUTION_SYMBOL, min_length=1, max_length=32)
+    side: str = Field(default=ROBINHOOD_CHAIN_EXECUTION_SIDE, min_length=3, max_length=4)
+    quantity: str = Field(default=str(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH), min_length=1, max_length=80)
+    slippage_bps: int = Field(
+        default=ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
+        ge=ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
+        le=ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
+    )
+    taker_address: Optional[str] = Field(default=None, min_length=42, max_length=42)
+    confirm_prepare: bool = Field(
+        default=False,
+        description="Must be true to create the dedicated prepared execution lifecycle row.",
+    )
+
+
+class RobinhoodChainExecutionSendClaimRequest(BaseModel):
+    wallet_address: str = Field(min_length=42, max_length=42)
+    plan_hash: str = Field(min_length=64, max_length=64)
+    claim_id: str = Field(min_length=64, max_length=64)
+    confirm_send_claim: bool = Field(
+        default=False,
+        description="Must be true to atomically reserve this prepared plan for one wallet send attempt.",
+    )
+
+
+class RobinhoodChainExecutionSubmissionRequest(BaseModel):
+    tx_hash: str = Field(min_length=66, max_length=66)
+    wallet_address: str = Field(min_length=42, max_length=42)
+    claim_id: str = Field(min_length=64, max_length=64)
+    confirm_record: bool = Field(
+        default=False,
+        description="Must be true to record the MetaMask-returned transaction hash.",
+    )
+
+
+class RobinhoodChainExecutionSubmissionFailureRequest(BaseModel):
+    wallet_address: str = Field(min_length=42, max_length=42)
+    claim_id: str = Field(min_length=64, max_length=64)
+    reason: str = Field(min_length=1, max_length=64)
+    message: Optional[str] = Field(default=None, max_length=512)
+    confirm_failure: bool = Field(
+        default=False,
+        description="Must be true to terminate a claimed send after MetaMask returned no transaction hash.",
+    )
+
+
 def _resolve_robinhood_chain_quote_taker(
     db: Session,
     requested_address: Optional[str] = None,
@@ -459,6 +515,179 @@ def _resolve_robinhood_chain_quote_taker(
                 "will_mutate": False,
             },
         ) from exc
+
+
+def _resolve_robinhood_chain_execution_taker(
+    db: Session,
+    requested_address: Optional[str] = None,
+) -> str:
+    """Resolve the saved RH Chain wallet and reject any execution override.
+
+    Quote-only endpoints retain their optional public-address override. The live
+    execution lifecycle does not: the connected MetaMask account must match the
+    saved ALL / robinhood_chain wallet on the backend as well as in the UI.
+    """
+    saved = _resolve_robinhood_chain_quote_taker(db, None)
+    try:
+        return validate_execution_saved_wallet(saved, requested_address)
+    except ValueError as exc:
+        error = str(exc)
+        status_code = 409 if error == "robinhood_chain_execution_saved_wallet_mismatch" else 400
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
+
+
+async def _refresh_robinhood_chain_execution_balance_snapshots(
+    db: Session,
+    wallet_address: str,
+) -> Dict[str, Any]:
+    """Force-refresh the saved RH Chain account snapshots after confirmation.
+
+    This is intentionally limited to native ETH and canonical registered USDG.
+    A snapshot failure never changes the already-verified execution lifecycle.
+    """
+    try:
+        normalized_address = validate_evm_address(wallet_address)
+    except ValueError as exc:
+        return {"ok": False, "refreshed": 0, "errors": [{"asset": "ALL", "error": str(exc)}]}
+
+    saved_row = (
+        db.query(WalletAddress)
+        .filter(
+            WalletAddress.network == _TOKEN_REGISTRY_CHAIN,
+            WalletAddress.wallet_id == _TOKEN_REGISTRY_VENUE,
+            WalletAddress.asset.in_(["ALL", "*"]),
+        )
+        .order_by(WalletAddress.created_at.desc())
+        .first()
+    )
+    if saved_row is None:
+        return {
+            "ok": False,
+            "refreshed": 0,
+            "errors": [{"asset": "ALL", "error": "saved_robinhood_chain_wallet_not_found"}],
+        }
+    try:
+        saved_address = validate_evm_address(str(saved_row.address or "").strip())
+    except ValueError as exc:
+        return {"ok": False, "refreshed": 0, "errors": [{"asset": "ALL", "error": str(exc)}]}
+    if saved_address.lower() != normalized_address.lower():
+        return {
+            "ok": False,
+            "refreshed": 0,
+            "errors": [{"asset": "ALL", "error": "saved_robinhood_chain_wallet_mismatch"}],
+        }
+
+    client = get_robinhood_chain_client()
+    refreshed = 0
+    errors: List[Dict[str, Any]] = []
+    items: List[Dict[str, Any]] = []
+
+    try:
+        eth_result = await client.get_native_balance(
+            normalized_address,
+            block_tag="latest",
+            force_refresh=True,
+        )
+        if not eth_result.get("ok"):
+            raise RuntimeError(str(eth_result.get("error") or eth_result))
+        balance_eth = Decimal(str(eth_result.get("balance_eth") or "0"))
+        snapshot = WalletAddressSnapshot(
+            wallet_address_id=saved_row.id,
+            asset="ETH",
+            network=_TOKEN_REGISTRY_CHAIN,
+            address=normalized_address,
+            balance_qty=float(balance_eth),
+            balance_raw={
+                "read_only": True,
+                "post_execution_refresh": True,
+                "chain_id": _EXPECTED_CHAIN_ID_DECIMAL,
+                "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+                "block_tag": eth_result.get("block_tag") or "latest",
+                "balance_wei": str(eth_result.get("balance_wei") or "0"),
+                "balance_eth": str(eth_result.get("balance_eth") or "0"),
+                "cached": bool(eth_result.get("cached")),
+                "fetched_at": eth_result.get("fetched_at"),
+                "source": "robinhood_chain_rpc",
+            },
+            source="robinhood_chain_rpc",
+            fetched_at=datetime.utcnow(),
+        )
+        db.add(snapshot)
+        db.commit()
+        refreshed += 1
+        items.append({
+            "asset": "ETH",
+            "balance": str(eth_result.get("balance_eth") or "0"),
+            "balance_atomic": str(eth_result.get("balance_wei") or "0"),
+            "cached": bool(eth_result.get("cached")),
+            "fetched_at": eth_result.get("fetched_at"),
+        })
+    except Exception as exc:
+        db.rollback()
+        errors.append({"asset": "ETH", "error": str(exc)})
+
+    try:
+        token_row, contract_address, token_decimals = _resolve_registered_erc20(db, "USDG")
+        token_result = await client.get_erc20_balance(
+            normalized_address,
+            contract_address,
+            token_decimals,
+            block_tag="latest",
+            force_refresh=True,
+        )
+        if not token_result.get("ok"):
+            raise RuntimeError(str(token_result.get("error") or token_result))
+        balance_token = Decimal(str(token_result.get("balance_token") or "0"))
+        snapshot = WalletAddressSnapshot(
+            wallet_address_id=saved_row.id,
+            asset="USDG",
+            network=_TOKEN_REGISTRY_CHAIN,
+            address=normalized_address,
+            balance_qty=float(balance_token),
+            balance_raw={
+                "read_only": True,
+                "post_execution_refresh": True,
+                "chain_id": _EXPECTED_CHAIN_ID_DECIMAL,
+                "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+                "block_tag": token_result.get("block_tag") or "latest",
+                "contract_address": contract_address,
+                "decimals": token_decimals,
+                "balance_atomic": str(token_result.get("balance_atomic") or "0"),
+                "balance_token": str(token_result.get("balance_token") or "0"),
+                "registry_id": int(token_row.id),
+                "registry_venue": token_row.venue,
+                "registry_label": token_row.label,
+                "cached": bool(token_result.get("cached")),
+                "fetched_at": token_result.get("fetched_at"),
+                "source": "robinhood_chain_erc20_rpc",
+            },
+            source="robinhood_chain_erc20_rpc",
+            fetched_at=datetime.utcnow(),
+        )
+        db.add(snapshot)
+        db.commit()
+        refreshed += 1
+        items.append({
+            "asset": "USDG",
+            "balance": str(token_result.get("balance_token") or "0"),
+            "balance_atomic": str(token_result.get("balance_atomic") or "0"),
+            "contract_address": contract_address,
+            "cached": bool(token_result.get("cached")),
+            "fetched_at": token_result.get("fetched_at"),
+        })
+    except Exception as exc:
+        db.rollback()
+        errors.append({"asset": "USDG", "error": str(exc)})
+
+    return {
+        "ok": len(errors) == 0,
+        "refreshed": refreshed,
+        "items": items,
+        "errors": errors,
+        "force_refresh": True,
+        "wallet_address_id": saved_row.id,
+        "wallet_address": normalized_address,
+    }
 
 
 def _quote_failure_status(result: Dict[str, Any]) -> int:
@@ -1236,6 +1465,186 @@ async def robinhood_chain_firm_quote_plan(
     if result.get("ok"):
         return result
     raise HTTPException(status_code=_quote_failure_status(result), detail=result)
+
+
+@router.get("/execution/status")
+async def robinhood_chain_execution_status() -> Dict[str, Any]:
+    """Return the dedicated RH-CHAIN.10D.1 browser-wallet execution gate."""
+    return get_robinhood_chain_execution_service().status()
+
+
+@router.post("/execution/prepare")
+async def robinhood_chain_execution_prepare(
+    request: RobinhoodChainExecutionPrepareRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Create one tightly bounded prepared lifecycle row and fresh transaction plan.
+
+    This endpoint writes only the dedicated robinhood_chain_executions table. It
+    does not connect MetaMask, sign, broadcast, create a generic order, or touch
+    ledger/FIFO/basis state.
+    """
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+
+    if str(request.symbol or "").strip().upper() != ROBINHOOD_CHAIN_EXECUTION_SYMBOL:
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_execution_symbol_locked"})
+    if str(request.side or "").strip().lower() != ROBINHOOD_CHAIN_EXECUTION_SIDE:
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_execution_side_locked"})
+    if str(request.quantity or "").strip() != str(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "robinhood_chain_execution_amount_locked",
+                "required_quantity_eth": str(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH),
+            },
+        )
+
+    taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
+    eth = _resolve_execution_discovery_token(db, "ETH")
+    usdg = _resolve_execution_discovery_token(db, "USDG")
+    try:
+        result = await get_robinhood_chain_execution_service().prepare(
+            db,
+            taker_address=taker,
+            eth_token=eth,
+            usdg_token=usdg,
+            slippage_bps=int(request.slippage_bps),
+            confirm_prepare=bool(request.confirm_prepare),
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    if result.get("ok"):
+        return result
+    db.rollback()
+    raise HTTPException(status_code=_quote_failure_status(result), detail=result)
+
+
+@router.get("/execution/{execution_id}")
+async def robinhood_chain_execution_get(
+    execution_id: str,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        payload = get_robinhood_chain_execution_service().get(db, execution_id)
+        db.rollback()
+        return payload
+    except ValueError as exc:
+        db.rollback()
+        status_code = 404 if str(exc) == "robinhood_chain_execution_not_found" else 400
+        raise HTTPException(status_code=status_code, detail={"error": str(exc)}) from exc
+
+
+@router.post("/execution/{execution_id}/claim-send")
+async def robinhood_chain_execution_claim_send(
+    execution_id: str,
+    request: RobinhoodChainExecutionSendClaimRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Atomically reserve one prepared plan for one explicit MetaMask request."""
+    try:
+        return get_robinhood_chain_execution_service().claim_send(
+            db,
+            execution_id=execution_id,
+            wallet_address=request.wallet_address,
+            plan_hash=request.plan_hash,
+            claim_id=request.claim_id,
+            confirm_send_claim=bool(request.confirm_send_claim),
+        )
+    except ValueError as exc:
+        db.rollback()
+        error = str(exc)
+        status_code = 404 if error == "robinhood_chain_execution_not_found" else 409
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
+
+
+@router.post("/execution/{execution_id}/submission")
+async def robinhood_chain_execution_record_submission(
+    execution_id: str,
+    request: RobinhoodChainExecutionSubmissionRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Record exactly one transaction hash returned by explicit MetaMask send."""
+    try:
+        return get_robinhood_chain_execution_service().record_submission(
+            db,
+            execution_id=execution_id,
+            tx_hash=request.tx_hash,
+            wallet_address=request.wallet_address,
+            claim_id=request.claim_id,
+            confirm_record=bool(request.confirm_record),
+        )
+    except ValueError as exc:
+        db.rollback()
+        status_code = 404 if str(exc) == "robinhood_chain_execution_not_found" else 409
+        raise HTTPException(status_code=status_code, detail={"error": str(exc)}) from exc
+
+
+@router.post("/execution/{execution_id}/submission-failure")
+async def robinhood_chain_execution_record_submission_failure(
+    execution_id: str,
+    request: RobinhoodChainExecutionSubmissionFailureRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Record a terminal MetaMask request failure only when no hash was returned."""
+    reason = str(request.reason or "").strip().lower()
+    if reason not in ROBINHOOD_CHAIN_SUBMISSION_FAILURE_REASONS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_robinhood_chain_submission_failure_reason",
+                "allowed": sorted(ROBINHOOD_CHAIN_SUBMISSION_FAILURE_REASONS),
+            },
+        )
+    try:
+        return get_robinhood_chain_execution_service().record_submission_failure(
+            db,
+            execution_id=execution_id,
+            wallet_address=request.wallet_address,
+            claim_id=request.claim_id,
+            reason=reason,
+            message=request.message,
+            confirm_failure=bool(request.confirm_failure),
+        )
+    except ValueError as exc:
+        db.rollback()
+        error = str(exc)
+        status_code = 404 if error == "robinhood_chain_execution_not_found" else 409
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
+
+
+@router.post("/execution/{execution_id}/refresh")
+async def robinhood_chain_execution_refresh(
+    execution_id: str,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Refresh receipt state, realized output, and saved ETH/USDG snapshots."""
+    try:
+        result = await get_robinhood_chain_execution_service().refresh_receipt(
+            db,
+            execution_id=execution_id,
+        )
+        execution = result.get("execution") if isinstance(result, dict) else None
+        if isinstance(execution, dict) and str(execution.get("status") or "").lower() == "confirmed":
+            result["balance_refresh"] = await _refresh_robinhood_chain_execution_balance_snapshots(
+                db,
+                str(execution.get("wallet_address") or ""),
+            )
+        return result
+    except ValueError as exc:
+        db.rollback()
+        error = str(exc)
+        if error == "robinhood_chain_execution_not_found":
+            status_code = 404
+        elif error == "robinhood_chain_execution_not_submitted":
+            status_code = 409
+        else:
+            status_code = 502
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
 
 
 @router.get("/orderbook")

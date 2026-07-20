@@ -1310,7 +1310,7 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
                     result = await get_robinhood_chain_client().get_native_balance(
                         normalized_address,
                         block_tag="latest",
-                        force_refresh=False,
+                        force_refresh=True,
                     )
                     if not result.get("ok"):
                         raise RuntimeError(str(result.get("error") or result))
@@ -1373,7 +1373,7 @@ async def wallet_balances_refresh(payload: WalletAddressRefreshRequest, db: Sess
                         contract_address,
                         token_decimals,
                         block_tag="latest",
-                        force_refresh=False,
+                        force_refresh=True,
                     )
                     if not token_result.get("ok"):
                         raise RuntimeError(str(token_result.get("error") or token_result))

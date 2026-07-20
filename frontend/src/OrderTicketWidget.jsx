@@ -4,7 +4,19 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Connection, clusterApiUrl } from "@solana/web3.js";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { UnifiedWalletButton } from "@jup-ag/wallet-adapter";
-import { getOrderRules, getRobinhoodChainFirmQuotePlan, getRobinhoodChainIndicativeQuote, getRobinhoodChainQuoteStatus } from "./lib/api";
+import {
+  claimRobinhoodChainExecutionSend,
+  getOrderRules,
+  getRobinhoodChainExecution,
+  getRobinhoodChainExecutionStatus,
+  getRobinhoodChainFirmQuotePlan,
+  getRobinhoodChainIndicativeQuote,
+  getRobinhoodChainQuoteStatus,
+  prepareRobinhoodChainExecution,
+  recordRobinhoodChainExecutionSubmission,
+  recordRobinhoodChainExecutionSubmissionFailure,
+  refreshRobinhoodChainExecution,
+} from "./lib/api";
 import { expandExponential } from "./lib/format";
 
 // Auth (local token) — used to gate funds actions.
@@ -38,6 +50,80 @@ const ROBINHOOD_CHAIN_NETWORK = Object.freeze({
   blockExplorerUrls: Object.freeze(["https://robinhoodchain.blockscout.com"]),
 });
 const ROBINHOOD_CHAIN_USDG_CONTRACT = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+const ROBINHOOD_CHAIN_PENDING_EXECUTION_KEY = "utt_robinhood_chain_pending_execution_v2";
+const ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH = "0.002";
+const ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI = 2000000000000000n;
+
+function robinhoodChainHexQuantity(value) {
+  const raw = typeof value === "bigint" ? value : BigInt(String(value ?? "0"));
+  if (raw < 0n) throw new Error("Negative EVM transaction quantities are not allowed.");
+  return `0x${raw.toString(16)}`;
+}
+
+function normalizeRobinhoodChainTransactionHash(value) {
+  const txHash = String(value || "").trim();
+  return /^0x[0-9a-fA-F]{64}$/.test(txHash) ? txHash.toLowerCase() : "";
+}
+
+function normalizeRobinhoodChainClaimId(value) {
+  const claimId = String(value || "").trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(claimId) ? claimId : "";
+}
+
+function createRobinhoodChainClaimId() {
+  if (typeof globalThis.crypto?.getRandomValues !== "function") {
+    throw new Error("Secure browser randomness is unavailable; the send claim cannot be created.");
+  }
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+async function robinhoodChainCalldataSha256(calldata) {
+  const raw = String(calldata || "").trim();
+  if (!/^0x(?:[0-9a-fA-F]{2})+$/.test(raw)) throw new Error("Prepared calldata is malformed.");
+  if (typeof globalThis.crypto?.subtle?.digest !== "function") {
+    throw new Error("Browser SHA-256 support is unavailable; transaction verification is blocked.");
+  }
+  const bytes = new Uint8Array(raw.slice(2).match(/.{2}/g).map((pair) => Number.parseInt(pair, 16)));
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function notifyRobinhoodChainAllOrdersRefresh() {
+  try {
+    window.dispatchEvent(new CustomEvent("utt:all-orders-refresh-request", {
+      detail: { source: "robinhood_chain_execution" },
+    }));
+  } catch {
+    // All Orders can still be loaded manually.
+  }
+}
+
+function readRobinhoodChainPendingExecution() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(ROBINHOOD_CHAIN_PENDING_EXECUTION_KEY) || "null");
+    if (!parsed || typeof parsed !== "object") return null;
+    const executionId = String(parsed.executionId || "").trim();
+    const claimId = normalizeRobinhoodChainClaimId(parsed.claimId);
+    const txHash = normalizeRobinhoodChainTransactionHash(parsed.txHash);
+    return executionId ? { executionId, claimId, txHash } : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeRobinhoodChainPendingExecution(value) {
+  try {
+    if (!value) {
+      localStorage.removeItem(ROBINHOOD_CHAIN_PENDING_EXECUTION_KEY);
+      return;
+    }
+    localStorage.setItem(ROBINHOOD_CHAIN_PENDING_EXECUTION_KEY, JSON.stringify(value));
+  } catch {
+    // Recovery storage is best-effort; backend idempotency remains authoritative.
+  }
+}
 
 const COUNTERPARTY_FEE_TIERS = {
   slow: { label: "Slow", blocks: 18, eta: "~3 hours" },
@@ -223,11 +309,11 @@ function robinhoodChainQuoteRules(symbol) {
     quote_only: true,
     synthetic_orderbook: true,
     execution_enabled: false,
-    errors: supported ? [] : ["RH-CHAIN.10D.0 supports ETH-USDG only"],
+    errors: supported ? [] : ["RH-CHAIN.10D.1B supports ETH-USDG only"],
     warnings: [
       "Synthetic 0x indicative quote samples; not resting orders.",
-      "RH-CHAIN.10D.0 may fetch a bounded firm quote and expose a validated unsigned transaction plan for review only.",
-      "No approval transaction, wallet prompt, signing, broadcast, or order recording.",
+      "RH-CHAIN.10D.1B may fetch a bounded firm quote and expose a validated unsigned transaction plan for review only.",
+      "Only an explicit reviewed 0.002 ETH SELL may open one MetaMask transaction request when the dedicated send gate is enabled.",
     ],
   };
 }
@@ -2985,11 +3071,44 @@ export default function OrderTicketWidget({
   limitPrice: limitPriceProp,
   setLimitPrice: setLimitPriceProp,
   venueTradeGate = null,
+  onAllOrdersRefresh = null,
+  onBalancesRefresh = null,
 }) {
   // Optional toast emitter (some app shells inject this; keep safe/no-op if absent)
   const onToast = (typeof window !== "undefined" && (window.__uttOnToast || window.uttOnToast))
     ? (window.__uttOnToast || window.uttOnToast)
     : undefined;
+
+  const requestAllOrdersRefresh = () => {
+    if (typeof onAllOrdersRefresh === "function") {
+      try {
+        const result = onAllOrdersRefresh();
+        if (result && typeof result.catch === "function") result.catch(() => {});
+        return;
+      } catch {
+        // Fall through to the event bridge.
+      }
+    }
+    notifyRobinhoodChainAllOrdersRefresh();
+  };
+
+  const requestRobinhoodChainBalancesRefresh = (detail = {}) => {
+    if (typeof onBalancesRefresh === "function") {
+      try {
+        const result = onBalancesRefresh(detail);
+        if (result && typeof result.catch === "function") result.catch(() => {});
+      } catch {
+        // The global event below remains available as a fallback.
+      }
+    }
+    try {
+      window.dispatchEvent(new CustomEvent("utt:robinhood-chain-balances-updated", {
+        detail: { source: "robinhood_chain_execution", ...detail },
+      }));
+    } catch {
+      // Wallet Addresses can still be refreshed manually.
+    }
+  };
 
   const walletKit = useWallet();
   const walletKitButtonHostRef = useRef(null);
@@ -3059,6 +3178,13 @@ export default function OrderTicketWidget({
     balancesFetchedAt: null,
     lastEvent: "init",
   }));
+  const [robinhoodChainExecutionStatus, setRobinhoodChainExecutionStatus] = useState(null);
+  const [robinhoodChainPreparedExecution, setRobinhoodChainPreparedExecution] = useState(null);
+  const [robinhoodChainExecutionBusy, setRobinhoodChainExecutionBusy] = useState(false);
+  const [robinhoodChainExecutionError, setRobinhoodChainExecutionError] = useState("");
+  const [robinhoodChainExecutionConfirmed, setRobinhoodChainExecutionConfirmed] = useState(false);
+  const [robinhoodChainSubmissionRecovery, setRobinhoodChainSubmissionRecovery] = useState(null);
+  const robinhoodChainExecutionSendRef = useRef(false);
 
   const venueLabel = hideVenueNames ? "••••" : String(effectiveVenue || "");
   const tradeGate = venueTradeGate && typeof venueTradeGate === "object" ? venueTradeGate : null;
@@ -3344,6 +3470,45 @@ export default function OrderTicketWidget({
     };
   }, [isRobinhoodChainVenue, apiBase]);
 
+  useEffect(() => {
+    if (!isRobinhoodChainVenue) return undefined;
+    let active = true;
+
+    const loadExecutionState = async () => {
+      try {
+        const status = await getRobinhoodChainExecutionStatus({ apiBase, timeout_ms: 30000 });
+        if (active) setRobinhoodChainExecutionStatus(status);
+      } catch (error) {
+        if (active) setRobinhoodChainExecutionError(robinhoodChainQuoteError(error));
+      }
+
+      const pending = readRobinhoodChainPendingExecution();
+      if (!pending?.executionId) return;
+      try {
+        const payload = await getRobinhoodChainExecution(pending.executionId, { apiBase, timeout_ms: 30000 });
+        if (!active) return;
+        setRobinhoodChainPreparedExecution({
+          ok: true,
+          execution: payload?.execution || null,
+          unsigned_transaction_plan: null,
+          send_gate: payload?.send_gate || null,
+          recovered: true,
+        });
+        if (pending.claimId && !payload?.execution?.tx_hash) {
+          setRobinhoodChainSubmissionRecovery(pending);
+        }
+      } catch {
+        // Keep local recovery information; the operator may retry recording.
+        if (active && pending.claimId) setRobinhoodChainSubmissionRecovery(pending);
+      }
+    };
+
+    void loadExecutionState();
+    return () => {
+      active = false;
+    };
+  }, [isRobinhoodChainVenue, apiBase]);
+
   const robinhoodChainConnectedAddress = normalizeRobinhoodChainEvmAddress(robinhoodChainWalletState.connectedAddress);
   const robinhoodChainSavedAddress = normalizeRobinhoodChainEvmAddress(robinhoodChainWalletState.savedAddress);
   const robinhoodChainWalletConnected = !!robinhoodChainConnectedAddress;
@@ -3369,6 +3534,9 @@ export default function OrderTicketWidget({
     setRobinhoodChainFirmPlan(null);
     setRobinhoodChainFirmPlanErrorText("");
     setRobinhoodChainFirmPlanLoading(false);
+    setRobinhoodChainPreparedExecution(null);
+    setRobinhoodChainExecutionConfirmed(false);
+    setRobinhoodChainExecutionError("");
     setSubmitOk((current) => (current?.quote_only ? null : current));
   }, [isRobinhoodChainVenue, otSymbol, side]);
 
@@ -6092,7 +6260,7 @@ export default function OrderTicketWidget({
       lines.push("Robinhood Chain RH-CHAIN.10D.0 can request bounded 0x indicative prices and a validated unsigned firm-quote plan for review. It cannot construct an approval transaction, prompt a wallet, sign, broadcast, or record an order.");
       lines.push("BUY uses Total (USDG) as exact input. SELL uses Qty (ETH) as exact input.");
       if (symbol !== "ETH-USDG") {
-        lines.push("RH-CHAIN.10D.0 supports ETH-USDG only.");
+        lines.push("RH-CHAIN.10D.1B supports ETH-USDG only.");
         fails.push("robinhood_chain_symbol_unsupported");
       }
       if (side === "buy" && totalQuoteNum === null) {
@@ -6510,6 +6678,56 @@ export default function OrderTicketWidget({
     !robinhoodChainFirmPlanLoading
   );
 
+
+  const robinhoodChainPreparedRow = robinhoodChainPreparedExecution?.execution || null;
+  const robinhoodChainPreparedPlan = robinhoodChainPreparedExecution?.unsigned_transaction_plan || null;
+  const robinhoodChainPreparedExpiresAt = Date.parse(
+    String(robinhoodChainPreparedRow?.plan_expires_at || robinhoodChainPreparedExecution?.plan_expires_at || "")
+  );
+  const robinhoodChainPreparedStale = Boolean(
+    robinhoodChainPreparedRow &&
+    Number.isFinite(robinhoodChainPreparedExpiresAt) &&
+    Date.now() >= robinhoodChainPreparedExpiresAt
+  );
+  const robinhoodChainExecutionTerminal = ["confirmed", "reverted", "verification_failed", "wallet_rejected", "submission_failed"].includes(
+    String(robinhoodChainPreparedRow?.status || "").trim().toLowerCase()
+  );
+  const canPrepareRobinhoodChainExecution = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainWalletReady &&
+    robinhoodChainFirmPlan?.ok &&
+    !robinhoodChainFirmPlanStale &&
+    String(side || "").toLowerCase() === "sell" &&
+    normalizeRobinhoodChainAmountText(qty) === ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH &&
+    robinhoodChainFirmPlan?.approval_required === false &&
+    !robinhoodChainExecutionBusy
+  );
+  const robinhoodChainSendGate = robinhoodChainPreparedExecution?.send_gate || robinhoodChainExecutionStatus || {};
+  const canSendRobinhoodChainExecution = Boolean(
+    robinhoodChainPreparedRow &&
+    robinhoodChainPreparedPlan &&
+    String(robinhoodChainPreparedRow.status || "") === "prepared" &&
+    !robinhoodChainPreparedStale &&
+    Number(robinhoodChainPreparedRow.slippage_bps) === Number(robinhoodChainSlippageBps) &&
+    robinhoodChainSendGate?.send_enabled === true &&
+    robinhoodChainWalletReady &&
+    robinhoodChainExecutionConfirmed &&
+    !robinhoodChainExecutionBusy &&
+    !robinhoodChainExecutionSendRef.current
+  );
+
+
+
+
+  useEffect(() => {
+    if (!isRobinhoodChainVenue) return undefined;
+    const status = String(robinhoodChainPreparedRow?.status || "").trim().toLowerCase();
+    if (status !== "pending" || !robinhoodChainPreparedRow?.id) return undefined;
+    const timer = window.setInterval(() => {
+      if (!robinhoodChainExecutionBusy) void refreshRobinhoodChainExecutionReceipt();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [isRobinhoodChainVenue, robinhoodChainPreparedRow?.id, robinhoodChainPreparedRow?.status, robinhoodChainExecutionBusy, apiBase]);
 
   const balanceWarning = useMemo(() => {
     if (side === "buy") {
@@ -7529,7 +7747,7 @@ async function submitLimitOrder() {
     if (!isRobinhoodChainVenue || robinhoodChainQuoteLoading) return;
     const symbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
     if (symbol !== "ETH-USDG") {
-      const msg = "RH-CHAIN.10D.0 supports ETH-USDG only.";
+      const msg = "RH-CHAIN.10D.1B supports ETH-USDG only.";
       setRobinhoodChainQuoteErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -7654,6 +7872,384 @@ async function submitLimitOrder() {
       if (robinhoodChainFirmPlanReqRef.current === reqId) {
         setRobinhoodChainFirmPlanLoading(false);
       }
+    }
+  }
+
+  async function refreshRobinhoodChainExecutionGate() {
+    try {
+      const status = await getRobinhoodChainExecutionStatus({ apiBase, timeout_ms: 30000 });
+      setRobinhoodChainExecutionStatus(status);
+      return status;
+    } catch (error) {
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainExecutionError(msg);
+      return null;
+    }
+  }
+
+  async function prepareRobinhoodChainLiveExecution() {
+    if (!canPrepareRobinhoodChainExecution) {
+      const msg = "A fresh matching 0.002 ETH SELL plan, connected saved wallet, and chain 4663 are required.";
+      setRobinhoodChainExecutionError(msg);
+      onToast?.({ kind: "warn", msg });
+      return;
+    }
+    setRobinhoodChainExecutionBusy(true);
+    setRobinhoodChainExecutionError("");
+    setRobinhoodChainExecutionConfirmed(false);
+    try {
+      const data = await prepareRobinhoodChainExecution(
+        {
+          symbol: "ETH-USDG",
+          side: "sell",
+          quantity: ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH,
+          slippage_bps: Number(robinhoodChainSlippageBps),
+          taker_address: robinhoodChainConnectedAddress,
+          confirm_prepare: true,
+        },
+        { apiBase, timeout_ms: 45000 }
+      );
+      if (!data?.ok || !data?.execution || !data?.unsigned_transaction_plan) {
+        throw new Error(data?.error || "Execution preparation returned an incomplete response.");
+      }
+      setRobinhoodChainPreparedExecution(data);
+      setRobinhoodChainExecutionStatus(data?.send_gate || null);
+      onToast?.({
+        kind: data?.send_gate?.send_enabled ? "ok" : "warn",
+        msg: data?.send_gate?.send_enabled
+          ? "0.002 ETH execution prepared. Review and explicitly confirm before MetaMask opens."
+          : "Execution prepared in review mode. Live send gate remains blocked.",
+      });
+    } catch (error) {
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainPreparedExecution(null);
+      setRobinhoodChainExecutionError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      setRobinhoodChainExecutionBusy(false);
+    }
+  }
+
+  async function recordRobinhoodChainSubmittedHash(executionId, txHash, claimId) {
+    const recorded = await recordRobinhoodChainExecutionSubmission(
+      executionId,
+      {
+        tx_hash: txHash,
+        wallet_address: robinhoodChainConnectedAddress,
+        claim_id: claimId,
+        confirm_record: true,
+      },
+      { apiBase, timeout_ms: 30000 }
+    );
+    if (!recorded?.ok || !recorded?.execution) {
+      throw new Error(recorded?.error || "Backend transaction recording failed.");
+    }
+    setRobinhoodChainPreparedExecution((current) => ({
+      ...(current || {}),
+      ok: true,
+      execution: recorded.execution,
+      send_gate: current?.send_gate || robinhoodChainExecutionStatus,
+    }));
+    setRobinhoodChainSubmissionRecovery(null);
+    writeRobinhoodChainPendingExecution({ executionId, claimId, txHash });
+    requestAllOrdersRefresh();
+    return recorded;
+  }
+
+  async function recordRobinhoodChainPreSubmissionFailure(executionId, claimId, error) {
+    const code = Number(error?.code);
+    const reason = code === 4001 ? "wallet_rejected" : "wallet_request_failed";
+    const message = robinhoodChainWalletErrorMessage(error, "MetaMask returned no transaction hash.");
+    try {
+      const recorded = await recordRobinhoodChainExecutionSubmissionFailure(
+        executionId,
+        {
+          wallet_address: robinhoodChainConnectedAddress,
+          claim_id: claimId,
+          reason,
+          message,
+          confirm_failure: true,
+        },
+        { apiBase, timeout_ms: 30000 }
+      );
+      if (recorded?.ok && recorded?.execution) {
+        setRobinhoodChainPreparedExecution((current) => ({
+          ...(current || {}),
+          ok: true,
+          execution: recorded.execution,
+          send_gate: current?.send_gate || robinhoodChainExecutionStatus,
+        }));
+        writeRobinhoodChainPendingExecution(null);
+        setRobinhoodChainSubmissionRecovery(null);
+      }
+    } catch {
+      // Keep the claim locally. It must not be reused for another send attempt.
+      setRobinhoodChainSubmissionRecovery({ executionId, claimId, txHash: "" });
+      writeRobinhoodChainPendingExecution({ executionId, claimId, txHash: "" });
+    }
+    return message;
+  }
+
+  async function sendRobinhoodChainPreparedExecution() {
+    if (!canSendRobinhoodChainExecution) return;
+    const provider = robinhoodChainMetaMaskProviderRef.current || getRobinhoodChainMetaMaskProvider();
+    if (!provider) {
+      setRobinhoodChainExecutionError("MetaMask was not detected.");
+      return;
+    }
+    if (robinhoodChainExecutionSendRef.current) return;
+
+    const execution = robinhoodChainPreparedRow;
+    const plan = robinhoodChainPreparedPlan;
+    const executionId = String(execution?.id || "").trim();
+    const planFrom = normalizeRobinhoodChainEvmAddress(plan?.from);
+    const planTo = normalizeRobinhoodChainEvmAddress(plan?.to);
+    const planData = String(plan?.calldata || "").trim();
+    const planValue = BigInt(String(plan?.value_wei || "0"));
+    const gasLimit = BigInt(String(plan?.gas_limit || "0"));
+    const gasPrice = BigInt(String(plan?.gas_price_wei || "0"));
+    const storedPlanHash = String(execution?.plan_hash || "").trim().toLowerCase();
+    const storedCalldataHash = String(execution?.calldata_sha256 || "").trim().toLowerCase();
+
+    if (
+      !executionId ||
+      normalizeRobinhoodChainQuoteSymbol(otSymbol) !== "ETH-USDG" ||
+      String(side || "").trim().toLowerCase() !== "sell" ||
+      normalizeRobinhoodChainAmountText(qty) !== ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH ||
+      Number(execution?.slippage_bps) !== Number(robinhoodChainSlippageBps) ||
+      Number(plan?.chain_id) !== ROBINHOOD_CHAIN_NETWORK.chainIdDecimal ||
+      plan?.native_input !== true ||
+      plan?.destination_allowlisted !== true ||
+      String(plan?.gas_limit || "") !== String(execution?.gas_limit || "") ||
+      String(plan?.gas_price_wei || "") !== String(execution?.gas_price_wei || "") ||
+      Number(plan?.calldata_bytes) !== Number(execution?.calldata_bytes) ||
+      planFrom !== robinhoodChainConnectedAddress ||
+      !planTo ||
+      !/^0x(?:[0-9a-fA-F]{2})+$/.test(planData)
+    ) {
+      setRobinhoodChainExecutionError("Prepared execution no longer matches the ticket, connected wallet, or transaction plan.");
+      return;
+    }
+    if (planTo !== normalizeRobinhoodChainEvmAddress(execution?.transaction_to)) {
+      setRobinhoodChainExecutionError("Prepared destination differs from the recorded reviewed plan.");
+      return;
+    }
+    if (planValue !== ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI || String(execution?.transaction_value_wei || "") !== planValue.toString()) {
+      setRobinhoodChainExecutionError("Prepared transaction value is not exactly 0.002 ETH.");
+      return;
+    }
+    if (!/^[0-9a-f]{64}$/.test(storedPlanHash) || !/^[0-9a-f]{64}$/.test(storedCalldataHash)) {
+      setRobinhoodChainExecutionError("Prepared plan identity is unavailable.");
+      return;
+    }
+    if (gasLimit <= 0n || gasPrice <= 0n) {
+      setRobinhoodChainExecutionError("Prepared gas fields are unavailable.");
+      return;
+    }
+
+    setRobinhoodChainExecutionBusy(true);
+    setRobinhoodChainExecutionError("");
+    robinhoodChainExecutionSendRef.current = true;
+    let returnedTxHash = "";
+    let claimId = "";
+    let sendClaimed = false;
+    let walletRequestStarted = false;
+    try {
+      const liveGate = await refreshRobinhoodChainExecutionGate();
+      if (liveGate?.send_enabled !== true) {
+        throw new Error(`Live send gate is blocked: ${(liveGate?.missing_requirements || []).join(", ") || "requirements unresolved"}.`);
+      }
+      if (Number.isFinite(robinhoodChainPreparedExpiresAt) && Date.now() >= robinhoodChainPreparedExpiresAt) {
+        throw new Error("Prepared plan expired before the send review. Build a fresh plan.");
+      }
+
+      const observedCalldataHash = await robinhoodChainCalldataSha256(planData);
+      if (observedCalldataHash !== storedCalldataHash || observedCalldataHash !== String(plan?.calldata_sha256 || "").toLowerCase()) {
+        throw new Error("Prepared calldata no longer matches the reviewed SHA-256 hash.");
+      }
+
+      const accounts = await provider.request({ method: "eth_accounts" });
+      const activeAddress = normalizeRobinhoodChainEvmAddress(Array.isArray(accounts) ? accounts[0] : "");
+      const chainId = normalizeRobinhoodChainEvmChainId(await provider.request({ method: "eth_chainId" }));
+      if (activeAddress !== robinhoodChainConnectedAddress || activeAddress !== robinhoodChainSavedAddress) {
+        throw new Error("MetaMask account changed or no longer matches the saved Robinhood Chain wallet.");
+      }
+      if (chainId !== ROBINHOOD_CHAIN_NETWORK.chainIdHex) {
+        throw new Error("MetaMask is not on Robinhood Chain mainnet (chain 4663).");
+      }
+      const balanceWei = robinhoodChainRpcBigInt(
+        await provider.request({ method: "eth_getBalance", params: [activeAddress, "latest"] })
+      );
+      const reviewedGasMaximum = gasLimit * gasPrice;
+      const reviewedMaximum = planValue + reviewedGasMaximum;
+      if (balanceWei < reviewedMaximum) {
+        throw new Error("Insufficient ETH for the exact 0.002 ETH input plus the reviewed gas maximum.");
+      }
+
+      const finalReview = [
+        "RH-CHAIN.10D.1B FINAL MAINNET REVIEW",
+        "",
+        "SELL exactly 0.002 ETH for USDG",
+        `Minimum received: ${execution?.minimum_output_amount || "—"} USDG`,
+        `Slippage: ${Number(execution?.slippage_bps || 0) / 100}%`,
+        `From: ${activeAddress}`,
+        `To: ${planTo}`,
+        `Value: ${planValue.toString()} wei (0.002 ETH)`,
+        `Gas limit: ${gasLimit.toString()}`,
+        `Gas price: ${gasPrice.toString()} wei`,
+        `Maximum network fee: ${robinhoodChainFormatAtomicUnits(reviewedGasMaximum, 18)} ETH`,
+        `Maximum ETH required: ${robinhoodChainFormatAtomicUnits(reviewedMaximum, 18)} ETH`,
+        `Plan hash: ${storedPlanHash}`,
+        "",
+        "MetaMask will open one transaction request. UTT will not retry automatically.",
+      ].join("\n");
+      if (!window.confirm(finalReview)) {
+        setRobinhoodChainExecutionError("Execution canceled before a send claim or MetaMask request was created.");
+        return;
+      }
+
+      claimId = createRobinhoodChainClaimId();
+      writeRobinhoodChainPendingExecution({ executionId, claimId, txHash: "" });
+      const claim = await claimRobinhoodChainExecutionSend(
+        executionId,
+        {
+          wallet_address: activeAddress,
+          plan_hash: storedPlanHash,
+          claim_id: claimId,
+          confirm_send_claim: true,
+        },
+        { apiBase, timeout_ms: 30000 }
+      );
+      if (!claim?.ok || claim?.claim_id !== claimId || claim?.send_gate?.send_enabled !== true) {
+        writeRobinhoodChainPendingExecution(null);
+        throw new Error(claim?.error || "The one-time send claim was not granted.");
+      }
+      sendClaimed = true;
+      setRobinhoodChainPreparedExecution((current) => ({
+        ...(current || {}),
+        ok: true,
+        execution: claim.execution,
+        unsigned_transaction_plan: plan,
+        send_gate: claim.send_gate,
+      }));
+
+      if (Number.isFinite(robinhoodChainPreparedExpiresAt) && Date.now() >= robinhoodChainPreparedExpiresAt) {
+        throw new Error("Prepared plan expired after the send claim and before MetaMask was opened.");
+      }
+
+      walletRequestStarted = true;
+      returnedTxHash = normalizeRobinhoodChainTransactionHash(
+        await provider.request({
+          method: "eth_sendTransaction",
+          params: [{
+            from: activeAddress,
+            to: planTo,
+            data: planData,
+            value: robinhoodChainHexQuantity(planValue),
+            gas: robinhoodChainHexQuantity(gasLimit),
+            gasPrice: robinhoodChainHexQuantity(gasPrice),
+          }],
+        })
+      );
+      if (!returnedTxHash) {
+        throw new Error("MetaMask did not return a valid 66-character transaction hash.");
+      }
+
+      writeRobinhoodChainPendingExecution({ executionId, claimId, txHash: returnedTxHash });
+      await recordRobinhoodChainSubmittedHash(executionId, returnedTxHash, claimId);
+      onToast?.({ kind: "ok", msg: "Robinhood Chain transaction submitted and recorded as pending." });
+    } catch (error) {
+      let msg = robinhoodChainWalletErrorMessage(error, "Robinhood Chain execution failed.");
+      if (returnedTxHash) {
+        const recovery = { executionId, claimId, txHash: returnedTxHash };
+        setRobinhoodChainSubmissionRecovery(recovery);
+        writeRobinhoodChainPendingExecution(recovery);
+        onToast?.({
+          kind: "warn",
+          msg: "MetaMask returned a transaction hash, but backend recording needs recovery. The transaction will not be sent again.",
+        });
+      } else if (sendClaimed && claimId && (!walletRequestStarted || Number(error?.code) === 4001)) {
+        msg = await recordRobinhoodChainPreSubmissionFailure(executionId, claimId, error);
+        onToast?.({ kind: "warn", msg: `${msg} A fresh execution must be prepared before any later attempt.` });
+      } else if (sendClaimed && claimId) {
+        const recovery = { executionId, claimId, txHash: "" };
+        setRobinhoodChainSubmissionRecovery(recovery);
+        writeRobinhoodChainPendingExecution(recovery);
+        msg = `${msg} The one-time send claim remains locked because no reliable transaction hash was returned; do not resubmit until MetaMask and the explorer are checked.`;
+        onToast?.({ kind: "warn", msg });
+      } else {
+        writeRobinhoodChainPendingExecution(null);
+        onToast?.({ kind: "warn", msg });
+      }
+      setRobinhoodChainExecutionError(msg);
+    } finally {
+      robinhoodChainExecutionSendRef.current = false;
+      setRobinhoodChainExecutionBusy(false);
+    }
+  }
+
+  async function recoverRobinhoodChainSubmissionRecord() {
+    const recovery = robinhoodChainSubmissionRecovery || readRobinhoodChainPendingExecution();
+    if (!recovery?.executionId || !recovery?.claimId || !recovery?.txHash || robinhoodChainExecutionBusy) return;
+    setRobinhoodChainExecutionBusy(true);
+    setRobinhoodChainExecutionError("");
+    try {
+      await recordRobinhoodChainSubmittedHash(recovery.executionId, recovery.txHash, recovery.claimId);
+      onToast?.({ kind: "ok", msg: "Pending Robinhood Chain transaction record recovered without resubmitting." });
+    } catch (error) {
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainExecutionError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      setRobinhoodChainExecutionBusy(false);
+    }
+  }
+
+  async function refreshRobinhoodChainExecutionReceipt() {
+    const executionId = String(robinhoodChainPreparedRow?.id || "").trim();
+    if (!executionId || robinhoodChainExecutionBusy) return;
+    setRobinhoodChainExecutionBusy(true);
+    setRobinhoodChainExecutionError("");
+    try {
+      const data = await refreshRobinhoodChainExecution(executionId, { apiBase, timeout_ms: 30000 });
+      if (!data?.ok || !data?.execution) throw new Error(data?.error || "Receipt refresh failed.");
+      setRobinhoodChainPreparedExecution((current) => ({
+        ...(current || {}),
+        ok: true,
+        execution: data.execution,
+        send_gate: current?.send_gate || robinhoodChainExecutionStatus,
+      }));
+      const status = String(data.execution.status || "").toLowerCase();
+      if (["confirmed", "reverted", "verification_failed"].includes(status)) {
+        writeRobinhoodChainPendingExecution(null);
+        setRobinhoodChainSubmissionRecovery(null);
+        requestAllOrdersRefresh();
+        if (status === "confirmed") {
+          requestRobinhoodChainBalancesRefresh({
+            executionId: data.execution.id,
+            balanceRefresh: data.balance_refresh || null,
+          });
+        }
+        const balanceErrors = Array.isArray(data?.balance_refresh?.errors)
+          ? data.balance_refresh.errors.length
+          : 0;
+        const receiptReconciled = data?.reconciled === true || data?.execution?.reconciliation?.reconciled === true;
+        onToast?.({
+          kind: status === "confirmed" && receiptReconciled && balanceErrors === 0 ? "ok" : "warn",
+          msg: status === "confirmed"
+            ? !receiptReconciled
+              ? "Robinhood Chain transaction is confirmed, but realized-output reconciliation is still pending."
+              : balanceErrors
+                ? `Robinhood Chain transaction confirmed; ${balanceErrors} balance snapshot refresh error${balanceErrors === 1 ? "" : "s"} require attention.`
+                : "Robinhood Chain transaction confirmed. Actual fill, All Orders, and balance snapshots were refreshed."
+            : `Robinhood Chain transaction is ${status}. All Orders refresh was requested.`,
+        });
+      }
+    } catch (error) {
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainExecutionError(msg);
+    } finally {
+      setRobinhoodChainExecutionBusy(false);
     }
   }
 
@@ -8656,10 +9252,10 @@ async function submitLimitOrder() {
               background: "linear-gradient(135deg, rgba(8, 47, 73, 0.30), rgba(30, 12, 58, 0.24))",
               color: "#dff9ff",
             }}
-            title="RH-CHAIN.10D.0: native ETH-USDG quote and unsigned-plan review. No signing, broadcast, approval construction, or order recording."
+            title="RH-CHAIN.10D.1B: tightly bounded explicit MetaMask execution lifecycle for SELL 0.002 ETH only."
           >
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10.5, fontWeight: 900 }}>
-              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-EVM · 0x · ETH-USDG · 10D.0</span>
+              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-EVM · 0x · ETH-USDG · 10D.1B</span>
               <span style={{ color: robinhoodChainWalletState.providerAvailable ? "#bbf7d0" : "#fde68a" }}>
                 MetaMask {robinhoodChainWalletState.providerAvailable ? "detected" : "unavailable"}
               </span>
@@ -8672,7 +9268,9 @@ async function submitLimitOrder() {
               <span style={{ color: robinhoodChainWalletMatchesSaved ? "#bbf7d0" : "#fde68a" }}>
                 Saved match {robinhoodChainWalletMatchesSaved ? "YES" : "NO"}
               </span>
-              <span style={{ color: "#c4b5fd" }}>REVIEW ONLY · NO SIGN / NO SEND</span>
+              <span style={{ color: robinhoodChainSendGate?.send_enabled ? "#bbf7d0" : "#c4b5fd" }}>
+                {robinhoodChainSendGate?.send_enabled ? "EXPLICIT SEND GATE READY" : "SEND GATE BLOCKED"}
+              </span>
             </div>
 
             <div style={{ marginTop: 5, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 10.5, color: "#bae6fd" }}>
@@ -8770,6 +9368,89 @@ async function submitLimitOrder() {
                   </pre>
                 </details>
               </details>
+            )}
+
+            {robinhoodChainExecutionError && (
+              <div style={{ marginTop: 6, color: "#fecdd3", fontSize: 10.5 }}>
+                {hideTableData ? "Robinhood Chain execution status requires attention." : robinhoodChainExecutionError}
+              </div>
+            )}
+
+            {robinhoodChainPreparedRow && (
+              <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(74, 222, 128, 0.18)", fontSize: 10.5 }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <b style={{ color: robinhoodChainExecutionTerminal ? "#fde68a" : "#bbf7d0" }}>
+                    EXECUTION {String(robinhoodChainPreparedRow.status || "prepared").toUpperCase()}
+                  </b>
+                  <span>ID: {hideTableData ? "••••" : shortenWalletAddress(robinhoodChainPreparedRow.id || "", 8, 6)}</span>
+                  {robinhoodChainPreparedRow.tx_hash && (
+                    <span>TX: {hideTableData ? "••••" : shortenWalletAddress(robinhoodChainPreparedRow.tx_hash, 10, 8)}</span>
+                  )}
+                  <span>Min: {hideTableData ? "••••" : `${robinhoodChainPreparedRow.minimum_output_amount || "—"} USDG`}</span>
+                  {robinhoodChainPreparedRow.actual_output_amount && (
+                    <span>Actual: {hideTableData ? "••••" : `${robinhoodChainPreparedRow.actual_output_amount} ${robinhoodChainPreparedRow.actual_output_asset || "USDG"}`}</span>
+                  )}
+                  {robinhoodChainPreparedRow.actual_network_fee && (
+                    <span>Fee: {hideTableData ? "••••" : `${robinhoodChainPreparedRow.actual_network_fee} ${robinhoodChainPreparedRow.actual_network_fee_asset || "ETH"}`}</span>
+                  )}
+                </div>
+
+                {String(robinhoodChainPreparedRow.status || "") === "prepared" && robinhoodChainPreparedPlan && (
+                  <div style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <label style={{ ...safePill, padding: "5px 7px", gap: 6 }}>
+                      <input
+                        type="checkbox"
+                        checked={robinhoodChainExecutionConfirmed}
+                        onChange={(event) => setRobinhoodChainExecutionConfirmed(event.target.checked)}
+                      />
+                      <span>I reviewed SELL 0.002 ETH</span>
+                    </label>
+                    <button
+                      type="button"
+                      style={{
+                        ...safeButton,
+                        ...(!canSendRobinhoodChainExecution ? safeButtonDisabled : {}),
+                        padding: "7px 10px",
+                        fontWeight: 900,
+                        border: "1px solid rgba(74, 222, 128, 0.55)",
+                      }}
+                      disabled={!canSendRobinhoodChainExecution}
+                      onClick={sendRobinhoodChainPreparedExecution}
+                    >
+                      {robinhoodChainExecutionBusy ? "Working…" : "Send 0.002 ETH with MetaMask"}
+                    </button>
+                    {!robinhoodChainSendGate?.send_enabled && (
+                      <span style={{ color: "#fde68a" }}>
+                        Missing: {(robinhoodChainSendGate?.missing_requirements || []).join(", ") || "live execution gate"}
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                {String(robinhoodChainPreparedRow.status || "") === "pending" && (
+                  <div style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <span style={{ color: "#bae6fd" }}>Receipt polling is read-only; no automatic transaction retry.</span>
+                    <button type="button" style={{ ...safeButton, padding: "5px 8px" }} disabled={robinhoodChainExecutionBusy} onClick={refreshRobinhoodChainExecutionReceipt}>
+                      Refresh Receipt
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {robinhoodChainSubmissionRecovery?.claimId && !robinhoodChainSubmissionRecovery?.txHash && (
+              <div style={{ marginTop: 6, fontSize: 10.5, color: "#fde68a" }}>
+                A send claim is retained without a transaction hash. Do not resubmit this execution; inspect MetaMask and prepare a fresh execution only after confirming no transaction was created.
+              </div>
+            )}
+
+            {robinhoodChainSubmissionRecovery?.txHash && (
+              <div style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 10.5, color: "#fde68a" }}>
+                <span>Transaction hash and one-time claim retained locally. Recording recovery will not resend it.</span>
+                <button type="button" style={{ ...safeButton, padding: "5px 8px" }} disabled={robinhoodChainExecutionBusy} onClick={recoverRobinhoodChainSubmissionRecord}>
+                  Recover Transaction Record
+                </button>
+              </div>
             )}
           </div>
         )}
@@ -9639,6 +10320,23 @@ async function submitLimitOrder() {
                   : robinhoodChainFirmPlan?.ok
                     ? "Refresh Unsigned Plan"
                     : "Build Unsigned Plan"}
+              </button>
+              <button
+                type="button"
+                style={{
+                  ...safeButton,
+                  ...(!canPrepareRobinhoodChainExecution ? safeButtonDisabled : {}),
+                  padding: "9px 12px",
+                  fontWeight: 900,
+                  border: "1px solid rgba(74, 222, 128, 0.50)",
+                  color: "#dcfce7",
+                  background: "rgba(20, 83, 45, 0.28)",
+                }}
+                disabled={!canPrepareRobinhoodChainExecution}
+                onClick={prepareRobinhoodChainLiveExecution}
+                title="Create a dedicated prepared execution record and a fresh 0.002 ETH plan. This still does not open MetaMask or send a transaction."
+              >
+                {robinhoodChainExecutionBusy ? "Preparing…" : "Prepare 0.002 ETH Send"}
               </button>
             </>
           )}

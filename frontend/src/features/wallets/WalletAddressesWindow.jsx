@@ -1437,6 +1437,24 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const onRobinhoodChainBalancesUpdated = () => {
+      void loadBalances();
+    };
+    window.addEventListener(
+      "utt:robinhood-chain-balances-updated",
+      onRobinhoodChainBalancesUpdated
+    );
+    return () => {
+      window.removeEventListener(
+        "utt:robinhood-chain-balances-updated",
+        onRobinhoodChainBalancesUpdated
+      );
+    };
+    // loadBalances intentionally reads the current pricing/limit state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [withPrices, balLimit]);
+
   return (
     <div className="utt-wallet-addresses-cyber">
       <style>{WALLET_CYBER_CSS}</style>

@@ -691,7 +691,17 @@ function isTerminalBucket(bucket) {
 
 function isTerminalStatus(status) {
   const s = String(status || "").toLowerCase();
-  return s === "filled" || s === "canceled" || s === "cancelled" || s === "rejected" || s === "done" || s === "closed";
+  return (
+    s === "filled" ||
+    s === "canceled" ||
+    s === "cancelled" ||
+    s === "rejected" ||
+    s === "done" ||
+    s === "closed" ||
+    s === "confirmed" ||
+    s === "reverted" ||
+    s === "verification_failed"
+  );
 }
 
 function isCanceledStatus(status) {
@@ -6329,6 +6339,11 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                           setLimitPrice={setOtLimitPrice}
                           venues={orderTicketVenuesList.length > 0 ? orderTicketVenuesList : (tradingVenuesList.length > 0 ? tradingVenuesList : supportedVenues)}
                           venueTradeGate={effectiveTradeVenueGate}
+                          onAllOrdersRefresh={doLoadAllOrders}
+                          onBalancesRefresh={() => doRefreshBalancesSafe({
+                            liveRefresh: false,
+                            forceAllVenuesTotal: true,
+                          })}
                         />
                       </div>
                     </div>

@@ -268,6 +268,14 @@ class Settings(BaseSettings):
         le=25.0,
     )
 
+    # RH-CHAIN.10D.1: dedicated browser-wallet execution gate.
+    # This remains separate from LIVE_VENUES and defaults off. Effective sending
+    # also requires global ARMED=1 and DRY_RUN=0, plus an explicit UI action.
+    robinhood_chain_live_execution_enabled: bool = Field(
+        default=False,
+        alias="ROBINHOOD_CHAIN_LIVE_EXECUTION_ENABLED",
+    )
+
     # ─────────────────────────────────────────────────────────────
     # Dex-Trade integration — optional & guarded
     #

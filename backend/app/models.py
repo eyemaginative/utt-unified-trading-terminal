@@ -606,3 +606,77 @@ class BridgeTransferRecord(Base):
         Index("ix_bridge_transfer_link_refs", "source_withdrawal_id", "destination_deposit_id"),
     )
 
+
+# =============================================================================
+# Robinhood Chain execution lifecycle (dedicated EVM swap records)
+# =============================================================================
+
+class RobinhoodChainExecution(Base):
+    """Dedicated lifecycle record for explicit MetaMask-submitted RH Chain swaps.
+
+    This table is intentionally separate from Order and VenueOrderRow because a
+    full EVM transaction hash is 66 characters with the 0x prefix and because
+    wallet-submitted swaps have a distinct prepared/claimed/pending lifecycle.
+    It does not mutate ledger, FIFO, or basis state.
+    """
+    __tablename__ = "robinhood_chain_executions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663)
+    wallet_address: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
+
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, default="ETH-USDG")
+    side: Mapped[str] = mapped_column(String(8), nullable=False, default="sell")
+    input_asset: Mapped[str] = mapped_column(String(16), nullable=False, default="ETH")
+    input_amount: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_amount_atomic: Mapped[str] = mapped_column(String(80), nullable=False)
+
+    expected_output_asset: Mapped[str] = mapped_column(String(16), nullable=False, default="USDG")
+    expected_output_amount: Mapped[str] = mapped_column(String(64), nullable=False)
+    minimum_output_amount: Mapped[str] = mapped_column(String(64), nullable=False)
+    slippage_bps: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    quote_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    plan_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    plan_fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    plan_expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    transaction_to: Mapped[str] = mapped_column(String(42), nullable=False)
+    transaction_value_wei: Mapped[str] = mapped_column(String(80), nullable=False)
+    calldata_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    calldata_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    gas_limit: Mapped[str] = mapped_column(String(80), nullable=False)
+    gas_price_wei: Mapped[str] = mapped_column(String(80), nullable=False)
+    route: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # prepared -> send_claimed -> pending -> confirmed/reverted
+    # Explicit pre-submission failures terminate as wallet_rejected/submission_failed.
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="prepared", index=True)
+    send_claim_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    send_claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    submission_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    submission_failure_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True, unique=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_receipt_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reverted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    block_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gas_used: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    effective_gas_price_wei: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    receipt_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_rh_chain_exec_status_created", "status", "created_at"),
+        Index("ix_rh_chain_exec_wallet_created", "wallet_address", "created_at"),
+        Index("ix_rh_chain_exec_tx_hash", "tx_hash"),
+    )

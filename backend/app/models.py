@@ -779,3 +779,90 @@ class RobinhoodChainBuyExecution(Base):
         Index("ix_rh_chain_buy_approval_hash", "approval_tx_hash"),
         Index("ix_rh_chain_buy_swap_hash", "swap_tx_hash"),
     )
+
+
+# =============================================================================
+# Robinhood Chain generalized exact-spend lifecycle (review-only R5A)
+# =============================================================================
+
+class RobinhoodChainSwapExecution(Base):
+    """Plan-bound review record for generalized Robinhood Chain exact-spend swaps.
+
+    R5A persists the finite approval and unsigned swap identities without
+    claiming, signing, broadcasting, or mutating ledger/FIFO/basis state.
+    """
+    __tablename__ = "robinhood_chain_swap_executions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663)
+    wallet_address: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False, default="0x")
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, default="ETH-USDG")
+    side: Mapped[str] = mapped_column(String(8), nullable=False, default="buy")
+
+    from_asset: Mapped[str] = mapped_column(String(32), nullable=False)
+    from_contract_address: Mapped[str] = mapped_column(String(42), nullable=False)
+    from_decimals: Mapped[int] = mapped_column(Integer, nullable=False)
+    from_native: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    to_asset: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_contract_address: Mapped[str] = mapped_column(String(42), nullable=False)
+    to_decimals: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_native: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    amount_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="exact_input")
+    exact_input_amount: Mapped[str] = mapped_column(String(64), nullable=False)
+    exact_input_amount_atomic: Mapped[str] = mapped_column(String(80), nullable=False)
+    expected_output_amount: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_output_amount_atomic: Mapped[str] = mapped_column(String(80), nullable=False)
+    minimum_output_amount: Mapped[str] = mapped_column(String(64), nullable=False)
+    minimum_output_amount_atomic: Mapped[str] = mapped_column(String(80), nullable=False)
+    slippage_bps: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+
+    quote_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    plan_fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    plan_expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    allowance_read_method: Mapped[str] = mapped_column(String(24), nullable=False, default="eth_call")
+    allowance_token_address: Mapped[str] = mapped_column(String(42), nullable=False)
+    allowance_spender: Mapped[str] = mapped_column(String(42), nullable=False)
+    allowance_current_atomic: Mapped[str] = mapped_column(String(80), nullable=False, default="0")
+    allowance_required_atomic: Mapped[str] = mapped_column(String(80), nullable=False)
+    allowance_shortfall_atomic: Mapped[str] = mapped_column(String(80), nullable=False, default="0")
+    approval_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    approval_amount: Mapped[str] = mapped_column(String(64), nullable=False)
+    approval_amount_atomic: Mapped[str] = mapped_column(String(80), nullable=False)
+    approval_plan_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    approval_transaction_to: Mapped[str] = mapped_column(String(42), nullable=False)
+    approval_transaction_value_wei: Mapped[str] = mapped_column(String(80), nullable=False, default="0")
+    approval_calldata_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    approval_calldata_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    approval_gas_limit: Mapped[str] = mapped_column(String(80), nullable=False)
+    approval_gas_price_wei: Mapped[str] = mapped_column(String(80), nullable=False)
+    approval_status: Mapped[str] = mapped_column(String(32), nullable=False, default="prepared")
+    approval_tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True, unique=True)
+
+    swap_plan_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    swap_transaction_to: Mapped[str] = mapped_column(String(42), nullable=False)
+    swap_transaction_value_wei: Mapped[str] = mapped_column(String(80), nullable=False, default="0")
+    swap_calldata_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    swap_calldata_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    swap_gas_limit: Mapped[str] = mapped_column(String(80), nullable=False)
+    swap_gas_price_wei: Mapped[str] = mapped_column(String(80), nullable=False)
+    swap_status: Mapped[str] = mapped_column(String(32), nullable=False, default="review_only")
+    swap_tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True, unique=True)
+    route: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="approval_prepared", index=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_rh_chain_swap_status_created", "status", "created_at"),
+        Index("ix_rh_chain_swap_wallet_created", "wallet_address", "created_at"),
+        Index("ix_rh_chain_swap_pair_mode", "from_asset", "to_asset", "amount_mode"),
+        Index("ix_rh_chain_swap_approval_hash", "approval_tx_hash"),
+        Index("ix_rh_chain_swap_tx_hash", "swap_tx_hash"),
+    )

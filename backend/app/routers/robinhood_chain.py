@@ -56,6 +56,15 @@ from ..services.robinhood_chain_buy_execution import (
     ROBINHOOD_CHAIN_BUY_SYMBOL,
     get_robinhood_chain_buy_execution_service,
 )
+from ..services.robinhood_chain_swap_execution import (
+    ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE,
+    ROBINHOOD_CHAIN_SWAP_DEFAULT_USDG,
+    ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE,
+    ROBINHOOD_CHAIN_SWAP_FROM_ASSET,
+    ROBINHOOD_CHAIN_SWAP_MAX_USDG,
+    ROBINHOOD_CHAIN_SWAP_TO_ASSET,
+    get_robinhood_chain_swap_execution_service,
+)
 
 
 router = APIRouter(prefix="/api/robinhood_chain", tags=["robinhood_chain"])
@@ -506,6 +515,23 @@ class RobinhoodChainBuyApprovalPrepareRequest(BaseModel):
 class RobinhoodChainBuySwapPrepareRequest(BaseModel):
     wallet_address: str = Field(min_length=42, max_length=42)
     confirm_prepare: bool = False
+
+
+class RobinhoodChainSwapExecutionPrepareRequest(BaseModel):
+    from_asset: str = Field(default=ROBINHOOD_CHAIN_SWAP_FROM_ASSET, min_length=1, max_length=32)
+    to_asset: str = Field(default=ROBINHOOD_CHAIN_SWAP_TO_ASSET, min_length=1, max_length=32)
+    amount_mode: str = Field(default=ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE, min_length=1, max_length=32)
+    exact_input_amount: str = Field(default=str(ROBINHOOD_CHAIN_SWAP_DEFAULT_USDG), min_length=1, max_length=80)
+    slippage_bps: int = Field(
+        default=ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
+        ge=ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
+        le=ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
+    )
+    taker_address: Optional[str] = Field(default=None, min_length=42, max_length=42)
+    confirm_prepare: bool = Field(
+        default=False,
+        description="Must be true to persist the R5A review-only exact-spend lifecycle record.",
+    )
 
 
 def _resolve_robinhood_chain_quote_taker(
@@ -1702,6 +1728,52 @@ async def robinhood_chain_execution_refresh(
         else:
             status_code = 502
         raise HTTPException(status_code=status_code, detail={"error": error}) from exc
+
+
+@router.get("/swap-execution/status")
+async def robinhood_chain_swap_execution_status() -> Dict[str, Any]:
+    """Return the review-only RH-CHAIN.10D.2-R5A exact-spend preparation gate."""
+    return get_robinhood_chain_swap_execution_service().status()
+
+
+@router.post("/swap-execution/prepare")
+async def robinhood_chain_swap_execution_prepare(
+    request: RobinhoodChainSwapExecutionPrepareRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    if str(request.from_asset).strip().upper() != ROBINHOOD_CHAIN_SWAP_FROM_ASSET:
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_swap_from_asset_locked"})
+    if str(request.to_asset).strip().upper() != ROBINHOOD_CHAIN_SWAP_TO_ASSET:
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_swap_to_asset_locked"})
+    if str(request.amount_mode).strip().lower() not in {ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE, ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE}:
+        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_swap_amount_mode_locked"})
+    taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
+    try:
+        return await get_robinhood_chain_swap_execution_service().prepare(
+            db,
+            taker_address=taker,
+            exact_input_amount=request.exact_input_amount,
+            slippage_bps=int(request.slippage_bps),
+            eth_token=_resolve_execution_discovery_token(db, "ETH"),
+            usdg_token=_resolve_execution_discovery_token(db, "USDG"),
+            confirm_prepare=bool(request.confirm_prepare),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+
+@router.get("/swap-execution/{execution_id}")
+async def robinhood_chain_swap_execution_get(execution_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    try:
+        payload = get_robinhood_chain_swap_execution_service().get(db, execution_id)
+        db.rollback()
+        return payload
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=404 if "not_found" in str(exc) else 400, detail={"error": str(exc)}) from exc
 
 
 @router.get("/buy-execution/status")

@@ -635,6 +635,50 @@ export async function getRobinhoodChainExecution(
   const res = await axios.get(`${base}/api/robinhood_chain/execution/${id}`, { timeout: timeout_ms });
   return res.data;
 }
+export async function getRobinhoodChainSwapExecutionStatus({ apiBase, timeout_ms = 30000 } = {}) {
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.get(`/api/robinhood_chain/swap-execution/status`, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}/api/robinhood_chain/swap-execution/status`, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function prepareRobinhoodChainSwapExecution(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
+  const body = {
+    from_asset: "USDG",
+    to_asset: "ETH",
+    amount_mode: "exact_spend",
+    exact_input_amount: "2",
+    slippage_bps: 100,
+    confirm_prepare: true,
+    ...payload,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/swap-execution/prepare`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/swap-execution/prepare`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function getRobinhoodChainSwapExecution(
+  executionId,
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  if (!id) throw new Error("executionId is required");
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.get(`/api/robinhood_chain/swap-execution/${id}`, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}/api/robinhood_chain/swap-execution/${id}`, { timeout: timeout_ms });
+  return res.data;
+}
+
 export async function getRobinhoodChainBuyExecutionStatus({ apiBase, timeout_ms = 30000 } = {}) {
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {

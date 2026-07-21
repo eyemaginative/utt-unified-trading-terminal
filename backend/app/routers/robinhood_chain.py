@@ -22,9 +22,10 @@ from ..services.robinhood_chain_history import (
     validate_transaction_hash,
 )
 from ..services.robinhood_chain_execution_discovery import (
-    ROBINHOOD_CHAIN_DISCOVERY_TOKENS,
-    ROBINHOOD_CHAIN_ROUTE_CAPABILITIES,
     get_robinhood_chain_execution_discovery_service,
+)
+from ..services.robinhood_chain_registry_discovery import (
+    get_robinhood_chain_registry_discovery_service,
 )
 from ..services.robinhood_chain_quotes import (
     ROBINHOOD_CHAIN_QUOTE_PROVIDER,
@@ -224,92 +225,20 @@ def _registered_history_token_map(db: Session) -> Dict[str, Dict[str, Any]]:
 
 
 def _resolve_execution_discovery_token(db: Session, symbol: str) -> Dict[str, Any]:
-    normalized = _normalize_registry_symbol(symbol)
-    candidate = ROBINHOOD_CHAIN_DISCOVERY_TOKENS.get(normalized)
-    if candidate is None:
+    """Resolve a Robinhood Chain identity exclusively from TokenRegistry."""
+    try:
+        return get_robinhood_chain_registry_discovery_service().resolve_token(db, symbol)
+    except ValueError as exc:
+        error = str(exc)
+        status_code = 404 if "not_found" in error else 422
         raise HTTPException(
-            status_code=404,
+            status_code=status_code,
             detail={
-                "error": "execution_discovery_symbol_not_allowlisted",
-                "symbol": normalized,
-                "allowed": sorted(ROBINHOOD_CHAIN_DISCOVERY_TOKENS.keys()),
+                "error": error,
+                "symbol": str(symbol or "").strip().upper(),
+                "identity_source": "token_registry",
             },
-        )
-
-    override = (
-        db.query(TokenRegistry)
-        .filter(
-            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
-            TokenRegistry.venue == _TOKEN_REGISTRY_VENUE,
-            TokenRegistry.symbol == normalized,
-        )
-        .first()
-    )
-    global_row = (
-        db.query(TokenRegistry)
-        .filter(
-            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
-            ((TokenRegistry.venue.is_(None)) | (TokenRegistry.venue == "")),
-            TokenRegistry.symbol == normalized,
-        )
-        .first()
-    )
-    row = override or global_row
-
-    identity = dict(candidate)
-    identity["symbol"] = normalized
-    identity["registry_id"] = int(row.id) if row is not None else None
-    identity["registry_venue"] = row.venue if row is not None else None
-    identity["registry_status"] = "registered" if row is not None else "official_candidate"
-
-    if normalized == _NATIVE_CURRENCY:
-        if row is not None:
-            if str(row.address or "").strip():
-                raise HTTPException(
-                    status_code=422,
-                    detail={"error": "execution_discovery_native_registry_mismatch", "symbol": normalized},
-                )
-            if int(row.decimals) != int(candidate["decimals"]):
-                raise HTTPException(
-                    status_code=422,
-                    detail={"error": "execution_discovery_decimals_mismatch", "symbol": normalized},
-                )
-        return identity
-
-    expected_contract = validate_evm_address(str(candidate["contract_address"]))
-    identity["contract_address"] = expected_contract
-    if row is not None:
-        try:
-            registered_contract = validate_evm_address(str(row.address or "").strip())
-            registered_decimals = int(row.decimals)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=422,
-                detail={"error": "invalid_execution_discovery_registry_identity", "symbol": normalized},
-            ) from exc
-        if registered_contract.lower() != expected_contract.lower():
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "execution_discovery_contract_mismatch",
-                    "symbol": normalized,
-                    "registry_id": int(row.id),
-                    "expected_contract": expected_contract,
-                    "registered_contract": registered_contract,
-                },
-            )
-        if registered_decimals != int(candidate["decimals"]):
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "execution_discovery_decimals_mismatch",
-                    "symbol": normalized,
-                    "registry_id": int(row.id),
-                    "expected_decimals": int(candidate["decimals"]),
-                    "registered_decimals": registered_decimals,
-                },
-            )
-    return identity
+        ) from exc
 
 
 # Callers select stable check names, never arbitrary JSON-RPC methods or params.
@@ -371,6 +300,47 @@ class RobinhoodChainExecutionDiscoveryRequest(BaseModel):
         description="Saved Robinhood Chain public address used only for provider diagnostics.",
     )
     force_refresh: bool = False
+
+
+class RobinhoodChainRegistryVerifyRequest(BaseModel):
+    force_refresh: bool = False
+    confirm_verify: bool = Field(
+        default=False,
+        description="Must be true to persist the read-only onchain identity verification result.",
+    )
+
+
+class RobinhoodChainPairObjectiveCreateRequest(BaseModel):
+    base_token_registry_id: int = Field(gt=0)
+    quote_token_registry_id: int = Field(gt=0)
+    mechanism: str = Field(default="swap", max_length=32)
+    notes: Optional[str] = Field(default=None, max_length=512)
+    confirm_create: bool = Field(
+        default=False,
+        description="Must be true to create or update the database-backed pair objective.",
+    )
+
+
+class RobinhoodChainPairObjectiveDeleteRequest(BaseModel):
+    confirm_delete: bool = Field(default=False)
+
+
+class RobinhoodChainPairDiscoveryRequest(BaseModel):
+    taker_address: str = Field(min_length=42, max_length=42)
+    base_probe_amount: str = Field(min_length=1, max_length=80)
+    quote_probe_amount: str = Field(min_length=1, max_length=80)
+    force_refresh: bool = False
+    confirm_discovery: bool = Field(
+        default=False,
+        description="Must be true to perform read-only provider/RPC calls and persist capability evidence.",
+    )
+
+
+class RobinhoodChainExecutionEvidenceSyncRequest(BaseModel):
+    confirm_sync: bool = Field(
+        default=False,
+        description="Must be true to persist capabilities derived from confirmed local execution records.",
+    )
 
 
 class RobinhoodChainIndicativeQuoteRequest(BaseModel):
@@ -1338,14 +1308,148 @@ async def robinhood_chain_transaction_accounting_preview(
     db.rollback()
     return preview
 
+@router.get("/registry-discovery/status")
+async def robinhood_chain_registry_discovery_status(
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    return get_robinhood_chain_registry_discovery_service().status(db)
+
+
+@router.get("/registry-discovery/assets")
+async def robinhood_chain_registry_discovery_assets(
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    service = get_robinhood_chain_registry_discovery_service()
+    return {
+        "ok": True,
+        "items": service.assets(db),
+        "blockchain_read_only": True,
+        "execution_enabled": False,
+    }
+
+
+@router.post("/registry-discovery/assets/{token_registry_id}/verify")
+async def robinhood_chain_registry_discovery_verify_asset(
+    token_registry_id: int,
+    request: RobinhoodChainRegistryVerifyRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return await get_robinhood_chain_registry_discovery_service().verify_asset(
+            db,
+            token_registry_id=token_registry_id,
+            force_refresh=bool(request.force_refresh),
+            confirm_verify=bool(request.confirm_verify),
+        )
+    except ValueError as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.get("/registry-discovery/objectives")
+async def robinhood_chain_registry_discovery_objectives(
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "items": get_robinhood_chain_registry_discovery_service().objectives(db),
+        "review_only": True,
+        "execution_enabled": False,
+    }
+
+
+@router.post("/registry-discovery/objectives")
+async def robinhood_chain_registry_discovery_create_objective(
+    request: RobinhoodChainPairObjectiveCreateRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_registry_discovery_service().create_objective(
+            db,
+            base_token_registry_id=request.base_token_registry_id,
+            quote_token_registry_id=request.quote_token_registry_id,
+            mechanism=request.mechanism,
+            notes=request.notes,
+            confirm_create=bool(request.confirm_create),
+        )
+    except ValueError as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.delete("/registry-discovery/objectives/{objective_id}")
+async def robinhood_chain_registry_discovery_delete_objective(
+    objective_id: str,
+    request: RobinhoodChainPairObjectiveDeleteRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_registry_discovery_service().delete_objective(
+            db,
+            objective_id=objective_id,
+            confirm_delete=bool(request.confirm_delete),
+        )
+    except ValueError as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(status_code=404 if "not_found" in error else 409, detail={"error": error}) from exc
+
+
+@router.post("/registry-discovery/objectives/{objective_id}/discover")
+async def robinhood_chain_registry_discovery_discover_objective(
+    objective_id: str,
+    request: RobinhoodChainPairDiscoveryRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return await get_robinhood_chain_registry_discovery_service().discover_objective(
+            db,
+            objective_id=objective_id,
+            taker_address=request.taker_address,
+            base_probe_amount=request.base_probe_amount,
+            quote_probe_amount=request.quote_probe_amount,
+            force_refresh=bool(request.force_refresh),
+            confirm_discovery=bool(request.confirm_discovery),
+        )
+    except ValueError as exc:
+        db.rollback()
+        error = str(exc)
+        status_code = 404 if "not_found" in error else 409
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
+
+
+@router.post("/registry-discovery/sync-execution-evidence")
+async def robinhood_chain_registry_discovery_sync_execution_evidence(
+    request: RobinhoodChainExecutionEvidenceSyncRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_registry_discovery_service().sync_execution_evidence(
+            db,
+            confirm_sync=bool(request.confirm_sync),
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
 @router.get("/execution-discovery/status")
-async def robinhood_chain_execution_discovery_status() -> Dict[str, Any]:
+async def robinhood_chain_execution_discovery_status(
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
     """Return secret-free, mainnet-only 0x discovery readiness."""
     if not bool(settings.robinhood_chain_enabled):
         raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
     if not bool(settings.robinhood_chain_effective_enabled()):
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
-    return get_robinhood_chain_execution_discovery_service().status()
+    capabilities = get_robinhood_chain_registry_discovery_service().route_capabilities(db)
+    return get_robinhood_chain_execution_discovery_service().status(
+        route_capabilities=capabilities,
+    )
 
 
 @router.post("/execution-discovery/probe")
@@ -1375,6 +1479,13 @@ async def robinhood_chain_execution_discovery_probe(
     buy_token = _resolve_execution_discovery_token(db, request.buy_symbol)
     if sell_token["symbol"] == buy_token["symbol"]:
         raise HTTPException(status_code=400, detail={"error": "identical_execution_discovery_assets"})
+    amount_mode = "exact_input" if request.sell_amount is not None and str(request.sell_amount).strip() else "exact_output"
+    capability = get_robinhood_chain_registry_discovery_service().route_capability(
+        db,
+        from_token_registry_id=int(sell_token["registry_id"]),
+        to_token_registry_id=int(buy_token["registry_id"]),
+        amount_mode=amount_mode,
+    )
 
     result = await get_robinhood_chain_execution_discovery_service().probe(
         sell_token=sell_token,
@@ -1383,6 +1494,9 @@ async def robinhood_chain_execution_discovery_probe(
         buy_amount=request.buy_amount,
         taker_address=taker_address,
         force_refresh=bool(request.force_refresh),
+        route_capability=capability,
+        require_live_verified=True,
+        max_probe_amount=(request.sell_amount if amount_mode == "exact_input" else request.buy_amount),
     )
     if result.get("ok"):
         return result
@@ -1421,17 +1535,18 @@ async def robinhood_chain_quotes_status(
     if not bool(settings.robinhood_chain_effective_enabled()):
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
 
-    eth = _resolve_execution_discovery_token(db, "ETH")
-    weth = _resolve_execution_discovery_token(db, "WETH")
-    usdg = _resolve_execution_discovery_token(db, "USDG")
+    registry_service = get_robinhood_chain_registry_discovery_service()
+    tokens = {
+        str(item.get("symbol") or "").strip().upper(): item
+        for item in registry_service.assets(db)
+        if item.get("symbol") and not item.get("identity_error")
+    }
     payload = get_robinhood_chain_quote_service().status()
     payload["firm_planning"] = get_robinhood_chain_transaction_planning_service().status()
-    payload["tokens"] = {
-        "ETH": eth,
-        "WETH": weth,
-        "USDG": usdg,
-    }
-    payload["route_capabilities"] = [dict(item) for item in ROBINHOOD_CHAIN_ROUTE_CAPABILITIES]
+    payload["tokens"] = tokens
+    payload["route_capabilities"] = registry_service.route_capabilities(db)
+    payload["token_identity_source"] = "token_registry"
+    payload["pair_capability_source"] = "database"
     payload["swap_oriented"] = True
     payload["amount_modes"] = ["exact_spend", "exact_receive"]
     payload["exact_receive_provider"] = "direct_router_required"

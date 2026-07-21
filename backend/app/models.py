@@ -866,3 +866,129 @@ class RobinhoodChainSwapExecution(Base):
         Index("ix_rh_chain_swap_approval_hash", "approval_tx_hash"),
         Index("ix_rh_chain_swap_tx_hash", "swap_tx_hash"),
     )
+
+
+# =============================================================================
+# Robinhood Chain registry-backed identity and pair discovery (R5C.1)
+# =============================================================================
+
+class RobinhoodChainRegistryVerification(Base):
+    """Latest read-only onchain identity verification for one Token Registry row."""
+
+    __tablename__ = "robinhood_chain_registry_verifications"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    token_registry_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("token_registry.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663)
+    asset_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    code_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    onchain_symbol: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    onchain_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    onchain_decimals: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    registry_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    canonical_status: Mapped[str] = mapped_column(String(32), nullable=False, default="unverified", index=True)
+    verification_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_rh_chain_registry_verify_status", "canonical_status", "verified_at"),
+    )
+
+
+class RobinhoodChainPairObjective(Base):
+    """Operator-created pair objective backed only by Token Registry row IDs."""
+
+    __tablename__ = "robinhood_chain_pair_objectives"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    base_token_registry_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("token_registry.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    quote_token_registry_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("token_registry.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    symbol: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    mechanism: Mapped[str] = mapped_column(String(32), nullable=False, default="swap")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    review_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    notes: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "base_token_registry_id",
+            "quote_token_registry_id",
+            name="uq_rh_chain_pair_objective_tokens",
+        ),
+        Index("ix_rh_chain_pair_objective_enabled", "enabled", "symbol"),
+    )
+
+
+class RobinhoodChainPairCapability(Base):
+    """Persisted review-only discovery evidence for one pair direction/mode."""
+
+    __tablename__ = "robinhood_chain_pair_capabilities"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    objective_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("robinhood_chain_pair_objectives.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    from_token_registry_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("token_registry.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    to_token_registry_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("token_registry.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    amount_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="exact_input")
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    indicative_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_tested")
+    firm_plan_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_tested")
+    execution_status: Mapped[str] = mapped_column(String(32), nullable=False, default="disabled")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    route_sources: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    probe_amount: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    price_impact_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    provider_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    backoff_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "objective_id",
+            "from_token_registry_id",
+            "to_token_registry_id",
+            "amount_mode",
+            "provider",
+            name="uq_rh_chain_pair_capability_direction",
+        ),
+        Index("ix_rh_chain_pair_capability_status", "indicative_status", "last_verified_at"),
+        Index("ix_rh_chain_pair_capability_enabled", "enabled", "execution_status"),
+    )

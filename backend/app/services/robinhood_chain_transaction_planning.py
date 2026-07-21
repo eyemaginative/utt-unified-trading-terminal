@@ -12,11 +12,6 @@ import httpx
 
 from ..config import settings
 from .evm_rpc import get_robinhood_chain_client, validate_evm_address
-from .robinhood_chain_execution_discovery import (
-    ROBINHOOD_CHAIN_DISCOVERY_TOKENS,
-    ROBINHOOD_CHAIN_ROUTE_CAPABILITIES,
-    robinhood_chain_route_capability,
-)
 
 
 EXPECTED_CHAIN_ID = 4663
@@ -282,8 +277,10 @@ class RobinhoodChainTransactionPlanningService:
             "exact_input_enabled": True,
             "exact_output_enabled": False,
             "provider_declared_exact_output_supported": True,
-            "capability_policy": "live_verified_pair_direction_amount_mode",
-            "route_capabilities": [dict(item) for item in ROBINHOOD_CHAIN_ROUTE_CAPABILITIES],
+            "capability_policy": "token_registry_database_pair_direction_amount_mode",
+            "route_capabilities": [],
+            "pair_capability_source": "database_router",
+            "token_contracts_hardcoded": False,
             "max_eth_input": _decimal_text(ROBINHOOD_CHAIN_MAX_ETH_INPUT),
             "max_usdg_input": _decimal_text(ROBINHOOD_CHAIN_MAX_USDG_INPUT),
             "default_slippage_bps": ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
@@ -305,20 +302,20 @@ class RobinhoodChainTransactionPlanningService:
 
     @staticmethod
     def _validate_canonical_token(token: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-        expected = ROBINHOOD_CHAIN_DISCOVERY_TOKENS[symbol]
         identity = _safe_token_identity(token)
         if identity["symbol"] != symbol:
             raise ValueError("firm_quote_token_identity_mismatch")
-        if int(identity["decimals"]) != int(expected["decimals"]):
-            raise ValueError("firm_quote_token_identity_mismatch")
-        if bool(identity.get("native")) != bool(expected.get("native")):
-            raise ValueError("firm_quote_token_identity_mismatch")
         try:
+            decimals = int(identity["decimals"])
             actual_contract = validate_evm_address(identity["contract_address"])
-            expected_contract = validate_evm_address(str(expected["contract_address"]))
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise ValueError("firm_quote_token_identity_mismatch") from exc
-        if actual_contract.lower() != expected_contract.lower():
+        if decimals < 0 or decimals > 18:
+            raise ValueError("firm_quote_token_identity_mismatch")
+        if symbol == "ETH":
+            if not bool(identity.get("native")) or decimals != 18:
+                raise ValueError("firm_quote_token_identity_mismatch")
+        elif bool(identity.get("native")):
             raise ValueError("firm_quote_token_identity_mismatch")
         identity["contract_address"] = actual_contract
         return identity
@@ -444,16 +441,24 @@ class RobinhoodChainTransactionPlanningService:
         except (ValueError, TypeError) as exc:
             return _safe_failure(str(exc))
 
-        capability = robinhood_chain_route_capability(
-            trade["sell_token"]["symbol"],
-            trade["buy_token"]["symbol"],
-            trade["amount_mode"],
-        )
-        if capability is None or capability.get("enabled") is not True:
+        if trade["amount_mode"] == "exact_output":
+            capability = {
+                "from_asset": trade["sell_token"]["symbol"],
+                "to_asset": trade["buy_token"]["symbol"],
+                "amount_mode": "exact_output",
+                "display_mode": "exact_receive",
+                "provider": ZEROX_PROVIDER,
+                "indicative_status": "provider_failure",
+                "firm_plan_status": "provider_failure",
+                "execution_status": "held",
+                "enabled": False,
+                "reason": "Exact-receive remains blocked pending direct-router research.",
+                "capability_source": "local_fail_closed_policy",
+            }
             return _safe_failure(
                 "firm_quote_route_mode_not_live_verified",
                 amount_mode=trade["amount_mode"],
-                display_mode="exact_receive" if trade["amount_mode"] == "exact_output" else "exact_spend",
+                display_mode="exact_receive",
                 input_asset=trade["sell_token"]["symbol"],
                 output_asset=trade["buy_token"]["symbol"],
                 route_capability=capability,

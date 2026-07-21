@@ -7,10 +7,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .robinhood_chain_execution_discovery import (
-    ROBINHOOD_CHAIN_ROUTE_CAPABILITIES,
     RobinhoodChainExecutionDiscoveryService,
     get_robinhood_chain_execution_discovery_service,
-    robinhood_chain_route_capability,
 )
 
 
@@ -208,7 +206,8 @@ class RobinhoodChainQuoteService:
             "exact_input_enabled": True,
             "exact_output_enabled": False,
             "capability_policy": "live_verified_pair_direction_amount_mode",
-            "route_capabilities": copy.deepcopy(list(ROBINHOOD_CHAIN_ROUTE_CAPABILITIES)),
+            "route_capabilities": [],
+            "pair_capability_source": "database_router",
             "will_mutate": False,
         }
 
@@ -450,7 +449,19 @@ class RobinhoodChainQuoteService:
             )
 
         if amount_mode == "exact_output":
-            capability = robinhood_chain_route_capability("USDG", "ETH", "exact_output")
+            capability = {
+                "from_asset": str(usdg_token.get("symbol") or "").strip().upper(),
+                "to_asset": str(eth_token.get("symbol") or "").strip().upper(),
+                "amount_mode": "exact_output",
+                "display_mode": "exact_receive",
+                "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER,
+                "indicative_status": "provider_failure",
+                "firm_plan_status": "provider_failure",
+                "execution_status": "held",
+                "enabled": False,
+                "reason": "Exact-receive remains blocked pending direct-router research.",
+                "capability_source": "local_fail_closed_policy",
+            }
             failure = _safe_failure(
                 {
                     "error": "robinhood_chain_exact_receive_route_unavailable",

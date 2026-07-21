@@ -23,128 +23,15 @@ ZEROX_PRICE_PATH = "/swap/allowance-holder/price"
 ZEROX_NATIVE_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 ERC20_DECIMALS_CALL_DATA = "0x313ce567"
 
-# RH-CHAIN.10A is intentionally limited to canonical mainnet discovery assets.
-# USDG remains an official candidate until the live probe is accepted and the
-# user explicitly saves it through Token Registry.
-ROBINHOOD_CHAIN_DISCOVERY_TOKENS: Dict[str, Dict[str, Any]] = {
-    "ETH": {
-        "symbol": "ETH",
-        "contract_address": ZEROX_NATIVE_TOKEN,
-        "decimals": 18,
-        "native": True,
-        "identity_source": "robinhood_chain_native",
-    },
-    "WETH": {
-        "symbol": "WETH",
-        "contract_address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
-        "decimals": 18,
-        "native": False,
-        "identity_source": "robinhood_official_contract_registry",
-    },
-    "USDG": {
-        "symbol": "USDG",
-        "contract_address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
-        "decimals": 6,
-        "native": False,
-        "identity_source": "robinhood_official_contract_registry",
-    },
-}
-
-ROBINHOOD_CHAIN_ROUTE_CAPABILITIES: Tuple[Dict[str, Any], ...] = (
-    {
-        "from_asset": "ETH",
-        "to_asset": "USDG",
-        "amount_mode": "exact_input",
-        "display_mode": "exact_spend",
-        "provider": ZEROX_PROVIDER,
-        "indicative_status": "live_verified",
-        "firm_plan_status": "live_verified",
-        "execution_status": "live_verified",
-        "enabled": True,
-        "evidence": "RH-CHAIN.10D.1B live acceptance",
-        "reason": None,
-    },
-    {
-        "from_asset": "USDG",
-        "to_asset": "ETH",
-        "amount_mode": "exact_input",
-        "display_mode": "exact_spend",
-        "provider": ZEROX_PROVIDER,
-        "indicative_status": "live_verified",
-        "firm_plan_status": "live_verified",
-        "execution_status": "review_only",
-        "enabled": True,
-        "evidence": "RH-CHAIN.10D.2-R3 live diagnostic",
-        "reason": "Quote and unsigned firm-plan review are verified; a generalized live execution lifecycle is not enabled yet.",
-    },
-    {
-        "from_asset": "USDG",
-        "to_asset": "WETH",
-        "amount_mode": "exact_input",
-        "display_mode": "exact_spend",
-        "provider": ZEROX_PROVIDER,
-        "indicative_status": "live_verified",
-        "firm_plan_status": "not_verified",
-        "execution_status": "disabled",
-        "enabled": True,
-        "evidence": "RH-CHAIN.10D.2-R3 live diagnostic",
-        "reason": "Read-only discovery is verified; firm planning and execution remain disabled pending a dedicated tranche.",
-    },
-    {
-        "from_asset": "USDG",
-        "to_asset": "ETH",
-        "amount_mode": "exact_output",
-        "display_mode": "exact_receive",
-        "provider": ZEROX_PROVIDER,
-        "indicative_status": "provider_failure",
-        "firm_plan_status": "provider_failure",
-        "execution_status": "held",
-        "enabled": False,
-        "evidence": "RH-CHAIN.10D.2-R3 live diagnostic",
-        "reason": "0x returned HTTP 500 for both indicative and firm exact-output native-ETH requests. Direct-router research is required.",
-    },
-    {
-        "from_asset": "USDG",
-        "to_asset": "WETH",
-        "amount_mode": "exact_output",
-        "display_mode": "exact_receive",
-        "provider": ZEROX_PROVIDER,
-        "indicative_status": "provider_failure",
-        "firm_plan_status": "provider_failure",
-        "execution_status": "disabled",
-        "enabled": False,
-        "evidence": "RH-CHAIN.10D.2-R3 live diagnostic",
-        "reason": "0x returned HTTP 500 for exact-output WETH discovery. The route is blocked before provider contact.",
-    },
-)
-
-
-def robinhood_chain_route_capability(
-    sell_symbol: Any,
-    buy_symbol: Any,
-    amount_mode: Any,
-) -> Optional[Dict[str, Any]]:
-    sell = str(sell_symbol or "").strip().upper()
-    buy = str(buy_symbol or "").strip().upper()
-    mode = str(amount_mode or "").strip().lower()
-    for item in ROBINHOOD_CHAIN_ROUTE_CAPABILITIES:
-        if (
-            item["from_asset"] == sell
-            and item["to_asset"] == buy
-            and item["amount_mode"] == mode
-        ):
-            return copy.deepcopy(item)
-    return None
+# Token identities and pair capabilities are supplied by the TokenRegistry-backed
+# R5C.1 discovery layer. This service intentionally keeps only provider protocol
+# constants; it contains no token contract addresses or pair allowlists.
 
 
 _DECIMAL_RE = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d+)?$")
 _HEX_DATA_RE = re.compile(r"^0x[0-9a-fA-F]*$")
 _MAX_ROUTE_FILLS = 25
 _MAX_PROVIDER_ERROR_TEXT = 1200
-_MAX_PROBE_WETH = Decimal("0.002")
-_MAX_PROBE_ETH = Decimal("0.002")
-
-
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -170,6 +57,13 @@ def _format_atomic_units(atomic: str, decimals: int) -> str:
     if remainder == 0:
         return str(whole)
     return f"{whole}.{remainder:0{places}d}".rstrip("0")
+
+
+def _format_decimal(value: Decimal) -> str:
+    text_value = format(value, "f")
+    if "." in text_value:
+        text_value = text_value.rstrip("0").rstrip(".")
+    return text_value
 
 
 def _display_amount_to_atomic(value: Any, decimals: int) -> Tuple[str, str]:
@@ -218,10 +112,14 @@ def _safe_token_identity(token: Dict[str, Any]) -> Dict[str, Any]:
         "contract_address": str(token.get("contract_address") or "").strip(),
         "decimals": int(token.get("decimals") or 0),
         "native": bool(token.get("native")),
+        "asset_kind": token.get("asset_kind"),
+        "label": token.get("label"),
         "identity_source": token.get("identity_source"),
         "registry_status": token.get("registry_status"),
         "registry_id": token.get("registry_id"),
         "registry_venue": token.get("registry_venue"),
+        "external_price_source": token.get("external_price_source"),
+        "external_price_id": token.get("external_price_id"),
     }
 
 
@@ -280,7 +178,7 @@ class RobinhoodChainExecutionDiscoveryService:
             "venue": str(raw.get("venue") or "zerox").strip() or "zerox",
         }
 
-    def status(self) -> Dict[str, Any]:
+    def status(self, *, route_capabilities: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         credential = self._credential()
         provider = str(settings.robinhood_chain_effective_swap_provider() or "").strip().lower()
         base_configured = bool(self.api_base.startswith("https://"))
@@ -305,8 +203,10 @@ class RobinhoodChainExecutionDiscoveryService:
             "exact_input_supported": True,
             "exact_output_supported": False,
             "provider_declared_exact_output_supported": True,
-            "capability_policy": "live_verified_pair_direction_amount_mode",
-            "route_capabilities": copy.deepcopy(list(ROBINHOOD_CHAIN_ROUTE_CAPABILITIES)),
+            "capability_policy": "token_registry_database_pair_direction_amount_mode",
+            "route_capabilities": copy.deepcopy(list(route_capabilities or [])),
+            "token_contracts_hardcoded": False,
+            "pair_capabilities_hardcoded": False,
             "timeout_s": self.timeout_s,
             "cache_ttl_s": self.cache_ttl_s,
             "error_backoff_s": self.error_backoff_s,
@@ -451,26 +351,24 @@ class RobinhoodChainExecutionDiscoveryService:
         amount_display: str,
         sell_token: Dict[str, Any],
         buy_token: Dict[str, Any],
+        max_probe_amount: Optional[Any] = None,
     ) -> None:
         amount = Decimal(amount_display)
-        sell_symbol = str(sell_token.get("symbol") or "").upper()
-        buy_symbol = str(buy_token.get("symbol") or "").upper()
-        max_usd = Decimal(str(self.max_sell_usd))
+        if max_probe_amount is not None and str(max_probe_amount).strip() != "":
+            try:
+                explicit_cap = Decimal(str(max_probe_amount).strip())
+            except InvalidOperation as exc:
+                raise ValueError("invalid_discovery_amount_cap") from exc
+            if not explicit_cap.is_finite() or explicit_cap <= 0 or amount > explicit_cap:
+                raise ValueError("discovery_amount_exceeds_cap")
 
-        if amount_mode == "exact_input":
-            if sell_symbol == "USDG" and amount > max_usd:
-                raise ValueError("discovery_amount_exceeds_cap")
-            if sell_symbol == "WETH" and amount > _MAX_PROBE_WETH:
-                raise ValueError("discovery_amount_exceeds_cap")
-            if sell_symbol == "ETH" and amount > _MAX_PROBE_ETH:
-                raise ValueError("discovery_amount_exceeds_cap")
-        else:
-            if buy_symbol == "USDG" and amount > max_usd:
-                raise ValueError("discovery_amount_exceeds_cap")
-            if buy_symbol == "WETH" and amount > _MAX_PROBE_WETH:
-                raise ValueError("discovery_amount_exceeds_cap")
-            if buy_symbol == "ETH" and amount > _MAX_PROBE_ETH:
-                raise ValueError("discovery_amount_exceeds_cap")
+        # Stable-token USD caps are driven by TokenRegistry metadata rather than
+        # symbol names. Non-stable assets remain bounded by the explicit
+        # objective probe amount supplied by the R5C.1 discovery layer.
+        stable_token = sell_token if amount_mode == "exact_input" else buy_token
+        stable_source = str(stable_token.get("external_price_source") or "").strip().lower()
+        if stable_source == "stable" and amount > Decimal(str(self.max_sell_usd)):
+            raise ValueError("discovery_amount_exceeds_cap")
 
     def _cache_key(self, params: Dict[str, str], sell_token: Dict[str, Any], buy_token: Dict[str, Any]) -> str:
         safe = {
@@ -584,8 +482,8 @@ class RobinhoodChainExecutionDiscoveryService:
             sell_value = Decimal(sell_display)
             buy_value = Decimal(buy_display)
             if sell_value > 0 and buy_value > 0:
-                price = format(buy_value / sell_value, "f").rstrip("0").rstrip(".")
-                inverse_price = format(sell_value / buy_value, "f").rstrip("0").rstrip(".")
+                price = _format_decimal(buy_value / sell_value)
+                inverse_price = _format_decimal(sell_value / buy_value)
 
         issues = self._normalize_issues(body.get("issues"))
         allowance_target = _safe_address_or_none(body.get("allowanceTarget"))
@@ -654,15 +552,15 @@ class RobinhoodChainExecutionDiscoveryService:
             "will_mutate": False,
         }
 
-        # USDG is a dollar-denominated discovery asset. Enforce the configured
-        # read-only probe cap against the provider-normalized result as well.
+        # Stable-value estimation is driven by TokenRegistry price-source
+        # metadata and never by a hardcoded ticker.
         max_usd = Decimal(str(self.max_sell_usd))
-        sell_symbol = str(sell_token.get("symbol") or "").upper()
-        buy_symbol = str(buy_token.get("symbol") or "").upper()
+        sell_stable = str(sell_token.get("external_price_source") or "").strip().lower() == "stable"
+        buy_stable = str(buy_token.get("external_price_source") or "").strip().lower() == "stable"
         usd_estimate: Optional[Decimal] = None
-        if sell_symbol == "USDG" and sell_display is not None:
+        if sell_stable and sell_display is not None:
             usd_estimate = Decimal(sell_display)
-        elif buy_symbol == "USDG" and buy_display is not None:
+        elif buy_stable and buy_display is not None:
             usd_estimate = Decimal(buy_display)
         response["discovery_value_usd_estimate"] = format(usd_estimate, "f") if usd_estimate is not None else None
         response["discovery_value_cap_usd"] = format(max_usd, "f")
@@ -686,6 +584,9 @@ class RobinhoodChainExecutionDiscoveryService:
         buy_amount: Optional[str],
         taker_address: str,
         force_refresh: bool = False,
+        route_capability: Optional[Dict[str, Any]] = None,
+        require_live_verified: bool = True,
+        max_probe_amount: Optional[Any] = None,
     ) -> Dict[str, Any]:
         provider = str(settings.robinhood_chain_effective_swap_provider() or "").strip().lower()
         credential = self._credential()
@@ -715,10 +616,16 @@ class RobinhoodChainExecutionDiscoveryService:
         buy_identity = _safe_token_identity(buy_token)
         sell_symbol = sell_identity["symbol"]
         buy_symbol = buy_identity["symbol"]
-        if sell_symbol not in ROBINHOOD_CHAIN_DISCOVERY_TOKENS or buy_symbol not in ROBINHOOD_CHAIN_DISCOVERY_TOKENS:
+        if not sell_symbol or not buy_symbol or sell_symbol == buy_symbol:
             return {"ok": False, "error": "unsupported_discovery_pair", "read_only": True, "will_mutate": False}
-        if sell_symbol == buy_symbol:
-            return {"ok": False, "error": "unsupported_discovery_pair", "read_only": True, "will_mutate": False}
+        for identity in (sell_identity, buy_identity):
+            try:
+                identity["contract_address"] = validate_evm_address(identity["contract_address"])
+                decimals = int(identity["decimals"])
+            except Exception:
+                return {"ok": False, "error": "invalid_registry_token_identity", "read_only": True, "will_mutate": False}
+            if decimals < 0 or decimals > 18 or identity.get("registry_id") is None:
+                return {"ok": False, "error": "invalid_registry_token_identity", "read_only": True, "will_mutate": False}
 
         has_sell = sell_amount is not None and str(sell_amount).strip() != ""
         has_buy = buy_amount is not None and str(buy_amount).strip() != ""
@@ -739,12 +646,13 @@ class RobinhoodChainExecutionDiscoveryService:
                 amount_display=requested_display,
                 sell_token=sell_identity,
                 buy_token=buy_identity,
+                max_probe_amount=max_probe_amount,
             )
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "read_only": True, "will_mutate": False}
 
-        capability = robinhood_chain_route_capability(sell_symbol, buy_symbol, amount_mode)
-        if capability is None or capability.get("enabled") is not True:
+        capability = copy.deepcopy(route_capability) if isinstance(route_capability, dict) else None
+        if require_live_verified and (capability is None or capability.get("enabled") is not True):
             return {
                 "ok": False,
                 "error": "execution_discovery_route_mode_not_live_verified",
@@ -795,6 +703,7 @@ class RobinhoodChainExecutionDiscoveryService:
             if cached is not None:
                 cached["chain"] = chain
                 cached["contract_checks"] = contract_checks
+                cached["route_capability"] = capability
                 return cached
 
         url = f"{self.api_base}{ZEROX_PRICE_PATH}"
@@ -889,6 +798,8 @@ class RobinhoodChainExecutionDiscoveryService:
                 )
                 normalized["chain"] = chain
                 normalized["contract_checks"] = contract_checks
+                normalized["route_capability"] = capability
+                normalized["provider_contacted"] = True
                 self._clear_backoff()
                 if normalized.get("ok"):
                     await self._store_cache(cache_key, normalized)

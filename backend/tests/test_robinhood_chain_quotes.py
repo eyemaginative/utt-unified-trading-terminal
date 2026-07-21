@@ -13,9 +13,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.robinhood_chain_execution_discovery import (  # noqa: E402
-    robinhood_chain_route_capability,
-)
+from app.services import robinhood_chain_execution_discovery as discovery_module  # noqa: E402
 from app.services.robinhood_chain_quotes import (  # noqa: E402
     ROBINHOOD_CHAIN_ASK_INPUT_AMOUNTS,
     ROBINHOOD_CHAIN_BID_INPUT_AMOUNTS,
@@ -259,19 +257,14 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quote["route_capability"]["indicative_status"], "provider_failure")
         self.assertEqual(discovery.calls, [])
 
-    def test_route_capability_matrix_separates_exact_spend_and_exact_receive(self) -> None:
-        exact_spend = robinhood_chain_route_capability("USDG", "ETH", "exact_input")
-        exact_receive = robinhood_chain_route_capability("USDG", "ETH", "exact_output")
-        wrapped_spend = robinhood_chain_route_capability("USDG", "WETH", "exact_input")
+    def test_route_capabilities_are_not_embedded_in_provider_service(self) -> None:
+        source = inspect.getsource(discovery_module)
 
-        self.assertTrue(exact_spend["enabled"])
-        self.assertEqual(exact_spend["display_mode"], "exact_spend")
-        self.assertEqual(exact_spend["firm_plan_status"], "live_verified")
-        self.assertFalse(exact_receive["enabled"])
-        self.assertEqual(exact_receive["display_mode"], "exact_receive")
-        self.assertEqual(exact_receive["indicative_status"], "provider_failure")
-        self.assertTrue(wrapped_spend["enabled"])
-        self.assertEqual(wrapped_spend["firm_plan_status"], "not_verified")
+        self.assertNotIn("ROBINHOOD_CHAIN_ROUTE_CAPABILITIES", source)
+        self.assertNotIn("ROBINHOOD_CHAIN_DISCOVERY_TOKENS", source)
+        self.assertIn("route_capabilities", source)
+        self.assertIn("token_contracts_hardcoded", source)
+        self.assertIn("pair_capabilities_hardcoded", source)
 
     async def test_unsupported_symbol_fails_closed_without_provider_call(self) -> None:
         service, discovery = self.make_service()

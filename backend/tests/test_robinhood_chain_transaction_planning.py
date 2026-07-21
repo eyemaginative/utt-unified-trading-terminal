@@ -290,18 +290,15 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rpc.rpc_calls, [])
         self.assertEqual(rpc.allowance_calls, [])
 
-    def test_status_exposes_live_verified_route_matrix(self) -> None:
+    def test_status_delegates_route_capabilities_to_database_router(self) -> None:
         service, _ = self.make_service()
         status = service.status()
         self.assertTrue(status["exact_input_enabled"])
         self.assertFalse(status["exact_output_enabled"])
         self.assertTrue(status["provider_declared_exact_output_supported"])
-        rows = status["route_capabilities"]
-        exact_spend = next(row for row in rows if row["from_asset"] == "USDG" and row["to_asset"] == "ETH" and row["display_mode"] == "exact_spend")
-        exact_receive = next(row for row in rows if row["from_asset"] == "USDG" and row["to_asset"] == "ETH" and row["display_mode"] == "exact_receive")
-        self.assertTrue(exact_spend["enabled"])
-        self.assertFalse(exact_receive["enabled"])
-        self.assertEqual(exact_receive["firm_plan_status"], "provider_failure")
+        self.assertEqual(status["route_capabilities"], [])
+        self.assertEqual(status["pair_capability_source"], "database_router")
+        self.assertFalse(status["token_contracts_hardcoded"])
 
     async def test_unsupported_symbol_fails_before_provider(self) -> None:
         service, rpc = self.make_service()

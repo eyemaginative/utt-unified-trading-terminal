@@ -33,6 +33,13 @@ USDG = {
     "decimals": 6,
     "native": False,
 }
+WETH = {
+    "symbol": "WETH",
+    "contract_address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "decimals": 18,
+    "native": False,
+    "registry_id": 44,
+}
 TAKER = "0x70c1ddd03bc4cb74efac3f12a41465d028ae490c"
 
 
@@ -65,6 +72,9 @@ class FakeDiscoveryService:
         buy_amount: str | None,
         taker_address: str,
         force_refresh: bool,
+        route_capability: dict | None = None,
+        require_live_verified: bool = True,
+        max_probe_amount: str | None = None,
     ) -> dict:
         amount_mode = "exact_output" if buy_amount is not None else "exact_input"
         amount_text = str(buy_amount if buy_amount is not None else sell_amount or "")
@@ -87,7 +97,9 @@ class FakeDiscoveryService:
             }
 
         amount = Decimal(amount_text)
-        if sell_token["symbol"] == "ETH":
+        sell_symbol = sell_token["symbol"]
+        buy_symbol = buy_token["symbol"]
+        if sell_symbol in {"ETH", "WETH"} and buy_symbol == "USDG":
             price = Decimal("1800") - amount * Decimal("100")
             sell_value = amount
             buy_value = amount * price
@@ -97,14 +109,20 @@ class FakeDiscoveryService:
             price = Decimal("1850")
             sell_value = amount * price
             buy_value = amount
-            fee_token = ETH["contract_address"].lower()
+            fee_token = buy_token["contract_address"].lower()
             fee_atomic = "100000000000"
-        else:
+        elif sell_symbol == "USDG" and buy_symbol in {"ETH", "WETH"}:
             price = Decimal("1820") + amount * Decimal("0.1")
             sell_value = amount
             buy_value = amount / price
-            fee_token = ETH["contract_address"].lower()
+            fee_token = buy_token["contract_address"].lower()
             fee_atomic = "100000000000"
+        else:
+            price = Decimal("2")
+            sell_value = amount
+            buy_value = amount / price
+            fee_token = buy_token["contract_address"].lower()
+            fee_atomic = "1"
 
         min_output = buy_value * Decimal("0.99")
         return {
@@ -255,6 +273,105 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(quote["provider_contacted"])
         self.assertFalse(quote["backoff_activated"])
         self.assertEqual(quote["route_capability"]["indicative_status"], "provider_failure")
+        self.assertEqual(discovery.calls, [])
+
+    async def test_database_capability_weth_usdg_synthetic_orderbook(self) -> None:
+        service, discovery = self.make_service()
+        base_to_quote = {
+            "symbol": "WETH-USDG",
+            "mechanism": "swap",
+            "from_asset": "WETH",
+            "to_asset": "USDG",
+            "amount_mode": "exact_input",
+            "indicative_status": "available",
+            "execution_status": "disabled",
+            "enabled": False,
+            "probe_amount": "0.0005",
+        }
+        quote_to_base = {
+            "symbol": "WETH-USDG",
+            "mechanism": "swap",
+            "from_asset": "USDG",
+            "to_asset": "WETH",
+            "amount_mode": "exact_input",
+            "indicative_status": "available",
+            "execution_status": "disabled",
+            "enabled": False,
+            "probe_amount": "1",
+        }
+
+        book = await service.synthetic_orderbook_for_pair(
+            symbol="WETH-USDG",
+            depth=3,
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token={**USDG, "registry_id": 45},
+            base_to_quote_capability=base_to_quote,
+            quote_to_base_capability=quote_to_base,
+            force_refresh=True,
+        )
+
+        self.assertTrue(book["ok"])
+        self.assertEqual(book["tranche"], "RH-CHAIN.10D.2-R5C.2")
+        self.assertEqual(book["symbol"], "WETH-USDG")
+        self.assertEqual(book["base_asset"], "WETH")
+        self.assertEqual(book["quote_asset"], "USDG")
+        self.assertEqual(book["identity_source"], "token_registry")
+        self.assertEqual(book["capability_source"], "database")
+        self.assertEqual(len(book["bids"]), 3)
+        self.assertEqual(len(book["asks"]), 3)
+        self.assertTrue(all(row["synthetic"] for row in [*book["bids"], *book["asks"]]))
+        self.assertTrue(all(row["quote_only"] for row in [*book["bids"], *book["asks"]]))
+        self.assertIsNone(book["transaction_calldata"])
+        self.assertFalse(book["execution_enabled"])
+        self.assertEqual(len(discovery.calls), 6)
+
+    async def test_generic_orderbook_blocks_provider_error_before_probe(self) -> None:
+        service, discovery = self.make_service()
+        blocked = {
+            "symbol": "SPCX-USDG",
+            "mechanism": "swap",
+            "from_asset": "SPCX",
+            "to_asset": "USDG",
+            "amount_mode": "exact_input",
+            "indicative_status": "provider_error",
+            "execution_status": "disabled",
+            "enabled": False,
+            "probe_amount": "0.01",
+        }
+        available = {
+            "symbol": "SPCX-USDG",
+            "mechanism": "swap",
+            "from_asset": "USDG",
+            "to_asset": "SPCX",
+            "amount_mode": "exact_input",
+            "indicative_status": "available",
+            "execution_status": "disabled",
+            "enabled": False,
+            "probe_amount": "1",
+        }
+        spcx = {
+            "symbol": "SPCX",
+            "contract_address": "0x" + "4a" * 20,
+            "decimals": 18,
+            "native": False,
+            "registry_id": 47,
+        }
+
+        book = await service.synthetic_orderbook_for_pair(
+            symbol="SPCX-USDG",
+            depth=3,
+            taker_address=TAKER,
+            base_token=spcx,
+            quote_token={**USDG, "registry_id": 45},
+            base_to_quote_capability=blocked,
+            quote_to_base_capability=available,
+            force_refresh=True,
+        )
+
+        self.assertFalse(book["ok"])
+        self.assertEqual(book["error"], "robinhood_chain_bid_direction_unavailable")
+        self.assertFalse(book["provider_contacted"])
         self.assertEqual(discovery.calls, [])
 
     def test_route_capabilities_are_not_embedded_in_provider_service(self) -> None:

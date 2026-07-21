@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .robinhood_chain_execution_discovery import (
@@ -70,6 +70,32 @@ def _safe_decimal(value: Any) -> Optional[Decimal]:
     except (InvalidOperation, ValueError, TypeError):
         return None
     return number if number.is_finite() else None
+
+
+def _token_symbol(token: Dict[str, Any]) -> str:
+    return str(token.get("symbol") or "").strip().upper()
+
+
+def _bounded_sample_amounts(seed: Any, decimals: int, levels: int) -> Tuple[str, ...]:
+    seed_amount = _safe_decimal(seed)
+    if seed_amount is None or seed_amount <= 0:
+        raise ValueError("invalid_robinhood_chain_book_probe_amount")
+    places = max(0, min(18, int(decimals)))
+    quantum = Decimal(1).scaleb(-places) if places > 0 else Decimal(1)
+    factors = (Decimal("0.25"), Decimal("0.5"), Decimal("1"), Decimal("2"), Decimal("4"))
+    out: List[str] = []
+    for factor in factors:
+        amount = (seed_amount * factor).quantize(quantum, rounding=ROUND_DOWN)
+        if amount <= 0 or amount > Decimal("25"):
+            continue
+        text = _decimal_text(amount)
+        if text not in out:
+            out.append(text)
+        if len(out) >= max(1, min(int(levels), ROBINHOOD_CHAIN_MAX_BOOK_LEVELS)):
+            break
+    if not out:
+        raise ValueError("robinhood_chain_book_probe_amount_below_precision")
+    return tuple(out)
 
 
 def _route_sources(result: Dict[str, Any]) -> List[str]:
@@ -722,6 +748,339 @@ class RobinhoodChainQuoteService:
             "cache_mixed": bool(all_rows) and any(bool(row.get("cached")) for row in all_rows) and not all(bool(row.get("cached")) for row in all_rows),
             "fetched_at": max(fetched_values) if fetched_values else None,
             "snapshot_source": "0x_indicative_samples",
+            "stale": False,
+            "synthetic": True,
+            "resting_order": False,
+            "quote_only": True,
+            "read_only": True,
+            "execution_enabled": False,
+            "signing_enabled": False,
+            "transaction_construction_enabled": False,
+            "firm_quote": False,
+            "transaction_calldata": None,
+            "will_mutate": False,
+        }
+        if not payload["ok"]:
+            payload["error"] = "synthetic_orderbook_liquidity_incomplete"
+        else:
+            await self._store_book(cache_key, payload)
+        return payload
+
+
+    @staticmethod
+    def _pair_capability_available(capability: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(capability, dict):
+            return False
+        return (
+            str(capability.get("amount_mode") or "").strip().lower() == "exact_input"
+            and str(capability.get("indicative_status") or "").strip().lower() in {"available", "live_verified"}
+            and str(capability.get("mechanism") or "swap").strip().lower() == "swap"
+        )
+
+    async def _probe_pair_quote(
+        self,
+        *,
+        symbol: str,
+        base_token: Dict[str, Any],
+        quote_token: Dict[str, Any],
+        sell_token: Dict[str, Any],
+        buy_token: Dict[str, Any],
+        requested_amount: str,
+        taker_address: str,
+        capability: Dict[str, Any],
+        force_refresh: bool,
+    ) -> Dict[str, Any]:
+        result = await self.discovery_service.probe(
+            sell_token=sell_token,
+            buy_token=buy_token,
+            sell_amount=requested_amount,
+            buy_amount=None,
+            taker_address=taker_address,
+            force_refresh=force_refresh,
+            route_capability=capability,
+            require_live_verified=False,
+            max_probe_amount=requested_amount,
+        )
+        if not result.get("ok"):
+            failure = _safe_failure(result, context="orderbook")
+            failure["symbol"] = symbol
+            failure["route_capability"] = copy.deepcopy(capability)
+            return failure
+
+        sell_amount = _safe_decimal(result.get("sell_amount"))
+        buy_amount = _safe_decimal(result.get("buy_amount"))
+        min_buy_amount = _safe_decimal(result.get("min_buy_amount"))
+        if sell_amount is None or buy_amount is None or sell_amount <= 0 or buy_amount <= 0:
+            failure = _safe_failure(
+                {"error": "invalid_provider_quote_amounts", "provider": result.get("provider")},
+                context="orderbook",
+            )
+            failure["symbol"] = symbol
+            return failure
+
+        base_symbol = _token_symbol(base_token)
+        quote_symbol = _token_symbol(quote_token)
+        sell_symbol = _token_symbol(sell_token)
+        buy_symbol = _token_symbol(buy_token)
+        if {base_symbol, quote_symbol} != {sell_symbol, buy_symbol}:
+            failure = _safe_failure(
+                {"error": "robinhood_chain_pair_identity_mismatch", "provider": result.get("provider")},
+                context="orderbook",
+            )
+            failure["symbol"] = symbol
+            return failure
+
+        if sell_symbol == base_symbol and buy_symbol == quote_symbol:
+            book_side = "bid"
+            base_quantity = sell_amount
+            quote_quantity = buy_amount
+            effective_price = quote_quantity / base_quantity
+        elif sell_symbol == quote_symbol and buy_symbol == base_symbol:
+            book_side = "ask"
+            base_quantity = buy_amount
+            quote_quantity = sell_amount
+            effective_price = quote_quantity / base_quantity
+        else:
+            failure = _safe_failure(
+                {"error": "robinhood_chain_pair_direction_mismatch", "provider": result.get("provider")},
+                context="orderbook",
+            )
+            failure["symbol"] = symbol
+            return failure
+
+        sources = _route_sources(result)
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "side": book_side,
+            "amount_mode": "exact_input",
+            "input_asset": sell_symbol,
+            "input_amount": _decimal_text(sell_amount),
+            "output_asset": buy_symbol,
+            "output_amount": _decimal_text(buy_amount),
+            "base_asset": base_symbol,
+            "quote_asset": quote_symbol,
+            "base_quantity": _decimal_text(base_quantity),
+            "quote_quantity": _decimal_text(quote_quantity),
+            "effective_price": _decimal_text(effective_price),
+            "minimum_received": _decimal_text(min_buy_amount) if min_buy_amount is not None else None,
+            "minimum_received_asset": buy_symbol if min_buy_amount is not None else None,
+            "route_sources": sources,
+            "route_source": sources[0] if sources else None,
+            "allowance_required": bool(result.get("allowance_required")),
+            "allowance_spender": result.get("allowance_spender"),
+            "total_network_fee_wei": result.get("total_network_fee"),
+            "total_network_fee_eth": _network_fee_eth(result),
+            "zero_x_fee": _normalize_zero_x_fee(
+                result,
+                eth_token=base_token,
+                usdg_token=quote_token,
+            ),
+            "cached": bool(result.get("cached")),
+            "fetched_at": result.get("fetched_at"),
+            "liquidity_available": bool(result.get("liquidity_available")),
+            "route_capability": copy.deepcopy(capability),
+            "read_only": True,
+            "quote_only": True,
+            "execution_enabled": False,
+            "transaction_calldata": None,
+            "will_mutate": False,
+        }
+
+    @staticmethod
+    def _pair_book_level(quote: Dict[str, Any], *, sample_input: str) -> Dict[str, Any]:
+        return {
+            "price": quote.get("effective_price"),
+            "size": quote.get("base_quantity"),
+            "side": quote.get("side"),
+            "sample_input_amount": sample_input,
+            "input_asset": quote.get("input_asset"),
+            "input_amount": quote.get("input_amount"),
+            "output_asset": quote.get("output_asset"),
+            "output_amount": quote.get("output_amount"),
+            "minimum_received": quote.get("minimum_received"),
+            "minimum_received_asset": quote.get("minimum_received_asset"),
+            "route_source": quote.get("route_source"),
+            "route_sources": quote.get("route_sources") or [],
+            "allowance_required": bool(quote.get("allowance_required")),
+            "allowance_spender": quote.get("allowance_spender"),
+            "network_fee_wei": quote.get("total_network_fee_wei"),
+            "network_fee_eth": quote.get("total_network_fee_eth"),
+            "zero_x_fee": quote.get("zero_x_fee"),
+            "cached": bool(quote.get("cached")),
+            "fetched_at": quote.get("fetched_at"),
+            "synthetic": True,
+            "resting_order": False,
+            "quote_only": True,
+            "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER,
+            "liquidity_type": "synthetic_quote_sample",
+            "liquidity_label": "SYNTH",
+            "source_type": "robinhood_chain_0x_indicative",
+        }
+
+    async def synthetic_orderbook_for_pair(
+        self,
+        *,
+        symbol: str,
+        depth: int,
+        taker_address: str,
+        base_token: Dict[str, Any],
+        quote_token: Dict[str, Any],
+        base_to_quote_capability: Dict[str, Any],
+        quote_to_base_capability: Dict[str, Any],
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        normalized_symbol = _normalize_symbol(symbol)
+        base_symbol = _token_symbol(base_token)
+        quote_symbol = _token_symbol(quote_token)
+        if normalized_symbol != f"{base_symbol}-{quote_symbol}":
+            return _safe_failure(
+                {"error": "robinhood_chain_pair_identity_mismatch", "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER},
+                context="orderbook",
+            )
+        if not self._pair_capability_available(base_to_quote_capability):
+            failure = _safe_failure(
+                {"error": "robinhood_chain_bid_direction_unavailable", "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER},
+                context="orderbook",
+            )
+            failure["route_capability"] = copy.deepcopy(base_to_quote_capability)
+            failure["provider_contacted"] = False
+            return failure
+        if not self._pair_capability_available(quote_to_base_capability):
+            failure = _safe_failure(
+                {"error": "robinhood_chain_ask_direction_unavailable", "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER},
+                context="orderbook",
+            )
+            failure["route_capability"] = copy.deepcopy(quote_to_base_capability)
+            failure["provider_contacted"] = False
+            return failure
+
+        levels = max(1, min(int(depth), ROBINHOOD_CHAIN_MAX_BOOK_LEVELS))
+        try:
+            bid_amounts = _bounded_sample_amounts(
+                base_to_quote_capability.get("probe_amount"),
+                int(base_token.get("decimals")),
+                levels,
+            )
+            ask_amounts = _bounded_sample_amounts(
+                quote_to_base_capability.get("probe_amount"),
+                int(quote_token.get("decimals")),
+                levels,
+            )
+        except (ValueError, TypeError) as exc:
+            return _safe_failure(
+                {"error": str(exc), "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER},
+                context="orderbook",
+            )
+
+        cache_key = f"pair|{normalized_symbol}|{taker_address.lower()}|{levels}|{','.join(bid_amounts)}|{','.join(ask_amounts)}"
+        if not force_refresh:
+            cached = await self._cached_book(cache_key)
+            if cached is not None:
+                return cached
+
+        bids: List[Dict[str, Any]] = []
+        asks: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for amount in bid_amounts:
+            quote = await self._probe_pair_quote(
+                symbol=normalized_symbol,
+                base_token=base_token,
+                quote_token=quote_token,
+                sell_token=base_token,
+                buy_token=quote_token,
+                requested_amount=amount,
+                taker_address=taker_address,
+                capability=base_to_quote_capability,
+                force_refresh=force_refresh,
+            )
+            if quote.get("ok") and quote.get("liquidity_available"):
+                bids.append(self._pair_book_level(quote, sample_input=amount))
+            else:
+                errors.append({
+                    "side": "bid",
+                    "sample_input_amount": amount,
+                    "error": quote.get("error"),
+                    "backoff_until": quote.get("backoff_until"),
+                })
+
+        for amount in ask_amounts:
+            quote = await self._probe_pair_quote(
+                symbol=normalized_symbol,
+                base_token=base_token,
+                quote_token=quote_token,
+                sell_token=quote_token,
+                buy_token=base_token,
+                requested_amount=amount,
+                taker_address=taker_address,
+                capability=quote_to_base_capability,
+                force_refresh=force_refresh,
+            )
+            if quote.get("ok") and quote.get("liquidity_available"):
+                asks.append(self._pair_book_level(quote, sample_input=amount))
+            else:
+                errors.append({
+                    "side": "ask",
+                    "sample_input_amount": amount,
+                    "error": quote.get("error"),
+                    "backoff_until": quote.get("backoff_until"),
+                })
+
+        bids.sort(key=lambda row: _safe_decimal(row.get("price")) or Decimal("0"), reverse=True)
+        asks.sort(key=lambda row: _safe_decimal(row.get("price")) or Decimal("0"))
+        best_bid = _safe_decimal(bids[0].get("price")) if bids else None
+        best_ask = _safe_decimal(asks[0].get("price")) if asks else None
+        spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
+        midpoint = (best_ask + best_bid) / Decimal(2) if best_bid is not None and best_ask is not None else None
+        spread_bps = spread / midpoint * Decimal(10000) if spread is not None and midpoint and midpoint > 0 else None
+        sources: List[str] = []
+        for row in [*bids, *asks]:
+            for source in row.get("route_sources") or []:
+                text = str(source or "").strip()
+                if text and text not in sources:
+                    sources.append(text)
+        all_rows = [*bids, *asks]
+        fetched_values = [str(row.get("fetched_at") or "") for row in all_rows if row.get("fetched_at")]
+        payload: Dict[str, Any] = {
+            "ok": bool(bids and asks),
+            "tranche": "RH-CHAIN.10D.2-R5C.2",
+            "venue": "robinhood_chain",
+            "network": "robinhood_chain",
+            "chain_id": 4663,
+            "chain_id_hex": "0x1237",
+            "mainnet_only": True,
+            "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER,
+            "router": ROBINHOOD_CHAIN_QUOTE_PROVIDER,
+            "symbol": normalized_symbol,
+            "resolvedSymbol": normalized_symbol,
+            "base_asset": base_symbol,
+            "quote_asset": quote_symbol,
+            "base_token_registry_id": base_token.get("registry_id"),
+            "quote_token_registry_id": quote_token.get("registry_id"),
+            "identity_source": "token_registry",
+            "capability_source": "database",
+            "depth_requested": int(depth),
+            "depth_returned": min(len(bids), len(asks)),
+            "max_depth": ROBINHOOD_CHAIN_MAX_BOOK_LEVELS,
+            "bids": bids,
+            "asks": asks,
+            "best_bid": _decimal_text(best_bid) if best_bid is not None else None,
+            "best_ask": _decimal_text(best_ask) if best_ask is not None else None,
+            "spread": _decimal_text(spread) if spread is not None else None,
+            "spread_bps": _decimal_text(spread_bps) if spread_bps is not None else None,
+            "midpoint": _decimal_text(midpoint) if midpoint is not None else None,
+            "sources": sources,
+            "route_sources": sources,
+            "errors": errors[:20],
+            "warning_count": len(errors),
+            "liquidity_available": bool(bids and asks),
+            "priceDecimals": max(6, min(12, int(quote_token.get("decimals") or 0))),
+            "sizeDecimals": max(0, min(18, int(base_token.get("decimals") or 0))),
+            "cached": bool(all_rows) and all(bool(row.get("cached")) for row in all_rows),
+            "cache_mixed": bool(all_rows) and any(bool(row.get("cached")) for row in all_rows) and not all(bool(row.get("cached")) for row in all_rows),
+            "fetched_at": max(fetched_values) if fetched_values else None,
+            "snapshot_source": "0x_database_capability_samples",
             "stale": False,
             "synthetic": True,
             "resting_order": False,

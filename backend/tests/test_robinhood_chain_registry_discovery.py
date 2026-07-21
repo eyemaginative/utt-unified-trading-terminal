@@ -586,6 +586,123 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("spcx-usdg", source)
         self.assertNotIn("spcx-weth", source)
 
+    def test_market_catalog_enables_only_two_direction_available_swap_books(self) -> None:
+        weth = self._token("WETH", "0x" + "a1" * 20, 18)
+        usdg = self._token("USDG", "0x" + "a2" * 20, 6)
+        result = self.service.create_objective(
+            self.db,
+            base_token_registry_id=weth.id,
+            quote_token_registry_id=usdg.id,
+            mechanism=MECHANISM_SWAP,
+            notes="catalog test",
+            confirm_create=True,
+        )
+        objective_id = result["objective"]["id"]
+        for from_row, to_row, amount in (
+            (weth, usdg, "0.0005"),
+            (usdg, weth, "1"),
+        ):
+            self.db.add(
+                RobinhoodChainPairCapability(
+                    objective_id=objective_id,
+                    from_token_registry_id=from_row.id,
+                    to_token_registry_id=to_row.id,
+                    amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                    provider="0x",
+                    indicative_status="available",
+                    firm_plan_status="not_tested",
+                    execution_status="disabled",
+                    enabled=False,
+                    probe_amount=amount,
+                    route_sources={"sources": ["Uniswap_V3"]},
+                    provider_error={},
+                    evidence={"provider_contacted": True},
+                )
+            )
+        self.db.commit()
+
+        catalog = self.service.market_catalog(self.db)
+        self.assertEqual(len(catalog), 1)
+        market = catalog[0]
+        self.assertEqual(market["tranche"], "RH-CHAIN.10D.2-R5C.2")
+        self.assertEqual(market["symbol"], "WETH-USDG")
+        self.assertEqual(market["indicative_state"], "available")
+        self.assertTrue(market["orderbook_enabled"])
+        self.assertEqual(market["available_direction_count"], 2)
+        self.assertFalse(market["execution_enabled"])
+        self.assertFalse(market["automatic_execution_promotion"])
+        self.assertEqual(market["identity_source"], "token_registry")
+        self.assertEqual(market["capability_source"], "database")
+
+    def test_market_catalog_classifies_wrap_and_provider_error_without_enabling_books(self) -> None:
+        eth = self._token("ETH", None, 18)
+        weth = self._token("WETH", "0x" + "b1" * 20, 18)
+        spcx = self._token("SPCX", "0x" + "b2" * 20, 18)
+        usdg = self._token("USDG", "0x" + "b3" * 20, 6)
+
+        wrap_result = self.service.create_objective(
+            self.db,
+            base_token_registry_id=weth.id,
+            quote_token_registry_id=eth.id,
+            mechanism=MECHANISM_WRAP_UNWRAP,
+            notes=None,
+            confirm_create=True,
+        )
+        spcx_result = self.service.create_objective(
+            self.db,
+            base_token_registry_id=spcx.id,
+            quote_token_registry_id=usdg.id,
+            mechanism=MECHANISM_SWAP,
+            notes=None,
+            confirm_create=True,
+        )
+        for objective_id, pairs, provider, status in (
+            (
+                wrap_result["objective"]["id"],
+                ((weth, eth), (eth, weth)),
+                "native_wrap",
+                "mechanism_configured",
+            ),
+            (
+                spcx_result["objective"]["id"],
+                ((spcx, usdg), (usdg, spcx)),
+                "0x",
+                "provider_error",
+            ),
+        ):
+            for from_row, to_row in pairs:
+                self.db.add(
+                    RobinhoodChainPairCapability(
+                        objective_id=objective_id,
+                        from_token_registry_id=from_row.id,
+                        to_token_registry_id=to_row.id,
+                        amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                        provider=provider,
+                        indicative_status=status,
+                        firm_plan_status="not_tested",
+                        execution_status="disabled",
+                        enabled=False,
+                        probe_amount="0.01",
+                        route_sources={"sources": [provider]},
+                        provider_error={"message": "provider failure"} if status == "provider_error" else {},
+                        evidence={"provider_contacted": status == "provider_error"},
+                    )
+                )
+        self.db.commit()
+
+        by_symbol = {item["symbol"]: item for item in self.service.market_catalog(self.db)}
+        wrap = by_symbol["WETH-ETH"]
+        self.assertEqual(wrap["indicative_state"], "mechanism_configured")
+        self.assertTrue(wrap["mechanism_configured"])
+        self.assertFalse(wrap["orderbook_enabled"])
+        self.assertEqual(wrap["orderbook_reason"], "wrap_unwrap_uses_dedicated_mechanism_view")
+
+        blocked = by_symbol["SPCX-USDG"]
+        self.assertEqual(blocked["indicative_state"], "provider_error")
+        self.assertEqual(blocked["provider_error_direction_count"], 2)
+        self.assertFalse(blocked["orderbook_enabled"])
+        self.assertEqual(blocked["orderbook_reason"], "provider_error")
+
     def test_router_exposes_review_only_registry_discovery_routes(self) -> None:
         from pathlib import Path
 
@@ -599,6 +716,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "/registry-discovery/status",
             "/registry-discovery/assets",
             "/registry-discovery/objectives",
+            "/registry-discovery/markets",
             "/registry-discovery/sync-execution-evidence",
         ):
             self.assertIn(route, router_source)

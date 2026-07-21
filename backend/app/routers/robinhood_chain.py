@@ -1361,6 +1361,24 @@ async def robinhood_chain_registry_discovery_objectives(
     }
 
 
+@router.get("/registry-discovery/markets")
+async def robinhood_chain_registry_discovery_markets(
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    service = get_robinhood_chain_registry_discovery_service()
+    return {
+        "ok": True,
+        "tranche": "RH-CHAIN.10D.2-R5C.2",
+        "items": service.market_catalog(db),
+        "token_identity_source": "token_registry",
+        "pair_capability_source": "database",
+        "hardcoded_markets": False,
+        "automatic_execution_promotion": False,
+        "review_only": True,
+        "execution_enabled": False,
+    }
+
+
 @router.post("/registry-discovery/objectives")
 async def robinhood_chain_registry_discovery_create_objective(
     request: RobinhoodChainPairObjectiveCreateRequest,
@@ -2282,17 +2300,77 @@ async def robinhood_chain_synthetic_orderbook(
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
 
     taker = _resolve_robinhood_chain_quote_taker(db, taker_address)
-    eth = _resolve_execution_discovery_token(db, "ETH")
-    usdg = _resolve_execution_discovery_token(db, "USDG")
-    result = await get_robinhood_chain_quote_service().synthetic_orderbook(
-        symbol=symbol,
+    registry_service = get_robinhood_chain_registry_discovery_service()
+    try:
+        market = registry_service.objective_by_symbol(db, symbol)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": str(exc),
+                "symbol": str(symbol or "").strip().upper(),
+                "identity_source": "token_registry",
+                "capability_source": "database",
+                "provider_contacted": False,
+            },
+        ) from exc
+
+    if str(market.get("mechanism") or "").strip().lower() != "swap":
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "robinhood_chain_orderbook_mechanism_not_supported",
+                "symbol": market.get("symbol"),
+                "mechanism": market.get("mechanism"),
+                "presentation": "wrap_unwrap",
+                "provider_contacted": False,
+                "read_only": True,
+                "execution_enabled": False,
+            },
+        )
+
+    base = market.get("base") if isinstance(market.get("base"), dict) else {}
+    quote = market.get("quote") if isinstance(market.get("quote"), dict) else {}
+    capabilities = [
+        item for item in (market.get("capabilities") or [])
+        if isinstance(item, dict)
+        and str(item.get("amount_mode") or "").strip().lower() == "exact_input"
+    ]
+
+    def direction_capability(from_asset: str, to_asset: str) -> Optional[Dict[str, Any]]:
+        return next(
+            (
+                item for item in capabilities
+                if str(item.get("from_asset") or "").strip().upper() == from_asset
+                and str(item.get("to_asset") or "").strip().upper() == to_asset
+            ),
+            None,
+        )
+
+    base_symbol = str(base.get("symbol") or "").strip().upper()
+    quote_symbol = str(quote.get("symbol") or "").strip().upper()
+    base_to_quote = direction_capability(base_symbol, quote_symbol)
+    quote_to_base = direction_capability(quote_symbol, base_symbol)
+
+    result = await get_robinhood_chain_quote_service().synthetic_orderbook_for_pair(
+        symbol=market.get("symbol") or symbol,
         depth=depth,
         taker_address=taker,
-        eth_token=eth,
-        usdg_token=usdg,
+        base_token=base,
+        quote_token=quote,
+        base_to_quote_capability=base_to_quote or {},
+        quote_to_base_capability=quote_to_base or {},
         force_refresh=bool(force_refresh),
     )
     db.rollback()
     if result.get("ok"):
+        result["market"] = {
+            "id": market.get("id"),
+            "symbol": market.get("symbol"),
+            "mechanism": market.get("mechanism"),
+            "review_only": market.get("review_only"),
+        }
         return result
     raise HTTPException(status_code=_quote_failure_status(result), detail=result)

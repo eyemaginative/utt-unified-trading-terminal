@@ -484,6 +484,17 @@ export async function getRobinhoodChainQuoteStatus({ apiBase, timeout_ms = 30000
   return res.data;
 }
 
+export async function getRobinhoodChainRegistryMarkets({ apiBase, timeout_ms = 30000 } = {}) {
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  const path = `/api/robinhood_chain/registry-discovery/markets`;
+  if (base === API_BASE) {
+    const res = await http.get(path, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}${path}`, { timeout: timeout_ms });
+  return res.data;
+}
+
 export async function getRobinhoodChainSyntheticOrderbook({
   symbol = "ETH-USDG",
   depth = 5,

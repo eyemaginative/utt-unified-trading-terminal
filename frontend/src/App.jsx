@@ -5659,12 +5659,6 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     setOtSymbol(String(obSymbol || "").trim());
   }, [obSymbol]);
 
-  useEffect(() => {
-    if (selectedVenueNorm !== ROBINHOOD_CHAIN_VENUE) return;
-    if (String(obSymbol || "").trim().toUpperCase() === "ETH-USDG") return;
-    setObSymbol("ETH-USDG");
-  }, [selectedVenueNorm, obSymbol]);
-
   // ─────────────────────────────────────────────────────────────
   // Market/Venue selection unification
   // ─────────────────────────────────────────────────────────────
@@ -6329,7 +6323,12 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                           fmtNum={fmtNum}
                           styles={styles}
                           otSymbol={otSymbol}
-                          setOtSymbol={setOtSymbol}
+                          setOtSymbol={(nextSymbol) => {
+                            setOtSymbol(nextSymbol);
+                            if (selectedVenueNorm === ROBINHOOD_CHAIN_VENUE) {
+                              setObSymbol(String(nextSymbol || "").trim());
+                            }
+                          }}
                           appContainerRef={appContainerRef}
                           hideVenueNames={hideVenueNames}
                           hideTableData={hideTableDataGlobal}

@@ -41,6 +41,14 @@ _ERC20_DECIMALS_SELECTOR = "0x313ce567"
 _DECIMAL_RE = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d+)?$")
 
 
+def _normalize_market_symbol(value: Any) -> str:
+    raw = str(value or "").strip().upper().replace("/", "-").replace("_", "-")
+    parts = [part.strip() for part in raw.split("-") if part.strip()]
+    if len(parts) != 2:
+        raise ValueError("invalid_robinhood_chain_market_symbol")
+    return f"{parts[0]}-{parts[1]}"
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -520,6 +528,130 @@ class RobinhoodChainRegistryDiscoveryService:
             .all()
         )
         return [self._objective_dict(db, row) for row in rows]
+
+    def objective_by_symbol(
+        self,
+        db: Session,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        normalized = _normalize_market_symbol(symbol)
+        row = (
+            db.query(RobinhoodChainPairObjective)
+            .filter(
+                RobinhoodChainPairObjective.symbol == normalized,
+                RobinhoodChainPairObjective.enabled.is_(True),
+            )
+            .first()
+        )
+        if row is None:
+            raise ValueError("robinhood_chain_pair_objective_not_found")
+        return self._objective_dict(db, row)
+
+    @staticmethod
+    def _market_indicative_state(capabilities: List[Dict[str, Any]]) -> str:
+        statuses = {
+            str(item.get("indicative_status") or "").strip().lower()
+            for item in capabilities
+            if isinstance(item, dict)
+        }
+        if "live_verified" in statuses:
+            return "live_verified"
+        if "available" in statuses:
+            return "available"
+        if "mechanism_configured" in statuses:
+            return "mechanism_configured"
+        if "provider_error" in statuses:
+            return "provider_error"
+        return "not_tested"
+
+    def market_catalog(self, db: Session) -> List[Dict[str, Any]]:
+        markets: List[Dict[str, Any]] = []
+        for objective in self.objectives(db):
+            capabilities = [
+                item for item in (objective.get("capabilities") or [])
+                if isinstance(item, dict)
+                and str(item.get("amount_mode") or "").strip().lower() == AMOUNT_MODE_EXACT_INPUT
+            ]
+            mechanism = str(objective.get("mechanism") or "").strip().lower()
+            expected_directions = {
+                (
+                    str(objective.get("base", {}).get("symbol") or "").strip().upper(),
+                    str(objective.get("quote", {}).get("symbol") or "").strip().upper(),
+                ),
+                (
+                    str(objective.get("quote", {}).get("symbol") or "").strip().upper(),
+                    str(objective.get("base", {}).get("symbol") or "").strip().upper(),
+                ),
+            }
+            available_statuses = {"available", "live_verified"}
+            available_directions = {
+                (
+                    str(item.get("from_asset") or "").strip().upper(),
+                    str(item.get("to_asset") or "").strip().upper(),
+                )
+                for item in capabilities
+                if str(item.get("indicative_status") or "").strip().lower() in available_statuses
+            }
+            provider_errors = [
+                item for item in capabilities
+                if str(item.get("indicative_status") or "").strip().lower() == "provider_error"
+            ]
+            live_verified = [
+                item for item in capabilities
+                if str(item.get("execution_status") or "").strip().lower() == "live_verified"
+                and item.get("enabled") is True
+            ]
+            mechanism_configured = bool(
+                mechanism == MECHANISM_WRAP_UNWRAP
+                and len(capabilities) == 2
+                and all(
+                    str(item.get("indicative_status") or "").strip().lower() == "mechanism_configured"
+                    for item in capabilities
+                )
+            )
+            orderbook_enabled = bool(
+                mechanism == MECHANISM_SWAP
+                and expected_directions
+                and expected_directions.issubset(available_directions)
+            )
+            if orderbook_enabled:
+                orderbook_reason = None
+            elif mechanism == MECHANISM_WRAP_UNWRAP:
+                orderbook_reason = "wrap_unwrap_uses_dedicated_mechanism_view"
+            elif provider_errors:
+                orderbook_reason = "provider_error"
+            else:
+                orderbook_reason = "both_exact_input_directions_not_available"
+
+            providers = sorted({
+                str(item.get("provider") or "").strip()
+                for item in capabilities
+                if str(item.get("provider") or "").strip()
+            })
+            verified_times = sorted(
+                str(item.get("last_verified_at") or "").strip()
+                for item in capabilities
+                if str(item.get("last_verified_at") or "").strip()
+            )
+            indicative_state = self._market_indicative_state(capabilities)
+            markets.append({
+                **objective,
+                "tranche": "RH-CHAIN.10D.2-R5C.2",
+                "identity_source": "token_registry",
+                "capability_source": "database",
+                "indicative_state": indicative_state,
+                "providers": providers,
+                "orderbook_enabled": orderbook_enabled,
+                "orderbook_reason": orderbook_reason,
+                "mechanism_configured": mechanism_configured,
+                "execution_enabled": bool(live_verified),
+                "automatic_execution_promotion": False,
+                "available_direction_count": len(available_directions),
+                "live_verified_direction_count": len(live_verified),
+                "provider_error_direction_count": len(provider_errors),
+                "last_verified_at": verified_times[-1] if verified_times else None,
+            })
+        return markets
 
     def create_objective(
         self,

@@ -41,6 +41,30 @@ WETH = {
     "registry_id": 44,
 }
 TAKER = "0x70c1ddd03bc4cb74efac3f12a41465d028ae490c"
+WETH_TO_USDG = {
+    "symbol": "WETH-USDG",
+    "mechanism": "swap",
+    "from_asset": "WETH",
+    "to_asset": "USDG",
+    "amount_mode": "exact_input",
+    "indicative_status": "available",
+    "firm_plan_status": "not_tested",
+    "execution_status": "disabled",
+    "enabled": False,
+    "probe_amount": "0.0005",
+}
+USDG_TO_WETH = {
+    "symbol": "WETH-USDG",
+    "mechanism": "swap",
+    "from_asset": "USDG",
+    "to_asset": "WETH",
+    "amount_mode": "exact_input",
+    "indicative_status": "available",
+    "firm_plan_status": "not_tested",
+    "execution_status": "disabled",
+    "enabled": False,
+    "probe_amount": "1",
+}
 
 
 def decimal_text(value: Decimal) -> str:
@@ -190,6 +214,9 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(endpoint_keywords <= service_keywords)
         self.assertNotIn("exact_output_quantity", endpoint_keywords)
         self.assertNotIn("maximum_total_quote", endpoint_keywords)
+        self.assertIn("base_token", endpoint_keywords)
+        self.assertIn("quote_token", endpoint_keywords)
+        self.assertIn("route_capability", endpoint_keywords)
 
     def make_service(self, *, fail_inputs: set[str] | None = None):
         discovery = FakeDiscoveryService(fail_inputs=fail_inputs)
@@ -383,10 +410,107 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("token_contracts_hardcoded", source)
         self.assertIn("pair_capabilities_hardcoded", source)
 
-    async def test_unsupported_symbol_fails_closed_without_provider_call(self) -> None:
+    async def test_weth_usdg_buy_quote_uses_database_capability_and_token_registry_identity(self) -> None:
         service, discovery = self.make_service()
         quote = await service.indicative_quote(
             symbol="WETH-USDG",
+            side="buy",
+            quantity=None,
+            total_quote="1.25",
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token=USDG,
+            route_capability=USDG_TO_WETH,
+            force_refresh=True,
+        )
+
+        self.assertTrue(quote["ok"])
+        self.assertEqual(quote["symbol"], "WETH-USDG")
+        self.assertEqual(quote["base_asset"], "WETH")
+        self.assertEqual(quote["quote_asset"], "USDG")
+        self.assertEqual(quote["input_asset"], "USDG")
+        self.assertEqual(quote["input_amount"], "1.25")
+        self.assertEqual(quote["output_asset"], "WETH")
+        self.assertEqual(quote["minimum_received_asset"], "WETH")
+        self.assertEqual(quote["token_identity_source"], "token_registry")
+        self.assertEqual(quote["pair_capability_source"], "database")
+        self.assertEqual(quote["route_capability"]["from_asset"], "USDG")
+        self.assertTrue(quote["allowance_required"])
+        self.assertFalse(quote["execution_enabled"])
+        self.assertIsNone(quote["transaction_calldata"])
+        self.assertGreaterEqual(len(discovery.calls), 1)
+        self.assertEqual(discovery.calls[0]["sell"], "USDG")
+        self.assertEqual(discovery.calls[0]["buy"], "WETH")
+
+    async def test_weth_usdg_sell_quote_retains_weth_allowance_requirement(self) -> None:
+        service, discovery = self.make_service()
+        quote = await service.indicative_quote(
+            symbol="WETH-USDG",
+            side="sell",
+            quantity="0.0005",
+            total_quote=None,
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token=USDG,
+            route_capability=WETH_TO_USDG,
+            force_refresh=True,
+        )
+
+        self.assertTrue(quote["ok"])
+        self.assertEqual(quote["input_asset"], "WETH")
+        self.assertEqual(quote["output_asset"], "USDG")
+        self.assertTrue(quote["allowance_required"])
+        self.assertIsNotNone(quote["allowance_spender"])
+        self.assertIn("allowance_required", quote["provider_warnings"])
+        self.assertEqual(discovery.calls[0]["sell"], "WETH")
+        self.assertEqual(discovery.calls[0]["buy"], "USDG")
+
+    async def test_weth_usdg_blocked_capability_fails_before_provider_contact(self) -> None:
+        service, discovery = self.make_service()
+        blocked = {**USDG_TO_WETH, "indicative_status": "provider_error"}
+        quote = await service.indicative_quote(
+            symbol="WETH-USDG",
+            side="buy",
+            quantity=None,
+            total_quote="1",
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token=USDG,
+            route_capability=blocked,
+            force_refresh=True,
+        )
+
+        self.assertFalse(quote["ok"])
+        self.assertEqual(quote["error"], "robinhood_chain_quote_route_unavailable")
+        self.assertFalse(quote["provider_contacted"])
+        self.assertEqual(discovery.calls, [])
+
+    async def test_weth_exact_receive_custom_quantity_is_blocked_without_provider_contact(self) -> None:
+        service, discovery = self.make_service()
+        quote = await service.indicative_quote(
+            symbol="WETH-USDG",
+            side="buy",
+            quantity="0.0007",
+            total_quote=None,
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token=USDG,
+            route_capability=None,
+            force_refresh=True,
+        )
+
+        self.assertFalse(quote["ok"])
+        self.assertEqual(quote["error"], "robinhood_chain_exact_receive_route_unavailable")
+        self.assertEqual(quote["input_asset"], "USDG")
+        self.assertEqual(quote["output_asset"], "WETH")
+        self.assertEqual(quote["requested_output"], "0.0007")
+        self.assertFalse(quote["provider_contacted"])
+        self.assertEqual(discovery.calls, [])
+
+    async def test_unsupported_symbol_fails_closed_without_provider_call(self) -> None:
+        service, discovery = self.make_service()
+        quote = await service.indicative_quote(
+            symbol="SPCX-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,

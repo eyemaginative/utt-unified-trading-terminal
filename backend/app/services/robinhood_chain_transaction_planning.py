@@ -19,6 +19,7 @@ EXPECTED_CHAIN_ID_HEX = hex(EXPECTED_CHAIN_ID)
 ZEROX_PROVIDER = "0x"
 ZEROX_FIRM_QUOTE_PATH = "/swap/allowance-holder/quote"
 ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL = "ETH-USDG"
+ROBINHOOD_CHAIN_REVIEW_FIRM_QUOTE_SYMBOLS: Tuple[str, ...] = ("ETH-USDG", "WETH-USDG")
 ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS = 100
 ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS = 10
 ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS = 300
@@ -272,7 +273,7 @@ class RobinhoodChainTransactionPlanningService:
             "provider_configured": provider == ZEROX_PROVIDER and self.api_base.startswith("https://") and credential is not None,
             "api_key_configured": credential is not None,
             "credential_source": credential.get("source") if credential else None,
-            "supported_symbols": [ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL],
+            "supported_symbols": list(ROBINHOOD_CHAIN_REVIEW_FIRM_QUOTE_SYMBOLS),
             "exact_input_only": True,
             "exact_input_enabled": True,
             "exact_output_enabled": False,
@@ -332,6 +333,21 @@ class RobinhoodChainTransactionPlanningService:
         raw = str(value or "").strip().upper().replace("/", "-").replace("_", "-")
         return "-".join(part for part in raw.split("-") if part)
 
+    @staticmethod
+    def _review_capability_available(
+        capability: Optional[Dict[str, Any]],
+        trade: Dict[str, Any],
+    ) -> bool:
+        if not isinstance(capability, dict):
+            return trade.get("symbol") == ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL
+        return (
+            str(capability.get("from_asset") or "").strip().upper() == trade["sell_token"]["symbol"]
+            and str(capability.get("to_asset") or "").strip().upper() == trade["buy_token"]["symbol"]
+            and str(capability.get("amount_mode") or "").strip().lower() == "exact_input"
+            and str(capability.get("mechanism") or "swap").strip().lower() == "swap"
+            and str(capability.get("indicative_status") or "").strip().lower() in {"available", "live_verified"}
+        )
+
     def _resolve_trade(
         self,
         *,
@@ -341,15 +357,25 @@ class RobinhoodChainTransactionPlanningService:
         total_quote: Optional[str],
         exact_output_quantity: Optional[str],
         maximum_total_quote: Optional[str],
-        eth_token: Dict[str, Any],
-        usdg_token: Dict[str, Any],
+        eth_token: Optional[Dict[str, Any]] = None,
+        usdg_token: Optional[Dict[str, Any]] = None,
+        base_token: Optional[Dict[str, Any]] = None,
+        quote_token: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         normalized_symbol = self._normalize_symbol(symbol)
-        if normalized_symbol != ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL:
+        if normalized_symbol not in ROBINHOOD_CHAIN_REVIEW_FIRM_QUOTE_SYMBOLS:
             raise ValueError("unsupported_robinhood_chain_quote_symbol")
+        parts = [part for part in normalized_symbol.split("-") if part]
+        if len(parts) != 2:
+            raise ValueError("unsupported_robinhood_chain_quote_symbol")
+        base_symbol, quote_symbol = parts
+        resolved_base = base_token if isinstance(base_token, dict) else eth_token
+        resolved_quote = quote_token if isinstance(quote_token, dict) else usdg_token
+        if not isinstance(resolved_base, dict) or not isinstance(resolved_quote, dict):
+            raise ValueError("firm_quote_token_identity_mismatch")
+        base = self._validate_canonical_token(resolved_base, base_symbol)
+        quote = self._validate_canonical_token(resolved_quote, quote_symbol)
         normalized_side = self._normalize_side(side)
-        eth = self._validate_canonical_token(eth_token, "ETH")
-        usdg = self._validate_canonical_token(usdg_token, "USDG")
 
         exact_output_requested = (
             normalized_side == "buy"
@@ -358,21 +384,21 @@ class RobinhoodChainTransactionPlanningService:
         if exact_output_requested:
             if str(total_quote or "").strip() or str(quantity or "").strip():
                 raise ValueError("conflicting_firm_quote_amounts")
-            buy_atomic, buy_display = _display_amount_to_atomic(exact_output_quantity, eth["decimals"])
+            buy_atomic, buy_display = _display_amount_to_atomic(exact_output_quantity, base["decimals"])
             maximum_sell_atomic, maximum_sell_display = _display_amount_to_atomic(
                 maximum_total_quote,
-                usdg["decimals"],
+                quote["decimals"],
             )
-            if Decimal(buy_display) != ROBINHOOD_CHAIN_EXACT_OUTPUT_BUY_ETH:
-                raise ValueError("unsupported_exact_output_buy_quantity")
-            if Decimal(maximum_sell_display) != ROBINHOOD_CHAIN_EXACT_OUTPUT_MAX_USDG:
-                raise ValueError("unsupported_exact_output_maximum_usdg")
+            if Decimal(buy_display) > ROBINHOOD_CHAIN_MAX_ETH_INPUT:
+                raise ValueError("firm_quote_amount_exceeds_cap")
+            if Decimal(maximum_sell_display) > ROBINHOOD_CHAIN_MAX_USDG_INPUT:
+                raise ValueError("firm_quote_amount_exceeds_cap")
             return {
                 "symbol": normalized_symbol,
                 "side": normalized_side,
                 "amount_mode": "exact_output",
-                "sell_token": usdg,
-                "buy_token": eth,
+                "sell_token": quote,
+                "buy_token": base,
                 "buy_amount_atomic": buy_atomic,
                 "buy_amount": buy_display,
                 "maximum_sell_amount_atomic": maximum_sell_atomic,
@@ -382,13 +408,13 @@ class RobinhoodChainTransactionPlanningService:
         if str(maximum_total_quote or "").strip():
             raise ValueError("maximum_total_quote_requires_exact_output")
         if normalized_side == "sell":
-            sell_token, buy_token = eth, usdg
-            requested_atomic, requested_display = _display_amount_to_atomic(quantity, eth["decimals"])
+            sell_token, buy_token = base, quote
+            requested_atomic, requested_display = _display_amount_to_atomic(quantity, base["decimals"])
             if Decimal(requested_display) > ROBINHOOD_CHAIN_MAX_ETH_INPUT:
                 raise ValueError("firm_quote_amount_exceeds_cap")
         else:
-            sell_token, buy_token = usdg, eth
-            requested_atomic, requested_display = _display_amount_to_atomic(total_quote, usdg["decimals"])
+            sell_token, buy_token = quote, base
+            requested_atomic, requested_display = _display_amount_to_atomic(total_quote, quote["decimals"])
             if Decimal(requested_display) > ROBINHOOD_CHAIN_MAX_USDG_INPUT:
                 raise ValueError("firm_quote_amount_exceeds_cap")
 
@@ -414,8 +440,11 @@ class RobinhoodChainTransactionPlanningService:
         exact_output_quantity: Optional[str] = None,
         maximum_total_quote: Optional[str] = None,
         taker_address: str,
-        eth_token: Dict[str, Any],
-        usdg_token: Dict[str, Any],
+        eth_token: Optional[Dict[str, Any]] = None,
+        usdg_token: Optional[Dict[str, Any]] = None,
+        base_token: Optional[Dict[str, Any]] = None,
+        quote_token: Optional[Dict[str, Any]] = None,
+        route_capability: Optional[Dict[str, Any]] = None,
         slippage_bps: int = ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
     ) -> Dict[str, Any]:
         provider = str(settings.robinhood_chain_effective_swap_provider() or "").strip().lower()
@@ -437,9 +466,22 @@ class RobinhoodChainTransactionPlanningService:
                 maximum_total_quote=maximum_total_quote,
                 eth_token=eth_token,
                 usdg_token=usdg_token,
+                base_token=base_token,
+                quote_token=quote_token,
             )
         except (ValueError, TypeError) as exc:
             return _safe_failure(str(exc))
+
+        if trade["amount_mode"] == "exact_input" and not self._review_capability_available(route_capability, trade):
+            return _safe_failure(
+                "firm_quote_route_capability_unavailable",
+                symbol=trade["symbol"],
+                input_asset=trade["sell_token"]["symbol"],
+                output_asset=trade["buy_token"]["symbol"],
+                amount_mode=trade["amount_mode"],
+                route_capability=route_capability,
+                provider_contacted=False,
+            )
 
         if trade["amount_mode"] == "exact_output":
             capability = {
@@ -461,6 +503,9 @@ class RobinhoodChainTransactionPlanningService:
                 display_mode="exact_receive",
                 input_asset=trade["sell_token"]["symbol"],
                 output_asset=trade["buy_token"]["symbol"],
+                requested_output=trade.get("buy_amount"),
+                maximum_input_ceiling=trade.get("maximum_sell_amount"),
+                maximum_input_ceiling_atomic=trade.get("maximum_sell_amount_atomic"),
                 route_capability=capability,
                 provider_contacted=False,
             )
@@ -762,6 +807,9 @@ class RobinhoodChainTransactionPlanningService:
             "symbol": trade["symbol"],
             "side": trade["side"],
             "amount_mode": trade["amount_mode"],
+            "route_capability": route_capability,
+            "token_identity_source": "token_registry",
+            "pair_capability_source": "database" if isinstance(route_capability, dict) else "legacy",
             "input_asset": trade["sell_token"]["symbol"],
             "input_amount": sell_display,
             "input_amount_atomic": sell_atomic,

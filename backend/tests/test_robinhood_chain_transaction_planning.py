@@ -33,7 +33,37 @@ USDG = {
     "decimals": 6,
     "native": False,
 }
+WETH = {
+    "symbol": "WETH",
+    "contract_address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "decimals": 18,
+    "native": False,
+    "identity_source": "token_registry",
+    "registry_id": 44,
+}
 TAKER = "0x70c1ddd03bc4cb74efac3f12a41465d028ae490c"
+WETH_TO_USDG = {
+    "symbol": "WETH-USDG",
+    "mechanism": "swap",
+    "from_asset": "WETH",
+    "to_asset": "USDG",
+    "amount_mode": "exact_input",
+    "indicative_status": "available",
+    "firm_plan_status": "not_tested",
+    "execution_status": "disabled",
+    "enabled": False,
+}
+USDG_TO_WETH = {
+    "symbol": "WETH-USDG",
+    "mechanism": "swap",
+    "from_asset": "USDG",
+    "to_asset": "WETH",
+    "amount_mode": "exact_input",
+    "indicative_status": "available",
+    "firm_plan_status": "not_tested",
+    "execution_status": "disabled",
+    "enabled": False,
+}
 ALLOWANCE_HOLDER = next(iter(ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST))
 
 
@@ -111,10 +141,16 @@ def firm_body(request: httpx.Request, *, destination: str = ALLOWANCE_HOLDER, va
         fee_token = ETH["contract_address"]
         allowance_issue = {"actual": "0", "spender": ALLOWANCE_HOLDER}
         transaction_value = "0" if value is None else value
-    else:
+    elif sell_token.lower() == USDG["contract_address"].lower():
         buy_amount = "545250000000000"
         min_buy_amount = "539797500000000"
-        fee_token = ETH["contract_address"]
+        fee_token = buy_token
+        allowance_issue = {"actual": "0", "spender": ALLOWANCE_HOLDER}
+        transaction_value = "0" if value is None else value
+    else:
+        buy_amount = "900000"
+        min_buy_amount = "891000"
+        fee_token = buy_token
         allowance_issue = {"actual": "0", "spender": ALLOWANCE_HOLDER}
         transaction_value = "0" if value is None else value
     return {
@@ -185,6 +221,9 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(endpoint_keywords <= service_keywords)
         self.assertIn("exact_output_quantity", endpoint_keywords)
         self.assertIn("maximum_total_quote", endpoint_keywords)
+        self.assertIn("base_token", endpoint_keywords)
+        self.assertIn("quote_token", endpoint_keywords)
+        self.assertIn("route_capability", endpoint_keywords)
 
     def make_service(self, *, allowance_atomic: int = 0, body_mutator=None):
         rpc = FakeRpcClient(allowance_atomic=allowance_atomic)
@@ -300,10 +339,132 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["pair_capability_source"], "database_router")
         self.assertFalse(status["token_contracts_hardcoded"])
 
+    async def test_weth_buy_plan_uses_usdg_allowance_and_review_only_weth_output(self) -> None:
+        service, rpc = self.make_service(allowance_atomic=2_000_000)
+        result = await service.firm_quote_plan(
+            symbol="WETH-USDG",
+            side="buy",
+            quantity=None,
+            total_quote="1.25",
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token=USDG,
+            route_capability=USDG_TO_WETH,
+            slippage_bps=100,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["symbol"], "WETH-USDG")
+        self.assertEqual(result["input_asset"], "USDG")
+        self.assertEqual(result["input_amount"], "1.25")
+        self.assertEqual(result["output_asset"], "WETH")
+        self.assertEqual(result["minimum_received_asset"], "WETH")
+        self.assertEqual(result["token_identity_source"], "token_registry")
+        self.assertEqual(result["pair_capability_source"], "database")
+        self.assertEqual(result["route_capability"]["from_asset"], "USDG")
+        self.assertFalse(result["approval_required"])
+        self.assertEqual(result["allowance"]["token"]["symbol"], "USDG")
+        self.assertEqual(rpc.allowance_calls[0]["contract"].lower(), USDG["contract_address"].lower())
+        self.assertEqual(result["unsigned_transaction_plan"]["value_wei"], "0")
+        self.assertFalse(result["unsigned_transaction_plan"]["native_input"])
+        self.assertTrue(result["review_only"])
+        self.assertFalse(result["execution_enabled"])
+        self.assertFalse(result["signing_enabled"])
+        self.assertFalse(result["broadcast_enabled"])
+
+    async def test_weth_sell_plan_uses_weth_allowance_and_zero_transaction_value(self) -> None:
+        service, rpc = self.make_service(allowance_atomic=0)
+        result = await service.firm_quote_plan(
+            symbol="WETH-USDG",
+            side="sell",
+            quantity="0.0005",
+            total_quote=None,
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token=USDG,
+            route_capability=WETH_TO_USDG,
+            slippage_bps=100,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["input_asset"], "WETH")
+        self.assertEqual(result["output_asset"], "USDG")
+        self.assertTrue(result["approval_required"])
+        self.assertEqual(result["allowance"]["token"]["symbol"], "WETH")
+        self.assertEqual(rpc.allowance_calls[0]["contract"].lower(), WETH["contract_address"].lower())
+        self.assertEqual(result["unsigned_transaction_plan"]["value_wei"], "0")
+        self.assertFalse(result["unsigned_transaction_plan"]["native_input"])
+
+    async def test_weth_blocked_capability_fails_before_rpc_or_provider(self) -> None:
+        service, rpc = self.make_service(allowance_atomic=0)
+        blocked = {**USDG_TO_WETH, "indicative_status": "provider_error"}
+        result = await service.firm_quote_plan(
+            symbol="WETH-USDG",
+            side="buy",
+            quantity=None,
+            total_quote="1",
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token=USDG,
+            route_capability=blocked,
+            slippage_bps=100,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "firm_quote_route_capability_unavailable")
+        self.assertFalse(result["provider_contacted"])
+        self.assertEqual(rpc.rpc_calls, [])
+        self.assertEqual(rpc.allowance_calls, [])
+
+    async def test_weth_exact_output_custom_amounts_remain_blocked_before_provider(self) -> None:
+        service, rpc = self.make_service(allowance_atomic=0)
+        result = await service.firm_quote_plan(
+            symbol="WETH-USDG",
+            side="buy",
+            quantity=None,
+            total_quote=None,
+            exact_output_quantity="0.0007",
+            maximum_total_quote="1.5",
+            taker_address=TAKER,
+            base_token=WETH,
+            quote_token=USDG,
+            route_capability=None,
+            slippage_bps=100,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "firm_quote_route_mode_not_live_verified")
+        self.assertEqual(result["input_asset"], "USDG")
+        self.assertEqual(result["output_asset"], "WETH")
+        self.assertEqual(result["requested_output"], "0.0007")
+        self.assertEqual(result["maximum_input_ceiling"], "1.5")
+        self.assertFalse(result["provider_contacted"])
+        self.assertEqual(rpc.rpc_calls, [])
+        self.assertEqual(rpc.allowance_calls, [])
+
+    async def test_weth_identity_cannot_be_substituted_with_native_eth(self) -> None:
+        service, rpc = self.make_service(allowance_atomic=0)
+        result = await service.firm_quote_plan(
+            symbol="WETH-USDG",
+            side="buy",
+            quantity=None,
+            total_quote="1",
+            taker_address=TAKER,
+            base_token=ETH,
+            quote_token=USDG,
+            route_capability=USDG_TO_WETH,
+            slippage_bps=100,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "firm_quote_token_identity_mismatch")
+        self.assertEqual(rpc.rpc_calls, [])
+        self.assertEqual(rpc.allowance_calls, [])
+
     async def test_unsupported_symbol_fails_before_provider(self) -> None:
         service, rpc = self.make_service()
         result = await service.firm_quote_plan(
-            symbol="WETH-USDG",
+            symbol="SPCX-USDG",
             side="sell",
             quantity="0.0001",
             total_quote=None,

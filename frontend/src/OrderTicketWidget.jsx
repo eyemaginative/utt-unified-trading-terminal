@@ -3401,6 +3401,8 @@ export default function OrderTicketWidget({
     )) || null
   ), [robinhoodChainMarkets, robinhoodChainPair.symbol]);
   const robinhoodChainLegacyExecutionMarket = robinhoodChainPair.symbol === "ETH-USDG";
+  const robinhoodChainWethReviewMarket = robinhoodChainPair.symbol === "WETH-USDG";
+  const robinhoodChainReviewQuoteMarket = robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket;
   const robinhoodChainNormalizedSide = String(side || "").trim().toLowerCase();
   const robinhoodChainFromAsset = robinhoodChainNormalizedSide === "sell"
     ? robinhoodChainPair.base
@@ -3480,6 +3482,14 @@ export default function OrderTicketWidget({
   const robinhoodChainIndicativeAvailable = ["available", "live_verified"].includes(
     String(robinhoodChainSelectedCapability?.indicative_status || "").trim().toLowerCase()
   );
+  const robinhoodChainQuoteReviewEnabled = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainReviewQuoteMarket &&
+    String(robinhoodChainSelectedMarket?.mechanism || "").trim().toLowerCase() === "swap" &&
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
+    robinhoodChainIndicativeAvailable
+  );
+  const robinhoodChainFirmPlanReviewEnabled = robinhoodChainQuoteReviewEnabled;
   const robinhoodChainMarketReviewAvailable = Boolean(
     robinhoodChainSelectedMarket && (
       robinhoodChainSelectedMarket?.orderbook_enabled === true ||
@@ -3503,12 +3513,9 @@ export default function OrderTicketWidget({
   const robinhoodChainRouteDisplayEnabled = robinhoodChainLegacyExecutionMarket
     ? robinhoodChainCapabilityEnabled
     : robinhoodChainMarketReviewAvailable;
-  const robinhoodChainBuyQtyLocked = Boolean(
-    isRobinhoodChainVenue &&
-    robinhoodChainNormalizedSide === "buy" &&
-    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
-  );
-  const robinhoodChainBuyQtyReadOnly = Boolean(isRobinhoodChainVenue && robinhoodChainNormalizedSide === "buy");
+  // R5C.3A keeps both Quantity and Total manually editable. Auto-calc is optional.
+  const robinhoodChainBuyQtyLocked = false;
+  const robinhoodChainBuyQtyReadOnly = false;
 
   useEffect(() => {
     if (!isRobinhoodChainVenue) {
@@ -3772,12 +3779,9 @@ export default function OrderTicketWidget({
     setRobinhoodChainBuyApprovalReviewed(false);
     setRobinhoodChainBuySwapReviewed(false);
     if (normalized === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE) {
-      setQty(ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH);
-      setTotalQuote(ROBINHOOD_CHAIN_BUY_MAXIMUM_USDG);
       setRobinhoodChainSlippageBps(100);
-    } else {
-      setQty("");
-      if (!String(totalQuote || "").trim() || Number(totalQuote) > 5) setTotalQuote("1");
+    } else if (!String(totalQuote || "").trim() || Number(totalQuote) > 5) {
+      setTotalQuote("1");
     }
   }
 
@@ -6491,12 +6495,6 @@ export default function OrderTicketWidget({
 
   useEffect(() => {
     if (robinhoodChainTicketFieldsUnavailable) return;
-    if (robinhoodChainBuyQtyLocked) {
-      if (normalizeRobinhoodChainAmountText(qty) !== ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH) {
-        setQty(ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH);
-      }
-      return;
-    }
     if (!autoCalc) return;
 
     if (lastEditedRef.current !== "qty" && lastEditedRef.current !== "total") lastEditedRef.current = "total";
@@ -6533,7 +6531,7 @@ export default function OrderTicketWidget({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoCalc, qtyFromTotal, totalFromQty, totalQuoteDecimals, pxNum, rules, robinhoodChainBuyQtyLocked, robinhoodChainTicketFieldsUnavailable, qty]);
+  }, [autoCalc, qtyFromTotal, totalFromQty, totalQuoteDecimals, pxNum, rules, robinhoodChainTicketFieldsUnavailable, qty]);
 
   useEffect(() => {
     autoCalcWriteGuardRef.current.qty = null;
@@ -6738,53 +6736,66 @@ export default function OrderTicketWidget({
       if (!robinhoodChainSelectedMarket) {
         lines.push(robinhoodChainMarketsError || "The selected symbol is not present in the Robinhood Chain database market catalog.");
         fails.push("robinhood_chain_market_not_registered");
-      } else if (!robinhoodChainLegacyExecutionMarket) {
+      } else if (!robinhoodChainReviewQuoteMarket) {
         const mechanism = String(robinhoodChainSelectedMarket?.mechanism || "unknown").replaceAll("_", " ");
         const marketState = robinhoodChainMarketStatusLabel(robinhoodChainSelectedMarket);
         lines.push(`${robinhoodChainPair.symbol}: ${mechanism}; ${marketState}.`);
         if (robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap") {
-          lines.push("This market uses a dedicated wrap/unwrap mechanism. R5C.2 does not fabricate a DEX book or construct a transaction.");
-        } else if (robinhoodChainSelectedMarket?.orderbook_enabled === true) {
-          lines.push("A bounded synthetic quote-only book is available. Order Ticket quote, firm-plan, approval, and execution controls remain locked in R5C.2.");
+          lines.push("This market uses a dedicated wrap/unwrap mechanism. R5C.3A does not fabricate a DEX book or construct a transaction.");
         } else if (String(robinhoodChainSelectedMarket?.indicative_state || "") === "provider_error") {
           lines.push("The persisted provider probe failed, so UTT blocks further ticket provider contact and keeps execution disabled.");
         } else {
           lines.push("Both exact-input directions are not available for ticket review.");
         }
-        fails.push("robinhood_chain_r5c2_market_review_only");
+        fails.push("robinhood_chain_market_review_unavailable");
       } else {
         lines.push(
-          side === "sell"
-            ? "RH-CHAIN.10D.1B SELL remains locked to exact spend 0.002 ETH with one explicit MetaMask request."
-            : exactReceive
-              ? "RH-CHAIN.10D.2 exact receive remains locked to 0.001 native ETH with a 2.00 USDG ceiling and is blocked before 0x contact until a direct route is verified."
-              : "Robinhood Chain reverse exact-spend review uses Spend USDG as the input and populates Est. ETH from the live quote."
+          robinhoodChainWethReviewMarket
+            ? exactReceive
+              ? "WETH-USDG exact receive accepts custom review values but remains blocked before provider contact until the route is verified."
+              : `R5C.3A enables a review-only ${robinhoodChainFromAsset}→${robinhoodChainToAsset} exact-spend quote and firm plan. Approval and execution remain disabled.`
+            : side === "sell"
+              ? "RH-CHAIN.10D.1B SELL execution remains limited to its accepted 0.002 ETH lifecycle; this ticket quote amount may be edited for review."
+              : exactReceive
+                ? "Exact receive accepts custom review values but remains blocked before provider contact until a direct route is verified."
+                : "Robinhood Chain reverse exact-spend review uses Spend USDG as the input and populates the estimated output from the live quote."
         );
-        if (!robinhoodChainCapabilityEnabled) {
+        const reviewRouteAvailable = exactReceive
+          ? robinhoodChainCapabilityEnabled
+          : robinhoodChainQuoteReviewEnabled;
+        if (!reviewRouteAvailable) {
           lines.push(
             robinhoodChainSelectedCapability?.reason ||
-            "The selected Robinhood Chain route and amount mode is not live verified."
+            "The selected Robinhood Chain route and amount mode is blocked before provider contact."
           );
           fails.push("robinhood_chain_route_mode_unavailable");
         }
-        if (side === "buy" && exactReceive && normalizeRobinhoodChainAmountText(qty) !== ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH) {
-          lines.push("RH-CHAIN.10D.2 exact receive must remain exactly 0.001 native ETH.");
-          fails.push("robinhood_chain_buy_exact_output_mismatch");
+        if (side === "buy" && exactReceive && qtyNum === null) {
+          lines.push(`Enter the custom ${robinhoodChainToAsset || "output asset"} quantity to receive.`);
+          fails.push("robinhood_chain_buy_exact_output_missing");
+        }
+        if (side === "buy" && exactReceive && totalQuoteNum === null) {
+          lines.push(`Enter the maximum ${robinhoodChainFromAsset || "input asset"} total to spend.`);
+          fails.push("robinhood_chain_buy_maximum_input_missing");
         }
         if (side === "buy" && exactReceive && Number(robinhoodChainSlippageBps) !== 100) {
-          lines.push("RH-CHAIN.10D.2 exact-receive slippage is locked to 1.00%.");
+          lines.push("Robinhood Chain exact-receive slippage remains fixed at 1.00% while the route is blocked.");
           fails.push("robinhood_chain_buy_slippage_mismatch");
         }
         if (side === "buy" && !exactReceive && totalQuoteNum === null) {
-          lines.push("Enter the USDG amount to spend for the reverse exact-spend quote.");
+          lines.push(`Enter the ${robinhoodChainFromAsset || "input asset"} amount to spend for the exact-spend quote.`);
           fails.push("robinhood_chain_buy_exact_spend_missing");
         }
         if (side === "sell" && qtyNum === null) {
-          lines.push("Enter Qty (ETH) for a SELL quote.");
+          lines.push(`Enter Qty (${robinhoodChainFromAsset || "input asset"}) for a SELL quote.`);
           fails.push("robinhood_chain_sell_qty_missing");
         }
         if (side === "sell" && qtyNum !== null && qtyNum > 0.002 + 1e-12) {
-          lines.push("RH-CHAIN SELL inputs are capped at 0.002 ETH.");
+          lines.push(`Robinhood Chain ${robinhoodChainFromAsset || "base"} review inputs are capped at 0.002.`);
+          fails.push("robinhood_chain_quote_cap");
+        }
+        if (side === "buy" && totalQuoteNum !== null && totalQuoteNum > 5 + 1e-12) {
+          lines.push(`Robinhood Chain ${robinhoodChainFromAsset || "quote"} review inputs are capped at 5.`);
           fails.push("robinhood_chain_quote_cap");
         }
       }
@@ -7115,15 +7126,10 @@ export default function OrderTicketWidget({
 
     if (isCounterpartyVenue) return qtyNum !== null && pxNum !== null;
     if (isRobinhoodChainVenue) {
-      if (normalizeRobinhoodChainQuoteSymbol(otSymbol) !== "ETH-USDG") return false;
-      if (!robinhoodChainCapabilityEnabled) return false;
-      if (side === "buy") {
-        if (robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE) {
-          return normalizeRobinhoodChainAmountText(qty) === ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH;
-        }
-        return totalQuoteNum !== null;
-      }
-      return qtyNum !== null;
+      if (!robinhoodChainReviewQuoteMarket) return false;
+      if (robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE) return false;
+      if (!robinhoodChainQuoteReviewEnabled) return false;
+      return side === "buy" ? totalQuoteNum !== null : qtyNum !== null;
     }
 
     // Solana DEX venues are swap-style:
@@ -7138,7 +7144,7 @@ export default function OrderTicketWidget({
 
     // CEX-style limit order
     return qtyNum !== null && pxNum !== null;
-  }, [effectiveVenue, otSymbol, side, isDexSwapVenue, isSolanaLimitMode, isCounterpartyVenue, isRobinhoodChainVenue, qtyNum, pxNum, totalQuoteNum, robinhoodChainCapabilityEnabled, robinhoodChainEffectiveAmountMode, qty]);
+  }, [effectiveVenue, otSymbol, side, isDexSwapVenue, isSolanaLimitMode, isCounterpartyVenue, isRobinhoodChainVenue, qtyNum, pxNum, totalQuoteNum, robinhoodChainReviewQuoteMarket, robinhoodChainQuoteReviewEnabled, robinhoodChainEffectiveAmountMode]);
 
   const canSubmit = useMemo(() => {
     if (!canSubmitBase) return false;
@@ -7215,7 +7221,7 @@ export default function OrderTicketWidget({
     !robinhoodChainQuoteStale &&
     !robinhoodChainQuoteLoading &&
     !robinhoodChainFirmPlanLoading &&
-    robinhoodChainCapabilityEnabled
+    robinhoodChainFirmPlanReviewEnabled
   );
 
 
@@ -7234,6 +7240,7 @@ export default function OrderTicketWidget({
   );
   const canPrepareRobinhoodChainExecution = Boolean(
     isRobinhoodChainVenue &&
+    robinhoodChainLegacyExecutionMarket &&
     robinhoodChainWalletReady &&
     robinhoodChainFirmPlan?.ok &&
     !robinhoodChainFirmPlanStale &&
@@ -7267,6 +7274,7 @@ export default function OrderTicketWidget({
   );
   const canPrepareRobinhoodChainSwapExecution = Boolean(
     isRobinhoodChainVenue &&
+    robinhoodChainLegacyExecutionMarket &&
     String(side || "").toLowerCase() === "buy" &&
     robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
     robinhoodChainCapabilityEnabled &&
@@ -7318,6 +7326,7 @@ export default function OrderTicketWidget({
   );
   const canPrepareRobinhoodChainBuyApproval = Boolean(
     isRobinhoodChainVenue &&
+    robinhoodChainLegacyExecutionMarket &&
     String(side || "").toLowerCase() === "buy" &&
     robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE &&
     robinhoodChainCapabilityEnabled &&
@@ -8438,15 +8447,15 @@ async function submitLimitOrder() {
   async function requestRobinhoodChainQuote(forceRefresh = true) {
     if (!isRobinhoodChainVenue || robinhoodChainQuoteLoading) return;
     const symbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
-    if (symbol !== "ETH-USDG") {
-      const msg = "Robinhood Chain supports ETH-USDG only.";
+    if (!robinhoodChainReviewQuoteMarket) {
+      const msg = "This Robinhood Chain market is not enabled for ticket quote review.";
       setRobinhoodChainQuoteErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
     }
 
-    if (!robinhoodChainCapabilityEnabled) {
-      const msg = robinhoodChainSelectedCapability?.reason || "This Robinhood Chain route and amount mode is not live verified.";
+    if (!robinhoodChainQuoteReviewEnabled) {
+      const msg = robinhoodChainSelectedCapability?.reason || "This Robinhood Chain route and amount mode is blocked before provider contact.";
       setRobinhoodChainQuoteErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -8457,9 +8466,9 @@ async function submitLimitOrder() {
     if (!String(inputAmount || "").trim()) {
       const msg = side === "buy"
         ? exactReceive
-          ? "Exact receive remains locked to 0.001 native ETH."
-          : "Enter the USDG amount to spend before requesting the reverse swap quote."
-        : "Enter the ETH amount to spend before requesting the swap quote.";
+          ? `Enter the custom ${robinhoodChainToAsset || "output asset"} quantity to receive.`
+          : `Enter the ${robinhoodChainFromAsset || "input asset"} amount to spend before requesting the quote.`
+        : `Enter the ${robinhoodChainFromAsset || "input asset"} quantity to spend before requesting the quote.`;
       setRobinhoodChainQuoteErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -8501,7 +8510,7 @@ async function submitLimitOrder() {
       }
       if (side === "buy") {
         if (exactReceive) {
-          setQty(ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH);
+          if (baseQuantity) setQty(baseQuantity);
           if (quoteQuantity) setTotalQuote(quoteQuantity);
         } else {
           if (baseQuantity) setQty(baseQuantity);
@@ -8542,7 +8551,7 @@ async function submitLimitOrder() {
             ? "Switch MetaMask to Robinhood Chain mainnet (chain ID 4663)."
             : robinhoodChainSavedAddress && !robinhoodChainWalletMatchesSaved
               ? "The connected MetaMask account must match the saved Robinhood Chain wallet."
-              : "Request a fresh indicative quote for the current ETH-USDG input before building an unsigned firm plan.";
+              : `Request a fresh indicative quote for the current ${normalizeRobinhoodChainQuoteSymbol(otSymbol)} input before building an unsigned firm plan.`;
       setRobinhoodChainFirmPlanErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -8555,17 +8564,17 @@ async function submitLimitOrder() {
       const data = await getRobinhoodChainFirmQuotePlan(
         {
           provider: "0x",
-          symbol: "ETH-USDG",
+          symbol: normalizeRobinhoodChainQuoteSymbol(otSymbol),
           side,
           quantity: side === "sell" ? String(qty || "").trim() : null,
           total_quote: side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND
             ? String(totalQuote || "").trim()
             : null,
           exact_output_quantity: side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
-            ? ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH
+            ? String(qty || "").trim()
             : null,
           maximum_total_quote: side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
-            ? ROBINHOOD_CHAIN_BUY_MAXIMUM_USDG
+            ? String(totalQuote || "").trim()
             : null,
           slippage_bps: side === "buy" ? 100 : Number(robinhoodChainSlippageBps),
           taker_address: robinhoodChainConnectedAddress,
@@ -8578,9 +8587,7 @@ async function submitLimitOrder() {
       onToast?.({
         kind: data?.approval_required ? "warn" : "ok",
         msg: data?.approval_required
-          ? side === "buy"
-            ? "Exact-output BUY plan is review-only. A separate finite 2.00 USDG approval is required before the swap can be prepared."
-            : "Unsigned Robinhood Chain plan ready for review; token approval is required before any later execution tranche."
+          ? `Unsigned ${String(data?.symbol || otSymbol)} plan is review-only. A separate ${String(data?.input_asset || "token")} approval would be required before a later execution tranche.`
           : "Unsigned Robinhood Chain plan ready for review. No wallet prompt, signature, or broadcast occurred.",
       });
     } catch (error) {
@@ -11071,10 +11078,12 @@ async function submitLimitOrder() {
               ? side === "buy"
                 ? "Robinhood Chain swap review: USDG to native ETH. Exact spend is live verified; exact receive remains held for direct-router research."
                 : "Robinhood Chain swap execution: native ETH to USDG with the accepted 0.002 ETH exact-spend lifecycle."
-              : `${robinhoodChainPair.symbol || "Robinhood Chain market"}: ${robinhoodChainMarketStatusLabel(robinhoodChainSelectedMarket)}. R5C.2 is review-only.`}
+              : robinhoodChainWethReviewMarket
+                ? "WETH-USDG: exact-spend indicative quote and unsigned firm-plan review are enabled; approval and execution remain locked in R5C.3A."
+                : `${robinhoodChainPair.symbol || "Robinhood Chain market"}: ${robinhoodChainMarketStatusLabel(robinhoodChainSelectedMarket)}. Review remains locked.`}
           >
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10.5, fontWeight: 900 }}>
-              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-SWAP · {Array.isArray(robinhoodChainSelectedMarket?.providers) && robinhoodChainSelectedMarket.providers.length ? robinhoodChainSelectedMarket.providers.join("+") : "DB"} · {robinhoodChainFromAsset || "?"} ▸ {robinhoodChainToAsset || "?"} · {robinhoodChainLegacyExecutionMarket ? (side === "sell" ? "10D.1B" : "10D.2-R5B") : "10D.2-R5C.2"}</span>
+              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-SWAP · {Array.isArray(robinhoodChainSelectedMarket?.providers) && robinhoodChainSelectedMarket.providers.length ? robinhoodChainSelectedMarket.providers.join("+") : "DB"} · {robinhoodChainFromAsset || "?"} ▸ {robinhoodChainToAsset || "?"} · {robinhoodChainLegacyExecutionMarket ? (side === "sell" ? "10D.1B" : "10D.2-R5B") : robinhoodChainWethReviewMarket ? "10D.2-R5C.3A" : "10D.2-R5C.2"}</span>
               <span style={{ color: robinhoodChainWalletState.providerAvailable ? "#bbf7d0" : "#fde68a" }}>
                 MetaMask {robinhoodChainWalletState.providerAvailable ? "detected" : "unavailable"}
               </span>
@@ -11089,7 +11098,7 @@ async function submitLimitOrder() {
               </span>
               <span style={{ color: robinhoodChainLegacyExecutionMarket && (side === "buy" ? robinhoodChainBuySendGate?.send_enabled : robinhoodChainSendGate?.send_enabled) ? "#bbf7d0" : "#c4b5fd" }}>
                 {!robinhoodChainLegacyExecutionMarket
-                  ? "R5C.2 EXECUTION LOCKED"
+                  ? robinhoodChainWethReviewMarket ? "R5C.3A EXECUTION LOCKED" : "R5C.2 EXECUTION LOCKED"
                   : (side === "buy" ? robinhoodChainBuySendGate?.send_enabled : robinhoodChainSendGate?.send_enabled)
                     ? "EXPLICIT SEND GATE READY"
                     : "SEND GATE BLOCKED"}
@@ -11121,7 +11130,11 @@ async function submitLimitOrder() {
                 <span style={{ color: "#67e8f9" }}>▸</span>
                 <span>TO <b style={{ color: "#a5f3fc" }}>{robinhoodChainToAsset}</b></span>
                 <span style={{ color: robinhoodChainRouteDisplayEnabled ? "#bbf7d0" : "#fecdd3", fontWeight: 900 }}>
-                  {robinhoodChainLegacyExecutionMarket ? (robinhoodChainCapabilityEnabled ? "ROUTE ENABLED" : "ROUTE BLOCKED") : robinhoodChainMarketReviewAvailable ? "MARKET REVIEW" : "MARKET BLOCKED"}
+                  {robinhoodChainLegacyExecutionMarket
+                    ? (robinhoodChainCapabilityEnabled ? "ROUTE ENABLED" : "ROUTE BLOCKED")
+                    : robinhoodChainWethReviewMarket && robinhoodChainQuoteReviewEnabled
+                      ? "QUOTE REVIEW ENABLED"
+                      : robinhoodChainMarketReviewAvailable ? "MARKET REVIEW" : "MARKET BLOCKED"}
                 </span>
                 <span style={{ color: "#c4b5fd" }}>
                   {robinhoodChainLegacyExecutionMarket ? String(robinhoodChainSelectedCapability?.indicative_status || "not verified").replaceAll("_", " ").toUpperCase() : robinhoodChainMarketStatusLabel(robinhoodChainSelectedMarket)}
@@ -11163,9 +11176,11 @@ async function submitLimitOrder() {
                   onClick={() => selectRobinhoodChainAmountMode(ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND)}
                   title={robinhoodChainLegacyExecutionMarket
                     ? "Exact spend sends sellAmount to the provider. This mode is live verified for ETH→USDG and USDG→ETH."
-                    : "R5C.2 displays the database capability but keeps Order Ticket provider requests and execution disabled."}
+                    : robinhoodChainWethReviewMarket
+                      ? "R5C.3A enables bounded exact-spend quote and unsigned firm-plan review; approval and execution remain disabled."
+                      : "The database capability is displayed, but ticket provider requests and execution remain disabled."}
                 >
-                  EXACT SPEND · {robinhoodChainLegacyExecutionMarket ? "LIVE" : robinhoodChainIndicativeAvailable ? "BOOK ONLY" : "BLOCKED"}
+                  EXACT SPEND · {robinhoodChainLegacyExecutionMarket ? "LIVE" : robinhoodChainWethReviewMarket && robinhoodChainQuoteReviewEnabled ? "REVIEW" : robinhoodChainIndicativeAvailable ? "BOOK ONLY" : "BLOCKED"}
                 </button>
                 <button
                   type="button"
@@ -11194,11 +11209,13 @@ async function submitLimitOrder() {
 
               {!robinhoodChainLegacyExecutionMarket ? (
                 <div style={{ marginTop: 6, color: robinhoodChainMarketReviewAvailable ? "#c4b5fd" : "#fecdd3", fontSize: 10.5, lineHeight: 1.25 }}>
-                  {robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap"
-                    ? "Dedicated wrap/unwrap mechanism presentation only. No DEX quote, approval, signature, or transaction construction occurs in R5C.2."
-                    : robinhoodChainSelectedMarket?.orderbook_enabled
-                      ? "Synthetic quote-only Order Book review is available. Ticket quote, firm-plan, approval, and execution remain locked."
-                      : "The persisted capability is unavailable. No provider request will be sent from the ticket, so provider backoff will not be retriggered."}
+                  {robinhoodChainWethReviewMarket
+                    ? "Synthetic Order Book review plus custom exact-spend indicative quote and unsigned firm-plan review are enabled. Approval, signing, submission, and execution remain locked."
+                    : robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap"
+                      ? "Dedicated wrap/unwrap mechanism presentation only. No DEX quote, approval, signature, or transaction construction occurs in R5C.3A."
+                      : robinhoodChainSelectedMarket?.orderbook_enabled
+                        ? "Synthetic quote-only Order Book review is available. Ticket quote, firm-plan, approval, and execution remain locked."
+                        : "The persisted capability is unavailable. No provider request will be sent from the ticket, so provider backoff will not be retriggered."}
                 </div>
               ) : !robinhoodChainCapabilityEnabled && (
                 <div style={{ marginTop: 6, color: "#fecdd3", fontSize: 10.5, lineHeight: 1.25 }}>
@@ -11289,14 +11306,16 @@ async function submitLimitOrder() {
             ) : (
               <div style={{ marginTop: 5, fontSize: 10.5, color: "#bae6fd" }}>
                 {!robinhoodChainLegacyExecutionMarket
-                  ? robinhoodChainWrapUnwrapReview
-                    ? `Mechanism-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"} review. Wrap/unwrap preview and transaction construction are not enabled in R5C.2; no DEX price or stale limit is displayed.`
-                    : robinhoodChainTicketFieldsUnavailable
-                      ? `Quote unavailable for ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted provider route is blocked, so the ticket clears stale values and sends no provider request.`
-                      : `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Synthetic-book levels may populate the fields, but ticket quoting, planning, and execution remain locked in R5C.2.`
+                  ? robinhoodChainWethReviewMarket
+                    ? `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Custom Quantity and Total are editable; exact-spend quote and unsigned firm-plan review are enabled, while approval and execution remain locked.`
+                    : robinhoodChainWrapUnwrapReview
+                      ? `Mechanism-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"} review. Wrap/unwrap preview and transaction construction are not enabled in R5C.3A; no DEX price or stale limit is displayed.`
+                      : robinhoodChainTicketFieldsUnavailable
+                        ? `Quote unavailable for ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted provider route is blocked, so the ticket clears stale values and sends no provider request.`
+                        : `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Ticket quoting and planning remain blocked for this market.`
                   : side === "buy"
                     ? robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
-                      ? "Exact receive remains locked to 0.001 native ETH and a 2.00 USDG ceiling, but 0x provider contact is blocked after repeated live HTTP 500 responses."
+                      ? `Enter custom ${robinhoodChainToAsset || "output"} Quantity and maximum ${robinhoodChainFromAsset || "input"} Total. Exact receive remains blocked before provider contact.`
                       : "Enter the USDG amount to spend. UTT will quote the estimated native ETH output and can build a review-only unsigned firm plan."
                     : "Enter the native ETH amount to spend, then request an indicative ETH→USDG swap quote."}
               </div>
@@ -11601,10 +11620,14 @@ async function submitLimitOrder() {
             {side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE && (
               <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(251, 113, 133, 0.22)", fontSize: 10.5 }}>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                  <b style={{ color: "#bbf7d0" }}>EXACT OUTPUT 0.001 ETH</b>
-                  <span>Maximum spend: <b>2.00 USDG</b></span>
-                  <span>Finite approval: <b>2.00 USDG</b></span>
-                  <span>Slippage: <b>1.00%</b></span>
+                  <b style={{ color: "#bbf7d0" }}>
+                    REQUESTED OUTPUT {hideTableData ? "••••" : (normalizeRobinhoodChainAmountText(qty) || "—")} {robinhoodChainToAsset || "OUTPUT"}
+                  </b>
+                  <span>
+                    Maximum spend: <b>{hideTableData ? "••••" : (normalizeRobinhoodChainAmountText(totalQuote) || "—")} {robinhoodChainFromAsset || "INPUT"}</b>
+                  </span>
+                  <span>Route: <b>BLOCKED BEFORE PROVIDER CONTACT</b></span>
+                  <span>Slippage: <b>{(Number(robinhoodChainSlippageBps) / 100).toFixed(2)}%</b></span>
                   <span>Automatic second transaction: <b>NO</b></span>
                 </div>
 
@@ -11876,32 +11899,25 @@ async function submitLimitOrder() {
               }}
               value={robinhoodChainTicketFieldsUnavailable
                 ? ""
-                : robinhoodChainBuyQtyLocked
-                  ? ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH
-                  : qty}
+                : qty}
               placeholder={robinhoodChainTicketFieldsUnavailable
                 ? robinhoodChainWrapUnwrapReview
                   ? "Preview not enabled"
                   : "Quote unavailable"
                 : "Amount"}
-              readOnly={robinhoodChainBuyQtyReadOnly}
-              aria-readonly={robinhoodChainBuyQtyReadOnly}
+              readOnly={false}
+              aria-readonly={false}
               disabled={robinhoodChainTicketFieldsUnavailable}
               title={robinhoodChainTicketFieldsUnavailable
                 ? robinhoodChainWrapUnwrapReview
-                  ? "Wrap/unwrap preview is not enabled in R5C.2. No stale output estimate is displayed."
+                  ? "Wrap/unwrap preview is not enabled in R5C.3A. No stale output estimate is displayed."
                   : "The provider route is unavailable. No stale output estimate is displayed."
-                : robinhoodChainBuyQtyLocked
-                  ? `RH-CHAIN.10D.2 exact receive remains locked to ${ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH} ${robinhoodChainToAsset || "output asset"} and is currently provider-blocked.`
-                  : robinhoodChainBuyQtyReadOnly
-                    ? robinhoodChainLegacyExecutionMarket
-                      ? "Reverse exact-spend mode: Qty is the estimated native ETH output and is populated by quote or auto-calc."
-                      : `Review-only mode: Qty represents the estimated ${robinhoodChainToAsset || "output asset"} output. Ticket quote and execution remain locked.`
-                    : "Order quantity"}
+                : isRobinhoodChainVenue
+                  ? `Custom ${robinhoodChainToAsset || robinhoodChainFromAsset || "asset"} quantity. Auto-calc may update it when enabled; turn Auto-calc off to keep manual values unchanged.`
+                  : "Order quantity"}
               onChange={(e) => {
-                if (robinhoodChainBuyQtyReadOnly) return;
                 lastEditedRef.current = "qty";
-                setQty(e.target.value);
+                setQty(sanitizeDecimalInput(e.target.value));
               }}
               inputMode="decimal"
             />
@@ -11981,7 +11997,7 @@ async function submitLimitOrder() {
             style={safePill}
             title={robinhoodChainTicketFieldsUnavailable
               ? robinhoodChainWrapUnwrapReview
-                ? `Input ${robinhoodChainFromAsset || "asset"} — wrap/unwrap preview is not enabled in R5C.2.`
+                ? `Input ${robinhoodChainFromAsset || "asset"} — wrap/unwrap preview is not enabled in R5C.3A.`
                 : `Input ${robinhoodChainFromAsset || "asset"} — quote unavailable.`
               : `Total (${totalLabel}) to spend/receive.`}
           >
@@ -12007,7 +12023,7 @@ async function submitLimitOrder() {
                 setTotalQuote(cleaned);
 
                 // DEX / Robinhood Chain quote-only: keep Total→Qty responsive when rules are local.
-                if ((isDexSwapVenue || (isRobinhoodChainVenue && !robinhoodChainBuyQtyLocked)) && autoCalc) {
+                if ((isDexSwapVenue || isRobinhoodChainVenue) && autoCalc) {
                   const t = Number(cleaned);
                   const p = Number(expandExponential(limitPrice));
                   if (Number.isFinite(t) && t > 0 && Number.isFinite(p) && p > 0) {
@@ -12026,33 +12042,27 @@ async function submitLimitOrder() {
           <label
             style={{
               ...safePill,
-              ...(robinhoodChainBuyQtyLocked
+              ...(isRobinhoodChainVenue && autoCalc
                 ? { borderColor: "rgba(34, 211, 238, 0.42)", color: "#a5f3fc" }
                 : {}),
             }}
             title={robinhoodChainTicketFieldsUnavailable
               ? robinhoodChainWrapUnwrapReview
-                ? "Wrap/unwrap preview is not enabled in R5C.2."
+                ? "Wrap/unwrap preview is not enabled in R5C.3A."
                 : "No provider quote is available; output calculation is disabled."
-              : robinhoodChainBuyQtyLocked
-                ? "Auto-calc cannot alter the locked 0.001 ETH exact-output quantity."
-                : "When enabled, Qty and Total stay in sync."}
+              : "When enabled, the last manually edited Quantity or Total field updates the other from Limit. Turn it off to keep both values independent."}
           >
             <input
               type="checkbox"
               checked={robinhoodChainTicketFieldsUnavailable ? false : autoCalc}
-              disabled={robinhoodChainTicketFieldsUnavailable || robinhoodChainBuyQtyLocked}
+              disabled={robinhoodChainTicketFieldsUnavailable}
               onChange={(e) => setAutoCalc(e.target.checked)}
             />
             <span>{robinhoodChainTicketFieldsUnavailable
               ? robinhoodChainWrapUnwrapReview
                 ? "Mechanism only"
                 : "Quote unavailable"
-              : robinhoodChainBuyQtyLocked
-                ? "Receive locked"
-                : robinhoodChainBuyQtyReadOnly
-                  ? "Output estimate"
-                  : "Auto-calc"}</span>
+              : "Auto-calc"}</span>
           </label>
         </div>
 
@@ -12639,11 +12649,17 @@ async function submitLimitOrder() {
                 : fmtNum
                   ? fmtNum(counterpartyExactDispenserTotalBtc)
                   : String(counterpartyExactDispenserTotalBtc)
-              : robinhoodChainTicketFieldsUnavailable || notional === null
-                ? "—"
-                : fmtNum
-                  ? fmtNum(notional)
-                  : String(notional)
+              : isRobinhoodChainVenue && side === "buy"
+                ? robinhoodChainTicketFieldsUnavailable || totalQuoteNum === null
+                  ? "—"
+                  : hideTableData
+                    ? "••••"
+                    : normalizeRobinhoodChainAmountText(totalQuote)
+                : robinhoodChainTicketFieldsUnavailable || notional === null
+                  ? "—"
+                  : fmtNum
+                    ? fmtNum(notional)
+                    : String(notional)
           }</b>
           {isCounterpartyLimitOrderMode ? <> • Miner Fee: <b>calculated during preview</b></> : null}
         </div>
@@ -12666,17 +12682,15 @@ async function submitLimitOrder() {
             }
             title={
               isRobinhoodChainVenue
-                ? !robinhoodChainLegacyExecutionMarket
-                  ? robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap"
-                    ? "Dedicated wrap/unwrap mechanism presentation only. R5C.2 does not construct or submit a transaction."
-                    : robinhoodChainSelectedMarket?.orderbook_enabled
-                      ? "This market is available in the synthetic Order Book. Order Ticket quoting and execution remain locked in R5C.2."
-                      : "This database market is unavailable; the ticket will not contact the provider."
-                  : robinhoodChainCapabilityEnabled
-                    ? canSubmit
-                      ? `Request a bounded read-only ${robinhoodChainFromAsset}→${robinhoodChainToAsset} ${robinhoodChainEffectiveAmountMode.replace("_", " ")} quote. No MetaMask prompt, signature, transaction, or order record.`
-                      : "Enter a valid amount for the selected Robinhood Chain swap mode."
-                    : robinhoodChainSelectedCapability?.reason || "The selected route mode is blocked before provider contact."
+                ? robinhoodChainQuoteReviewEnabled
+                  ? canSubmit
+                    ? `Request a bounded read-only ${robinhoodChainFromAsset}→${robinhoodChainToAsset} ${robinhoodChainEffectiveAmountMode.replace("_", " ")} quote. No MetaMask prompt, signature, transaction, or order record.`
+                    : "Enter a valid custom amount for the selected Robinhood Chain review mode."
+                  : robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap"
+                    ? "Dedicated wrap/unwrap mechanism presentation only. R5C.3A does not construct or submit a transaction."
+                    : String(robinhoodChainSelectedMarket?.indicative_state || "") === "provider_error"
+                      ? "This database market is unavailable; the ticket will not contact the provider."
+                      : robinhoodChainSelectedCapability?.reason || "The selected route mode is blocked before provider contact."
                 : isCounterpartyVenue
                 ? canCounterpartyComposePreview
                   ? isCounterpartyLimitOrderMode
@@ -12693,23 +12707,19 @@ async function submitLimitOrder() {
             }
           >
             {isRobinhoodChainVenue
-              ? !robinhoodChainLegacyExecutionMarket
-                ? robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap"
-                  ? "Wrap / Unwrap Review Only"
-                  : robinhoodChainSelectedMarket?.orderbook_enabled
-                    ? "Synthetic Book Review Only"
+              ? robinhoodChainQuoteLoading
+                ? "Fetching Swap Quote…"
+                : robinhoodChainQuoteReviewEnabled
+                  ? robinhoodChainQuote?.ok
+                    ? "Refresh Swap Quote"
+                    : "Get Exact-Spend Quote"
+                  : robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap"
+                    ? "Wrap / Unwrap Review Only"
                     : String(robinhoodChainSelectedMarket?.indicative_state || "") === "provider_error"
                       ? "Provider Route Unavailable"
-                      : "Market Review Locked"
-                : robinhoodChainQuoteLoading
-                  ? "Fetching Swap Quote…"
-                  : !robinhoodChainCapabilityEnabled
-                    ? "Route Mode Blocked"
-                    : robinhoodChainQuote?.ok
-                      ? "Refresh Swap Quote"
                       : robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
-                        ? "Get Exact-Receive Quote"
-                        : "Get Exact-Spend Quote"
+                        ? "Exact Receive Blocked"
+                        : "Route Mode Blocked"
               : submitting
               ? "Submitting…"
               : isCounterpartyVenue
@@ -12763,11 +12773,9 @@ async function submitLimitOrder() {
                 onClick={requestRobinhoodChainFirmPlan}
                 title={canBuildRobinhoodChainFirmPlan
                   ? "Fetch a fresh 0x firm quote and display a validated unsigned plan. No signature or transaction occurs."
-                  : !robinhoodChainLegacyExecutionMarket
-                    ? "R5C.2 does not request firm plans for newly discovered markets."
-                    : !robinhoodChainCapabilityEnabled
-                      ? robinhoodChainSelectedCapability?.reason || "The selected route mode is not live verified."
-                      : "Connect the saved MetaMask wallet on chain 4663 and request a fresh matching indicative quote first."}
+                  : !robinhoodChainFirmPlanReviewEnabled
+                    ? robinhoodChainSelectedCapability?.reason || "This route is not enabled for review-only firm planning."
+                    : "Connect the saved MetaMask wallet on chain 4663 and request a fresh matching indicative quote first."}
               >
                 {robinhoodChainFirmPlanLoading
                   ? "Building Plan…"
@@ -12775,7 +12783,7 @@ async function submitLimitOrder() {
                     ? "Refresh Unsigned Plan"
                     : "Build Unsigned Plan"}
               </button>
-              {side === "sell" && (
+              {robinhoodChainLegacyExecutionMarket && side === "sell" && (
                 <button
                   type="button"
                   style={{
@@ -12794,7 +12802,7 @@ async function submitLimitOrder() {
                   {robinhoodChainExecutionBusy ? "Preparing…" : "Prepare 0.002 ETH Send"}
                 </button>
               )}
-              {side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
+              {robinhoodChainLegacyExecutionMarket && side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
                 <button
                   type="button"
                   style={{
@@ -12820,7 +12828,7 @@ async function submitLimitOrder() {
                         : "Prepare Allowance-Sufficient Review"}
                 </button>
               )}
-              {side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE && (
+              {robinhoodChainLegacyExecutionMarket && side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE && (
                 <button
                   type="button"
                   style={{

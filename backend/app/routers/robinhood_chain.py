@@ -241,6 +241,83 @@ def _resolve_execution_discovery_token(db: Session, symbol: str) -> Dict[str, An
         ) from exc
 
 
+def _resolve_robinhood_chain_review_market(
+    db: Session,
+    *,
+    symbol: str,
+    side: str,
+    amount_mode: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Resolve one database market and fail closed before provider contact."""
+    registry_service = get_robinhood_chain_registry_discovery_service()
+    try:
+        market = registry_service.objective_by_symbol(db, symbol)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": str(exc),
+                "symbol": str(symbol or "").strip().upper(),
+                "identity_source": "token_registry",
+                "capability_source": "database",
+                "provider_contacted": False,
+            },
+        ) from exc
+
+    if str(market.get("mechanism") or "").strip().lower() != "swap":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "robinhood_chain_quote_mechanism_not_supported",
+                "symbol": market.get("symbol"),
+                "mechanism": market.get("mechanism"),
+                "provider_contacted": False,
+                "read_only": True,
+                "execution_enabled": False,
+            },
+        )
+
+    base = market.get("base") if isinstance(market.get("base"), dict) else {}
+    quote = market.get("quote") if isinstance(market.get("quote"), dict) else {}
+    base_symbol = str(base.get("symbol") or "").strip().upper()
+    quote_symbol = str(quote.get("symbol") or "").strip().upper()
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        raise HTTPException(status_code=400, detail={"error": "invalid_quote_side"})
+    from_asset = base_symbol if normalized_side == "sell" else quote_symbol
+    to_asset = quote_symbol if normalized_side == "sell" else base_symbol
+    normalized_mode = str(amount_mode or "exact_input").strip().lower()
+
+    capability = next(
+        (
+            item for item in (market.get("capabilities") or [])
+            if isinstance(item, dict)
+            and str(item.get("from_asset") or "").strip().upper() == from_asset
+            and str(item.get("to_asset") or "").strip().upper() == to_asset
+            and str(item.get("amount_mode") or "").strip().lower() == normalized_mode
+        ),
+        None,
+    )
+    if normalized_mode == "exact_input":
+        indicative_status = str((capability or {}).get("indicative_status") or "").strip().lower()
+        if indicative_status not in {"available", "live_verified"}:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "robinhood_chain_quote_route_unavailable",
+                    "symbol": market.get("symbol"),
+                    "input_asset": from_asset,
+                    "output_asset": to_asset,
+                    "amount_mode": normalized_mode,
+                    "route_capability": capability,
+                    "provider_contacted": False,
+                    "read_only": True,
+                    "execution_enabled": False,
+                },
+            )
+    return market, base, quote, capability
+
+
 # Callers select stable check names, never arbitrary JSON-RPC methods or params.
 _PROBE_DEFINITIONS: Dict[str, Tuple[str, List[Any]]] = {
     "chain_id": ("eth_chainId", []),
@@ -750,6 +827,9 @@ def _quote_failure_status(result: Dict[str, Any]) -> int:
         "execution_discovery_route_mode_not_live_verified",
         "robinhood_chain_exact_receive_route_unavailable",
         "firm_quote_route_mode_not_live_verified",
+        "robinhood_chain_quote_route_unavailable",
+        "firm_quote_route_capability_unavailable",
+        "robinhood_chain_quote_mechanism_not_supported",
     }:
         return 409
     if error in {
@@ -1604,8 +1684,8 @@ async def robinhood_chain_indicative_quote(
 ) -> Dict[str, Any]:
     """Return a bounded indicative quote without constructing or submitting a trade.
 
-    RH-CHAIN.10D.2 uses BUY quantity=0.001 with total_quote omitted to request
-    exact output under the fixed 2.00 USDG ceiling.
+    RH-CHAIN.10D.2-R5C.3A adds database-gated WETH-USDG exact-input review
+    quotes. Exact receive remains fail-closed before provider contact.
     """
     if not bool(settings.robinhood_chain_enabled):
         raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
@@ -1624,16 +1704,26 @@ async def robinhood_chain_indicative_quote(
         )
 
     taker_address = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
-    eth = _resolve_execution_discovery_token(db, "ETH")
-    usdg = _resolve_execution_discovery_token(db, "USDG")
-    result = await get_robinhood_chain_quote_service().indicative_quote(
+    exact_output_buy = (
+        str(request.side or "").strip().lower() == "buy"
+        and str(request.quantity or "").strip() != ""
+        and str(request.total_quote or "").strip() == ""
+    )
+    market, base, quote, capability = _resolve_robinhood_chain_review_market(
+        db,
         symbol=request.symbol,
+        side=request.side,
+        amount_mode="exact_output" if exact_output_buy else "exact_input",
+    )
+    result = await get_robinhood_chain_quote_service().indicative_quote(
+        symbol=market.get("symbol") or request.symbol,
         side=request.side,
         quantity=request.quantity,
         total_quote=request.total_quote,
         taker_address=taker_address,
-        eth_token=eth,
-        usdg_token=usdg,
+        base_token=base,
+        quote_token=quote,
+        route_capability=capability,
         force_refresh=bool(request.force_refresh),
     )
     db.rollback()
@@ -1671,18 +1761,27 @@ async def robinhood_chain_firm_quote_plan(
         )
 
     taker_address = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
-    eth = _resolve_execution_discovery_token(db, "ETH")
-    usdg = _resolve_execution_discovery_token(db, "USDG")
-    result = await get_robinhood_chain_transaction_planning_service().firm_quote_plan(
+    exact_output_buy = (
+        str(request.side or "").strip().lower() == "buy"
+        and str(request.exact_output_quantity or "").strip() != ""
+    )
+    market, base, quote, capability = _resolve_robinhood_chain_review_market(
+        db,
         symbol=request.symbol,
+        side=request.side,
+        amount_mode="exact_output" if exact_output_buy else "exact_input",
+    )
+    result = await get_robinhood_chain_transaction_planning_service().firm_quote_plan(
+        symbol=market.get("symbol") or request.symbol,
         side=request.side,
         quantity=request.quantity,
         total_quote=request.total_quote,
         exact_output_quantity=request.exact_output_quantity,
         maximum_total_quote=request.maximum_total_quote,
         taker_address=taker_address,
-        eth_token=eth,
-        usdg_token=usdg,
+        base_token=base,
+        quote_token=quote,
+        route_capability=capability,
         slippage_bps=int(request.slippage_bps),
     )
     db.rollback()

@@ -13,6 +13,7 @@ from .robinhood_chain_execution_discovery import (
 
 
 ROBINHOOD_CHAIN_QUOTE_SYMBOL = "ETH-USDG"
+ROBINHOOD_CHAIN_REVIEW_QUOTE_SYMBOLS: Tuple[str, ...] = ("ETH-USDG", "WETH-USDG")
 ROBINHOOD_CHAIN_QUOTE_PROVIDER = "0x"
 ROBINHOOD_CHAIN_MAX_BOOK_LEVELS = 5
 ROBINHOOD_CHAIN_EXACT_OUTPUT_BUY_ETH = Decimal("0.001")
@@ -214,7 +215,7 @@ class RobinhoodChainQuoteService:
             "provider_configured": bool(discovery.get("provider_configured")),
             "api_key_configured": bool(discovery.get("api_key_configured")),
             "credential_source": discovery.get("credential_source"),
-            "supported_symbols": [ROBINHOOD_CHAIN_QUOTE_SYMBOL],
+            "supported_symbols": list(ROBINHOOD_CHAIN_REVIEW_QUOTE_SYMBOLS),
             "max_book_levels_per_side": ROBINHOOD_CHAIN_MAX_BOOK_LEVELS,
             "bid_input_amounts_eth": list(ROBINHOOD_CHAIN_BID_INPUT_AMOUNTS),
             "ask_input_amounts_usdg": list(ROBINHOOD_CHAIN_ASK_INPUT_AMOUNTS),
@@ -243,8 +244,9 @@ class RobinhoodChainQuoteService:
         *,
         side: str,
         symbol: str,
-        eth_token: Dict[str, Any],
-        usdg_token: Dict[str, Any],
+        base_token: Dict[str, Any],
+        quote_token: Dict[str, Any],
+        route_capability: Optional[Dict[str, Any]] = None,
         amount_mode: str = "exact_input",
     ) -> Dict[str, Any]:
         normalized_side = _normalize_side(side)
@@ -263,24 +265,28 @@ class RobinhoodChainQuoteService:
                 context="indicative",
             )
 
+        base_symbol = _token_symbol(base_token)
+        quote_symbol = _token_symbol(quote_token)
         if normalized_side == "sell":
+            sell_token = base_token
             base_quantity = sell_amount
             quote_quantity = buy_amount
-            input_asset = "ETH"
-            output_asset = "USDG"
+            input_asset = base_symbol
+            output_asset = quote_symbol
             input_amount = sell_amount
             output_amount = buy_amount
             minimum_received = min_buy_amount
-            minimum_received_asset = "USDG"
+            minimum_received_asset = quote_symbol
         else:
+            sell_token = quote_token
             base_quantity = buy_amount
             quote_quantity = sell_amount
-            input_asset = "USDG"
-            output_asset = "ETH"
+            input_asset = quote_symbol
+            output_asset = base_symbol
             input_amount = sell_amount
             output_amount = buy_amount
             minimum_received = min_buy_amount
-            minimum_received_asset = "ETH"
+            minimum_received_asset = base_symbol
 
         if base_quantity <= 0 or quote_quantity <= 0:
             return _safe_failure(
@@ -290,9 +296,10 @@ class RobinhoodChainQuoteService:
 
         effective_price = quote_quantity / base_quantity
         sources = _route_sources(result)
-        allowance_required = normalized_side == "buy" and bool(result.get("allowance_required"))
+        sell_is_native = bool(sell_token.get("native"))
+        allowance_required = not sell_is_native and bool(result.get("allowance_required"))
         provider_warnings = list(result.get("provider_warnings") or [])[:20]
-        if normalized_side == "sell":
+        if sell_is_native:
             provider_warnings = [warning for warning in provider_warnings if str(warning) != "allowance_required"]
         return {
             "ok": True,
@@ -309,20 +316,20 @@ class RobinhoodChainQuoteService:
             "input_amount": _decimal_text(input_amount),
             "output_asset": output_asset,
             "output_amount": _decimal_text(output_amount),
-            "base_asset": "ETH",
-            "quote_asset": "USDG",
+            "base_asset": base_symbol,
+            "quote_asset": quote_symbol,
             "base_quantity": _decimal_text(base_quantity),
             "quote_quantity": _decimal_text(quote_quantity),
             "effective_price": _decimal_text(effective_price),
             "minimum_received": _decimal_text(minimum_received) if minimum_received is not None else None,
             "minimum_received_asset": minimum_received_asset if minimum_received is not None else None,
             "maximum_input_ceiling": _decimal_text(ROBINHOOD_CHAIN_MAXIMUM_BUY_USDG)
-            if normalized_side == "buy" and normalized_amount_mode == "exact_output"
+            if normalized_side == "buy" and normalized_amount_mode == "exact_output" and quote_symbol == "USDG"
             else None,
             "maximum_input_ceiling_atomic": "2000000"
-            if normalized_side == "buy" and normalized_amount_mode == "exact_output"
+            if normalized_side == "buy" and normalized_amount_mode == "exact_output" and quote_symbol == "USDG"
             else None,
-            "maximum_input_ceiling_asset": "USDG"
+            "maximum_input_ceiling_asset": quote_symbol
             if normalized_side == "buy" and normalized_amount_mode == "exact_output"
             else None,
             "price_impact_bps": None,
@@ -338,13 +345,16 @@ class RobinhoodChainQuoteService:
             "total_network_fee_eth": _network_fee_eth(result),
             "zero_x_fee": _normalize_zero_x_fee(
                 result,
-                eth_token=eth_token,
-                usdg_token=usdg_token,
+                eth_token=base_token,
+                usdg_token=quote_token,
             ),
             "allowance_required": allowance_required,
             "allowance_spender": result.get("allowance_spender") if allowance_required else None,
             "provider_warnings": provider_warnings,
             "liquidity_available": bool(result.get("liquidity_available")),
+            "route_capability": copy.deepcopy(route_capability) if isinstance(route_capability, dict) else None,
+            "token_identity_source": "token_registry",
+            "pair_capability_source": "database" if isinstance(route_capability, dict) else "legacy",
             "cached": bool(result.get("cached")),
             "elapsed_ms": result.get("elapsed_ms"),
             "fetched_at": result.get("fetched_at"),
@@ -366,51 +376,63 @@ class RobinhoodChainQuoteService:
     async def _probe_quote(
         self,
         *,
+        symbol: str,
         side: str,
         requested_amount: str,
         amount_mode: str,
         taker_address: str,
-        eth_token: Dict[str, Any],
-        usdg_token: Dict[str, Any],
+        base_token: Dict[str, Any],
+        quote_token: Dict[str, Any],
+        route_capability: Optional[Dict[str, Any]],
         force_refresh: bool,
     ) -> Dict[str, Any]:
         normalized_side = _normalize_side(side)
         normalized_amount_mode = str(amount_mode or "exact_input").strip().lower()
         if normalized_side == "sell":
-            result = await self.discovery_service.probe(
-                sell_token=eth_token,
-                buy_token=usdg_token,
-                sell_amount=requested_amount,
-                buy_amount=None,
-                taker_address=taker_address,
-                force_refresh=force_refresh,
-            )
+            sell_token = base_token
+            buy_token = quote_token
+            sell_amount = requested_amount
+            buy_amount = None
         elif normalized_amount_mode == "exact_output":
-            result = await self.discovery_service.probe(
-                sell_token=usdg_token,
-                buy_token=eth_token,
-                sell_amount=None,
-                buy_amount=requested_amount,
-                taker_address=taker_address,
-                force_refresh=force_refresh,
-            )
+            sell_token = quote_token
+            buy_token = base_token
+            sell_amount = None
+            buy_amount = requested_amount
         else:
-            result = await self.discovery_service.probe(
-                sell_token=usdg_token,
-                buy_token=eth_token,
-                sell_amount=requested_amount,
-                buy_amount=None,
-                taker_address=taker_address,
-                force_refresh=force_refresh,
+            sell_token = quote_token
+            buy_token = base_token
+            sell_amount = requested_amount
+            buy_amount = None
+
+        probe_kwargs: Dict[str, Any] = {
+            "sell_token": sell_token,
+            "buy_token": buy_token,
+            "sell_amount": sell_amount,
+            "buy_amount": buy_amount,
+            "taker_address": taker_address,
+            "force_refresh": force_refresh,
+        }
+        if isinstance(route_capability, dict):
+            probe_kwargs.update(
+                {
+                    "route_capability": route_capability,
+                    "require_live_verified": False,
+                    "max_probe_amount": requested_amount,
+                }
             )
+        result = await self.discovery_service.probe(**probe_kwargs)
         if not result.get("ok"):
-            return _safe_failure(result, context="indicative")
+            failure = _safe_failure(result, context="indicative")
+            failure["symbol"] = symbol
+            failure["route_capability"] = copy.deepcopy(route_capability) if isinstance(route_capability, dict) else None
+            return failure
         quote = self._normalize_quote(
             result,
             side=normalized_side,
-            symbol=ROBINHOOD_CHAIN_QUOTE_SYMBOL,
-            eth_token=eth_token,
-            usdg_token=usdg_token,
+            symbol=symbol,
+            base_token=base_token,
+            quote_token=quote_token,
+            route_capability=route_capability,
             amount_mode=normalized_amount_mode,
         )
         if (
@@ -441,12 +463,22 @@ class RobinhoodChainQuoteService:
         quantity: Optional[str],
         total_quote: Optional[str],
         taker_address: str,
-        eth_token: Dict[str, Any],
-        usdg_token: Dict[str, Any],
+        eth_token: Optional[Dict[str, Any]] = None,
+        usdg_token: Optional[Dict[str, Any]] = None,
+        base_token: Optional[Dict[str, Any]] = None,
+        quote_token: Optional[Dict[str, Any]] = None,
+        route_capability: Optional[Dict[str, Any]] = None,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
         normalized_symbol = _normalize_symbol(symbol)
-        if normalized_symbol != ROBINHOOD_CHAIN_QUOTE_SYMBOL:
+        resolved_base = base_token if isinstance(base_token, dict) else eth_token
+        resolved_quote = quote_token if isinstance(quote_token, dict) else usdg_token
+        base_symbol = _token_symbol(resolved_base or {})
+        quote_symbol = _token_symbol(resolved_quote or {})
+        if (
+            normalized_symbol not in ROBINHOOD_CHAIN_REVIEW_QUOTE_SYMBOLS
+            or normalized_symbol != f"{base_symbol}-{quote_symbol}"
+        ):
             return _safe_failure(
                 {
                     "error": "unsupported_robinhood_chain_quote_symbol",
@@ -466,18 +498,33 @@ class RobinhoodChainQuoteService:
                 quantity if exact_output_buy or normalized_side == "sell" else total_quote,
                 field="exact_output_quantity" if exact_output_buy else ("quote_amount" if normalized_side == "buy" else "quantity"),
             )
-            if exact_output_buy and requested != ROBINHOOD_CHAIN_EXACT_OUTPUT_BUY_ETH:
-                raise ValueError("unsupported_exact_output_buy_quantity")
         except ValueError as exc:
             return _safe_failure(
                 {"error": str(exc), "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER},
                 context="indicative",
             )
 
+        if (
+            amount_mode == "exact_input"
+            and normalized_symbol != ROBINHOOD_CHAIN_QUOTE_SYMBOL
+            and not self._pair_capability_available(route_capability)
+        ):
+            failure = _safe_failure(
+                {
+                    "error": "robinhood_chain_quote_route_unavailable",
+                    "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER,
+                },
+                context="indicative",
+            )
+            failure["symbol"] = normalized_symbol
+            failure["route_capability"] = copy.deepcopy(route_capability) if isinstance(route_capability, dict) else None
+            failure["provider_contacted"] = False
+            return failure
+
         if amount_mode == "exact_output":
             capability = {
-                "from_asset": str(usdg_token.get("symbol") or "").strip().upper(),
-                "to_asset": str(eth_token.get("symbol") or "").strip().upper(),
+                "from_asset": quote_symbol,
+                "to_asset": base_symbol,
                 "amount_mode": "exact_output",
                 "display_mode": "exact_receive",
                 "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER,
@@ -497,13 +544,16 @@ class RobinhoodChainQuoteService:
             )
             failure.update(
                 {
+                    "symbol": normalized_symbol,
                     "amount_mode": "exact_output",
                     "display_mode": "exact_receive",
-                    "input_asset": "USDG",
-                    "output_asset": "ETH",
+                    "input_asset": quote_symbol,
+                    "output_asset": base_symbol,
                     "requested_output": _decimal_text(requested),
-                    "maximum_input_ceiling": _decimal_text(ROBINHOOD_CHAIN_MAXIMUM_BUY_USDG),
-                    "maximum_input_ceiling_atomic": "2000000",
+                    "maximum_input_ceiling": _decimal_text(ROBINHOOD_CHAIN_MAXIMUM_BUY_USDG)
+                    if quote_symbol == "USDG"
+                    else None,
+                    "maximum_input_ceiling_atomic": "2000000" if quote_symbol == "USDG" else None,
                     "route_capability": capability,
                     "provider_contacted": False,
                     "backoff_activated": False,
@@ -512,22 +562,21 @@ class RobinhoodChainQuoteService:
             return failure
 
         quote = await self._probe_quote(
+            symbol=normalized_symbol,
             side=normalized_side,
             requested_amount=_decimal_text(requested),
             amount_mode=amount_mode,
             taker_address=taker_address,
-            eth_token=eth_token,
-            usdg_token=usdg_token,
+            base_token=resolved_base or {},
+            quote_token=resolved_quote or {},
+            route_capability=route_capability,
             force_refresh=force_refresh,
         )
         if not quote.get("ok"):
             return quote
-        if amount_mode == "exact_output":
-            quote["reference_price"] = None
-            quote["reference_input_amount"] = None
-            return quote
 
-        reference_amount = (
+        capability_reference = _safe_decimal((route_capability or {}).get("probe_amount"))
+        reference_amount = _decimal_text(capability_reference) if capability_reference and capability_reference > 0 else (
             ROBINHOOD_CHAIN_ASK_INPUT_AMOUNTS[0]
             if normalized_side == "buy"
             else ROBINHOOD_CHAIN_BID_INPUT_AMOUNTS[0]
@@ -537,12 +586,14 @@ class RobinhoodChainQuoteService:
             reference_price = _safe_decimal(quote.get("effective_price"))
         else:
             reference = await self._probe_quote(
+                symbol=normalized_symbol,
                 side=normalized_side,
                 requested_amount=reference_amount,
                 amount_mode="exact_input",
                 taker_address=taker_address,
-                eth_token=eth_token,
-                usdg_token=usdg_token,
+                base_token=resolved_base or {},
+                quote_token=resolved_quote or {},
+                route_capability=route_capability,
                 force_refresh=False,
             )
             if reference.get("ok"):
@@ -662,8 +713,10 @@ class RobinhoodChainQuoteService:
                 requested_amount=amount,
                 amount_mode="exact_input",
                 taker_address=taker_address,
-                eth_token=eth_token,
-                usdg_token=usdg_token,
+                symbol=normalized_symbol,
+                base_token=eth_token,
+                quote_token=usdg_token,
+                route_capability=None,
                 force_refresh=force_refresh,
             )
             if quote.get("ok") and quote.get("liquidity_available"):
@@ -682,8 +735,10 @@ class RobinhoodChainQuoteService:
                 requested_amount=amount,
                 amount_mode="exact_input",
                 taker_address=taker_address,
-                eth_token=eth_token,
-                usdg_token=usdg_token,
+                symbol=normalized_symbol,
+                base_token=eth_token,
+                quote_token=usdg_token,
+                route_capability=None,
                 force_refresh=force_refresh,
             )
             if quote.get("ok") and quote.get("liquidity_available"):

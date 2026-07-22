@@ -665,10 +665,12 @@ def _resolve_robinhood_chain_execution_taker(
 async def _refresh_robinhood_chain_execution_balance_snapshots(
     db: Session,
     wallet_address: str,
+    additional_erc20_assets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Force-refresh the saved RH Chain account snapshots after confirmation.
 
-    This is intentionally limited to native ETH and canonical registered USDG.
+    Native ETH and canonical USDG are always refreshed. Confirmed ERC-20 output
+    assets, such as WETH, may be added explicitly without changing execution state.
     A snapshot failure never changes the already-verified execution lifecycle.
     """
     try:
@@ -752,58 +754,65 @@ async def _refresh_robinhood_chain_execution_balance_snapshots(
         db.rollback()
         errors.append({"asset": "ETH", "error": str(exc)})
 
-    try:
-        token_row, contract_address, token_decimals = _resolve_registered_erc20(db, "USDG")
-        token_result = await client.get_erc20_balance(
-            normalized_address,
-            contract_address,
-            token_decimals,
-            block_tag="latest",
-            force_refresh=True,
-        )
-        if not token_result.get("ok"):
-            raise RuntimeError(str(token_result.get("error") or token_result))
-        balance_token = Decimal(str(token_result.get("balance_token") or "0"))
-        snapshot = WalletAddressSnapshot(
-            wallet_address_id=saved_row.id,
-            asset="USDG",
-            network=_TOKEN_REGISTRY_CHAIN,
-            address=normalized_address,
-            balance_qty=float(balance_token),
-            balance_raw={
-                "read_only": True,
-                "post_execution_refresh": True,
-                "chain_id": _EXPECTED_CHAIN_ID_DECIMAL,
-                "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
-                "block_tag": token_result.get("block_tag") or "latest",
-                "contract_address": contract_address,
-                "decimals": token_decimals,
+    requested_erc20_assets = ["USDG"]
+    for raw_symbol in additional_erc20_assets or []:
+        symbol = str(raw_symbol or "").strip().upper()
+        if symbol and symbol not in {"ETH", *requested_erc20_assets}:
+            requested_erc20_assets.append(symbol)
+
+    for symbol in requested_erc20_assets:
+        try:
+            token_row, contract_address, token_decimals = _resolve_registered_erc20(db, symbol)
+            token_result = await client.get_erc20_balance(
+                normalized_address,
+                contract_address,
+                token_decimals,
+                block_tag="latest",
+                force_refresh=True,
+            )
+            if not token_result.get("ok"):
+                raise RuntimeError(str(token_result.get("error") or token_result))
+            balance_token = Decimal(str(token_result.get("balance_token") or "0"))
+            snapshot = WalletAddressSnapshot(
+                wallet_address_id=saved_row.id,
+                asset=symbol,
+                network=_TOKEN_REGISTRY_CHAIN,
+                address=normalized_address,
+                balance_qty=float(balance_token),
+                balance_raw={
+                    "read_only": True,
+                    "post_execution_refresh": True,
+                    "chain_id": _EXPECTED_CHAIN_ID_DECIMAL,
+                    "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+                    "block_tag": token_result.get("block_tag") or "latest",
+                    "contract_address": contract_address,
+                    "decimals": token_decimals,
+                    "balance_atomic": str(token_result.get("balance_atomic") or "0"),
+                    "balance_token": str(token_result.get("balance_token") or "0"),
+                    "registry_id": int(token_row.id),
+                    "registry_venue": token_row.venue,
+                    "registry_label": token_row.label,
+                    "cached": bool(token_result.get("cached")),
+                    "fetched_at": token_result.get("fetched_at"),
+                    "source": "robinhood_chain_erc20_rpc",
+                },
+                source="robinhood_chain_erc20_rpc",
+                fetched_at=datetime.utcnow(),
+            )
+            db.add(snapshot)
+            db.commit()
+            refreshed += 1
+            items.append({
+                "asset": symbol,
+                "balance": str(token_result.get("balance_token") or "0"),
                 "balance_atomic": str(token_result.get("balance_atomic") or "0"),
-                "balance_token": str(token_result.get("balance_token") or "0"),
-                "registry_id": int(token_row.id),
-                "registry_venue": token_row.venue,
-                "registry_label": token_row.label,
+                "contract_address": contract_address,
                 "cached": bool(token_result.get("cached")),
                 "fetched_at": token_result.get("fetched_at"),
-                "source": "robinhood_chain_erc20_rpc",
-            },
-            source="robinhood_chain_erc20_rpc",
-            fetched_at=datetime.utcnow(),
-        )
-        db.add(snapshot)
-        db.commit()
-        refreshed += 1
-        items.append({
-            "asset": "USDG",
-            "balance": str(token_result.get("balance_token") or "0"),
-            "balance_atomic": str(token_result.get("balance_atomic") or "0"),
-            "contract_address": contract_address,
-            "cached": bool(token_result.get("cached")),
-            "fetched_at": token_result.get("fetched_at"),
-        })
-    except Exception as exc:
-        db.rollback()
-        errors.append({"asset": "USDG", "error": str(exc)})
+            })
+        except Exception as exc:
+            db.rollback()
+            errors.append({"asset": symbol, "error": str(exc)})
 
     return {
         "ok": len(errors) == 0,
@@ -2124,7 +2133,28 @@ async def robinhood_chain_swap_execution_prepare_fresh_swap(
     if not bool(settings.robinhood_chain_effective_enabled()):
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
     try:
-        return await get_robinhood_chain_swap_execution_service().prepare_swap(
+        service = get_robinhood_chain_swap_execution_service()
+        current = service.get(db, execution_id)
+        execution = current.get("execution") if isinstance(current, dict) else None
+        if not isinstance(execution, dict):
+            raise ValueError("robinhood_chain_swap_execution_not_found")
+        to_asset = str(execution.get("to_asset") or "").strip().upper()
+        if to_asset == "WETH":
+            market, base_token, quote_token, capability = _resolve_robinhood_chain_review_market(
+                db,
+                symbol="WETH-USDG",
+                side="buy",
+                amount_mode="exact_input",
+            )
+            if str(market.get("symbol") or "").strip().upper() != "WETH-USDG":
+                raise ValueError("robinhood_chain_swap_fresh_market_identity_mismatch")
+            return await service.prepare_swap(
+                db, execution_id=execution_id, wallet_address=request.wallet_address,
+                eth_token=None, usdg_token=quote_token, output_token=base_token,
+                route_capability=capability,
+                confirm_prepare=bool(request.confirm_prepare),
+            )
+        return await service.prepare_swap(
             db, execution_id=execution_id, wallet_address=request.wallet_address,
             eth_token=_resolve_execution_discovery_token(db, "ETH"),
             usdg_token=_resolve_execution_discovery_token(db, "USDG"),
@@ -2192,8 +2222,11 @@ async def robinhood_chain_swap_execution_refresh_swap(
         result = await get_robinhood_chain_swap_execution_service().refresh_swap(db, execution_id=execution_id)
         execution = result.get("execution") if isinstance(result, dict) else None
         if isinstance(execution, dict) and str(execution.get("status") or "").lower() == "confirmed":
+            output_asset = str(execution.get("actual_output_asset") or execution.get("to_asset") or "").strip().upper()
             result["balance_refresh"] = await _refresh_robinhood_chain_execution_balance_snapshots(
-                db, str(execution.get("wallet_address") or ""),
+                db,
+                str(execution.get("wallet_address") or ""),
+                additional_erc20_assets=[output_asset] if output_asset not in {"", "ETH", "USDG"} else None,
             )
         return result
     except (ValueError, KeyError) as exc:

@@ -34,11 +34,12 @@ from .robinhood_chain_transaction_planning import (
 
 
 ROBINHOOD_CHAIN_SWAP_TRANCHE = "RH-CHAIN.10D.2-R5B"
+ROBINHOOD_CHAIN_WETH_SWAP_TRANCHE = "RH-CHAIN.10D.2-R5C.3C"
 ROBINHOOD_CHAIN_SWAP_FROM_ASSET = "USDG"
 ROBINHOOD_CHAIN_SWAP_TO_ASSET = "ETH"
 ROBINHOOD_CHAIN_SWAP_APPROVAL_TO_ASSETS = frozenset({"ETH", "WETH"})
 ROBINHOOD_CHAIN_SWAP_SYMBOLS_BY_TO_ASSET = {"ETH": "ETH-USDG", "WETH": "WETH-USDG"}
-ROBINHOOD_CHAIN_SWAP_STAGE_ENABLED_TO_ASSETS = frozenset({"ETH"})
+ROBINHOOD_CHAIN_SWAP_STAGE_ENABLED_TO_ASSETS = frozenset({"ETH", "WETH"})
 ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE = "exact_input"
 ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE = "exact_spend"
 ROBINHOOD_CHAIN_SWAP_SYMBOL = "ETH-USDG"
@@ -207,7 +208,7 @@ def _swap_gate() -> Dict[str, Any]:
         "approval_only_to_assets": sorted(ROBINHOOD_CHAIN_SWAP_APPROVAL_TO_ASSETS - ROBINHOOD_CHAIN_SWAP_STAGE_ENABLED_TO_ASSETS),
         "swap_stage_enabled_to_assets": sorted(ROBINHOOD_CHAIN_SWAP_STAGE_ENABLED_TO_ASSETS),
         "weth_approval_enabled": True,
-        "weth_swap_enabled": False,
+        "weth_swap_enabled": True,
         "amount_mode": ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE,
         "display_mode": ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE,
         "default_input_amount": _decimal_text(ROBINHOOD_CHAIN_SWAP_DEFAULT_USDG),
@@ -287,7 +288,11 @@ def serialize_swap_execution(row: RobinhoodChainSwapExecution) -> Dict[str, Any]
     return {
         "id": str(row.id),
         "venue": "robinhood_chain",
-        "tranche": ROBINHOOD_CHAIN_SWAP_TRANCHE,
+        "tranche": (
+            ROBINHOOD_CHAIN_WETH_SWAP_TRANCHE
+            if str(row.to_asset or "").strip().upper() == "WETH"
+            else ROBINHOOD_CHAIN_SWAP_TRANCHE
+        ),
         "chain_id": int(row.chain_id),
         "wallet_address": row.wallet_address,
         "provider": row.provider,
@@ -314,6 +319,7 @@ def serialize_swap_execution(row: RobinhoodChainSwapExecution) -> Dict[str, Any]
         "approval_status": row.approval_status,
         "swap_status": row.swap_status,
         "approval_execution_enabled": bool(_swap_gate()["send_enabled"]),
+        "swap_stage_enabled": bool(_swap_stage_enabled(row)),
         "swap_execution_enabled": bool(_swap_gate()["send_enabled"] and _swap_stage_enabled(row)),
         "approval_only": not _swap_stage_enabled(row),
         "swap_stage_locked_reason": None if _swap_stage_enabled(row) else "RH-CHAIN.10D.2-R5C.3C",
@@ -662,7 +668,7 @@ class RobinhoodChainSwapExecutionService:
             route={
                 **dict(plan.get("route") or {}),
                 "approval_scope": {
-                    "tranche": "RH-CHAIN.10D.2-R5C.3B" if output_asset == "WETH" else ROBINHOOD_CHAIN_SWAP_TRANCHE,
+                    "tranche": ROBINHOOD_CHAIN_WETH_SWAP_TRANCHE if output_asset == "WETH" else ROBINHOOD_CHAIN_SWAP_TRANCHE,
                     "approval_only": output_asset not in ROBINHOOD_CHAIN_SWAP_STAGE_ENABLED_TO_ASSETS,
                     "swap_stage_locked_reason": None if output_asset in ROBINHOOD_CHAIN_SWAP_STAGE_ENABLED_TO_ASSETS else "RH-CHAIN.10D.2-R5C.3C",
                     "approval_amount_policy": "set_total_required_allowance",
@@ -923,7 +929,9 @@ class RobinhoodChainSwapExecutionService:
 
     async def prepare_swap(
         self, db: Session, *, execution_id: str, wallet_address: str,
-        eth_token: Dict[str, Any], usdg_token: Dict[str, Any], confirm_prepare: bool,
+        eth_token: Optional[Dict[str, Any]], usdg_token: Dict[str, Any], confirm_prepare: bool,
+        output_token: Optional[Dict[str, Any]] = None,
+        route_capability: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if confirm_prepare is not True:
             raise ValueError("confirm_robinhood_chain_swap_fresh_prepare_required")
@@ -935,20 +943,42 @@ class RobinhoodChainSwapExecutionService:
         swap_lifecycle = _stage_lifecycle(row, "swap")
         if swap_lifecycle.get("send_claim_id") or row.swap_tx_hash:
             raise ValueError("robinhood_chain_swap_already_claimed_or_submitted")
+
+        output_asset = str(row.to_asset or "").strip().upper()
+        resolved_output_token = _validated_output_token(
+            output_token if isinstance(output_token, dict) else eth_token,
+            output_asset,
+        )
+        if (
+            validate_evm_address(str(resolved_output_token.get("contract_address") or "")).lower()
+            != validate_evm_address(row.to_contract_address).lower()
+            or int(resolved_output_token.get("decimals") or -1) != int(row.to_decimals)
+            or bool(resolved_output_token.get("native")) != bool(row.to_native)
+        ):
+            raise ValueError("robinhood_chain_swap_output_identity_changed")
+
         allowance = await self.rpc_client.get_erc20_allowance(
             owner_address=row.wallet_address, contract_address=row.allowance_token_address,
             spender_address=row.allowance_spender, decimals=ROBINHOOD_CHAIN_SWAP_USDG_DECIMALS, force_refresh=True,
         )
         if allowance.get("ok") is not True or int(str(allowance.get("allowance_atomic") or "0")) < int(row.exact_input_amount_atomic):
             raise ValueError("robinhood_chain_swap_fresh_allowance_insufficient")
+
+        trade_symbol = ROBINHOOD_CHAIN_SWAP_SYMBOLS_BY_TO_ASSET[output_asset]
         plan = await self.planning_service.firm_quote_plan(
-            symbol=ROBINHOOD_CHAIN_SWAP_SYMBOL, side=ROBINHOOD_CHAIN_SWAP_SIDE, quantity=None,
+            symbol=trade_symbol, side=ROBINHOOD_CHAIN_SWAP_SIDE, quantity=None,
             total_quote=row.exact_input_amount, exact_output_quantity=None, maximum_total_quote=None,
-            taker_address=row.wallet_address, eth_token=eth_token, usdg_token=usdg_token, slippage_bps=int(row.slippage_bps),
+            taker_address=row.wallet_address, base_token=resolved_output_token, quote_token=usdg_token,
+            route_capability=route_capability, slippage_bps=int(row.slippage_bps),
         )
         if plan.get("ok") is not True:
             raise ValueError(str(plan.get("error") or "robinhood_chain_swap_fresh_plan_failed"))
-        if str(plan.get("amount_mode")) != "exact_input" or str(plan.get("input_asset")) != "USDG" or str(plan.get("output_asset")) != "ETH":
+        if (
+            str(plan.get("symbol") or "").strip().upper() != trade_symbol
+            or str(plan.get("amount_mode")) != "exact_input"
+            or str(plan.get("input_asset")) != "USDG"
+            or str(plan.get("output_asset")) != output_asset
+        ):
             raise ValueError("robinhood_chain_swap_fresh_plan_identity_mismatch")
         if str(plan.get("input_amount_atomic")) != str(row.exact_input_amount_atomic):
             raise ValueError("robinhood_chain_swap_fresh_plan_input_mismatch")
@@ -965,7 +995,7 @@ class RobinhoodChainSwapExecutionService:
         destination = validate_evm_address(str(unsigned.get("to") or "")).lower()
         if unsigned.get("destination_allowlisted") is not True or destination not in ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST:
             raise ValueError("robinhood_chain_swap_destination_not_allowlisted")
-        if str(unsigned.get("value_wei")) != "0":
+        if str(unsigned.get("value_wei")) != "0" or bool(unsigned.get("native_input")):
             raise ValueError("robinhood_chain_swap_transaction_value_mismatch")
         calldata = str(unsigned.get("calldata") or "")
         if not re.fullmatch(r"0x[0-9a-fA-F]+", calldata) or len(calldata[2:]) % 2:
@@ -979,14 +1009,21 @@ class RobinhoodChainSwapExecutionService:
             raise ValueError("robinhood_chain_swap_fresh_plan_expired")
         plan_hash = _hash_payload({
             "chain_id": EXPECTED_CHAIN_ID, "wallet": row.wallet_address, "quote_id": str(plan.get("quote_id")),
+            "symbol": trade_symbol, "output_asset": output_asset,
             "input_atomic": str(row.exact_input_amount_atomic), "output_atomic": str(output_atomic),
             "minimum_atomic": str(minimum_atomic), "destination": destination,
             "calldata_sha256": calldata_hash, "plan_expires_at": _as_utc(expires).isoformat(),
         })
         route = _route_copy(row)
         route["fills"] = (plan.get("route") or {}).get("fills") or []
-        route["firm_plan"] = {"quote_id": plan.get("quote_id"), "route_sources": plan.get("route_sources") or []}
+        route["firm_plan"] = {
+            "quote_id": plan.get("quote_id"),
+            "symbol": trade_symbol,
+            "output_asset": output_asset,
+            "route_sources": plan.get("route_sources") or [],
+        }
         row.route = route
+        row.symbol = trade_symbol
         row.quote_id = str(plan.get("quote_id"))
         row.plan_fetched_at = _utc_naive(fetched)
         row.plan_expires_at = _utc_naive(expires)
@@ -1040,16 +1077,30 @@ class RobinhoodChainSwapExecutionService:
             raise ValueError("robinhood_chain_swap_not_claimable")
         eth_balance = await self.rpc_client.get_native_balance(row.wallet_address, block_tag="latest", force_refresh=True)
         usdg_balance = await self.rpc_client.get_erc20_balance(row.wallet_address, row.allowance_token_address, ROBINHOOD_CHAIN_SWAP_USDG_DECIMALS, block_tag="latest", force_refresh=True)
-        if eth_balance.get("ok") is not True or usdg_balance.get("ok") is not True:
+        output_balance = None
+        if not row.to_native:
+            output_balance = await self.rpc_client.get_erc20_balance(
+                row.wallet_address, row.to_contract_address, int(row.to_decimals),
+                block_tag="latest", force_refresh=True,
+            )
+        if (
+            eth_balance.get("ok") is not True
+            or usdg_balance.get("ok") is not True
+            or (output_balance is not None and output_balance.get("ok") is not True)
+        ):
             raise ValueError("robinhood_chain_swap_pre_balance_snapshot_failed")
         now = utc_now()
+        pre_balance_snapshot = {
+            "captured_at": now.isoformat(),
+            "eth_balance_wei": str(eth_balance.get("balance_wei") or "0"),
+            "usdg_balance_atomic": str(usdg_balance.get("balance_atomic") or "0"),
+            "output_asset": str(row.to_asset or "").strip().upper(),
+        }
+        if output_balance is not None:
+            pre_balance_snapshot["output_balance_atomic"] = str(output_balance.get("balance_atomic") or "0")
         _set_stage_lifecycle(row, "swap", {
             "send_claim_id": claim, "send_claimed_at": now.isoformat(),
-            "pre_balance_snapshot": {
-                "captured_at": now.isoformat(),
-                "eth_balance_wei": str(eth_balance.get("balance_wei") or "0"),
-                "usdg_balance_atomic": str(usdg_balance.get("balance_atomic") or "0"),
-            },
+            "pre_balance_snapshot": pre_balance_snapshot,
         })
         row.status = "swap_send_claimed"
         row.swap_status = "send_claimed"
@@ -1112,6 +1163,40 @@ class RobinhoodChainSwapExecutionService:
             raise ValueError("robinhood_chain_swap_usdg_spend_mismatch")
         return net_input_atomic, transfer_log_count
 
+    def _decode_erc20_swap_output(self, row: RobinhoodChainSwapExecution, receipt: Dict[str, Any]) -> tuple[int, int]:
+        if row.to_native:
+            raise ValueError("robinhood_chain_swap_output_must_be_erc20")
+        wallet = row.wallet_address.lower()
+        output_contract = validate_evm_address(row.to_contract_address).lower()
+        net_output_atomic = 0
+        transfer_log_count = 0
+        for item in receipt.get("logs") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                if validate_evm_address(str(item.get("address") or "")).lower() != output_contract:
+                    continue
+            except ValueError:
+                continue
+            topics = item.get("topics")
+            if not isinstance(topics, list) or len(topics) < 3 or str(topics[0]).lower() != _ERC20_TRANSFER_TOPIC0:
+                continue
+            source = _topic_address(topics[1])
+            destination = _topic_address(topics[2])
+            try:
+                amount = decode_hex_quantity(item.get("data"))
+            except ValueError:
+                continue
+            if destination == wallet:
+                net_output_atomic += amount
+                transfer_log_count += 1
+            if source == wallet:
+                net_output_atomic -= amount
+                transfer_log_count += 1
+        if net_output_atomic <= 0:
+            raise ValueError("robinhood_chain_swap_erc20_output_transfer_missing")
+        return net_output_atomic, transfer_log_count
+
     async def refresh_swap(self, db: Session, *, execution_id: str) -> Dict[str, Any]:
         row = self._get(db, execution_id)
         _require_swap_stage_enabled(row)
@@ -1146,7 +1231,8 @@ class RobinhoodChainSwapExecutionService:
             row.swap_status = "reverted"
             row.error_code = "swap_reverted"
         elif receipt_status == 1:
-            input_atomic, transfer_log_count = self._decode_swap_input(row, receipt)
+            input_atomic, input_transfer_log_count = self._decode_swap_input(row, receipt)
+            output_asset = str(row.to_asset or "").strip().upper()
             block_number = int(lifecycle_values.get("block_number") or 0)
             if block_number <= 0:
                 raise ValueError("robinhood_chain_swap_receipt_block_missing")
@@ -1166,11 +1252,24 @@ class RobinhoodChainSwapExecutionService:
                 row.wallet_address, row.allowance_token_address, ROBINHOOD_CHAIN_SWAP_USDG_DECIMALS,
                 block_tag=after_tag, force_refresh=True,
             )
+            pre_output_result = None
+            post_output_result = None
+            if not row.to_native:
+                pre_output_result = await self.rpc_client.get_erc20_balance(
+                    row.wallet_address, row.to_contract_address, int(row.to_decimals),
+                    block_tag=before_tag, force_refresh=True,
+                )
+                post_output_result = await self.rpc_client.get_erc20_balance(
+                    row.wallet_address, row.to_contract_address, int(row.to_decimals),
+                    block_tag=after_tag, force_refresh=True,
+                )
             if (
                 pre_eth_result.get("ok") is not True
                 or post_eth_result.get("ok") is not True
                 or pre_usdg_result.get("ok") is not True
                 or post_usdg_result.get("ok") is not True
+                or (pre_output_result is not None and pre_output_result.get("ok") is not True)
+                or (post_output_result is not None and post_output_result.get("ok") is not True)
             ):
                 raise ValueError("robinhood_chain_swap_receipt_block_balance_snapshot_failed")
             gas_used = int(lifecycle_values.get("gas_used") or 0)
@@ -1184,23 +1283,56 @@ class RobinhoodChainSwapExecutionService:
             post_usdg = int(str(post_usdg_result.get("balance_atomic") or "0"))
             if pre_usdg - post_usdg != input_atomic:
                 raise ValueError("robinhood_chain_swap_usdg_balance_delta_mismatch")
-            output_wei = post_eth - pre_eth + swap_fee_wei
-            if output_wei <= 0 or output_wei < int(row.minimum_output_amount_atomic):
-                raise ValueError("robinhood_chain_swap_native_output_missing_or_below_minimum")
+
+            output_transfer_log_count = 0
+            output_snapshot: Dict[str, Any] = {"output_asset": output_asset}
+            if row.to_native:
+                output_atomic = post_eth - pre_eth + swap_fee_wei
+                if output_atomic <= 0 or output_atomic < int(row.minimum_output_amount_atomic):
+                    raise ValueError("robinhood_chain_swap_native_output_missing_or_below_minimum")
+            else:
+                receipt_output_atomic, output_transfer_log_count = self._decode_erc20_swap_output(row, receipt)
+                pre_output = int(str((pre_output_result or {}).get("balance_atomic") or "0"))
+                post_output = int(str((post_output_result or {}).get("balance_atomic") or "0"))
+                output_atomic = post_output - pre_output
+                if output_atomic != receipt_output_atomic:
+                    raise ValueError("robinhood_chain_swap_erc20_output_balance_delta_mismatch")
+                if output_atomic <= 0 or output_atomic < int(row.minimum_output_amount_atomic):
+                    raise ValueError("robinhood_chain_swap_erc20_output_missing_or_below_minimum")
+                output_snapshot.update({
+                    "output_contract_address": validate_evm_address(row.to_contract_address),
+                    "pre_output_balance_atomic": str(pre_output),
+                    "post_output_balance_atomic": str(post_output),
+                })
+
             approval_lifecycle = _stage_lifecycle(row, "approval")
             approval_fee_wei = int(approval_lifecycle.get("gas_used") or 0) * int(approval_lifecycle.get("effective_gas_price_wei") or 0)
             input_amount = Decimal(input_atomic) / (Decimal(10) ** ROBINHOOD_CHAIN_SWAP_USDG_DECIMALS)
-            output_amount = Decimal(output_wei) / _WEI_PER_ETH
+            output_amount = Decimal(output_atomic) / (Decimal(10) ** int(row.to_decimals))
             reconciliation = {
-                "version": ROBINHOOD_CHAIN_SWAP_TRANCHE, "reconciled": True, "reconciled_at": now.isoformat(),
-                "input_asset": "USDG", "input_amount_atomic": str(input_atomic), "input_amount": _decimal_text(input_amount),
-                "output_asset": "ETH", "output_amount_atomic": str(output_wei), "output_amount": _decimal_text(output_amount),
-                "minimum_output_amount_atomic": row.minimum_output_amount_atomic, "minimum_output_amount": row.minimum_output_amount,
-                "average_fill_price": _decimal_text(input_amount / output_amount), "fee_asset": "ETH",
-                "swap_network_fee_wei": str(swap_fee_wei), "swap_network_fee": _decimal_text(Decimal(swap_fee_wei) / _WEI_PER_ETH),
-                "approval_network_fee_wei": str(approval_fee_wei), "approval_network_fee": _decimal_text(Decimal(approval_fee_wei) / _WEI_PER_ETH),
-                "total_network_fee_wei": str(swap_fee_wei + approval_fee_wei), "total_network_fee": _decimal_text(Decimal(swap_fee_wei + approval_fee_wei) / _WEI_PER_ETH),
-                "usdg_transfer_log_count": transfer_log_count, "approval_tx_hash": row.approval_tx_hash, "swap_tx_hash": row.swap_tx_hash,
+                "version": ROBINHOOD_CHAIN_WETH_SWAP_TRANCHE if output_asset == "WETH" else ROBINHOOD_CHAIN_SWAP_TRANCHE,
+                "reconciled": True,
+                "reconciled_at": now.isoformat(),
+                "input_asset": str(row.from_asset or "USDG").strip().upper(),
+                "input_amount_atomic": str(input_atomic),
+                "input_amount": _decimal_text(input_amount),
+                "output_asset": output_asset,
+                "output_amount_atomic": str(output_atomic),
+                "output_amount": _decimal_text(output_amount),
+                "minimum_output_amount_atomic": row.minimum_output_amount_atomic,
+                "minimum_output_amount": row.minimum_output_amount,
+                "average_fill_price": _decimal_text(input_amount / output_amount),
+                "fee_asset": "ETH",
+                "swap_network_fee_wei": str(swap_fee_wei),
+                "swap_network_fee": _decimal_text(Decimal(swap_fee_wei) / _WEI_PER_ETH),
+                "approval_network_fee_wei": str(approval_fee_wei),
+                "approval_network_fee": _decimal_text(Decimal(approval_fee_wei) / _WEI_PER_ETH),
+                "total_network_fee_wei": str(swap_fee_wei + approval_fee_wei),
+                "total_network_fee": _decimal_text(Decimal(swap_fee_wei + approval_fee_wei) / _WEI_PER_ETH),
+                "usdg_transfer_log_count": input_transfer_log_count,
+                "output_transfer_log_count": output_transfer_log_count,
+                "approval_tx_hash": row.approval_tx_hash,
+                "swap_tx_hash": row.swap_tx_hash,
             }
             route = _route_copy(row)
             route["execution_reconciliation"] = reconciliation
@@ -1215,6 +1347,7 @@ class RobinhoodChainSwapExecutionService:
                     "post_eth_balance_wei": str(post_eth),
                     "pre_usdg_balance_atomic": str(pre_usdg),
                     "post_usdg_balance_atomic": str(post_usdg),
+                    **output_snapshot,
                 },
             })
             row.status = "confirmed"

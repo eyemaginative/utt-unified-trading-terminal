@@ -7398,8 +7398,8 @@ export default function OrderTicketWidget({
   );
   const canPrepareRobinhoodChainFreshSwap = Boolean(
     robinhoodChainSwapRow &&
-    String(robinhoodChainSwapRow.to_asset || "").toUpperCase() === "ETH" &&
-    robinhoodChainSwapRow.swap_execution_enabled !== false &&
+    ["ETH", "WETH"].includes(String(robinhoodChainSwapRow.to_asset || "").toUpperCase()) &&
+    robinhoodChainSwapRow.swap_stage_enabled === true &&
     ["approval_confirmed", "allowance_sufficient", "swap_prepared"].includes(String(robinhoodChainSwapRow.status || "")) &&
     (String(robinhoodChainSwapRow.status || "") !== "swap_prepared" || !robinhoodChainSwapPlan || robinhoodChainSwapPlanStale) &&
     robinhoodChainWalletReady &&
@@ -7407,8 +7407,8 @@ export default function OrderTicketWidget({
   );
   const canSendRobinhoodChainSwap = Boolean(
     robinhoodChainSwapRow &&
-    String(robinhoodChainSwapRow.to_asset || "").toUpperCase() === "ETH" &&
-    robinhoodChainSwapRow.swap_execution_enabled !== false &&
+    ["ETH", "WETH"].includes(String(robinhoodChainSwapRow.to_asset || "").toUpperCase()) &&
+    robinhoodChainSwapRow.swap_stage_enabled === true &&
     robinhoodChainSwapPlan &&
     String(robinhoodChainSwapRow.status || "") === "swap_prepared" &&
     !robinhoodChainSwapPlanStale &&
@@ -9204,7 +9204,7 @@ async function submitLimitOrder() {
       setRobinhoodChainSwapExecutionStatus(data?.review_gate || robinhoodChainSwapExecutionStatus);
       setRobinhoodChainWalletNotice(
         robinhoodChainToAsset === "WETH"
-          ? "Finite USDG approval prepared for WETH review. The WETH swap remains locked in R5C.3C; no MetaMask request occurred."
+          ? "Finite USDG approval prepared for WETH review. Swap preparation remains a separate explicit R5C.3C action; no MetaMask request occurred."
           : "Finite exact-spend approval prepared for review only. No MetaMask request occurred."
       );
     } catch (error) {
@@ -9350,7 +9350,7 @@ async function submitLimitOrder() {
         `Plan hash: ${planHash}`,
         "",
         String(row?.to_asset || "").toUpperCase() === "WETH"
-          ? "This opens one MetaMask approval request only. WETH swap preparation and submission remain locked in R5C.3C."
+          ? "This opens one MetaMask approval request only. A fresh WETH swap plan and a separate explicit MetaMask request are still required."
           : "This opens one MetaMask approval request only. No swap request will open automatically.",
       ].join("\n");
       if (!window.confirm(review)) {
@@ -9430,14 +9430,14 @@ async function submitLimitOrder() {
           spender: planSpender,
           transaction_value_wei: "0",
           automatic_second_transaction: false,
-          swap_stage_enabled: false,
+          swap_stage_enabled: row?.swap_stage_enabled === true,
         },
         "Robinhood Chain Approval Submitted"
       );
       onToast?.({
         kind: "ok",
         msg: String(row?.to_asset || "").toUpperCase() === "WETH"
-          ? "Finite USDG approval submitted for WETH. WETH swap preparation remains locked in R5C.3C."
+          ? "Finite USDG approval submitted for WETH. No swap request was opened; wait for confirmation, then prepare a fresh WETH plan explicitly."
           : "Finite USDG approval submitted. No swap request was opened.",
       });
     } catch (error) {
@@ -9509,15 +9509,15 @@ async function submitLimitOrder() {
             spender: data.execution.allowance?.spender || data.execution.approval?.spender || null,
             transaction_value_wei: "0",
             automatic_second_transaction: false,
-            swap_stage_enabled: false,
-            swap_stage_locked_reason: data.execution.swap_stage_locked_reason || "RH-CHAIN.10D.2-R5C.3C",
+            swap_stage_enabled: data.execution.swap_stage_enabled === true,
+            swap_stage_locked_reason: data.execution.swap_stage_locked_reason || null,
           },
           "Robinhood Chain Approval Confirmed"
         );
         onToast?.({
           kind: "ok",
           msg: String(data.execution?.to_asset || "").toUpperCase() === "WETH"
-            ? "Finite USDG approval confirmed onchain. WETH swap preparation remains locked in R5C.3C."
+            ? "Finite USDG approval confirmed onchain. Prepare and review a fresh WETH plan before any separate swap request."
             : "Finite USDG approval confirmed onchain. The swap remains locked until you prepare and review a fresh plan.",
         });
       } else if (status === "approval_reverted") {
@@ -9600,12 +9600,15 @@ async function submitLimitOrder() {
     const gasPrice = BigInt(String(plan?.gas_price_wei || "0"));
     const planHash = String(row?.swap?.plan_hash || "").trim().toLowerCase();
     const storedCalldataHash = String(row?.swap?.calldata_sha256 || "").trim().toLowerCase();
+    const outputAsset = String(row?.to_asset || "").trim().toUpperCase();
 
     if (
       !executionId ||
       String(row?.status || "") !== "swap_prepared" ||
-      String(row?.from_asset || "") !== "USDG" ||
-      String(row?.to_asset || "") !== "ETH" ||
+      String(row?.from_asset || "").toUpperCase() !== "USDG" ||
+      !["ETH", "WETH"].includes(outputAsset) ||
+      outputAsset !== String(robinhoodChainToAsset || "").trim().toUpperCase() ||
+      String(plan?.output_asset || "").trim().toUpperCase() !== outputAsset ||
       String(row?.amount_mode || "") !== "exact_input" ||
       Number(plan?.chain_id) !== ROBINHOOD_CHAIN_NETWORK.chainIdDecimal ||
       planFrom !== robinhoodChainConnectedAddress ||
@@ -9619,7 +9622,7 @@ async function submitLimitOrder() {
       gasPrice <= 0n ||
       robinhoodChainSwapPlanStale
     ) {
-      setRobinhoodChainSwapError("The fresh exact-spend swap plan no longer matches the reviewed R5B lifecycle.");
+      setRobinhoodChainSwapError("The fresh exact-spend swap plan no longer matches the reviewed Robinhood Chain lifecycle.");
       return;
     }
 
@@ -9657,11 +9660,11 @@ async function submitLimitOrder() {
       if (balanceWei < maximumFeeWei) throw new Error("Insufficient ETH for the reviewed swap gas maximum.");
 
       const review = [
-        "RH-CHAIN.10D.2-R5B · STAGE 2 EXACT-SPEND SWAP",
+        `${outputAsset === "WETH" ? "RH-CHAIN.10D.2-R5C.3C" : "RH-CHAIN.10D.2-R5B"} · STAGE 2 EXACT-SPEND SWAP`,
         "",
         `Spend exactly ${row?.exact_input_amount} USDG`,
-        `Expected native ETH: ${row?.expected_output_amount}`,
-        `Minimum native ETH: ${row?.minimum_output_amount}`,
+        `Expected ${outputAsset}: ${row?.expected_output_amount}`,
+        `Minimum ${outputAsset}: ${row?.minimum_output_amount}`,
         `From: ${activeAddress}`,
         `To: ${planTo}`,
         "Transaction value: 0 wei",
@@ -9735,7 +9738,29 @@ async function submitLimitOrder() {
       }));
       setRobinhoodChainSwapReviewed(false);
       requestAllOrdersRefresh();
-      onToast?.({ kind: "ok", msg: "Exact-spend swap submitted and recorded as pending." });
+      openSubmitResultModal(
+        "ok",
+        {
+          ok: true,
+          venue: "robinhood_chain",
+          symbol: row?.symbol || `${outputAsset}-USDG`,
+          side: row?.side || "buy",
+          type: "swap",
+          status: "submitted",
+          execution_id: executionId,
+          transaction_hash: returnedTxHash,
+          input_asset: row?.from_asset || "USDG",
+          input_amount: row?.exact_input_amount || null,
+          expected_output_asset: outputAsset,
+          expected_output_amount: row?.expected_output_amount || null,
+          minimum_output_amount: row?.minimum_output_amount || null,
+          transaction_value_wei: "0",
+          automatic_second_transaction: false,
+          automatic_retry: false,
+        },
+        "Robinhood Chain Swap Submitted"
+      );
+      onToast?.({ kind: "ok", msg: `Exact-spend ${outputAsset} swap submitted and recorded as pending.` });
     } catch (error) {
       let msg = robinhoodChainWalletErrorMessage(error, "Robinhood Chain exact-spend swap failed.");
       if (returnedTxHash) {
@@ -9744,6 +9769,30 @@ async function submitLimitOrder() {
         msg = await recordRobinhoodChainSwapFailure(executionId, "swap", claimId, error);
       }
       setRobinhoodChainSwapError(msg);
+      const rejected = Number(error?.code) === 4001 || /declined|rejected/i.test(String(msg || ""));
+      openSubmitResultModal(
+        "error",
+        {
+          ok: false,
+          venue: "robinhood_chain",
+          symbol: row?.symbol || `${outputAsset || "ETH"}-USDG`,
+          side: row?.side || "buy",
+          type: "swap",
+          status: rejected ? "wallet_rejected" : returnedTxHash ? "recording_recovery_required" : "submission_failed",
+          execution_id: executionId || null,
+          transaction_hash: returnedTxHash || null,
+          input_asset: row?.from_asset || "USDG",
+          input_amount: row?.exact_input_amount || null,
+          expected_output_asset: outputAsset || row?.to_asset || null,
+          expected_output_amount: row?.expected_output_amount || null,
+          minimum_output_amount: row?.minimum_output_amount || null,
+          transaction_value_wei: "0",
+          error: msg,
+          automatic_second_transaction: false,
+          automatic_retry: false,
+        },
+        rejected ? "Robinhood Chain Swap Rejected" : "Robinhood Chain Swap Failed"
+      );
       onToast?.({ kind: "warn", msg });
     } finally {
       robinhoodChainSwapSendRef.current = false;
@@ -9786,7 +9835,7 @@ async function submitLimitOrder() {
             swap_transaction_hash: data.execution.swap?.tx_hash || null,
             actual_input_asset: data.execution.actual_input_asset || "USDG",
             actual_input_amount: data.execution.actual_input_amount || null,
-            actual_output_asset: data.execution.actual_output_asset || "ETH",
+            actual_output_asset: data.execution.actual_output_asset || data.execution.to_asset || "ETH",
             actual_output_amount: data.execution.actual_output_amount || null,
             approval_network_fee_eth: data.execution.actual_approval_network_fee || null,
             swap_network_fee_eth: data.execution.actual_network_fee || null,
@@ -9801,7 +9850,7 @@ async function submitLimitOrder() {
             confirmationPayload,
             "Robinhood Chain Swap Confirmed"
           );
-          onToast?.({ kind: "ok", msg: "Exact-spend swap confirmed. Actual USDG input, native ETH output, both gas fees, balances, and All Orders were refreshed." });
+          onToast?.({ kind: "ok", msg: `Exact-spend swap confirmed. Actual USDG input, ${data.execution.actual_output_asset || data.execution.to_asset || "output"} output, gas fees, balances, and All Orders were refreshed.` });
         } else {
           onToast?.({ kind: "warn", msg: `Robinhood Chain exact-spend swap is ${status}. No automatic retry occurred.` });
         }
@@ -11775,7 +11824,7 @@ async function submitLimitOrder() {
                 fontSize: 10.5,
               }}>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", color: "#a5f3fc" }}>
-                  <b>{robinhoodChainSwapRow.approval_only ? "R5C.3B FINITE APPROVAL" : "R5B EXACT-SPEND EXECUTION"}</b>
+                  <b>{String(robinhoodChainSwapRow.to_asset || "").toUpperCase() === "WETH" ? "R5C.3C WETH EXACT-SPEND" : robinhoodChainSwapRow.approval_only ? "R5C.3B FINITE APPROVAL" : "R5B EXACT-SPEND EXECUTION"}</b>
                   <span>FROM USDG ▸ TO {robinhoodChainSwapRow.to_native ? "NATIVE " : ""}{robinhoodChainSwapRow.to_asset || "OUTPUT"}</span>
                   <span>STATUS {String(robinhoodChainSwapRow.status || "prepared").toUpperCase()}</span>
                   <span>AUTOMATIC SECOND TX <b>NO</b></span>
@@ -11902,7 +11951,7 @@ async function submitLimitOrder() {
                         disabled={!canPrepareRobinhoodChainFreshSwap}
                         onClick={prepareRobinhoodChainSwapFreshReview}
                       >
-                        {robinhoodChainSwapBusy ? "Preparing…" : "Prepare Fresh 2 USDG Swap"}
+                        {robinhoodChainSwapBusy ? "Preparing…" : `Prepare Fresh ${robinhoodChainSwapRow.exact_input_amount} USDG → ${robinhoodChainSwapRow.to_asset}`}
                       </button>
                       <span style={{ color: "#c4b5fd" }}>A fresh plan is mandatory after approval confirmation.</span>
                     </div>
@@ -11911,8 +11960,8 @@ async function submitLimitOrder() {
                     <>
                       <div style={{ marginTop: 7, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
                         <span style={safePill}>Fresh plan: <b>{robinhoodChainSwapPlanStale ? "STALE" : "READY"}</b></span>
-                        <span style={safePill}>Expected: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.expected_output_amount} ETH</b></span>
-                        <span style={safePill}>Minimum: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.minimum_output_amount} ETH</b></span>
+                        <span style={safePill}>Expected: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.expected_output_amount} {robinhoodChainSwapRow.to_asset}</b></span>
+                        <span style={safePill}>Minimum: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.minimum_output_amount} {robinhoodChainSwapRow.to_asset}</b></span>
                         <span style={safePill}>Destination: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapPlan.to || "", 8, 6)}</b></span>
                         <span style={safePill}>Calldata hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.calldata_sha256 || "", 10, 8)}</b></span>
                         <span style={safePill}>Plan hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.plan_hash || "", 10, 8)}</b></span>
@@ -11926,7 +11975,7 @@ async function submitLimitOrder() {
                             checked={robinhoodChainSwapReviewed}
                             onChange={(event) => setRobinhoodChainSwapReviewed(event.target.checked)}
                           />
-                          <span>I reviewed exact spend {robinhoodChainSwapRow.exact_input_amount} USDG and minimum {robinhoodChainSwapRow.minimum_output_amount} ETH</span>
+                          <span>I reviewed exact spend {robinhoodChainSwapRow.exact_input_amount} USDG and minimum {robinhoodChainSwapRow.minimum_output_amount} {robinhoodChainSwapRow.to_asset}</span>
                         </label>
                         <button
                           type="button"
@@ -11955,7 +12004,7 @@ async function submitLimitOrder() {
                   {String(robinhoodChainSwapRow.status || "") === "confirmed" && robinhoodChainSwapRow.reconciliation && (
                     <div style={{ marginTop: 7, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
                       <span style={safePill}>Actual spend: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_input_amount} USDG</b></span>
-                      <span style={safePill}>Actual output: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_output_amount} ETH</b></span>
+                      <span style={safePill}>Actual output: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_output_amount} {robinhoodChainSwapRow.actual_output_asset || robinhoodChainSwapRow.to_asset}</b></span>
                       <span style={safePill}>Approval gas: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_approval_network_fee} ETH</b></span>
                       <span style={safePill}>Swap gas: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_network_fee} ETH</b></span>
                       <span style={safePill}>Total gas: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_total_network_fee} ETH</b></span>

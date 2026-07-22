@@ -136,8 +136,10 @@ class FakeRpcClient:
         self.swap_receipt = None
         self.native_balance_wei = 10 * 10**18
         self.usdg_balance_atomic = 3_710_769
+        self.weth_balance_atomic = 0
         self.native_balances_by_tag: dict[str, int] = {}
         self.usdg_balances_by_tag: dict[str, int] = {}
+        self.weth_balances_by_tag: dict[str, int] = {}
         self.approval_amount_atomic = 2_000_000
         self.calls: list[tuple] = []
 
@@ -166,7 +168,11 @@ class FakeRpcClient:
         self, address, contract_address, decimals, *, block_tag="latest", force_refresh=True
     ):
         self.calls.append(("erc20_balance", address, contract_address, decimals, block_tag, force_refresh))
-        balance = self.usdg_balances_by_tag.get(str(block_tag), self.usdg_balance_atomic)
+        is_weth = str(contract_address or "").lower() == WETH["contract_address"].lower()
+        if is_weth:
+            balance = self.weth_balances_by_tag.get(str(block_tag), self.weth_balance_atomic)
+        else:
+            balance = self.usdg_balances_by_tag.get(str(block_tag), self.usdg_balance_atomic)
         return {"ok": True, "balance_atomic": str(balance)}
 
     async def rpc_read(self, method, params, *, cache_namespace=None, force_refresh=False):
@@ -221,6 +227,18 @@ def usdg_spend_log(amount_atomic: int):
             TRANSFER_TOPIC0,
             "0x" + TAKER[2:].lower().rjust(64, "0"),
             "0x" + SPENDER[2:].lower().rjust(64, "0"),
+        ],
+        "data": hex(amount_atomic),
+    }
+
+
+def weth_receive_log(amount_atomic: int):
+    return {
+        "address": WETH["contract_address"],
+        "topics": [
+            TRANSFER_TOPIC0,
+            "0x" + SPENDER[2:].lower().rjust(64, "0"),
+            "0x" + TAKER[2:].lower().rjust(64, "0"),
         ],
         "data": hex(amount_atomic),
     }
@@ -646,18 +664,20 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "usdg_balance_delta_mismatch"):
             await self.service.refresh_swap(self.db, execution_id=execution_id)
 
-    async def test_status_exposes_weth_approval_only_boundary(self):
+    async def test_status_enables_separate_weth_swap_stage(self):
         status = self.service.status()
         self.assertIn("WETH", status["approval_to_assets"])
-        self.assertIn("WETH", status["approval_only_to_assets"])
+        self.assertNotIn("WETH", status["approval_only_to_assets"])
         self.assertTrue(status["weth_approval_enabled"])
-        self.assertFalse(status["weth_swap_enabled"])
-        self.assertNotIn("WETH", status["swap_stage_enabled_to_assets"])
+        self.assertTrue(status["weth_swap_enabled"])
+        self.assertIn("WETH", status["swap_stage_enabled_to_assets"])
+        self.assertFalse(status["automatic_second_transaction"])
 
-    async def test_prepare_weth_persists_finite_approval_only_lifecycle(self):
+    async def test_prepare_weth_persists_finite_approval_and_separate_swap_lifecycle(self):
         result = await self.prepare_weth("1")
         self.assertTrue(result["ok"])
         row = result["execution"]
+        self.assertEqual(row["tranche"], "RH-CHAIN.10D.2-R5C.3C")
         self.assertEqual(row["symbol"], "WETH-USDG")
         self.assertEqual(row["from_asset"], "USDG")
         self.assertEqual(row["to_asset"], "WETH")
@@ -666,11 +686,12 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["exact_input_amount"], "1")
         self.assertEqual(row["approval"]["amount_atomic"], "1000000")
         self.assertEqual(row["approval"]["amount_policy"], "set_total_required_allowance")
-        self.assertTrue(row["approval_only"])
+        self.assertFalse(row["approval_only"])
+        self.assertTrue(row["swap_stage_enabled"])
         self.assertFalse(row["swap_execution_enabled"])
-        self.assertEqual(row["swap_stage_locked_reason"], "RH-CHAIN.10D.2-R5C.3C")
-        self.assertEqual(row["swap_status"], "locked_r5c3c")
-        self.assertIsNone(self.service.get(self.db, row["id"])["unsigned_transaction_plan"])
+        self.assertIsNone(row["swap_stage_locked_reason"])
+        self.assertEqual(row["swap_status"], "review_only")
+        self.assertFalse(row["automatic_second_transaction"])
 
     async def test_weth_requires_distinct_non_native_token_identity(self):
         bad_weth = {**WETH, "native": True}
@@ -716,7 +737,8 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(failed["execution"]["status"], "approval_wallet_rejected")
         self.assertIsNone(failed["execution"]["approval"]["tx_hash"])
-        self.assertTrue(failed["execution"]["approval_only"])
+        self.assertFalse(failed["execution"]["approval_only"])
+        self.assertTrue(failed["execution"]["swap_stage_enabled"])
         self.assertFalse(failed["execution"]["automatic_second_transaction"])
 
     async def test_weth_approval_confirmation_refreshes_allowance_and_stops(self):
@@ -739,11 +761,11 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed["execution"]["status"], "approval_confirmed")
         self.assertEqual(refreshed["execution"]["allowance"]["shortfall_atomic"], "0")
         self.assertFalse(refreshed["execution"]["allowance"]["approval_required"])
-        self.assertTrue(refreshed["execution"]["approval_only"])
-        self.assertFalse(refreshed["execution"]["swap_execution_enabled"])
-        self.assertIsNone(self.service.get(self.db, execution_id)["unsigned_transaction_plan"])
+        self.assertFalse(refreshed["execution"]["approval_only"])
+        self.assertTrue(refreshed["execution"]["swap_stage_enabled"])
+        self.assertFalse(refreshed["execution"]["automatic_second_transaction"])
 
-    async def test_weth_prepare_swap_is_locked_until_r5c3c(self):
+    async def test_weth_prepare_swap_requires_fresh_allowance_and_weth_plan(self):
         prepared = await self.prepare_weth("1")
         row = self.db.get(RobinhoodChainSwapExecution, prepared["execution"]["id"])
         row.status = "approval_confirmed"
@@ -752,26 +774,159 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         row.allowance_shortfall_atomic = "0"
         row.approval_required = False
         self.db.add(row); self.db.commit()
-        with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_stage_locked_r5c3c"):
+
+        with self.assertRaisesRegex(ValueError, "fresh_allowance_insufficient"):
             await self.service.prepare_swap(
                 self.db, execution_id=row.id, wallet_address=TAKER,
-                eth_token=ETH, usdg_token=USDG, confirm_prepare=True,
+                eth_token=None, usdg_token=USDG, output_token=WETH,
+                route_capability=WETH_CAPABILITY, confirm_prepare=True,
             )
-        self.assertEqual(len(self.planning.calls), 1)
 
-    async def test_weth_swap_claim_is_locked_even_when_global_gate_is_live(self):
+        self.rpc.allowance_atomic = 1_000_000
+        self.planning.allowance_atomic = 1_000_000
+        swap = await self.service.prepare_swap(
+            self.db, execution_id=row.id, wallet_address=TAKER,
+            eth_token=None, usdg_token=USDG, output_token=WETH,
+            route_capability=WETH_CAPABILITY, confirm_prepare=True,
+        )
+        self.assertEqual(swap["execution"]["status"], "swap_prepared")
+        self.assertEqual(swap["execution"]["symbol"], "WETH-USDG")
+        self.assertEqual(swap["execution"]["to_asset"], "WETH")
+        self.assertEqual(swap["unsigned_transaction_plan"]["output_asset"], "WETH")
+        self.assertEqual(swap["unsigned_transaction_plan"]["value_wei"], "0")
+        self.assertFalse(swap["execution"]["automatic_second_transaction"])
+        self.assertEqual(self.planning.calls[-1]["symbol"], "WETH-USDG")
+        self.assertEqual(self.planning.calls[-1]["base_token"]["symbol"], "WETH")
+        self.assertEqual(self.planning.calls[-1]["route_capability"], WETH_CAPABILITY)
+
+    async def test_weth_swap_claim_and_wallet_rejection_are_separate_and_hash_free(self):
         prepared = await self.prepare_weth("1")
         row = self.db.get(RobinhoodChainSwapExecution, prepared["execution"]["id"])
-        row.status = "swap_prepared"
-        row.swap_status = "prepared"
+        row.status = "approval_confirmed"
+        row.approval_status = "confirmed"
+        row.allowance_current_atomic = row.exact_input_amount_atomic
+        row.allowance_shortfall_atomic = "0"
+        row.approval_required = False
         self.db.add(row); self.db.commit()
+        self.rpc.allowance_atomic = 1_000_000
+        self.planning.allowance_atomic = 1_000_000
+        swap = await self.service.prepare_swap(
+            self.db, execution_id=row.id, wallet_address=TAKER,
+            eth_token=None, usdg_token=USDG, output_token=WETH,
+            route_capability=WETH_CAPABILITY, confirm_prepare=True,
+        )
         with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
-            with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_stage_locked_r5c3c"):
-                await self.service.claim_swap_send(
-                    self.db, execution_id=row.id, wallet_address=TAKER,
-                    plan_hash=row.swap_plan_hash, claim_id=SWAP_CLAIM,
-                    confirm_send_claim=True,
-                )
+            claimed = await self.service.claim_swap_send(
+                self.db, execution_id=row.id, wallet_address=TAKER,
+                plan_hash=swap["execution"]["swap"]["plan_hash"], claim_id=SWAP_CLAIM,
+                confirm_send_claim=True,
+            )
+        self.assertEqual(claimed["execution"]["status"], "swap_send_claimed")
+        failed = self.service.record_submission_failure(
+            self.db, execution_id=row.id, stage="swap", wallet_address=TAKER,
+            claim_id=SWAP_CLAIM, reason="wallet_rejected", message="declined",
+            confirm_failure=True,
+        )
+        self.assertEqual(failed["execution"]["status"], "swap_wallet_rejected")
+        self.assertIsNone(failed["execution"]["swap"]["tx_hash"])
+        self.assertFalse(failed["execution"]["automatic_second_transaction"])
+
+    async def test_confirmed_weth_swap_reconciles_transfer_balance_and_eth_gas(self):
+        prepared = await self.prepare_weth("1")
+        execution_id = prepared["execution"]["id"]
+        row = self.db.get(RobinhoodChainSwapExecution, execution_id)
+        row.status = "approval_confirmed"
+        row.approval_status = "confirmed"
+        row.allowance_current_atomic = row.exact_input_amount_atomic
+        row.allowance_shortfall_atomic = "0"
+        row.approval_required = False
+        self.db.add(row); self.db.commit()
+        self.rpc.allowance_atomic = 1_000_000
+        self.planning.allowance_atomic = 1_000_000
+        swap = await self.service.prepare_swap(
+            self.db, execution_id=execution_id, wallet_address=TAKER,
+            eth_token=None, usdg_token=USDG, output_token=WETH,
+            route_capability=WETH_CAPABILITY, confirm_prepare=True,
+        )
+        with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
+            await self.service.claim_swap_send(
+                self.db, execution_id=execution_id, wallet_address=TAKER,
+                plan_hash=swap["execution"]["swap"]["plan_hash"], claim_id=SWAP_CLAIM,
+                confirm_send_claim=True,
+            )
+        self.service.record_swap_submission(
+            self.db, execution_id=execution_id, tx_hash=SWAP_TX_HASH,
+            wallet_address=TAKER, claim_id=SWAP_CLAIM, confirm_record=True,
+        )
+        actual_output_atomic = 530_000_000_000_000
+        swap_fee_wei = 245_000 * 80_000_000
+        before_tag = hex(123455)
+        after_tag = hex(123456)
+        self.rpc.native_balances_by_tag[before_tag] = self.rpc.native_balance_wei
+        self.rpc.native_balances_by_tag[after_tag] = self.rpc.native_balance_wei - swap_fee_wei
+        self.rpc.usdg_balances_by_tag[before_tag] = 3_710_769
+        self.rpc.usdg_balances_by_tag[after_tag] = 2_710_769
+        self.rpc.weth_balances_by_tag[before_tag] = 0
+        self.rpc.weth_balances_by_tag[after_tag] = actual_output_atomic
+        self.rpc.swap_receipt = receipt(
+            SWAP_TX_HASH,
+            1,
+            logs=[usdg_spend_log(1_000_000), weth_receive_log(actual_output_atomic)],
+        )
+        result = await self.service.refresh_swap(self.db, execution_id=execution_id)
+        reconciled = result["execution"]
+        self.assertEqual(reconciled["status"], "confirmed")
+        self.assertEqual(reconciled["actual_input_asset"], "USDG")
+        self.assertEqual(reconciled["actual_input_amount"], "1")
+        self.assertEqual(reconciled["actual_output_asset"], "WETH")
+        self.assertEqual(reconciled["actual_output_amount_atomic"], str(actual_output_atomic))
+        self.assertEqual(reconciled["actual_output_amount"], "0.00053")
+        self.assertEqual(reconciled["actual_network_fee_wei"], str(swap_fee_wei))
+        self.assertEqual(reconciled["reconciliation"]["output_transfer_log_count"], 1)
+        self.assertFalse(reconciled["automatic_second_transaction"])
+
+    async def test_weth_reconciliation_rejects_transfer_and_balance_mismatch(self):
+        prepared = await self.prepare_weth("1")
+        execution_id = prepared["execution"]["id"]
+        row = self.db.get(RobinhoodChainSwapExecution, execution_id)
+        row.status = "approval_confirmed"
+        row.approval_status = "confirmed"
+        row.allowance_current_atomic = row.exact_input_amount_atomic
+        row.allowance_shortfall_atomic = "0"
+        row.approval_required = False
+        self.db.add(row); self.db.commit()
+        self.rpc.allowance_atomic = 1_000_000
+        self.planning.allowance_atomic = 1_000_000
+        swap = await self.service.prepare_swap(
+            self.db, execution_id=execution_id, wallet_address=TAKER,
+            eth_token=None, usdg_token=USDG, output_token=WETH,
+            route_capability=WETH_CAPABILITY, confirm_prepare=True,
+        )
+        with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
+            await self.service.claim_swap_send(
+                self.db, execution_id=execution_id, wallet_address=TAKER,
+                plan_hash=swap["execution"]["swap"]["plan_hash"], claim_id=SWAP_CLAIM,
+                confirm_send_claim=True,
+            )
+        self.service.record_swap_submission(
+            self.db, execution_id=execution_id, tx_hash=SWAP_TX_HASH,
+            wallet_address=TAKER, claim_id=SWAP_CLAIM, confirm_record=True,
+        )
+        before_tag = hex(123455)
+        after_tag = hex(123456)
+        self.rpc.native_balances_by_tag[before_tag] = self.rpc.native_balance_wei
+        self.rpc.native_balances_by_tag[after_tag] = self.rpc.native_balance_wei - (245_000 * 80_000_000)
+        self.rpc.usdg_balances_by_tag[before_tag] = 3_710_769
+        self.rpc.usdg_balances_by_tag[after_tag] = 2_710_769
+        self.rpc.weth_balances_by_tag[before_tag] = 0
+        self.rpc.weth_balances_by_tag[after_tag] = 529_999_999_999_999
+        self.rpc.swap_receipt = receipt(
+            SWAP_TX_HASH,
+            1,
+            logs=[usdg_spend_log(1_000_000), weth_receive_log(530_000_000_000_000)],
+        )
+        with self.assertRaisesRegex(ValueError, "erc20_output_balance_delta_mismatch"):
+            await self.service.refresh_swap(self.db, execution_id=execution_id)
 
     def test_router_weth_prepare_uses_database_capability_and_token_registry_identity(self):
         source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
@@ -780,6 +935,9 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("to_asset=to_asset", source)
         self.assertIn("to_token=base_token", source)
         self.assertIn("route_capability=capability", source)
+        self.assertIn('symbol="WETH-USDG"', source)
+        self.assertIn("output_token=base_token", source)
+        self.assertIn("additional_erc20_assets=[output_asset]", source)
 
     async def test_evm_rpc_supports_read_only_historical_balance_tags(self):
         client = EvmRpcClient(name="test", rpc_url="http://example.invalid", expected_chain_id=4663)
@@ -813,8 +971,9 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"venue": "robinhood_chain"', source)
         self.assertIn('"side": "buy"', source)
         self.assertIn('"type": "swap"', source)
-        self.assertIn('"expected_input_asset": "USDG"', source)
-        self.assertIn('"expected_output_asset": "ETH"', source)
+        self.assertIn('"expected_input_asset": str(row.from_asset', source)
+        self.assertIn('"expected_output_asset": str(row.to_asset', source)
+        self.assertIn('"actual_output_asset": reconciliation.get("output_asset")', source)
 
 
 if __name__ == "__main__":

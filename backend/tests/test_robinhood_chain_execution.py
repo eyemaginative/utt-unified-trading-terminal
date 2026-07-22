@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,8 +20,10 @@ if str(BACKEND_ROOT) not in sys.path:
 from app.config import settings  # noqa: E402
 from app.models import RobinhoodChainExecution, TokenRegistry, WalletAddress, WalletAddressSnapshot  # noqa: E402
 from app.services.robinhood_chain_execution import (  # noqa: E402
+    ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH,
     ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI,
     RobinhoodChainExecutionService,
+    normalize_robinhood_chain_execution_quantity,
     validate_execution_saved_wallet,
 )
 
@@ -51,29 +54,44 @@ USDG = {
 class FakePlanningService:
     def __init__(self) -> None:
         self.calls = []
-        self.quote_id = "11" * 32
         self.fetched = datetime.now(timezone.utc)
         self.expires = self.fetched + timedelta(seconds=30)
+        self.plan_input_amount_override = None
+        self.plan_input_atomic_override = None
+        self.plan_value_override = None
 
     async def firm_quote_plan(self, **kwargs):
         self.calls.append(dict(kwargs))
         fetched = self.fetched
         expires = self.expires
+        amount = Decimal(str(kwargs["quantity"]))
+        amount_text = format(amount, "f").rstrip("0").rstrip(".")
+        amount_atomic = int(amount * (Decimal(10) ** 18))
+        ratio = amount / Decimal("0.002")
+        output_amount = Decimal("3.727812") * ratio
+        minimum_received = Decimal("3.690612") * ratio
+        minimum_received_atomic = int(minimum_received * (Decimal(10) ** 6))
+        quote_id = hashlib.sha256(
+            f"{amount_text}|{int(kwargs['slippage_bps'])}|{TAKER}".encode("utf-8")
+        ).hexdigest()
+        plan_input_amount = self.plan_input_amount_override or amount_text
+        plan_input_atomic = self.plan_input_atomic_override or str(amount_atomic)
+        plan_value = self.plan_value_override or str(amount_atomic)
         return {
             "ok": True,
             "chain_id": 4663,
             "symbol": "ETH-USDG",
             "side": "sell",
             "input_asset": "ETH",
-            "input_amount": "0.002",
-            "input_amount_atomic": str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI),
+            "input_amount": plan_input_amount,
+            "input_amount_atomic": plan_input_atomic,
             "output_asset": "USDG",
-            "output_amount": "3.727812",
-            "minimum_received": "3.690612",
-            "minimum_received_atomic": "3690612",
+            "output_amount": format(output_amount, "f").rstrip("0").rstrip("."),
+            "minimum_received": format(minimum_received, "f").rstrip("0").rstrip("."),
+            "minimum_received_atomic": str(minimum_received_atomic),
             "slippage_bps": int(kwargs["slippage_bps"]),
             "approval_required": False,
-            "quote_id": self.quote_id,
+            "quote_id": quote_id,
             "fetched_at": fetched.isoformat(),
             "plan_expires_at": expires.isoformat(),
             "route": {
@@ -82,7 +100,7 @@ class FakePlanningService:
             "unsigned_transaction_plan": {
                 "from": TAKER,
                 "to": DESTINATION,
-                "value_wei": str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI),
+                "value_wei": plan_value,
                 "gas_limit": "300000",
                 "gas_price_wei": "80000000",
                 "calldata": CALldata,
@@ -95,10 +113,11 @@ class FakePlanningService:
 
 
 class FakeRpcClient:
-    def __init__(self, *, receipt=None, mutate_tx=None, transaction_available=True) -> None:
+    def __init__(self, *, receipt=None, mutate_tx=None, transaction_available=True, transaction_value_wei=ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI) -> None:
         self.receipt = receipt
         self.mutate_tx = mutate_tx
         self.transaction_available = transaction_available
+        self.transaction_value_wei = int(transaction_value_wei)
         self.calls = []
 
     async def verify_expected_chain(self, *, force_refresh=False):
@@ -119,7 +138,7 @@ class FakeRpcClient:
                 "hash": TX_HASH,
                 "from": TAKER,
                 "to": DESTINATION,
-                "value": hex(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI),
+                "value": hex(self.transaction_value_wei),
                 "input": CALldata,
             }
             if self.mutate_tx:
@@ -203,18 +222,19 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.db.close()
 
-    async def prepare(self):
+    async def prepare(self, quantity="0.002"):
         return await self.service.prepare(
             self.db,
             taker_address=TAKER,
             eth_token=ETH,
             usdg_token=USDG,
+            quantity=quantity,
             slippage_bps=100,
             confirm_prepare=True,
         )
 
-    async def prepare_and_claim(self):
-        prepared = await self.prepare()
+    async def prepare_and_claim(self, quantity="0.002"):
+        prepared = await self.prepare(quantity)
         with (
             patch.object(settings.__class__, "robinhood_chain_effective_enabled", return_value=True),
             patch.object(settings, "robinhood_chain_live_execution_enabled", True),
@@ -231,8 +251,8 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
         return prepared, claim
 
-    async def prepare_claim_and_record(self):
-        prepared, claim = await self.prepare_and_claim()
+    async def prepare_claim_and_record(self, quantity="0.002"):
+        prepared, claim = await self.prepare_and_claim(quantity)
         recorded = self.service.record_submission(
             self.db,
             execution_id=prepared["execution"]["id"],
@@ -243,7 +263,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         return prepared, claim, recorded
 
-    async def test_prepare_is_fixed_and_idempotent(self):
+    async def test_prepare_preserves_legacy_maximum_and_is_idempotent(self):
         first = await self.prepare()
         second = await self.prepare()
         self.assertTrue(first["ok"])
@@ -258,12 +278,73 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["tx_hash"])
         self.assertEqual(self.db.query(RobinhoodChainExecution).count(), 1)
 
-    async def test_previous_0001_prepared_row_cannot_receive_send_claim(self):
-        prepared = await self.prepare()
+    async def test_custom_0001_prepare_preserves_amount_and_plan_request(self):
+        prepared = await self.prepare("0.001")
+        row = prepared["execution"]
+        self.assertEqual(row["input_amount"], "0.001")
+        self.assertEqual(row["input_amount_atomic"], "1000000000000000")
+        self.assertEqual(row["transaction_value_wei"], "1000000000000000")
+        self.assertEqual(self.planning.calls[-1]["quantity"], "0.001")
+        self.assertEqual(prepared["unsigned_transaction_plan"]["value_wei"], "1000000000000000")
+
+    async def test_custom_amounts_are_distinct_and_each_is_idempotent(self):
+        first_001 = await self.prepare("0.001")
+        second_001 = await self.prepare("0.001")
+        first_002 = await self.prepare("0.002")
+        second_002 = await self.prepare("0.002")
+        self.assertFalse(first_001["idempotent"])
+        self.assertTrue(second_001["idempotent"])
+        self.assertFalse(first_002["idempotent"])
+        self.assertTrue(second_002["idempotent"])
+        self.assertNotEqual(first_001["execution"]["id"], first_002["execution"]["id"])
+        self.assertNotEqual(first_001["execution"]["plan_hash"], first_002["execution"]["plan_hash"])
+        self.assertEqual(self.db.query(RobinhoodChainExecution).count(), 2)
+
+    async def test_custom_quantity_validation_fails_closed(self):
+        cases = (
+            ("0", "invalid_robinhood_chain_execution_quantity"),
+            ("-0.001", "invalid_robinhood_chain_execution_quantity"),
+            ("0.002000000000000001", "quantity_exceeds_cap"),
+            ("0.0000000000000000001", "precision_exceeded"),
+        )
+        for quantity, expected in cases:
+            with self.subTest(quantity=quantity):
+                with self.assertRaisesRegex(ValueError, expected):
+                    await self.prepare(quantity)
+        self.assertEqual(self.db.query(RobinhoodChainExecution).count(), 0)
+
+    async def test_quantity_normalizer_preserves_18_decimal_atomic_identity(self):
+        amount, text, atomic = normalize_robinhood_chain_execution_quantity("0.000000000000000001")
+        self.assertEqual(amount, Decimal("0.000000000000000001"))
+        self.assertEqual(text, "0.000000000000000001")
+        self.assertEqual(atomic, 1)
+        self.assertEqual(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH, Decimal("0.002"))
+
+    async def test_firm_plan_display_amount_mismatch_is_rejected(self):
+        self.planning.plan_input_amount_override = "0.0015"
+        with self.assertRaisesRegex(ValueError, "execution_plan_input_amount_mismatch"):
+            await self.prepare("0.001")
+
+    async def test_firm_plan_atomic_amount_mismatch_is_rejected(self):
+        self.planning.plan_input_atomic_override = "1000000000000001"
+        with self.assertRaisesRegex(ValueError, "execution_plan_input_amount_mismatch"):
+            await self.prepare("0.001")
+
+    async def test_firm_plan_transaction_value_mismatch_is_rejected(self):
+        self.planning.plan_value_override = "1000000000000001"
+        with self.assertRaisesRegex(ValueError, "execution_plan_transaction_value_mismatch"):
+            await self.prepare("0.001")
+
+    async def test_custom_0001_row_can_receive_send_claim(self):
+        prepared, claim = await self.prepare_and_claim("0.001")
+        self.assertTrue(claim["ok"])
+        self.assertEqual(claim["execution"]["input_amount"], "0.001")
+        self.assertEqual(claim["execution"]["transaction_value_wei"], "1000000000000000")
+
+    async def test_inconsistent_dynamic_row_cannot_receive_send_claim(self):
+        prepared = await self.prepare("0.001")
         row = self.db.query(RobinhoodChainExecution).one()
-        row.input_amount = "0.001"
-        row.input_amount_atomic = "1000000000000000"
-        row.transaction_value_wei = "1000000000000000"
+        row.transaction_value_wei = str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI)
         self.db.commit()
         with (
             patch.object(settings.__class__, "robinhood_chain_effective_enabled", return_value=True),
@@ -271,7 +352,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(settings, "armed", True),
             patch.object(settings, "dry_run", False),
         ):
-            with self.assertRaisesRegex(ValueError, "locked_input_amount_mismatch"):
+            with self.assertRaisesRegex(ValueError, "locked_transaction_value_mismatch"):
                 self.service.claim_send(
                     self.db,
                     execution_id=prepared["execution"]["id"],
@@ -280,6 +361,13 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
                     claim_id=CLAIM_ID,
                     confirm_send_claim=True,
                 )
+
+    def test_router_normalizes_custom_quantity_and_passes_it_to_service(self):
+        source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
+        self.assertIn("normalize_robinhood_chain_execution_quantity(request.quantity)", source)
+        self.assertIn("quantity=normalized_quantity", source)
+        self.assertIn('"maximum_quantity_eth"', source)
+        self.assertNotIn('"robinhood_chain_execution_amount_locked"', source)
 
     async def test_post_confirmation_balance_snapshot_helper_force_refreshes_eth_and_usdg(self):
         engine = create_engine("sqlite:///:memory:", future=True)
@@ -345,6 +433,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
                 taker_address=TAKER,
                 eth_token=ETH,
                 usdg_token=USDG,
+                quantity="0.001",
                 slippage_bps=100,
                 confirm_prepare=False,
             )

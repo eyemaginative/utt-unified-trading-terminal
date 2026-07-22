@@ -22,8 +22,13 @@ from .robinhood_chain_transaction_planning import (
 
 ROBINHOOD_CHAIN_EXECUTION_SYMBOL = "ETH-USDG"
 ROBINHOOD_CHAIN_EXECUTION_SIDE = "sell"
+# Backward-compatible names retained for callers that display the historical
+# accepted amount. R5C.3B.1 treats this value as the maximum reviewed input,
+# not as a mandatory fixed amount.
 ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH = Decimal("0.002")
 ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI = 2_000_000_000_000_000
+ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH = ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH
+ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI = ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI
 ROBINHOOD_CHAIN_EXECUTION_STATUSES = frozenset(
     {
         "prepared",
@@ -94,6 +99,36 @@ def _decimal_text(value: Any, *, field: str) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
+
+
+def normalize_robinhood_chain_execution_quantity(value: Any) -> tuple[Decimal, str, int]:
+    """Normalize one positive native-ETH input bounded by the reviewed cap."""
+    raw = str(value if value is not None else "").strip()
+    try:
+        amount = Decimal(raw)
+    except Exception as exc:
+        raise ValueError("invalid_robinhood_chain_execution_quantity") from exc
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("invalid_robinhood_chain_execution_quantity")
+
+    normalized = amount.normalize()
+    if normalized.as_tuple().exponent < -18:
+        raise ValueError("robinhood_chain_execution_quantity_precision_exceeded")
+    if amount > ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH:
+        raise ValueError("robinhood_chain_execution_quantity_exceeds_cap")
+
+    atomic_decimal = amount * _WEI_PER_ETH
+    integral_atomic = atomic_decimal.to_integral_value()
+    if atomic_decimal != integral_atomic:
+        raise ValueError("robinhood_chain_execution_quantity_precision_exceeded")
+    atomic = int(integral_atomic)
+    if atomic <= 0 or atomic > ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI:
+        raise ValueError("robinhood_chain_execution_quantity_exceeds_cap")
+
+    text = format(amount, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return amount, text or "0", atomic
 
 
 def _topic_address(value: Any, *, field: str) -> str:
@@ -344,8 +379,12 @@ def _execution_gate() -> Dict[str, Any]:
         "chain_id": EXPECTED_CHAIN_ID,
         "symbol": ROBINHOOD_CHAIN_EXECUTION_SYMBOL,
         "side": ROBINHOOD_CHAIN_EXECUTION_SIDE,
-        "exact_input_eth": format(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH, "f"),
-        "exact_input_wei": str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI),
+        "exact_input_policy": "custom_up_to_reviewed_maximum",
+        "exact_input_eth": format(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH, "f"),
+        "exact_input_wei": str(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI),
+        "maximum_input_eth": format(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH, "f"),
+        "maximum_input_wei": str(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI),
+        "custom_input_enabled": True,
         "dedicated_execution_enabled": dedicated,
         "armed": armed,
         "dry_run": dry_run,
@@ -370,9 +409,15 @@ def _validate_execution_row_lock(row: RobinhoodChainExecution) -> None:
         raise ValueError("robinhood_chain_execution_locked_input_asset_mismatch")
     if str(row.expected_output_asset or "").strip().upper() != "USDG":
         raise ValueError("robinhood_chain_execution_locked_output_asset_mismatch")
-    if str(row.input_amount_atomic or "").strip() != str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI):
+    try:
+        _, normalized_amount, expected_atomic = normalize_robinhood_chain_execution_quantity(row.input_amount)
+    except ValueError as exc:
+        raise ValueError("robinhood_chain_execution_locked_input_amount_mismatch") from exc
+    if normalized_amount != str(row.input_amount or "").strip():
         raise ValueError("robinhood_chain_execution_locked_input_amount_mismatch")
-    if str(row.transaction_value_wei or "").strip() != str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI):
+    if str(row.input_amount_atomic or "").strip() != str(expected_atomic):
+        raise ValueError("robinhood_chain_execution_locked_input_amount_mismatch")
+    if str(row.transaction_value_wei or "").strip() != str(expected_atomic):
         raise ValueError("robinhood_chain_execution_locked_transaction_value_mismatch")
 
 
@@ -472,6 +517,7 @@ class RobinhoodChainExecutionService:
         taker_address: str,
         eth_token: Dict[str, Any],
         usdg_token: Dict[str, Any],
+        quantity: Any = ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH,
         slippage_bps: int,
         confirm_prepare: bool,
     ) -> Dict[str, Any]:
@@ -479,10 +525,11 @@ class RobinhoodChainExecutionService:
             raise ValueError("confirm_prepare_required")
 
         taker = validate_evm_address(taker_address).lower()
+        _, requested_amount_text, requested_amount_wei = normalize_robinhood_chain_execution_quantity(quantity)
         plan = await self.planning_service.firm_quote_plan(
             symbol=ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL,
             side=ROBINHOOD_CHAIN_EXECUTION_SIDE,
-            quantity=format(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH, "f"),
+            quantity=requested_amount_text,
             total_quote=None,
             taker_address=taker,
             eth_token=eth_token,
@@ -505,9 +552,19 @@ class RobinhoodChainExecutionService:
             raise ValueError("execution_plan_input_asset_mismatch")
         if str(plan.get("output_asset") or "").strip().upper() != "USDG":
             raise ValueError("execution_plan_output_asset_mismatch")
-        if str(plan.get("input_amount_atomic") or "").strip() != str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI):
+        try:
+            _, planned_amount_text, planned_amount_wei = normalize_robinhood_chain_execution_quantity(
+                plan.get("input_amount")
+            )
+        except ValueError as exc:
+            raise ValueError("execution_plan_input_amount_mismatch") from exc
+        if planned_amount_text != requested_amount_text:
             raise ValueError("execution_plan_input_amount_mismatch")
-        if identity["transaction_value_wei"] != str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI):
+        if str(plan.get("input_amount_atomic") or "").strip() != str(requested_amount_wei):
+            raise ValueError("execution_plan_input_amount_mismatch")
+        if planned_amount_wei != requested_amount_wei:
+            raise ValueError("execution_plan_input_amount_mismatch")
+        if identity["transaction_value_wei"] != str(requested_amount_wei):
             raise ValueError("execution_plan_transaction_value_mismatch")
         if identity["wallet_address"] != taker:
             raise ValueError("execution_plan_wallet_mismatch")
@@ -544,8 +601,8 @@ class RobinhoodChainExecutionService:
             symbol=ROBINHOOD_CHAIN_EXECUTION_SYMBOL,
             side=ROBINHOOD_CHAIN_EXECUTION_SIDE,
             input_asset="ETH",
-            input_amount=format(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH, "f"),
-            input_amount_atomic=str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI),
+            input_amount=requested_amount_text,
+            input_amount_atomic=str(requested_amount_wei),
             expected_output_asset="USDG",
             expected_output_amount=_decimal_text(plan.get("output_amount"), field="expected_output"),
             minimum_output_amount=_decimal_text(plan.get("minimum_received"), field="minimum_output"),

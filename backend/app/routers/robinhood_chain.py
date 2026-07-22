@@ -41,10 +41,12 @@ from ..services.robinhood_chain_transaction_planning import (
 )
 from ..services.robinhood_chain_execution import (
     ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH,
+    ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH,
     ROBINHOOD_CHAIN_EXECUTION_SIDE,
     ROBINHOOD_CHAIN_EXECUTION_SYMBOL,
     ROBINHOOD_CHAIN_SUBMISSION_FAILURE_REASONS,
     get_robinhood_chain_execution_service,
+    normalize_robinhood_chain_execution_quantity,
     validate_execution_saved_wallet,
 )
 from ..services.robinhood_chain_buy_execution import (
@@ -59,6 +61,7 @@ from ..services.robinhood_chain_buy_execution import (
 )
 from ..services.robinhood_chain_swap_execution import (
     ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE,
+    ROBINHOOD_CHAIN_SWAP_APPROVAL_TO_ASSETS,
     ROBINHOOD_CHAIN_SWAP_DEFAULT_USDG,
     ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE,
     ROBINHOOD_CHAIN_SWAP_FROM_ASSET,
@@ -566,7 +569,12 @@ class RobinhoodChainBuySwapPrepareRequest(BaseModel):
 
 class RobinhoodChainSwapExecutionPrepareRequest(BaseModel):
     from_asset: str = Field(default=ROBINHOOD_CHAIN_SWAP_FROM_ASSET, min_length=1, max_length=32)
-    to_asset: str = Field(default=ROBINHOOD_CHAIN_SWAP_TO_ASSET, min_length=1, max_length=32)
+    to_asset: str = Field(
+        default=ROBINHOOD_CHAIN_SWAP_TO_ASSET,
+        min_length=1,
+        max_length=32,
+        description="Approval-review output asset. R5C.3B accepts ETH or WETH; WETH swap execution remains locked.",
+    )
     amount_mode: str = Field(default=ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE, min_length=1, max_length=32)
     exact_input_amount: str = Field(default=str(ROBINHOOD_CHAIN_SWAP_DEFAULT_USDG), min_length=1, max_length=80)
     slippage_bps: int = Field(
@@ -1816,14 +1824,16 @@ async def robinhood_chain_execution_prepare(
         raise HTTPException(status_code=400, detail={"error": "robinhood_chain_execution_symbol_locked"})
     if str(request.side or "").strip().lower() != ROBINHOOD_CHAIN_EXECUTION_SIDE:
         raise HTTPException(status_code=400, detail={"error": "robinhood_chain_execution_side_locked"})
-    if str(request.quantity or "").strip() != str(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH):
+    try:
+        _, normalized_quantity, _ = normalize_robinhood_chain_execution_quantity(request.quantity)
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail={
-                "error": "robinhood_chain_execution_amount_locked",
-                "required_quantity_eth": str(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH),
+                "error": str(exc),
+                "maximum_quantity_eth": str(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH),
             },
-        )
+        ) from exc
 
     taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
     eth = _resolve_execution_discovery_token(db, "ETH")
@@ -1834,6 +1844,7 @@ async def robinhood_chain_execution_prepare(
             taker_address=taker,
             eth_token=eth,
             usdg_token=usdg,
+            quantity=normalized_quantity,
             slippage_bps=int(request.slippage_bps),
             confirm_prepare=bool(request.confirm_prepare),
         )
@@ -1972,7 +1983,7 @@ async def robinhood_chain_execution_refresh(
 
 @router.get("/swap-execution/status")
 async def robinhood_chain_swap_execution_status() -> Dict[str, Any]:
-    """Return the RH-CHAIN.10D.2-R5B two-stage exact-spend execution gate."""
+    """Return the exact-spend approval gate and the separately scoped swap gate."""
     return get_robinhood_chain_swap_execution_service().status()
 
 
@@ -1985,10 +1996,36 @@ async def robinhood_chain_swap_execution_prepare(
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
     if str(request.from_asset).strip().upper() != ROBINHOOD_CHAIN_SWAP_FROM_ASSET:
         raise HTTPException(status_code=400, detail={"error": "robinhood_chain_swap_from_asset_locked"})
-    if str(request.to_asset).strip().upper() != ROBINHOOD_CHAIN_SWAP_TO_ASSET:
-        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_swap_to_asset_locked"})
+    to_asset = str(request.to_asset).strip().upper()
+    if to_asset not in ROBINHOOD_CHAIN_SWAP_APPROVAL_TO_ASSETS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "robinhood_chain_swap_to_asset_locked",
+                "allowed_to_assets": sorted(ROBINHOOD_CHAIN_SWAP_APPROVAL_TO_ASSETS),
+            },
+        )
     if str(request.amount_mode).strip().lower() not in {ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE, ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE}:
         raise HTTPException(status_code=400, detail={"error": "robinhood_chain_swap_amount_mode_locked"})
+    market_symbol = f"{to_asset}-USDG"
+    market, base_token, quote_token, capability = _resolve_robinhood_chain_review_market(
+        db,
+        symbol=market_symbol,
+        side="buy",
+        amount_mode="exact_input",
+    )
+    if (
+        str(base_token.get("symbol") or "").strip().upper() != to_asset
+        or str(quote_token.get("symbol") or "").strip().upper() != ROBINHOOD_CHAIN_SWAP_FROM_ASSET
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "robinhood_chain_swap_market_identity_mismatch",
+                "symbol": market.get("symbol"),
+                "provider_contacted": False,
+            },
+        )
     taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
     try:
         return await get_robinhood_chain_swap_execution_service().prepare(
@@ -1996,8 +2033,11 @@ async def robinhood_chain_swap_execution_prepare(
             taker_address=taker,
             exact_input_amount=request.exact_input_amount,
             slippage_bps=int(request.slippage_bps),
-            eth_token=_resolve_execution_discovery_token(db, "ETH"),
-            usdg_token=_resolve_execution_discovery_token(db, "USDG"),
+            eth_token=base_token if to_asset == "ETH" else None,
+            usdg_token=quote_token,
+            to_asset=to_asset,
+            to_token=base_token,
+            route_capability=capability,
             confirm_prepare=bool(request.confirm_prepare),
         )
     except (ValueError, KeyError) as exc:

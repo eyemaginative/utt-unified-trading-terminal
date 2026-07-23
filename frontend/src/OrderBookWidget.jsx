@@ -669,8 +669,7 @@ export default function OrderBookWidget({
   effectiveVenue,
   fmtNum,
   styles,
-  obSymbol,
-  setObSymbol,
+  marketSymbol,
   obDepth,
   setObDepth,
   appContainerRef,
@@ -678,6 +677,9 @@ export default function OrderBookWidget({
   onPickPrice,
   onPickQty,
 }) {
+  // RH-UI.MKT.1: App owns the committed market. This widget may refresh it,
+  // but it must not substitute or mutate it.
+  const obSymbol = String(marketSymbol || "").trim();
   const [obBids, setObBids] = useState([]);
   const [obAsks, setObAsks] = useState([]);
   const [obLoading, setObLoading] = useState(false);
@@ -691,9 +693,6 @@ export default function OrderBookWidget({
   const [counterpartyLiquidityFilter, setCounterpartyLiquidityFilter] = useState(() => readCounterpartyLiquidityFilter());
   const [counterpartyExecutionMode, setCounterpartyExecutionMode] = useState(() => readCounterpartyExecutionMode());
   const quoteUsdReqRef = useRef(0);
-
-  // NEW: local draft so typing doesn't spam the backend
-  const [symbolDraft, setSymbolDraft] = useState(String(obSymbol || ""));
 
   // Order rules (price display + click-to-ticket normalization) for ANY venue
   const [priceDecimals, setPriceDecimals] = useState(null);
@@ -851,9 +850,16 @@ export default function OrderBookWidget({
     };
   }, []);
 
-  // Keep draft in sync when parent sets obSymbol (e.g. from clicks elsewhere)
+  // Reset stale book state whenever the App-level venue/market/depth changes.
   useEffect(() => {
-    setSymbolDraft(String(obSymbol || ""));
+    try {
+      if (abortRef.current) abortRef.current.abort();
+    } catch {
+      // ignore
+    }
+    inFlightRef.current = false;
+    setObLoading(false);
+    setObError(null);
     // Reset pair gating when symbol changes externally. Preserve an active
     // Counterparty service-wide cooldown so symbol changes cannot bypass 429.
     pairNotFoundRef.current = false;
@@ -877,6 +883,8 @@ export default function OrderBookWidget({
       cooldownUntilRef.current = 0;
       cooldownPowRef.current = 0;
       setCounterpartyResilience(null);
+      setObAsks([]);
+      setObBids([]);
       setOrderBookMeta(null);
     }
     setHydrationStatus(null);
@@ -937,15 +945,6 @@ export default function OrderBookWidget({
         if (cancelled || robinhoodChainMarketsReqRef.current !== reqId) return;
         setRobinhoodChainMarkets(items);
 
-        const current = robinhoodChainPairParts(obSymbol).symbol;
-        const currentExists = items.some((item) => robinhoodChainPairParts(item?.symbol).symbol === current);
-        if (!currentExists && items.length > 0) {
-          const preferred = items.find((item) => item?.execution_enabled === true)
-            || items.find((item) => item?.orderbook_enabled === true)
-            || items[0];
-          const next = robinhoodChainPairParts(preferred?.symbol).symbol;
-          if (next) setObSymbol(next);
-        }
       } catch (error) {
         if (cancelled || String(error?.name || "") === "AbortError") return;
         setRobinhoodChainMarkets([]);
@@ -2496,9 +2495,9 @@ function clampBox(next) {
     );
   }
 
-  function commitSymbolAndRefresh(force = false) {
-    const next = String(symbolDraft || "").trim();
-    if (!next) return;
+  function refreshSelectedMarket(force = false) {
+    const selectedMarket = String(obSymbol || "").trim();
+    if (!selectedMarket) return;
 
     const now = Date.now();
     if (isCounterpartyVenue && now < (cooldownUntilRef.current || 0)) {
@@ -2513,15 +2512,8 @@ function clampBox(next) {
       cooldownPowRef.current = 0;
     }
 
-    if (next !== String(obSymbol || "")) {
-      setObSymbol(next);
-      // fetch immediately using override (so we don't wait for parent state to propagate)
-      void fetchOrderBook({ symbolOverride: next, force: true });
-      void fetchOrderRules(next);
-    } else {
-      void fetchOrderBook({ force: !!force });
-      void fetchOrderRules(next);
-    }
+    void fetchOrderBook({ force: !!force });
+    void fetchOrderRules(selectedMarket);
   }
 
   const counterpartyCooldownRemainingMs = isCounterpartyVenue
@@ -2602,43 +2594,14 @@ function clampBox(next) {
         </div>
 
         <div style={topControlsStyle}>
-          <div style={topPillCompact()}>
-            <span>Symbol</span>
-            {isRobinhoodChainVenue ? (
-              <select
-                style={{ ...darkSelectStyle, width: "100%", minWidth: 0, flex: "1 1 0" }}
-                value={robinhoodChainPairParts(obSymbol).symbol}
-                disabled={robinhoodChainMarketsLoading || robinhoodChainMarkets.length === 0}
-                onChange={(event) => {
-                  const next = robinhoodChainPairParts(event.target.value).symbol;
-                  if (!next) return;
-                  setSymbolDraft(next);
-                  setObSymbol(next);
-                  pairNotFoundRef.current = false;
-                }}
-                title="Database-backed Robinhood Chain market objectives. Contracts and decimals come from TokenRegistry."
-              >
-                {robinhoodChainMarkets.length === 0 ? (
-                  <option style={darkOptionStyle} value={robinhoodChainPairParts(obSymbol).symbol}>
-                    {robinhoodChainMarketsLoading ? "Loading database markets…" : "No database markets"}
-                  </option>
-                ) : robinhoodChainMarkets.map((market) => (
-                  <option key={market?.id || market?.symbol} style={darkOptionStyle} value={robinhoodChainPairParts(market?.symbol).symbol}>
-                    {market?.symbol} · {robinhoodChainMarketStatusLabel(market)}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input
-                style={inputCompact({ width: "100%", minWidth: 0, flex: "1 1 0" })}
-                value={symbolDraft}
-                placeholder="e.g. BTC-USD"
-                onChange={(e) => setSymbolDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") commitSymbolAndRefresh(true);
-                }}
-              />
-            )}
+          <div
+            style={topPillCompact()}
+            title="Market follows the top-level MARKET selector. Change it in the main UTT header."
+          >
+            <span>Market</span>
+            <b style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {obSymbol || "—"}
+            </b>
           </div>
 
           <button
@@ -2654,7 +2617,7 @@ function clampBox(next) {
             style={{ ...btnCompact(), ...((obLoading || counterpartyCooldownActive) ? styles.buttonDisabled : {}) }}
             disabled={obLoading || counterpartyCooldownActive}
             title={counterpartyCooldownActive ? `Counterparty cooldown active. Refresh available in ${counterpartyCooldownLabel}.` : "Refresh OrderBook"}
-            onClick={() => commitSymbolAndRefresh(true)}
+            onClick={() => refreshSelectedMarket(true)}
           >
             {obLoading ? "Loading…" : counterpartyCooldownActive ? `Retry ${counterpartyCooldownLabel}` : "Refresh"}
           </button>

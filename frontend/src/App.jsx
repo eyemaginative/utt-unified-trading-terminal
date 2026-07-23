@@ -5614,9 +5614,11 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
   }, [discVenue, supportedVenues, tab]);
 
   // ─────────────────────────────────────────────────────────────
-  // Order Book widget state
+  // Global committed market state
   // ─────────────────────────────────────────────────────────────
-  const [obSymbol, setObSymbol] = useState("BTC-USD");
+  // RH-UI.MKT.1: this is the single market authority for Chart,
+  // Order Book, and Order Ticket. Widget-local market controls are read-only.
+  const [activeMarketSymbol, setActiveMarketSymbol] = useState("BTC-USD");
   const [obDepth, setObDepth] = useState(25);
 
   const selectedVenueNorm = normalizeVenue(venue);
@@ -5651,13 +5653,8 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
   // ─────────────────────────────────────────────────────────────
   // Order Ticket state
   // ─────────────────────────────────────────────────────────────
-  const [otSymbol, setOtSymbol] = useState(obSymbol);
   const [otQty, setOtQty] = useState("");
   const [otLimitPrice, setOtLimitPrice] = useState("");
-
-  useEffect(() => {
-    setOtSymbol(String(obSymbol || "").trim());
-  }, [obSymbol]);
 
   // ─────────────────────────────────────────────────────────────
   // Market/Venue selection unification
@@ -5692,7 +5689,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     }
 
     if (setInput) setMarketInput(sym);
-    setObSymbol(sym);
+    setActiveMarketSymbol(sym);
 
     const v = String(venueCandidate || "").trim().toLowerCase();
     const vOk = v && supportedVenues.includes(v);
@@ -6039,7 +6036,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
               localStorage.removeItem(LS_VISIBLE_WIDGETS);
               setVisible({ ...DEFAULT_VISIBLE });
             }}
-            obSymbol={obSymbol}
+            obSymbol={activeMarketSymbol}
             arbVenues={arbVenues}
             fmtPrice={fmtPrice}
             hideVenueNames={hideVenueNames}
@@ -6082,7 +6079,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                   appContainerRef={appContainerRef}
                   headerRef={headerRef}
                   venue={effectiveChartVenue}
-                  symbolCanon={obSymbol}
+                  symbolCanon={activeMarketSymbol}
                   interval="15"
                   hideVenueNames={hideVenueNames}
                   visible={visible}
@@ -6268,8 +6265,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                           effectiveVenue={effectiveObVenue}
                           fmtNum={fmtNum}
                           styles={styles}
-                          obSymbol={obSymbol}
-                          setObSymbol={setObSymbol}
+                          marketSymbol={activeMarketSymbol}
                           obDepth={obDepth}
                           setObDepth={setObDepth}
                           appContainerRef={appContainerRef}
@@ -6322,13 +6318,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
                           effectiveVenue={effectiveTradeVenue}
                           fmtNum={fmtNum}
                           styles={styles}
-                          otSymbol={otSymbol}
-                          setOtSymbol={(nextSymbol) => {
-                            setOtSymbol(nextSymbol);
-                            if (selectedVenueNorm === ROBINHOOD_CHAIN_VENUE) {
-                              setObSymbol(String(nextSymbol || "").trim());
-                            }
-                          }}
+                          marketSymbol={activeMarketSymbol}
                           appContainerRef={appContainerRef}
                           hideVenueNames={hideVenueNames}
                           hideTableData={hideTableDataGlobal}
@@ -6401,7 +6391,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
               <ArbWindow
                 {...common}
                 styles={styles}
-                symbolCanon={obSymbol}
+                symbolCanon={activeMarketSymbol}
                 venues={arbVenues}
                 fmtPrice={fmtPrice}
                 fetchArbSnapshot={({ apiBase, symbol, venues }) => getArbSnapshot({ apiBase, symbol, venues })}

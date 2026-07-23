@@ -3152,8 +3152,7 @@ export default function OrderTicketWidget({
   effectiveVenue,
   fmtNum,
   styles,
-  otSymbol,
-  setOtSymbol,
+  marketSymbol,
   appContainerRef,
   hideVenueNames = false,
 
@@ -3168,6 +3167,10 @@ export default function OrderTicketWidget({
   onAllOrdersRefresh = null,
   onBalancesRefresh = null,
 }) {
+  // RH-UI.MKT.1: App owns the committed market. The ticket consumes it as
+  // read-only identity and invalidates stale review state when it changes.
+  const otSymbol = String(marketSymbol || "").trim();
+
   // Optional toast emitter (some app shells inject this; keep safe/no-op if absent)
   const onToast = (typeof window !== "undefined" && (window.__uttOnToast || window.uttOnToast))
     ? (window.__uttOnToast || window.uttOnToast)
@@ -3587,15 +3590,6 @@ export default function OrderTicketWidget({
         if (cancelled || robinhoodChainMarketsReqRef.current !== reqId) return;
         setRobinhoodChainMarkets(items);
 
-        const current = robinhoodChainPairParts(otSymbol).symbol;
-        const currentExists = items.some((market) => normalizeRobinhoodChainQuoteSymbol(market?.symbol) === current);
-        if (!currentExists && items.length > 0) {
-          const preferred = items.find((market) => market?.execution_enabled === true)
-            || items.find((market) => market?.orderbook_enabled === true)
-            || items[0];
-          const next = robinhoodChainPairParts(preferred?.symbol).symbol;
-          if (next) setOtSymbol(next);
-        }
       } catch (error) {
         if (cancelled) return;
         setRobinhoodChainMarkets([]);
@@ -4013,6 +4007,19 @@ export default function OrderTicketWidget({
     robinhoodChainWalletOnExpectedChain &&
     (robinhoodChainWalletMatchesSaved || (robinhoodChainCapabilityFallbackActive && !robinhoodChainSavedAddress))
   );
+
+  useEffect(() => {
+    // A venue/market change must never leave a review or submission surface
+    // attached to the previously selected market.
+    setShowConfirm(false);
+    setSubmitError(null);
+    setSubmitOk(null);
+    setShowSubmitResult(false);
+    setSubmitResultKind(null);
+    setSubmitResultPayload(null);
+    setSubmitResultText("");
+    setSubmitResultTitle("");
+  }, [effectiveVenue, otSymbol]);
 
   useEffect(() => {
     robinhoodChainQuoteReqRef.current += 1;
@@ -11208,46 +11215,14 @@ async function submitLimitOrder() {
           className="utt-order-ticket-scroll"
         >
           <div style={rowStyle}>
-          <div style={safePill}>
-            <span>Symbol</span>
-            {isRobinhoodChainVenue ? (
-              <select
-                style={{ ...darkSelectStyle, width: 210, maxWidth: "100%" }}
-                value={robinhoodChainPair.symbol}
-                disabled={robinhoodChainMarketsLoading || robinhoodChainMarkets.length === 0}
-                onChange={(event) => {
-                  const next = robinhoodChainPairParts(event.target.value).symbol;
-                  if (!next) return;
-                  setOtSymbol(next);
-                  robinhoodChainQuoteReqRef.current += 1;
-                  robinhoodChainFirmPlanReqRef.current += 1;
-                  setRobinhoodChainQuote(null);
-                  setRobinhoodChainQuoteErrorText("");
-                  setRobinhoodChainFirmPlan(null);
-                  setRobinhoodChainFirmPlanErrorText("");
-                  setRobinhoodChainSwapPrepared(null);
-                  setRobinhoodChainSwapError("");
-                }}
-                title="Database-backed Robinhood Chain market objectives. Token contracts and decimals remain in TokenRegistry."
-              >
-                {robinhoodChainMarkets.length === 0 ? (
-                  <option style={darkOptionStyle} value={robinhoodChainPair.symbol}>
-                    {robinhoodChainMarketsLoading ? "Loading database markets…" : "No database markets"}
-                  </option>
-                ) : robinhoodChainMarkets.map((market) => (
-                  <option key={market?.id || market?.symbol} style={darkOptionStyle} value={robinhoodChainPairParts(market?.symbol).symbol}>
-                    {market?.symbol} · {robinhoodChainMarketStatusLabel(market)}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input
-                style={{ ...safeInput, width: 150 }}
-                value={otSymbol}
-                placeholder="e.g. BTC-USD"
-                onChange={(e) => setOtSymbol(e.target.value)}
-              />
-            )}
+          <div
+            style={safePill}
+            title="Market follows the top-level MARKET selector. Change it in the main UTT header."
+          >
+            <span>Market</span>
+            <b style={{ maxWidth: 210, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {otSymbol || "—"}
+            </b>
           </div>
 
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>

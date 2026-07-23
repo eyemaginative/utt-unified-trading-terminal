@@ -75,7 +75,6 @@ router = APIRouter(prefix="/api/robinhood_chain", tags=["robinhood_chain"])
 
 _EXPECTED_CHAIN_ID_DECIMAL = 4663
 _EXPECTED_CHAIN_ID_HEX = hex(_EXPECTED_CHAIN_ID_DECIMAL)
-_NATIVE_CURRENCY = "ETH"
 _EXPLORER_URL = "https://robinhoodchain.blockscout.com"
 _TOKEN_REGISTRY_CHAIN = "robinhood_chain"
 _TOKEN_REGISTRY_VENUE = "robinhood_chain"
@@ -90,136 +89,101 @@ def _normalize_registry_symbol(symbol: str) -> str:
     return normalized
 
 
+def _resolve_native_registry_identity(db: Session) -> Dict[str, Any]:
+    try:
+        return get_robinhood_chain_registry_discovery_service().native_identity(db)
+    except ValueError as exc:
+        error = str(exc)
+        raise HTTPException(
+            status_code=404 if "not_found" in error else 409,
+            detail={
+                "error": error,
+                "chain": _TOKEN_REGISTRY_CHAIN,
+                "identity_source": "token_registry",
+            },
+        ) from exc
+
+
 def _resolve_registered_erc20(db: Session, symbol: str) -> Tuple[TokenRegistry, str, int]:
     normalized_symbol = _normalize_registry_symbol(symbol)
-    if normalized_symbol == _NATIVE_CURRENCY:
+    try:
+        identity = get_robinhood_chain_registry_discovery_service().resolve_token(
+            db,
+            normalized_symbol,
+        )
+    except ValueError as exc:
+        error = str(exc)
+        raise HTTPException(
+            status_code=404 if "not_found" in error else 422,
+            detail={
+                "error": error,
+                "chain": _TOKEN_REGISTRY_CHAIN,
+                "symbol": normalized_symbol,
+                "identity_source": "token_registry",
+            },
+        ) from exc
+
+    if bool(identity.get("native")):
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "native_asset_not_erc20",
-                "message": "ETH is the native Robinhood Chain asset; use the native balance endpoint.",
+                "message": "The requested Token Registry identity is native; use the native balance endpoint.",
                 "symbol": normalized_symbol,
+                "registry_id": identity.get("registry_id"),
+                "identity_source": "token_registry",
             },
         )
 
-    override = (
-        db.query(TokenRegistry)
-        .filter(
-            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
-            TokenRegistry.venue == _TOKEN_REGISTRY_VENUE,
-            TokenRegistry.symbol == normalized_symbol,
-        )
-        .first()
-    )
-    global_row = (
-        db.query(TokenRegistry)
-        .filter(
-            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
-            ((TokenRegistry.venue.is_(None)) | (TokenRegistry.venue == "")),
-            TokenRegistry.symbol == normalized_symbol,
-        )
-        .first()
-    )
-    row = override or global_row
+    registry_id = int(identity.get("registry_id"))
+    row = db.query(TokenRegistry).filter(TokenRegistry.id == registry_id).first()
     if row is None:
         raise HTTPException(
             status_code=404,
             detail={
-                "error": "registered_erc20_not_found",
+                "error": "robinhood_chain_registry_token_not_found",
                 "chain": _TOKEN_REGISTRY_CHAIN,
                 "symbol": normalized_symbol,
+                "registry_id": registry_id,
             },
         )
-
-    try:
-        contract = validate_evm_address(str(row.address or "").strip())
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "invalid_registered_erc20_contract",
-                "chain": _TOKEN_REGISTRY_CHAIN,
-                "symbol": normalized_symbol,
-                "registry_id": row.id,
-                "message": str(exc),
-            },
-        ) from exc
-
-    try:
-        decimals = int(row.decimals)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "invalid_registered_erc20_decimals",
-                "chain": _TOKEN_REGISTRY_CHAIN,
-                "symbol": normalized_symbol,
-                "registry_id": row.id,
-            },
-        ) from exc
-    if decimals < 0 or decimals > 18:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "invalid_registered_erc20_decimals",
-                "chain": _TOKEN_REGISTRY_CHAIN,
-                "symbol": normalized_symbol,
-                "registry_id": row.id,
-                "decimals": decimals,
-            },
-        )
-
+    contract = validate_evm_address(str(identity.get("registry_contract_address") or "").strip())
+    decimals = int(identity.get("decimals"))
     return row, contract, decimals
 
 
 def _registered_history_token_map(db: Session) -> Dict[str, Dict[str, Any]]:
-    """Return a bounded contract-keyed Token Registry view for history labels.
-
-    Venue-specific Robinhood Chain rows win over global rows. Malformed rows are
-    skipped rather than weakening the history endpoint's strict address rules.
-    """
-    overrides = (
-        db.query(TokenRegistry)
-        .filter(
-            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
-            TokenRegistry.venue == _TOKEN_REGISTRY_VENUE,
-            TokenRegistry.symbol != _NATIVE_CURRENCY,
-        )
-        .order_by(TokenRegistry.symbol.asc())
-        .limit(100)
-        .all()
-    )
-    global_rows = (
-        db.query(TokenRegistry)
-        .filter(
-            TokenRegistry.chain == _TOKEN_REGISTRY_CHAIN,
-            ((TokenRegistry.venue.is_(None)) | (TokenRegistry.venue == "")),
-            TokenRegistry.symbol != _NATIVE_CURRENCY,
-        )
-        .order_by(TokenRegistry.symbol.asc())
-        .limit(100)
-        .all()
-    )
+    """Return the effective contract-keyed Token Registry view for history labels."""
+    service = get_robinhood_chain_registry_discovery_service()
+    try:
+        rows = service.registry_rows(db)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": str(exc),
+                "identity_source": "token_registry",
+            },
+        ) from exc
 
     selected: Dict[str, Dict[str, Any]] = {}
-    for row in [*(overrides or []), *(global_rows or [])]:
+    for row in rows:
         try:
-            contract = validate_evm_address(str(row.address or "").strip())
+            identity = service.token_identity(db, row)
+            if bool(identity.get("native")):
+                continue
+            contract = validate_evm_address(
+                str(identity.get("registry_contract_address") or "").strip()
+            )
             contract_key = contract.lower()
             if contract_key in selected:
                 continue
-            decimals = int(row.decimals)
-            if decimals < 0 or decimals > 18:
-                continue
-            symbol = str(row.symbol or "").strip().upper()
-            if not symbol or symbol == _NATIVE_CURRENCY:
-                continue
             selected[contract_key] = {
-                "registry_id": int(row.id),
-                "registry_venue": row.venue,
-                "symbol": symbol,
-                "decimals": decimals,
-                "label": row.label,
+                "registry_id": int(identity["registry_id"]),
+                "registry_venue": identity.get("registry_venue"),
+                "symbol": str(identity.get("symbol") or "").strip().upper(),
+                "decimals": int(identity["decimals"]),
+                "label": identity.get("label"),
                 "contract_address": contract,
             }
         except Exception:
@@ -669,7 +633,7 @@ async def _refresh_robinhood_chain_execution_balance_snapshots(
 ) -> Dict[str, Any]:
     """Force-refresh the saved RH Chain account snapshots after confirmation.
 
-    Native ETH and canonical USDG are always refreshed. Confirmed ERC-20 output
+    The Token Registry native identity and canonical USDG are always refreshed. Confirmed ERC-20 output
     assets, such as WETH, may be added explicitly without changing execution state.
     A snapshot failure never changes the already-verified execution lifecycle.
     """
@@ -705,6 +669,13 @@ async def _refresh_robinhood_chain_execution_balance_snapshots(
             "errors": [{"asset": "ALL", "error": "saved_robinhood_chain_wallet_mismatch"}],
         }
 
+    try:
+        native_identity = _resolve_native_registry_identity(db)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
+        return {"ok": False, "refreshed": 0, "errors": [{"asset": "native", **detail}]}
+    native_symbol = str(native_identity.get("symbol") or "").strip().upper()
+
     client = get_robinhood_chain_client()
     refreshed = 0
     errors: List[Dict[str, Any]] = []
@@ -721,7 +692,7 @@ async def _refresh_robinhood_chain_execution_balance_snapshots(
         balance_eth = Decimal(str(eth_result.get("balance_eth") or "0"))
         snapshot = WalletAddressSnapshot(
             wallet_address_id=saved_row.id,
-            asset="ETH",
+            asset=native_symbol,
             network=_TOKEN_REGISTRY_CHAIN,
             address=normalized_address,
             balance_qty=float(balance_eth),
@@ -744,7 +715,7 @@ async def _refresh_robinhood_chain_execution_balance_snapshots(
         db.commit()
         refreshed += 1
         items.append({
-            "asset": "ETH",
+            "asset": native_symbol,
             "balance": str(eth_result.get("balance_eth") or "0"),
             "balance_atomic": str(eth_result.get("balance_wei") or "0"),
             "cached": bool(eth_result.get("cached")),
@@ -752,12 +723,12 @@ async def _refresh_robinhood_chain_execution_balance_snapshots(
         })
     except Exception as exc:
         db.rollback()
-        errors.append({"asset": "ETH", "error": str(exc)})
+        errors.append({"asset": native_symbol, "error": str(exc)})
 
     requested_erc20_assets = ["USDG"]
     for raw_symbol in additional_erc20_assets or []:
         symbol = str(raw_symbol or "").strip().upper()
-        if symbol and symbol not in {"ETH", *requested_erc20_assets}:
+        if symbol and symbol not in {native_symbol, *requested_erc20_assets}:
             requested_erc20_assets.append(symbol)
 
     for symbol in requested_erc20_assets:
@@ -883,16 +854,28 @@ def _configured_rpc_http() -> str:
     return settings.robinhood_chain_effective_rpc_http()
 
 
-def _status_payload() -> Dict[str, Any]:
+def _status_payload(db: Optional[Session] = None) -> Dict[str, Any]:
     configured_chain_id = int(settings.robinhood_chain_chain_id)
     configured_match = configured_chain_id == _EXPECTED_CHAIN_ID_DECIMAL
     observed = str(_LAST_OBSERVED_CHAIN_ID or "").strip().lower() or None
     observed_match = observed == _EXPECTED_CHAIN_ID_HEX if observed is not None else None
 
+    native_identity = None
+    native_identity_error = None
+    if db is not None and hasattr(db, "query"):
+        try:
+            native_identity = _resolve_native_registry_identity(db)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
+            native_identity_error = detail.get("error")
+
     return {
         "venue": "robinhood_chain",
         "network": "mainnet",
-        "native_currency": _NATIVE_CURRENCY,
+        "native_currency": (native_identity or {}).get("symbol"),
+        "native_currency_source": "token_registry",
+        "native_identity_ready": native_identity_error is None and native_identity is not None,
+        "native_identity_error": native_identity_error,
         "explorer_url": _EXPLORER_URL,
         "read_only": True,
         "enabled": bool(settings.robinhood_chain_enabled),
@@ -1133,13 +1116,16 @@ async def _rpc_check(check: str, *, force_refresh: bool) -> Dict[str, Any]:
 
 
 @router.get("/status")
-def robinhood_chain_status() -> Dict[str, Any]:
-    return _status_payload()
+def robinhood_chain_status(
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    return _status_payload(db)
 
 
 @router.post("/rpc_probe")
 async def robinhood_chain_rpc_probe(
     payload: Optional[RobinhoodChainProbeRequest] = None,
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     if not bool(settings.robinhood_chain_enabled):
         raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
@@ -1182,15 +1168,16 @@ async def robinhood_chain_rpc_probe(
         "chain_id_matches": chain_matches,
         "requested_checks": checks,
         "results": results,
-        "status": _status_payload(),
+        "status": _status_payload(db),
     }
 
 @router.get("/address/{address}/balance")
 async def robinhood_chain_address_balance(
     address: str,
     force_refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Return the native ETH balance for one Robinhood Chain address.
+    """Return the registry-defined native balance for one Robinhood Chain address.
 
     This endpoint is read-only. It verifies chain ID 4663 before reading the
     latest balance and never constructs, signs, or broadcasts a transaction.
@@ -1207,6 +1194,7 @@ async def robinhood_chain_address_balance(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    native_identity = _resolve_native_registry_identity(db)
     result = await get_robinhood_chain_client().get_native_balance(
         normalized_address,
         block_tag="latest",
@@ -1224,8 +1212,12 @@ async def robinhood_chain_address_balance(
         "chain_id": _EXPECTED_CHAIN_ID_DECIMAL,
         "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
         "address": result.get("address"),
-        "asset": _NATIVE_CURRENCY,
+        "asset": native_identity.get("symbol"),
+        "decimals": int(native_identity.get("decimals")),
+        "registry_id": int(native_identity.get("registry_id")),
+        "registry_venue": native_identity.get("registry_venue"),
         "balance_wei": result.get("balance_wei"),
+        "balance_native": result.get("balance_eth"),
         "balance_eth": result.get("balance_eth"),
         "block_tag": result.get("block_tag"),
         "cached": bool(result.get("cached")),

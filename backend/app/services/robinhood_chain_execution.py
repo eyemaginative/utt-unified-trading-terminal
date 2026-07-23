@@ -18,6 +18,11 @@ from .robinhood_chain_transaction_planning import (
     RobinhoodChainTransactionPlanningService,
     get_robinhood_chain_transaction_planning_service,
 )
+from .robinhood_chain_registry_authority import (
+    effective_native_row,
+    effective_row_by_symbol,
+    identity_fields_from_row,
+)
 
 
 ROBINHOOD_CHAIN_EXECUTION_SYMBOL = "ETH-USDG"
@@ -50,8 +55,6 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _QUOTE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _CLAIM_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _ERC20_TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-_ROBINHOOD_CHAIN_USDG_CONTRACT = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
-_ROBINHOOD_CHAIN_USDG_DECIMALS = 6
 _WEI_PER_ETH = Decimal(10) ** 18
 
 
@@ -144,13 +147,58 @@ def _execution_reconciliation(row: RobinhoodChainExecution) -> Optional[Dict[str
     return dict(value) if isinstance(value, dict) else None
 
 
+def _resolve_receipt_registry_identities(
+    db: Session,
+    row: RobinhoodChainExecution,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    output_row = effective_row_by_symbol(db, row.expected_output_asset)
+    output_identity = identity_fields_from_row(output_row)
+    if output_identity.get("native") is True:
+        raise ValueError("robinhood_chain_execution_output_registry_identity_must_be_erc20")
+    if not str(output_identity.get("address") or "").strip():
+        raise ValueError("robinhood_chain_execution_output_registry_contract_required")
+
+    native_row = effective_native_row(db)
+    native_identity = identity_fields_from_row(native_row)
+    if native_identity.get("native") is not True:
+        raise ValueError("robinhood_chain_execution_native_registry_identity_required")
+    if str(native_identity.get("address") or "").strip():
+        raise ValueError("robinhood_chain_execution_native_registry_address_must_be_blank")
+
+    return output_identity, native_identity
+
+
 def _decode_confirmed_execution_reconciliation(
     row: RobinhoodChainExecution,
     receipt: Dict[str, Any],
+    *,
+    output_identity: Dict[str, Any],
+    native_identity: Dict[str, Any],
 ) -> Dict[str, Any]:
     logs = receipt.get("logs")
     if not isinstance(logs, list):
         raise ValueError("robinhood_chain_receipt_logs_missing")
+
+    expected_output_symbol = str(row.expected_output_asset or "").strip().upper()
+    output_symbol = str(output_identity.get("symbol") or "").strip().upper()
+    native_symbol = str(native_identity.get("symbol") or "").strip().upper()
+    if not expected_output_symbol or output_symbol != expected_output_symbol:
+        raise ValueError("robinhood_chain_execution_output_registry_symbol_mismatch")
+    if not native_symbol:
+        raise ValueError("robinhood_chain_execution_native_registry_symbol_required")
+
+    output_contract = validate_evm_address(
+        str(output_identity.get("address") or "").strip()
+    ).lower()
+    try:
+        output_decimals = int(output_identity.get("decimals"))
+        native_decimals = int(native_identity.get("decimals"))
+    except Exception as exc:
+        raise ValueError("invalid_robinhood_chain_execution_registry_decimals") from exc
+    if not (0 <= output_decimals <= 18):
+        raise ValueError("invalid_robinhood_chain_execution_output_registry_decimals")
+    if not (0 <= native_decimals <= 18):
+        raise ValueError("invalid_robinhood_chain_execution_native_registry_decimals")
 
     recipient = validate_evm_address(row.wallet_address).lower()
     output_atomic = 0
@@ -163,7 +211,7 @@ def _decode_confirmed_execution_reconciliation(
             contract = validate_evm_address(str(item.get("address") or "")).lower()
         except ValueError:
             continue
-        if contract != _ROBINHOOD_CHAIN_USDG_CONTRACT:
+        if contract != output_contract:
             continue
 
         topics = item.get("topics")
@@ -172,7 +220,10 @@ def _decode_confirmed_execution_reconciliation(
         if str(topics[0] or "").strip().lower() != _ERC20_TRANSFER_TOPIC0:
             continue
         try:
-            transfer_recipient = _topic_address(topics[2], field="usdg_transfer_recipient_topic")
+            transfer_recipient = _topic_address(
+                topics[2],
+                field="output_transfer_recipient_topic",
+            )
         except ValueError:
             continue
         if transfer_recipient != recipient:
@@ -189,7 +240,7 @@ def _decode_confirmed_execution_reconciliation(
         matching_logs += 1
 
     if output_atomic <= 0 or matching_logs <= 0:
-        raise ValueError("robinhood_chain_usdg_transfer_to_wallet_not_found")
+        raise ValueError("robinhood_chain_output_transfer_to_wallet_not_found")
 
     gas_used = decode_hex_quantity(receipt.get("gasUsed")) if receipt.get("gasUsed") else 0
     effective_gas_price = (
@@ -200,33 +251,35 @@ def _decode_confirmed_execution_reconciliation(
     if gas_used <= 0 or effective_gas_price <= 0:
         raise ValueError("robinhood_chain_receipt_gas_fields_missing")
 
-    output_amount = Decimal(output_atomic) / (Decimal(10) ** _ROBINHOOD_CHAIN_USDG_DECIMALS)
+    output_amount = Decimal(output_atomic) / (Decimal(10) ** output_decimals)
     input_amount = Decimal(str(row.input_amount or "0"))
     minimum_output = Decimal(str(row.minimum_output_amount or "0"))
     if input_amount <= 0:
         raise ValueError("invalid_robinhood_chain_execution_input_amount")
 
-    network_fee_wei = int(gas_used) * int(effective_gas_price)
-    network_fee_eth = Decimal(network_fee_wei) / _WEI_PER_ETH
+    network_fee_atomic = int(gas_used) * int(effective_gas_price)
+    network_fee = Decimal(network_fee_atomic) / (Decimal(10) ** native_decimals)
     average_fill_price = output_amount / input_amount
     minimum_limit_price = minimum_output / input_amount
 
     return {
-        "version": "RH-CHAIN.10D.1B",
+        "version": "RH-REG.AUTH.1A.2",
         "reconciled": True,
         "reconciled_at": utc_now().isoformat(),
-        "output_asset": "USDG",
-        "output_contract": _ROBINHOOD_CHAIN_USDG_CONTRACT,
-        "output_decimals": _ROBINHOOD_CHAIN_USDG_DECIMALS,
+        "identity_source": "token_registry",
+        "output_asset": output_symbol,
+        "output_contract": output_contract,
+        "output_decimals": output_decimals,
         "output_amount_atomic": str(output_atomic),
         "output_amount": _decimal_text(output_amount, field="actual_output_amount"),
         "average_fill_price": _decimal_text(average_fill_price, field="actual_average_fill_price"),
         "minimum_limit_price": _decimal_text(minimum_limit_price, field="minimum_limit_price"),
         "transfer_log_count": int(matching_logs),
         "recipient": recipient,
-        "fee_asset": "ETH",
-        "network_fee_wei": str(network_fee_wei),
-        "network_fee": _decimal_text(network_fee_eth, field="actual_network_fee"),
+        "fee_asset": native_symbol,
+        "fee_asset_decimals": native_decimals,
+        "network_fee_wei": str(network_fee_atomic),
+        "network_fee": _decimal_text(network_fee, field="actual_network_fee"),
         "gas_used": str(gas_used),
         "effective_gas_price_wei": str(effective_gas_price),
     }
@@ -1034,7 +1087,13 @@ class RobinhoodChainExecutionService:
         )
         if status_value == 1:
             try:
-                reconciliation = _decode_confirmed_execution_reconciliation(row, receipt)
+                output_identity, native_identity = _resolve_receipt_registry_identities(db, row)
+                reconciliation = _decode_confirmed_execution_reconciliation(
+                    row,
+                    receipt,
+                    output_identity=output_identity,
+                    native_identity=native_identity,
+                )
             except ValueError as exc:
                 row.status = "verification_failed"
                 row.error_code = "receipt_reconciliation_failed"

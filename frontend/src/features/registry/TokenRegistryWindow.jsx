@@ -10,8 +10,7 @@ const EXTERNAL_PRICE_SOURCE_OPTIONS = ["", "stable", "coingecko", "derived", "no
 
 const ROBINHOOD_CHAIN_ID = 4663;
 const ROBINHOOD_CHAIN_ID_HEX = "0x1237";
-const ROBINHOOD_CHAIN_NATIVE_SYMBOL = "ETH";
-const ROBINHOOD_CHAIN_NATIVE_DECIMALS = 18;
+const ROBINHOOD_CHAIN_ASSET_KINDS = ["erc20", "native"];
 const EVM_CONTRACT_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 function isRobinhoodChain(value) {
@@ -32,18 +31,24 @@ function addressLabelForChain(value) {
   return isRobinhoodChain(value) ? "Contract address / native marker" : GENERIC_ADDRESS_LABEL;
 }
 
-function addressPlaceholderForChain(value, symbolValue = "") {
+function normalizeRobinhoodAssetKind(value, addressValue = "") {
+  const kind = String(value || "").trim().toLowerCase();
+  if (kind === "native") return "native";
+  if (kind === "erc20" || kind === "contract") return "erc20";
+  return String(addressValue || "").trim() ? "erc20" : "native";
+}
+
+function addressPlaceholderForChain(value, assetKindValue = "erc20") {
   const c = String(value || "").trim().toLowerCase();
-  const s = String(symbolValue || "").trim().toUpperCase();
   if (c === "counterparty") return "optional for protocol/global asset";
-  if (c === "robinhood_chain" && s === ROBINHOOD_CHAIN_NATIVE_SYMBOL) {
-    return "blank for native ETH";
+  if (c === "robinhood_chain" && normalizeRobinhoodAssetKind(assetKindValue) === "native") {
+    return "blank for the chain-native asset";
   }
   if (c === "robinhood_chain") return "0x + 40 hex contract address";
   return GENERIC_ADDRESS_PLACEHOLDER;
 }
 
-function validateTokenIdentityInput(chainValue, symbolValue, addressValue, decimalsValue) {
+function validateTokenIdentityInput(chainValue, symbolValue, addressValue, decimalsValue, assetKindValue = "") {
   const c = String(chainValue || "").trim().toLowerCase();
   const s = String(symbolValue || "").trim().toUpperCase();
   const a = String(addressValue || "").trim();
@@ -62,25 +67,21 @@ function validateTokenIdentityInput(chainValue, symbolValue, addressValue, decim
   }
 
   if (c === "robinhood_chain") {
-    if (s === ROBINHOOD_CHAIN_NATIVE_SYMBOL) {
+    const assetKind = normalizeRobinhoodAssetKind(assetKindValue, a);
+    if (assetKind === "native") {
       if (a) {
         return {
           ok: false,
           native: true,
-          message: "Native ETH must use a blank contract address. Use WETH or another distinct symbol for ERC-20 contracts.",
-        };
-      }
-      if (d !== ROBINHOOD_CHAIN_NATIVE_DECIMALS) {
-        return {
-          ok: false,
-          native: true,
-          message: "Native Robinhood Chain ETH must use exactly 18 decimals.",
+          assetKind,
+          message: "A Robinhood Chain native asset must use a blank Token Registry address.",
         };
       }
       return {
         ok: true,
         native: true,
-        message: "Native ETH identity is valid: blank contract address and 18 decimals.",
+        assetKind,
+        message: "Native identity is valid: symbol and decimals come from this blank-address Token Registry row.",
       };
     }
 
@@ -88,20 +89,23 @@ function validateTokenIdentityInput(chainValue, symbolValue, addressValue, decim
       return {
         ok: false,
         native: false,
-        message: "Robinhood Chain ERC-20 rows require a contract address.",
+        assetKind,
+        message: "A Robinhood Chain ERC-20 row requires a contract address.",
       };
     }
     if (!EVM_CONTRACT_ADDRESS_RE.test(a)) {
       return {
         ok: false,
         native: false,
+        assetKind,
         message: "Contract address must be 0x followed by exactly 40 hexadecimal characters.",
       };
     }
     return {
       ok: true,
       native: false,
-      message: "Robinhood Chain ERC-20 identity is structurally valid.",
+      assetKind,
+      message: "Robinhood Chain ERC-20 identity is structurally valid and registry-defined.",
     };
   }
 
@@ -118,11 +122,11 @@ function chainIdentityProfile(value) {
       accent: "cyan",
       badges: [
         `Mainnet ${ROBINHOOD_CHAIN_ID} / ${ROBINHOOD_CHAIN_ID_HEX}`,
-        "Native ETH · 18 decimals",
-        "ERC-20 contracts · strict EVM address",
-        "Registry-only · no wallet prompt",
+        "Native identity · blank address",
+        "ERC-20 identity · strict EVM address",
+        "Symbol + decimals · registry authority",
       ],
-      detail: "Native ETH uses a blank contract address. All non-ETH rows are treated as future ERC-20 identities and require an exact 20-byte EVM contract address.",
+      detail: "Choose Native or ERC-20 explicitly. Native symbol and decimals are stored in the Token Registry row; ERC-20 rows require an exact 20-byte EVM contract address.",
     };
   }
   if (c === "hydration" || c === "polkadot") {
@@ -699,6 +703,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   // Add form
   const [symbol, setSymbol] = useState("");
   const [address, setAddress] = useState("");
+  const [assetKind, setAssetKind] = useState("erc20");
   const [decimals, setDecimals] = useState("");
   const [label, setLabel] = useState("");
   const [venue, setVenue] = useState(""); // optional override scope (blank = global)
@@ -710,6 +715,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const [editRow, setEditRow] = useState({
     symbol: "",
     address: "",
+    asset_kind: "erc20",
     decimals: "",
     label: "",
     venue: "",
@@ -743,8 +749,8 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const activeVenueFilter = useMemo(() => defaultVenueForChain(chain), [chain]);
   const activeChainProfile = useMemo(() => chainIdentityProfile(chain), [chain]);
   const tokenIdentityValidation = useMemo(
-    () => validateTokenIdentityInput(chain, symbol, address, decimals),
-    [chain, symbol, address, decimals]
+    () => validateTokenIdentityInput(chain, symbol, address, decimals, assetKind),
+    [chain, symbol, address, decimals, assetKind]
   );
   const showHydrationRoutes = useMemo(() => {
     const c = String(chain || "").trim().toLowerCase();
@@ -924,19 +930,9 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const useSuggestion = useCallback((sug) => {
     setSymbol(String(sug?.symbol || "").trim());
     setAddress(String(sug?.address || "").trim());
+    setAssetKind("erc20");
     setDecimals(sug?.decimals == null ? "" : String(sug.decimals));
     setVenue(String(sug?.venue || "").trim());
-  }, []);
-
-  const useRobinhoodNativeEthPreset = useCallback(() => {
-    setSymbol(ROBINHOOD_CHAIN_NATIVE_SYMBOL);
-    setAddress("");
-    setDecimals(String(ROBINHOOD_CHAIN_NATIVE_DECIMALS));
-    setLabel("Robinhood Chain ETH");
-    setVenue("");
-    setExternalPriceSource("coingecko");
-    setExternalPriceId("ethereum");
-    setErr(null);
   }, []);
 
   const addSuggestion = useCallback(async (sug) => {
@@ -986,6 +982,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         decimals: Number(String(decimals || "").trim()),
         label: String(label || "").trim(),
       };
+      if (isRobinhoodChain(chain)) payload.asset_kind = normalizeRobinhoodAssetKind(assetKind, address);
       const v = String(venue || "").trim();
       if (v) payload.venue = v;
       const eps = String(externalPriceSource || "").trim();
@@ -1003,6 +1000,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
       setSymbol("");
       setAddress("");
+      setAssetKind("erc20");
       setDecimals("");
       setLabel("");
       setVenue("");
@@ -1015,24 +1013,27 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     } finally {
       setSaving(false);
     }
-  }, [API_BASE, canAdd, chain, symbol, address, decimals, label, venue, externalPriceSource, externalPriceId, load, loadSuggestions]);
+  }, [API_BASE, canAdd, chain, symbol, address, assetKind, decimals, label, venue, externalPriceSource, externalPriceId, load, loadSuggestions]);
 
   const startEdit = useCallback((row) => {
     setEditId(row?.id || null);
     setEditRow({
       symbol: String(row?.symbol || ""),
       address: String(row?.address || ""),
+      asset_kind: isRobinhoodChain(chain)
+        ? normalizeRobinhoodAssetKind(row?.asset_kind, row?.address)
+        : "erc20",
       decimals: String(row?.decimals ?? ""),
       label: String(row?.label || ""),
       venue: String(row?.venue || ""),
       external_price_source: String(row?.external_price_source || ""),
       external_price_id: String(row?.external_price_id || ""),
     });
-  }, []);
+  }, [chain]);
 
   const cancelEdit = useCallback(() => {
     setEditId(null);
-    setEditRow({ symbol: "", address: "", decimals: "", label: "", venue: "", external_price_source: "", external_price_id: "" });
+    setEditRow({ symbol: "", address: "", asset_kind: "erc20", decimals: "", label: "", venue: "", external_price_source: "", external_price_id: "" });
   }, []);
 
   const saveEdit = useCallback(async () => {
@@ -1042,7 +1043,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     const s = String(editRow.symbol || "").trim();
     const a = String(editRow.address || "").trim();
     const d = Number(String(editRow.decimals || "").trim());
-    const editValidation = validateTokenIdentityInput(chain, s, a, editRow.decimals);
+    const editValidation = validateTokenIdentityInput(chain, s, a, editRow.decimals, editRow.asset_kind);
     if (!editValidation.ok) {
       setErr(`Edit: ${editValidation.message}`);
       return;
@@ -1058,6 +1059,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         decimals: d,
         label: String(editRow.label || "").trim(),
       };
+      if (isRobinhoodChain(chain)) payload.asset_kind = normalizeRobinhoodAssetKind(editRow.asset_kind, a);
       const v = String(editRow.venue || "").trim();
       if (v) payload.venue = v;
       payload.external_price_source = String(editRow.external_price_source || "").trim();
@@ -1126,12 +1128,13 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
             c,
             row?.symbol,
             row?.address,
-            row?.decimals
+            row?.decimals,
+            row?.asset_kind
           );
           if (!validation.ok) {
             throw new Error(validation.message);
           }
-          alert(`Registry identity valid:\n\nchain=robinhood_chain\nsymbol=${row?.symbol || a.toUpperCase()}\nkind=${validation.native ? "native ETH" : "ERC-20 contract"}\naddress=${row?.address || "(blank native address)"}\ndecimals=${row?.decimals}\nvenue=${row?.venue || "global"}\npriceSource=${row?.external_price_source || "—"}\npriceId=${row?.external_price_id || "—"}\n\nNo RPC balance read or wallet request was performed.`);
+          alert(`Registry identity valid:\n\nchain=robinhood_chain\nsymbol=${row?.symbol || a.toUpperCase()}\nkind=${validation.native ? "native" : "ERC-20 contract"}\naddress=${row?.address || "(blank native address)"}\ndecimals=${row?.decimals}\nvenue=${row?.venue || "global"}\npriceSource=${row?.external_price_source || "—"}\npriceId=${row?.external_price_id || "—"}\n\nNo RPC balance read or wallet request was performed.`);
           return;
         }
 
@@ -1622,25 +1625,33 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
             <div style={panelEyebrowStyle}>REGISTRY WRITE PREVIEW</div>
             <div style={panelTitleStyle}>Add token identity</div>
           </div>
-          {isRobinhoodChain(chain) ? (
-            <button
-              type="button"
-              onClick={useRobinhoodNativeEthPreset}
-              style={presetBtnStyle}
-              disabled={saving}
-              title="Fill the native ETH identity without saving it"
-            >
-              Load native ETH preset
-            </button>
-          ) : null}
         </div>
         <div style={addTokenGridStyle}>
           <input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="SYMBOL (e.g. UTTT)" style={inputStyle} />
+          {isRobinhoodChain(chain) ? (
+            <select
+              value={assetKind}
+              onChange={(e) => {
+                const next = normalizeRobinhoodAssetKind(e.target.value);
+                setAssetKind(next);
+                if (next === "native") setAddress("");
+              }}
+              style={selectStyle}
+              title="Registry asset kind"
+            >
+              {ROBINHOOD_CHAIN_ASSET_KINDS.map((kind) => (
+                <option key={kind} value={kind} style={selectOptionStyle}>
+                  {kind === "native" ? "Native asset" : "ERC-20 contract"}
+                </option>
+              ))}
+            </select>
+          ) : null}
           <input
             value={address}
             onChange={(e) => setAddress(e.target.value)}
-            placeholder={addressPlaceholderForChain(chain, symbol)}
+            placeholder={addressPlaceholderForChain(chain, assetKind)}
             aria-label={addressLabelForChain(chain)}
+            disabled={isRobinhoodChain(chain) && assetKind === "native"}
             style={inputStyle}
           />
           <input value={decimals} onChange={(e) => setDecimals(e.target.value)} placeholder="decimals" style={inputStyle} />
@@ -1665,7 +1676,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         </div>
         {isRobinhoodChain(chain) ? (
           <div style={robinhoodHelpStyle}>
-            <b>Robinhood Chain rules:</b> native ETH must be <code style={codeStyle}>ETH</code>, blank contract address, and 18 decimals. Every other symbol is treated as an ERC-20 identity and requires an exact <code style={codeStyle}>0x</code> + 40-hex contract address. Preset loading never writes to the database.
+            <b>Robinhood Chain rules:</b> choose Native or ERC-20 explicitly. A Native row uses a blank address and keeps its symbol and decimals in Token Registry. An ERC-20 row requires an exact <code style={codeStyle}>0x</code> + 40-hex contract address. Only one effective Native identity is allowed per scope.
           </div>
         ) : null}
         {chain !== "solana" && (
@@ -2077,9 +2088,33 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                     </td>
                     <td style={tdStyle}>
                       {isEdit ? (
-                        <input value={editRow.address} onChange={(e) => setEditRow((p) => ({ ...p, address: e.target.value }))} style={inputStyle} />
+                        <div style={{ display: "grid", gap: 6, minWidth: 210 }}>
+                          {isRobinhoodChain(chain) ? (
+                            <select
+                              value={normalizeRobinhoodAssetKind(editRow.asset_kind, editRow.address)}
+                              onChange={(e) => {
+                                const next = normalizeRobinhoodAssetKind(e.target.value);
+                                setEditRow((p) => ({ ...p, asset_kind: next, address: next === "native" ? "" : p.address }));
+                              }}
+                              style={selectStyle}
+                            >
+                              {ROBINHOOD_CHAIN_ASSET_KINDS.map((kind) => (
+                                <option key={kind} value={kind} style={selectOptionStyle}>
+                                  {kind === "native" ? "Native asset" : "ERC-20 contract"}
+                                </option>
+                              ))}
+                            </select>
+                          ) : null}
+                          <input
+                            value={editRow.address}
+                            onChange={(e) => setEditRow((p) => ({ ...p, address: e.target.value }))}
+                            disabled={isRobinhoodChain(chain) && normalizeRobinhoodAssetKind(editRow.asset_kind, editRow.address) === "native"}
+                            placeholder={addressPlaceholderForChain(chain, editRow.asset_kind)}
+                            style={inputStyle}
+                          />
+                        </div>
                       ) : (
-                        <code style={codeStyle}>{row.address || (isRobinhoodChain(chain) && String(row.symbol || "").toUpperCase() === ROBINHOOD_CHAIN_NATIVE_SYMBOL ? "native · no contract" : "—")}</code>
+                        <code style={codeStyle}>{row.address || (isRobinhoodChain(chain) && row?.native ? "native · no contract" : "—")}</code>
                       )}
                     </td>
                     <td style={tdStyle}>
@@ -2465,13 +2500,6 @@ const panelTitleStyle = {
   marginTop: 2,
   fontSize: 14,
   fontWeight: 850,
-};
-
-const presetBtnStyle = {
-  ...btnStyle,
-  border: "1px solid rgba(167,139,250,0.34)",
-  background: "linear-gradient(180deg, rgba(109,40,217,0.22), rgba(49,46,129,0.18))",
-  color: "#ddd6fe",
 };
 
 const mappingCountBadgeStyle = {

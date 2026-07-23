@@ -23,12 +23,18 @@ from .robinhood_chain_execution_discovery import (
     ZEROX_NATIVE_TOKEN,
     get_robinhood_chain_execution_discovery_service,
 )
+from .robinhood_chain_registry_authority import (
+    ROBINHOOD_CHAIN,
+    ROBINHOOD_CHAIN_VENUE,
+    RobinhoodChainRegistryAuthorityError,
+    effective_native_row,
+    effective_row_by_symbol,
+    identity_fields_from_row,
+    select_effective_registry_rows,
+)
 
 
-ROBINHOOD_CHAIN = "robinhood_chain"
-ROBINHOOD_CHAIN_VENUE = "robinhood_chain"
 ROBINHOOD_CHAIN_ID = 4663
-NATIVE_SYMBOL = "ETH"
 AMOUNT_MODE_EXACT_INPUT = "exact_input"
 MECHANISM_SWAP = "swap"
 MECHANISM_WRAP_UNWRAP = "wrap_unwrap"
@@ -160,32 +166,11 @@ def _registry_external_price_meta(db: Session, token_id: int) -> Dict[str, Optio
 
 
 def _select_registry_rows(db: Session) -> List[TokenRegistry]:
-    overrides = (
-        db.query(TokenRegistry)
-        .filter(
-            TokenRegistry.chain == ROBINHOOD_CHAIN,
-            TokenRegistry.venue == ROBINHOOD_CHAIN_VENUE,
-        )
-        .order_by(TokenRegistry.symbol.asc())
-        .limit(250)
-        .all()
+    return select_effective_registry_rows(
+        db,
+        venue=ROBINHOOD_CHAIN_VENUE,
+        limit=250,
     )
-    globals_ = (
-        db.query(TokenRegistry)
-        .filter(
-            TokenRegistry.chain == ROBINHOOD_CHAIN,
-            ((TokenRegistry.venue.is_(None)) | (TokenRegistry.venue == "")),
-        )
-        .order_by(TokenRegistry.symbol.asc())
-        .limit(250)
-        .all()
-    )
-    selected: Dict[str, TokenRegistry] = {}
-    for row in [*(overrides or []), *(globals_ or [])]:
-        symbol = str(row.symbol or "").strip().upper()
-        if symbol and symbol not in selected:
-            selected[symbol] = row
-    return [selected[key] for key in sorted(selected)]
 
 
 class RobinhoodChainRegistryDiscoveryService:
@@ -201,12 +186,23 @@ class RobinhoodChainRegistryDiscoveryService:
         self.discovery_service = discovery_service or get_robinhood_chain_execution_discovery_service()
 
     def status(self, db: Session) -> Dict[str, Any]:
+        try:
+            native_identity = self.native_identity(db)
+            native_identity_error = None
+        except ValueError as exc:
+            native_identity = None
+            native_identity_error = str(exc)
         return {
             "ok": True,
             "tranche": "RH-CHAIN.10D.2-R5C.1",
             "chain": ROBINHOOD_CHAIN,
             "chain_id": ROBINHOOD_CHAIN_ID,
             "token_registry_authority": True,
+            "native_identity": native_identity,
+            "native_identity_ready": native_identity_error is None,
+            "native_identity_error": native_identity_error,
+            "hardcoded_native_symbol": False,
+            "hardcoded_native_decimals": False,
             "hardcoded_token_contracts": False,
             "hardcoded_pair_contracts": False,
             "asset_verification_count": db.query(RobinhoodChainRegistryVerification).count(),
@@ -244,35 +240,27 @@ class RobinhoodChainRegistryDiscoveryService:
         return row
 
     def _registry_row_by_symbol(self, db: Session, symbol: str) -> TokenRegistry:
-        normalized = str(symbol or "").strip().upper()
-        if not normalized:
-            raise ValueError("robinhood_chain_registry_symbol_required")
-        for row in self.registry_rows(db):
-            if str(row.symbol or "").strip().upper() == normalized:
-                return row
-        raise ValueError("robinhood_chain_registry_token_not_found")
+        try:
+            return effective_row_by_symbol(
+                db,
+                symbol,
+                venue=ROBINHOOD_CHAIN_VENUE,
+            )
+        except RobinhoodChainRegistryAuthorityError as exc:
+            raise ValueError(exc.code) from exc
 
     def token_identity(self, db: Session, row: TokenRegistry) -> Dict[str, Any]:
-        symbol = str(row.symbol or "").strip().upper()
-        if not symbol:
-            raise ValueError("robinhood_chain_registry_symbol_required")
         try:
-            decimals = int(row.decimals)
-        except Exception as exc:
-            raise ValueError("invalid_robinhood_chain_registry_decimals") from exc
-        if decimals < 0 or decimals > 18:
-            raise ValueError("invalid_robinhood_chain_registry_decimals")
+            identity_fields = identity_fields_from_row(row)
+        except RobinhoodChainRegistryAuthorityError as exc:
+            raise ValueError(exc.code) from exc
 
-        raw_address = str(row.address or "").strip()
-        native = not raw_address
-        if native:
-            if symbol != NATIVE_SYMBOL or decimals != 18:
-                raise ValueError("invalid_robinhood_chain_native_registry_identity")
-            contract_address = ZEROX_NATIVE_TOKEN
-            asset_kind = "native"
-        else:
-            contract_address = validate_evm_address(raw_address)
-            asset_kind = "erc20"
+        symbol = str(identity_fields["symbol"])
+        decimals = int(identity_fields["decimals"])
+        native = bool(identity_fields["native"])
+        registry_contract_address = identity_fields["address"]
+        contract_address = ZEROX_NATIVE_TOKEN if native else registry_contract_address
+        asset_kind = str(identity_fields["asset_kind"])
 
         price_meta = _registry_external_price_meta(db, int(row.id))
         return {
@@ -283,7 +271,7 @@ class RobinhoodChainRegistryDiscoveryService:
             "symbol": symbol,
             "label": row.label,
             "contract_address": contract_address,
-            "registry_contract_address": None if native else contract_address,
+            "registry_contract_address": registry_contract_address,
             "decimals": decimals,
             "native": native,
             "asset_kind": asset_kind,
@@ -292,6 +280,13 @@ class RobinhoodChainRegistryDiscoveryService:
 
     def resolve_token(self, db: Session, symbol: str) -> Dict[str, Any]:
         return self.token_identity(db, self._registry_row_by_symbol(db, symbol))
+
+    def native_identity(self, db: Session) -> Dict[str, Any]:
+        try:
+            row = effective_native_row(db, venue=ROBINHOOD_CHAIN_VENUE)
+        except RobinhoodChainRegistryAuthorityError as exc:
+            raise ValueError(exc.code) from exc
+        return self.token_identity(db, row)
 
     def _verification_row(self, db: Session, token_registry_id: int) -> Optional[RobinhoodChainRegistryVerification]:
         return (
@@ -384,9 +379,9 @@ class RobinhoodChainRegistryDiscoveryService:
             onchain_symbol = identity["symbol"]
             onchain_name = registry_row.label or identity["symbol"]
             onchain_decimals = identity["decimals"]
-            registry_match = identity["symbol"] == NATIVE_SYMBOL and identity["decimals"] == 18
-            canonical_status = "verified" if registry_match else "registry_mismatch"
-            verification_error = None if registry_match else "native_registry_identity_mismatch"
+            registry_match = True
+            canonical_status = "verified"
+            verification_error = None
         else:
             contract = identity["registry_contract_address"]
             code_result = await self.rpc_client.rpc_read(

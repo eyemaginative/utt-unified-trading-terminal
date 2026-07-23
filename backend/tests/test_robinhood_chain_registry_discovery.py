@@ -193,6 +193,10 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     def test_status_is_review_only_and_has_no_hardcoded_identity_flags(self) -> None:
         status = self.service.status(self.db)
         self.assertTrue(status["token_registry_authority"])
+        self.assertFalse(status["native_identity_ready"])
+        self.assertEqual(status["native_identity_error"], "robinhood_chain_native_registry_identity_not_found")
+        self.assertFalse(status["hardcoded_native_symbol"])
+        self.assertFalse(status["hardcoded_native_decimals"])
         self.assertFalse(status["hardcoded_token_contracts"])
         self.assertFalse(status["hardcoded_pair_contracts"])
         self.assertFalse(status["execution_enabled"])
@@ -202,12 +206,14 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["will_mutate_chain"])
 
     def test_native_identity_is_resolved_from_blank_registry_address(self) -> None:
-        row = self._token("ETH", None, 18)
+        row = self._token("GASX", None, 9)
         identity = self.service.token_identity(self.db, row)
         self.assertTrue(identity["native"])
         self.assertEqual(identity["asset_kind"], "native")
+        self.assertEqual(identity["symbol"], "GASX")
         self.assertEqual(identity["registry_id"], row.id)
-        self.assertEqual(identity["decimals"], 18)
+        self.assertEqual(identity["decimals"], 9)
+        self.assertIsNone(identity["registry_contract_address"])
 
     def test_erc20_identity_uses_registry_address_decimals_and_price_metadata(self) -> None:
         address = "0x" + "12" * 20
@@ -219,13 +225,14 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(identity["external_price_source"], "stable")
         self.assertEqual(identity["identity_source"], "token_registry")
 
-    def test_invalid_native_registry_identity_fails_closed(self) -> None:
-        row = self._token("NOTETH", None, 18)
-        with self.assertRaisesRegex(ValueError, "invalid_robinhood_chain_native_registry_identity"):
-            self.service.token_identity(self.db, row)
+    def test_ambiguous_effective_native_registry_identity_fails_closed(self) -> None:
+        self._token("GASX", None, 9)
+        self._token("FUEL", None, 7, venue="robinhood_chain")
+        with self.assertRaisesRegex(ValueError, "ambiguous_robinhood_chain_native_registry_identity"):
+            self.service.registry_rows(self.db)
 
     async def test_verify_native_identity_persists_verified_record_without_contract_call(self) -> None:
-        row = self._token("ETH", None, 18, label="Native")
+        row = self._token("GASX", None, 9, label="Native Gas")
         result = await self.service.verify_asset(
             self.db,
             token_registry_id=row.id,
@@ -235,6 +242,8 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["verification"]["canonical_status"], "verified")
         self.assertIsNone(result["verification"]["code_present"])
+        self.assertEqual(result["verification"]["onchain_symbol"], "GASX")
+        self.assertEqual(result["verification"]["onchain_decimals"], 9)
         self.assertFalse(any(method == "eth_getCode" for method, _ in self.fake_rpc.calls))
 
     async def test_verify_erc20_identity_matches_onchain_metadata(self) -> None:
@@ -410,7 +419,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wrap_unwrap_records_two_review_only_capabilities_without_provider_call(self) -> None:
         wrapped = self._token("WRAPPED", "0x" + "70" * 20, 18)
-        native = self._token("ETH", None, 18)
+        native = self._token("GASX", None, 9)
         self._mark_verified(wrapped)
         self._mark_verified(native)
         objective = self.service.create_objective(
@@ -490,6 +499,15 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(capability["execution_enabled"])
         self.assertEqual(capability["execution_status"], "live_verified")
 
+
+    def test_venue_override_preserves_symbol_priority_without_token_fallback(self) -> None:
+        global_row = self._token("ALPHA", "0x" + "d1" * 20, 6)
+        override = self._token("ALPHA", "0x" + "d2" * 20, 7, venue="robinhood_chain")
+        selected = self.service.resolve_token(self.db, "ALPHA")
+        self.assertEqual(selected["registry_id"], override.id)
+        self.assertNotEqual(selected["registry_id"], global_row.id)
+        self.assertEqual(selected["decimals"], 7)
+        self.assertEqual(selected["registry_venue"], "robinhood_chain")
 
     def test_provider_price_normalization_preserves_integer_trailing_zero(self) -> None:
         provider = RobinhoodChainExecutionDiscoveryService(
@@ -573,34 +591,40 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     def test_discovery_sources_contain_no_known_token_contract_or_pair_objectives(self) -> None:
         import inspect
         import app.services.robinhood_chain_execution_discovery as provider_module
+        import app.services.robinhood_chain_registry_authority as authority_module
         import app.services.robinhood_chain_registry_discovery as registry_module
 
         source = (
             inspect.getsource(provider_module)
             + "\n"
+            + inspect.getsource(authority_module)
+            + "\n"
             + inspect.getsource(registry_module)
         ).lower()
-        self.assertNotIn("0x0bd7d308f8e1639fab988df18a8011f41eacad73", source)
-        self.assertNotIn("0x5fc5360d0400a0fd4f2af552add042d716f1d168", source)
-        self.assertNotIn("0x4a0e65a3eccec6dbe60ae065f2e7bb85fae35eea", source)
-        self.assertNotIn("spcx-usdg", source)
-        self.assertNotIn("spcx-weth", source)
+        import re
+
+        hex_literals = set(re.findall(r"0x[0-9a-f]{40}", source))
+        self.assertEqual(hex_literals, {provider_module.ZEROX_NATIVE_TOKEN.lower()})
+        self.assertNotIn("supported_output_tokens", source)
+        self.assertNotIn("approval_tokens", source)
+        self.assertNotIn('native_symbol = "eth"', source)
+        self.assertNotIn('native_decimals = 18', source)
 
     def test_market_catalog_enables_only_two_direction_available_swap_books(self) -> None:
-        weth = self._token("WETH", "0x" + "a1" * 20, 18)
-        usdg = self._token("USDG", "0x" + "a2" * 20, 6)
+        base = self._token("ALPHA", "0x" + "a1" * 20, 18)
+        quote = self._token("BETA", "0x" + "a2" * 20, 6)
         result = self.service.create_objective(
             self.db,
-            base_token_registry_id=weth.id,
-            quote_token_registry_id=usdg.id,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
             mechanism=MECHANISM_SWAP,
             notes="catalog test",
             confirm_create=True,
         )
         objective_id = result["objective"]["id"]
         for from_row, to_row, amount in (
-            (weth, usdg, "0.0005"),
-            (usdg, weth, "1"),
+            (base, quote, "0.0005"),
+            (quote, base, "1"),
         ):
             self.db.add(
                 RobinhoodChainPairCapability(
@@ -625,7 +649,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(catalog), 1)
         market = catalog[0]
         self.assertEqual(market["tranche"], "RH-CHAIN.10D.2-R5C.2")
-        self.assertEqual(market["symbol"], "WETH-USDG")
+        self.assertEqual(market["symbol"], "ALPHA-BETA")
         self.assertEqual(market["indicative_state"], "available")
         self.assertTrue(market["orderbook_enabled"])
         self.assertEqual(market["available_direction_count"], 2)
@@ -635,23 +659,23 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(market["capability_source"], "database")
 
     def test_market_catalog_classifies_wrap_and_provider_error_without_enabling_books(self) -> None:
-        eth = self._token("ETH", None, 18)
-        weth = self._token("WETH", "0x" + "b1" * 20, 18)
-        spcx = self._token("SPCX", "0x" + "b2" * 20, 18)
-        usdg = self._token("USDG", "0x" + "b3" * 20, 6)
+        native = self._token("GASX", None, 9)
+        wrapped = self._token("WGASX", "0x" + "b1" * 20, 9)
+        blocked_base = self._token("GAMMA", "0x" + "b2" * 20, 18)
+        blocked_quote = self._token("DELTA", "0x" + "b3" * 20, 6)
 
         wrap_result = self.service.create_objective(
             self.db,
-            base_token_registry_id=weth.id,
-            quote_token_registry_id=eth.id,
+            base_token_registry_id=wrapped.id,
+            quote_token_registry_id=native.id,
             mechanism=MECHANISM_WRAP_UNWRAP,
             notes=None,
             confirm_create=True,
         )
-        spcx_result = self.service.create_objective(
+        blocked_result = self.service.create_objective(
             self.db,
-            base_token_registry_id=spcx.id,
-            quote_token_registry_id=usdg.id,
+            base_token_registry_id=blocked_base.id,
+            quote_token_registry_id=blocked_quote.id,
             mechanism=MECHANISM_SWAP,
             notes=None,
             confirm_create=True,
@@ -659,13 +683,13 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         for objective_id, pairs, provider, status in (
             (
                 wrap_result["objective"]["id"],
-                ((weth, eth), (eth, weth)),
+                ((wrapped, native), (native, wrapped)),
                 "native_wrap",
                 "mechanism_configured",
             ),
             (
-                spcx_result["objective"]["id"],
-                ((spcx, usdg), (usdg, spcx)),
+                blocked_result["objective"]["id"],
+                ((blocked_base, blocked_quote), (blocked_quote, blocked_base)),
                 "0x",
                 "provider_error",
             ),
@@ -691,13 +715,13 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.db.commit()
 
         by_symbol = {item["symbol"]: item for item in self.service.market_catalog(self.db)}
-        wrap = by_symbol["WETH-ETH"]
+        wrap = by_symbol["WGASX-GASX"]
         self.assertEqual(wrap["indicative_state"], "mechanism_configured")
         self.assertTrue(wrap["mechanism_configured"])
         self.assertFalse(wrap["orderbook_enabled"])
         self.assertEqual(wrap["orderbook_reason"], "wrap_unwrap_uses_dedicated_mechanism_view")
 
-        blocked = by_symbol["SPCX-USDG"]
+        blocked = by_symbol["GAMMA-DELTA"]
         self.assertEqual(blocked["indicative_state"], "provider_error")
         self.assertEqual(blocked["provider_error_direction_count"], 2)
         self.assertFalse(blocked["orderbook_enabled"])

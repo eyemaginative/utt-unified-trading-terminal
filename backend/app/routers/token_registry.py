@@ -11,7 +11,14 @@ from sqlalchemy import text
 
 from ..db import get_db
 from ..models import TokenRegistry
-from ..services.evm_rpc import validate_evm_address
+from ..services.robinhood_chain_registry_authority import (
+    ASSET_KIND_NATIVE,
+    ROBINHOOD_CHAIN,
+    RobinhoodChainRegistryAuthorityError,
+    assert_native_write_unambiguous,
+    normalize_identity_input,
+    row_asset_kind,
+)
 
 router = APIRouter(prefix="/api/token_registry", tags=["token_registry"])
 
@@ -50,11 +57,6 @@ def _validate_address(addr: Optional[str]) -> Optional[str]:
     return a or None
 
 
-ROBINHOOD_CHAIN = "robinhood_chain"
-ROBINHOOD_CHAIN_NATIVE_SYMBOL = "ETH"
-ROBINHOOD_CHAIN_NATIVE_DECIMALS = 18
-
-
 def _token_identity_error(error: str, message: str, **context: Any) -> None:
     detail: Dict[str, Any] = {
         "error": error,
@@ -71,51 +73,49 @@ def _validate_chain_token_identity(
     symbol: str,
     address: Optional[str],
     decimals: int,
-) -> tuple[Optional[str], int]:
+    asset_kind: Optional[str] = None,
+) -> tuple[Optional[str], int, Optional[str]]:
     c = _norm_chain(chain)
     s = _norm_symbol(symbol)
     a = _validate_address(address)
     d = _validate_decimals(decimals)
 
     if c != ROBINHOOD_CHAIN:
-        return a, d
-
-    if s == ROBINHOOD_CHAIN_NATIVE_SYMBOL:
-        if a is not None:
-            _token_identity_error(
-                "robinhood_chain_native_address_must_be_blank",
-                "Robinhood Chain native ETH must use a blank contract address. Use a distinct symbol such as WETH for ERC-20 contracts.",
-                symbol=s,
-                address=a,
-            )
-        if d != ROBINHOOD_CHAIN_NATIVE_DECIMALS:
-            _token_identity_error(
-                "robinhood_chain_native_decimals_must_be_18",
-                "Robinhood Chain native ETH must use exactly 18 decimals.",
-                symbol=s,
-                decimals=d,
-                expected_decimals=ROBINHOOD_CHAIN_NATIVE_DECIMALS,
-            )
-        return None, ROBINHOOD_CHAIN_NATIVE_DECIMALS
-
-    if a is None:
-        _token_identity_error(
-            "robinhood_chain_erc20_contract_required",
-            "Robinhood Chain ERC-20 registry rows require a contract address.",
-            symbol=s,
-        )
+        return a, d, None
 
     try:
-        normalized = validate_evm_address(a)
-    except ValueError as exc:
-        _token_identity_error(
-            "invalid_robinhood_chain_contract_address",
-            str(exc),
+        identity = normalize_identity_input(
             symbol=s,
             address=a,
+            decimals=d,
+            asset_kind=asset_kind,
         )
+    except RobinhoodChainRegistryAuthorityError as exc:
+        _token_identity_error(exc.code, exc.message, **exc.context)
 
-    return normalized, d
+    return identity["address"], int(identity["decimals"]), str(identity["asset_kind"])
+
+
+def _assert_native_write_allowed(
+    db: Session,
+    *,
+    chain: str,
+    venue: Optional[str],
+    symbol: str,
+    asset_kind: Optional[str],
+    exclude_token_id: Optional[int] = None,
+) -> None:
+    if _norm_chain(chain) != ROBINHOOD_CHAIN or asset_kind != ASSET_KIND_NATIVE:
+        return
+    try:
+        assert_native_write_unambiguous(
+            db,
+            venue=venue,
+            symbol=symbol,
+            exclude_token_id=exclude_token_id,
+        )
+    except RobinhoodChainRegistryAuthorityError as exc:
+        _token_identity_error(exc.code, exc.message, **exc.context)
 
 
 def _clean_optional_str(value: Optional[str]) -> Optional[str]:
@@ -231,6 +231,7 @@ class TokenRegistryCreate(BaseModel):
     venue: Optional[str] = Field(default=None, description="Optional venue override (e.g. coinbase); omit for global mapping")
     symbol: str = Field(..., description="Symbol ticker, e.g. UTTT")
     address: Optional[str] = Field(default=None, description="Contract/mint address (chain-specific)")
+    asset_kind: Optional[str] = Field(default=None, description="Robinhood Chain only: native or erc20; blank infers from address for compatibility")
     decimals: int = Field(..., ge=0, le=18)
     label: Optional[str] = Field(default=None, description="Optional display label/name")
     external_price_source: Optional[str] = Field(default=None, description="Optional external price source: stable, coingecko, derived, none")
@@ -241,6 +242,7 @@ class TokenRegistryUpdate(BaseModel):
     venue: Optional[str] = Field(default=None)
     symbol: Optional[str] = Field(default=None)
     address: Optional[str] = Field(default=None)
+    asset_kind: Optional[str] = Field(default=None)
     decimals: Optional[int] = Field(default=None, ge=0, le=18)
     label: Optional[str] = Field(default=None)
     external_price_source: Optional[str] = Field(default=None)
@@ -249,12 +251,15 @@ class TokenRegistryUpdate(BaseModel):
 
 def _row_to_dict(r: TokenRegistry, *, external_meta: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, Any]:
     meta = external_meta or {}
+    asset_kind = row_asset_kind(r) if _norm_chain(r.chain) == ROBINHOOD_CHAIN else None
     return {
         "id": r.id,
         "chain": r.chain,
         "venue": r.venue,
         "symbol": r.symbol,
         "address": r.address,
+        "asset_kind": asset_kind,
+        "native": asset_kind == ASSET_KIND_NATIVE if asset_kind else None,
         "decimals": int(r.decimals),
         "label": r.label,
         "external_price_source": meta.get("external_price_source"),
@@ -295,12 +300,6 @@ def create_token(req: TokenRegistryCreate, db: Session = Depends(get_db)) -> Dic
     c = _norm_chain(req.chain)
     v = _norm_venue(req.venue)
     s = _norm_symbol(req.symbol)
-    a, d = _validate_chain_token_identity(
-        chain=c,
-        symbol=s,
-        address=req.address,
-        decimals=req.decimals,
-    )
     label = (req.label or "").strip() or None
     external_price_source = _norm_external_price_source(req.external_price_source)
     external_price_id = _clean_optional_str(req.external_price_id)
@@ -311,6 +310,22 @@ def create_token(req: TokenRegistryCreate, db: Session = Depends(get_db)) -> Dic
         db.query(TokenRegistry)
         .filter(TokenRegistry.chain == c, TokenRegistry.venue.is_(v) if v is None else TokenRegistry.venue == v, TokenRegistry.symbol == s)
         .first()
+    )
+
+    a, d, asset_kind = _validate_chain_token_identity(
+        chain=c,
+        symbol=s,
+        address=req.address,
+        decimals=req.decimals,
+        asset_kind=req.asset_kind,
+    )
+    _assert_native_write_allowed(
+        db,
+        chain=c,
+        venue=v,
+        symbol=s,
+        asset_kind=asset_kind,
+        exclude_token_id=int(row.id) if row is not None else None,
     )
 
     if row is None:
@@ -341,19 +356,27 @@ def update_token(token_id: int, req: TokenRegistryUpdate, db: Session = Depends(
     if row is None:
         raise HTTPException(status_code=404, detail="token not found")
 
-    if req.venue is not None:
-        row.venue = _norm_venue(req.venue)
-
+    next_venue = _norm_venue(req.venue) if req.venue is not None else _norm_venue(row.venue)
     next_symbol = _norm_symbol(req.symbol) if req.symbol is not None else _norm_symbol(row.symbol)
     next_address = _validate_address(req.address) if req.address is not None else _validate_address(row.address)
     next_decimals = _validate_decimals(req.decimals) if req.decimals is not None else _validate_decimals(row.decimals)
-    next_address, next_decimals = _validate_chain_token_identity(
+    next_address, next_decimals, asset_kind = _validate_chain_token_identity(
         chain=row.chain,
         symbol=next_symbol,
         address=next_address,
         decimals=next_decimals,
+        asset_kind=req.asset_kind,
+    )
+    _assert_native_write_allowed(
+        db,
+        chain=row.chain,
+        venue=next_venue,
+        symbol=next_symbol,
+        asset_kind=asset_kind,
+        exclude_token_id=int(row.id),
     )
 
+    row.venue = next_venue
     row.symbol = next_symbol
     row.address = next_address
     row.decimals = next_decimals

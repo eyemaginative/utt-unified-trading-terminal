@@ -28,6 +28,11 @@ from app.services.robinhood_chain_execution import (  # noqa: E402
 )
 
 
+def _runtime_test_contract_address(label: str) -> str:
+    digest = hashlib.sha256(str(label).encode("utf-8")).hexdigest()
+    return "0x" + digest[-40:]
+
+
 TAKER = "0x70c1ddd03bc4cb74efac3f12a41465d028ae490c"
 DESTINATION = "0x0000000000001ff3684f28c67538d4d072c22734"
 TX_HASH = "0x" + "ab" * 32
@@ -39,13 +44,13 @@ ACTUAL_USDG_ATOMIC = 3_710_769
 
 ETH = {
     "symbol": "ETH",
-    "contract_address": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "contract_address": None,
     "decimals": 18,
     "native": True,
 }
 USDG = {
     "symbol": "USDG",
-    "contract_address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "contract_address": _runtime_test_contract_address("robinhood-chain-output-token"),
     "decimals": 6,
     "native": False,
 }
@@ -214,8 +219,30 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         engine = create_engine("sqlite:///:memory:", future=True)
         RobinhoodChainExecution.__table__.create(bind=engine)
+        TokenRegistry.__table__.create(bind=engine)
         self.Session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
         self.db = self.Session()
+        self.db.add_all(
+            [
+                TokenRegistry(
+                    chain="robinhood_chain",
+                    venue=None,
+                    symbol=ETH["symbol"],
+                    address=None,
+                    decimals=ETH["decimals"],
+                    label="Test Native Asset",
+                ),
+                TokenRegistry(
+                    chain="robinhood_chain",
+                    venue=None,
+                    symbol=USDG["symbol"],
+                    address=USDG["contract_address"],
+                    decimals=USDG["decimals"],
+                    label="Test Output Token",
+                ),
+            ]
+        )
+        self.db.commit()
         self.planning = FakePlanningService()
         self.service = RobinhoodChainExecutionService(planning_service=self.planning)
 
@@ -385,15 +412,23 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
                 label="MetaMask",
                 owner_scope="user",
             )
+            native_token = TokenRegistry(
+                chain="robinhood_chain",
+                venue="robinhood_chain",
+                symbol=ETH["symbol"],
+                address=None,
+                decimals=ETH["decimals"],
+                label="Test Native Asset",
+            )
             token = TokenRegistry(
                 chain="robinhood_chain",
                 venue="robinhood_chain",
-                symbol="USDG",
+                symbol=USDG["symbol"],
                 address=USDG["contract_address"],
-                decimals=6,
-                label="Global Dollar",
+                decimals=USDG["decimals"],
+                label="Test Output Token",
             )
-            db.add_all([wallet, token])
+            db.add_all([wallet, native_token, token])
             db.commit()
 
             fake = FakeBalanceClient()
@@ -411,10 +446,11 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["refreshed"], 2)
-            self.assertEqual([item["asset"] for item in result["items"]], ["ETH", "USDG"])
+            expected_assets = [ETH["symbol"], USDG["symbol"]]
+            self.assertEqual([item["asset"] for item in result["items"]], expected_assets)
             self.assertTrue(all(call[-1] is True for call in fake.calls))
             rows = db.query(WalletAddressSnapshot).order_by(WalletAddressSnapshot.asset.asc()).all()
-            self.assertEqual([row.asset for row in rows], ["ETH", "USDG"])
+            self.assertEqual([row.asset for row in rows], expected_assets)
             self.assertAlmostEqual(rows[0].balance_qty, 0.028812857556354184)
             self.assertAlmostEqual(rows[1].balance_qty, 3.710769)
             self.assertTrue(all(row.balance_raw.get("post_execution_refresh") is True for row in rows))
@@ -596,8 +632,17 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["actual_output_amount_atomic"], str(ACTUAL_USDG_ATOMIC))
         self.assertEqual(row["actual_average_fill_price"], "1855.3845")
         self.assertEqual(row["actual_network_fee"], "0.0000196")
-        self.assertEqual(row["actual_network_fee_asset"], "ETH")
+        self.assertEqual(row["actual_network_fee_asset"], ETH["symbol"])
         self.assertTrue(row["reconciliation"]["reconciled"])
+        self.assertEqual(row["reconciliation"]["identity_source"], "token_registry")
+        self.assertEqual(row["reconciliation"]["output_asset"], USDG["symbol"])
+        self.assertEqual(
+            row["reconciliation"]["output_contract"],
+            USDG["contract_address"].lower(),
+        )
+        self.assertEqual(row["reconciliation"]["output_decimals"], USDG["decimals"])
+        self.assertEqual(row["reconciliation"]["fee_asset"], ETH["symbol"])
+        self.assertEqual(row["reconciliation"]["fee_asset_decimals"], ETH["decimals"])
         self.assertEqual(self.service.status()["tranche"], "RH-CHAIN.10D.1B")
         self.assertFalse(self.service.status()["ledger_mutation_enabled"])
         self.assertFalse(self.service.status()["fifo_mutation_enabled"])
@@ -614,7 +659,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed["execution"]["error_code"], "receipt_reconciliation_failed")
         self.assertEqual(
             refreshed["execution"]["error_message"],
-            "robinhood_chain_usdg_transfer_to_wallet_not_found",
+            "robinhood_chain_output_transfer_to_wallet_not_found",
         )
 
     async def test_confirmed_row_can_be_backfilled_after_earlier_tranche(self):
@@ -696,9 +741,9 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(mapped["avg_fill_price"], 1855.3845)
         self.assertAlmostEqual(mapped["limit_price"], 1845.306)
         self.assertAlmostEqual(mapped["fee"], 0.0000196)
-        self.assertEqual(mapped["fee_asset"], "ETH")
+        self.assertEqual(mapped["fee_asset"], ETH["symbol"])
         self.assertAlmostEqual(mapped["total_after_fee"], 3.710769)
-        self.assertEqual(mapped["actual_output_asset"], "USDG")
+        self.assertEqual(mapped["actual_output_asset"], USDG["symbol"])
         self.assertTrue(mapped["execution_reconciled"])
 
 

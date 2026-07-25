@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 from datetime import datetime, timezone
@@ -14,7 +15,6 @@ from ..models import RobinhoodChainExecution
 from .evm_rpc import decode_hex_quantity, validate_evm_address
 from .robinhood_chain_transaction_planning import (
     EXPECTED_CHAIN_ID,
-    ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL,
     RobinhoodChainTransactionPlanningService,
     get_robinhood_chain_transaction_planning_service,
 )
@@ -22,6 +22,9 @@ from .robinhood_chain_registry_authority import (
     effective_native_row,
     effective_row_by_symbol,
     identity_fields_from_row,
+)
+from .robinhood_chain_registry_discovery import (
+    get_robinhood_chain_registry_discovery_service,
 )
 
 
@@ -413,6 +416,51 @@ def _plan_hash(plan: Dict[str, Any], identity: Dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _planning_service_uses_registry_contract(planning_service: Any) -> bool:
+    """Detect the RH-REG.AUTH.1B planner without breaking legacy test doubles."""
+    try:
+        parameters = inspect.signature(planning_service.firm_quote_plan).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return "requested_amount" in parameters and "route_capability" in parameters
+
+
+def _resolve_execution_planning_context(db: Session) -> Dict[str, Any]:
+    """Resolve the fixed legacy execution market through database/registry authority."""
+    service = get_robinhood_chain_registry_discovery_service()
+    market = service.objective_by_symbol(db, ROBINHOOD_CHAIN_EXECUTION_SYMBOL)
+    base_token = market.get("base") if isinstance(market.get("base"), dict) else {}
+    quote_token = market.get("quote") if isinstance(market.get("quote"), dict) else {}
+    base_symbol = str(base_token.get("symbol") or "").strip().upper()
+    quote_symbol = str(quote_token.get("symbol") or "").strip().upper()
+    route_capability = next(
+        (
+            item
+            for item in (market.get("capabilities") or [])
+            if isinstance(item, dict)
+            and str(item.get("from_asset") or "").strip().upper() == base_symbol
+            and str(item.get("to_asset") or "").strip().upper() == quote_symbol
+            and str(item.get("amount_mode") or "").strip().lower() == "exact_input"
+        ),
+        None,
+    )
+    if route_capability is None:
+        raise ValueError("robinhood_chain_execution_route_capability_unavailable")
+
+    native_token = service.native_identity(db)
+    registry_tokens = [
+        service.token_identity(db, row)
+        for row in service.registry_rows(db)
+    ]
+    return {
+        "base_token": base_token,
+        "quote_token": quote_token,
+        "native_token": native_token,
+        "registry_tokens": registry_tokens,
+        "route_capability": route_capability,
+    }
+
+
 def _execution_gate() -> Dict[str, Any]:
     dedicated = bool(getattr(settings, "robinhood_chain_live_execution_enabled", False))
     armed = bool(getattr(settings, "armed", False))
@@ -579,16 +627,34 @@ class RobinhoodChainExecutionService:
 
         taker = validate_evm_address(taker_address).lower()
         _, requested_amount_text, requested_amount_wei = normalize_robinhood_chain_execution_quantity(quantity)
-        plan = await self.planning_service.firm_quote_plan(
-            symbol=ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL,
-            side=ROBINHOOD_CHAIN_EXECUTION_SIDE,
-            quantity=requested_amount_text,
-            total_quote=None,
-            taker_address=taker,
-            eth_token=eth_token,
-            usdg_token=usdg_token,
-            slippage_bps=int(slippage_bps),
-        )
+        if _planning_service_uses_registry_contract(self.planning_service):
+            planning_context = _resolve_execution_planning_context(db)
+            plan = await self.planning_service.firm_quote_plan(
+                symbol=ROBINHOOD_CHAIN_EXECUTION_SYMBOL,
+                side=ROBINHOOD_CHAIN_EXECUTION_SIDE,
+                amount_mode="exact_input",
+                requested_amount=requested_amount_text,
+                maximum_input_amount=None,
+                taker_address=taker,
+                base_token=planning_context["base_token"],
+                quote_token=planning_context["quote_token"],
+                native_token=planning_context["native_token"],
+                registry_tokens=planning_context["registry_tokens"],
+                route_capability=planning_context["route_capability"],
+                slippage_bps=int(slippage_bps),
+            )
+        else:
+            # Compatibility for the unchanged legacy execution test double.
+            plan = await self.planning_service.firm_quote_plan(
+                symbol=ROBINHOOD_CHAIN_EXECUTION_SYMBOL,
+                side=ROBINHOOD_CHAIN_EXECUTION_SIDE,
+                quantity=requested_amount_text,
+                total_quote=None,
+                taker_address=taker,
+                eth_token=eth_token,
+                usdg_token=usdg_token,
+                slippage_bps=int(slippage_bps),
+            )
         if not plan.get("ok"):
             return plan
 

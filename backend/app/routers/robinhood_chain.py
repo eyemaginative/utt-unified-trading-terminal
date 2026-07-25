@@ -29,12 +29,10 @@ from ..services.robinhood_chain_registry_discovery import (
 )
 from ..services.robinhood_chain_quotes import (
     ROBINHOOD_CHAIN_QUOTE_PROVIDER,
-    ROBINHOOD_CHAIN_QUOTE_SYMBOL,
     get_robinhood_chain_quote_service,
 )
 from ..services.robinhood_chain_transaction_planning import (
     ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
-    ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL,
     ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
     ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
     get_robinhood_chain_transaction_planning_service,
@@ -214,7 +212,8 @@ def _resolve_robinhood_chain_review_market(
     symbol: str,
     side: str,
     amount_mode: str,
-) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+    capability_status_field: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """Resolve one database market and fail closed before provider contact."""
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
@@ -250,10 +249,12 @@ def _resolve_robinhood_chain_review_market(
     quote_symbol = str(quote.get("symbol") or "").strip().upper()
     normalized_side = str(side or "").strip().lower()
     if normalized_side not in {"buy", "sell"}:
-        raise HTTPException(status_code=400, detail={"error": "invalid_quote_side"})
+        raise HTTPException(status_code=400, detail={"error": "invalid_quote_side", "provider_contacted": False})
+    normalized_mode = str(amount_mode or "").strip().lower()
+    if normalized_mode not in {"exact_input", "exact_output"}:
+        raise HTTPException(status_code=400, detail={"error": "invalid_quote_amount_mode", "provider_contacted": False})
     from_asset = base_symbol if normalized_side == "sell" else quote_symbol
     to_asset = quote_symbol if normalized_side == "sell" else base_symbol
-    normalized_mode = str(amount_mode or "exact_input").strip().lower()
 
     capability = next(
         (
@@ -265,24 +266,53 @@ def _resolve_robinhood_chain_review_market(
         ),
         None,
     )
-    if normalized_mode == "exact_input":
-        indicative_status = str((capability or {}).get("indicative_status") or "").strip().lower()
-        if indicative_status not in {"available", "live_verified"}:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "robinhood_chain_quote_route_unavailable",
-                    "symbol": market.get("symbol"),
-                    "input_asset": from_asset,
-                    "output_asset": to_asset,
-                    "amount_mode": normalized_mode,
-                    "route_capability": capability,
-                    "provider_contacted": False,
-                    "read_only": True,
-                    "execution_enabled": False,
-                },
-            )
+    status_field = str(capability_status_field or "").strip()
+    if status_field not in {"indicative_status", "firm_plan_status"}:
+        raise HTTPException(status_code=500, detail={"error": "invalid_review_capability_status_field"})
+    capability_status = str((capability or {}).get(status_field) or "").strip().lower()
+    if capability_status not in {"available", "live_verified"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "robinhood_chain_quote_route_unavailable"
+                if status_field == "indicative_status"
+                else "firm_quote_route_capability_unavailable",
+                "symbol": market.get("symbol"),
+                "input_asset": from_asset,
+                "output_asset": to_asset,
+                "amount_mode": normalized_mode,
+                "capability_status_field": status_field,
+                "capability_status": capability_status or "missing",
+                "route_capability": capability,
+                "provider_contacted": False,
+                "read_only": True,
+                "execution_enabled": False,
+            },
+        )
     return market, base, quote, capability
+
+
+def _resolve_robinhood_chain_review_identities(
+    db: Session,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    registry_service = get_robinhood_chain_registry_discovery_service()
+    registry_tokens = [
+        item for item in registry_service.assets(db)
+        if isinstance(item, dict)
+        and not item.get("identity_error")
+        and item.get("registry_id") is not None
+    ]
+    native_token = next((item for item in registry_tokens if item.get("native") is True), None)
+    if native_token is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "robinhood_chain_native_registry_identity_not_found",
+                "identity_source": "token_registry",
+                "provider_contacted": False,
+            },
+        )
+    return registry_tokens, native_token
 
 
 # Callers select stable check names, never arbitrary JSON-RPC methods or params.
@@ -392,24 +422,23 @@ class RobinhoodChainIndicativeQuoteRequest(BaseModel):
         default="0x",
         min_length=1,
         max_length=16,
-        description="Fixed quote provider identifier; only 0x is accepted in RH-CHAIN.10B.",
+        description="Fixed quote provider identifier; only 0x is accepted.",
     )
     symbol: str = Field(
-        default=ROBINHOOD_CHAIN_QUOTE_SYMBOL,
         min_length=1,
         max_length=32,
-        description="Canonical quote-only market symbol. RH-CHAIN.10D.0 supports ETH-USDG only.",
+        description="Explicit database-registered market symbol.",
     )
     side: str = Field(min_length=3, max_length=4, description="buy or sell")
-    quantity: Optional[str] = Field(
-        default=None,
-        max_length=80,
-        description="Exact ETH input for sell quotes.",
+    amount_mode: str = Field(
+        min_length=10,
+        max_length=12,
+        description="Explicit provider amount mode: exact_input or exact_output.",
     )
-    total_quote: Optional[str] = Field(
-        default=None,
+    requested_amount: str = Field(
+        min_length=1,
         max_length=80,
-        description="Exact USDG input for buy quotes.",
+        description="Requested amount in the capability-defined input or output asset.",
     )
     taker_address: Optional[str] = Field(
         default=None,
@@ -425,40 +454,34 @@ class RobinhoodChainFirmQuotePlanRequest(BaseModel):
         default="0x",
         min_length=1,
         max_length=16,
-        description="Fixed provider identifier; only 0x AllowanceHolder is accepted in RH-CHAIN.10C.",
+        description="Fixed provider identifier; only 0x AllowanceHolder is accepted.",
     )
     symbol: str = Field(
-        default=ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL,
         min_length=1,
         max_length=32,
-        description="Canonical market symbol. RH-CHAIN.10D.0 supports ETH-USDG only.",
+        description="Explicit database-registered market symbol.",
     )
     side: str = Field(min_length=3, max_length=4, description="buy or sell")
-    quantity: Optional[str] = Field(
-        default=None,
-        max_length=80,
-        description="Exact ETH input for sell plans.",
+    amount_mode: str = Field(
+        min_length=10,
+        max_length=12,
+        description="Explicit provider amount mode: exact_input or exact_output.",
     )
-    total_quote: Optional[str] = Field(
-        default=None,
+    requested_amount: str = Field(
+        min_length=1,
         max_length=80,
-        description="Exact USDG input for exact-input buy plans.",
+        description="Requested amount in the capability-defined input or output asset.",
     )
-    exact_output_quantity: Optional[str] = Field(
+    maximum_input_amount: Optional[str] = Field(
         default=None,
         max_length=80,
-        description="Exact ETH output for the RH-CHAIN.10D.2 reverse BUY.",
-    )
-    maximum_total_quote: Optional[str] = Field(
-        default=None,
-        max_length=80,
-        description="Strict maximum USDG spend for an exact-output BUY.",
+        description="Required only for a database-verified exact-output capability.",
     )
     slippage_bps: int = Field(
         default=ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
         ge=ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
         le=ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
-        description="Bounded exact-input slippage protection in basis points.",
+        description="Bounded slippage protection in basis points.",
     )
     taker_address: Optional[str] = Field(
         default=None,
@@ -801,13 +824,21 @@ def _quote_failure_status(result: Dict[str, Any]) -> int:
     if error in {
         "unsupported_robinhood_chain_quote_symbol",
         "invalid_quote_side",
+        "invalid_quote_amount_mode",
+        "invalid_requested_amount",
         "invalid_quantity",
         "invalid_quote_amount",
         "invalid_discovery_amount",
         "discovery_amount_exceeds_cap",
         "unsupported_discovery_pair",
         "invalid_firm_quote_amount",
-        "firm_quote_amount_exceeds_cap",
+        "firm_quote_amount_exceeds_capability_probe",
+        "firm_quote_input_ceiling_unavailable",
+        "firm_quote_input_exceeds_firm_plan_ceiling",
+        "firm_quote_maximum_input_exceeds_capability_ceiling",
+        "robinhood_chain_quote_amount_exceeds_indicative_ceiling",
+        "robinhood_chain_quote_exact_output_exceeds_probe_evidence",
+        "maximum_input_amount_requires_exact_output",
         "invalid_slippage_bps",
     }:
         return 400
@@ -817,6 +848,9 @@ def _quote_failure_status(result: Dict[str, Any]) -> int:
         "firm_quote_route_mode_not_live_verified",
         "robinhood_chain_quote_route_unavailable",
         "firm_quote_route_capability_unavailable",
+        "firm_quote_probe_evidence_missing",
+        "firm_quote_exact_output_ceiling_unavailable",
+        "robinhood_chain_quote_probe_evidence_missing",
         "robinhood_chain_quote_mechanism_not_supported",
     }:
         return 409
@@ -1643,20 +1677,53 @@ async def robinhood_chain_quotes_status(
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
 
     registry_service = get_robinhood_chain_registry_discovery_service()
+    registry_tokens, native_token = _resolve_robinhood_chain_review_identities(db)
     tokens = {
         str(item.get("symbol") or "").strip().upper(): item
-        for item in registry_service.assets(db)
-        if item.get("symbol") and not item.get("identity_error")
+        for item in registry_tokens
+        if item.get("symbol")
     }
+    markets = registry_service.market_catalog(db)
+    route_capabilities = registry_service.route_capabilities(db)
+    indicative_symbols = sorted({
+        str(item.get("symbol") or "").strip().upper()
+        for item in route_capabilities
+        if str(item.get("mechanism") or "swap").strip().lower() == "swap"
+        and str(item.get("indicative_status") or "").strip().lower() in {"available", "live_verified"}
+    })
+    firm_symbols = sorted({
+        str(item.get("symbol") or "").strip().upper()
+        for item in route_capabilities
+        if str(item.get("mechanism") or "swap").strip().lower() == "swap"
+        and str(item.get("firm_plan_status") or "").strip().lower() in {"available", "live_verified"}
+    })
     payload = get_robinhood_chain_quote_service().status()
+    payload["supported_symbols"] = indicative_symbols
+    payload["review_markets"] = markets
     payload["firm_planning"] = get_robinhood_chain_transaction_planning_service().status()
+    payload["firm_planning"]["supported_symbols"] = firm_symbols
+    payload["firm_planning"]["route_capabilities"] = route_capabilities
+    payload["firm_planning"]["exact_output_enabled"] = any(
+        str(item.get("amount_mode") or "").strip().lower() == "exact_output"
+        and str(item.get("firm_plan_status") or "").strip().lower() in {"available", "live_verified"}
+        for item in route_capabilities
+    )
     payload["tokens"] = tokens
-    payload["route_capabilities"] = registry_service.route_capabilities(db)
+    payload["native_fee_identity"] = native_token
+    payload["route_capabilities"] = route_capabilities
     payload["token_identity_source"] = "token_registry"
     payload["pair_capability_source"] = "database"
     payload["swap_oriented"] = True
-    payload["amount_modes"] = ["exact_spend", "exact_receive"]
-    payload["exact_receive_provider"] = "direct_router_required"
+    payload["amount_modes"] = sorted({
+        str(item.get("display_mode") or item.get("amount_mode") or "").strip().lower()
+        for item in route_capabilities
+        if item.get("display_mode") or item.get("amount_mode")
+    })
+    payload["exact_output_enabled"] = any(
+        str(item.get("amount_mode") or "").strip().lower() == "exact_output"
+        and str(item.get("indicative_status") or "").strip().lower() in {"available", "live_verified"}
+        for item in route_capabilities
+    )
     wallet_row = (
         db.query(WalletAddress)
         .filter(
@@ -1693,8 +1760,9 @@ async def robinhood_chain_indicative_quote(
 ) -> Dict[str, Any]:
     """Return a bounded indicative quote without constructing or submitting a trade.
 
-    RH-CHAIN.10D.2-R5C.3A adds database-gated WETH-USDG exact-input review
-    quotes. Exact receive remains fail-closed before provider contact.
+    The requested market, identities, direction, and amount mode must be present
+    in database-backed capability evidence. Exact-input review uses an explicit
+    direction ceiling when present, otherwise the configured read-only value cap.
     """
     if not bool(settings.robinhood_chain_enabled):
         raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
@@ -1713,25 +1781,24 @@ async def robinhood_chain_indicative_quote(
         )
 
     taker_address = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
-    exact_output_buy = (
-        str(request.side or "").strip().lower() == "buy"
-        and str(request.quantity or "").strip() != ""
-        and str(request.total_quote or "").strip() == ""
-    )
     market, base, quote, capability = _resolve_robinhood_chain_review_market(
         db,
         symbol=request.symbol,
         side=request.side,
-        amount_mode="exact_output" if exact_output_buy else "exact_input",
+        amount_mode=request.amount_mode,
+        capability_status_field="indicative_status",
     )
+    registry_tokens, native_token = _resolve_robinhood_chain_review_identities(db)
     result = await get_robinhood_chain_quote_service().indicative_quote(
         symbol=market.get("symbol") or request.symbol,
         side=request.side,
-        quantity=request.quantity,
-        total_quote=request.total_quote,
+        amount_mode=request.amount_mode,
+        requested_amount=request.requested_amount,
         taker_address=taker_address,
         base_token=base,
         quote_token=quote,
+        native_token=native_token,
+        registry_tokens=registry_tokens,
         route_capability=capability,
         force_refresh=bool(request.force_refresh),
     )
@@ -1748,8 +1815,8 @@ async def robinhood_chain_firm_quote_plan(
 ) -> Dict[str, Any]:
     """Return a bounded firm 0x quote and validated unsigned transaction plan.
 
-    Native ETH input requires no allowance and must carry the exact input in
-    transaction.value. ERC-20 input reads current allowance with eth_call. The
+    Native registry input requires no allowance and must carry the exact input in
+    transaction.value. ERC-20 registry input reads current allowance with eth_call. The
     endpoint never builds an approval transaction, prompts a wallet, signs,
     broadcasts, records an order, or mutates ledger/FIFO/basis state.
     """
@@ -1770,26 +1837,25 @@ async def robinhood_chain_firm_quote_plan(
         )
 
     taker_address = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
-    exact_output_buy = (
-        str(request.side or "").strip().lower() == "buy"
-        and str(request.exact_output_quantity or "").strip() != ""
-    )
     market, base, quote, capability = _resolve_robinhood_chain_review_market(
         db,
         symbol=request.symbol,
         side=request.side,
-        amount_mode="exact_output" if exact_output_buy else "exact_input",
+        amount_mode=request.amount_mode,
+        capability_status_field="firm_plan_status",
     )
+    registry_tokens, native_token = _resolve_robinhood_chain_review_identities(db)
     result = await get_robinhood_chain_transaction_planning_service().firm_quote_plan(
         symbol=market.get("symbol") or request.symbol,
         side=request.side,
-        quantity=request.quantity,
-        total_quote=request.total_quote,
-        exact_output_quantity=request.exact_output_quantity,
-        maximum_total_quote=request.maximum_total_quote,
+        amount_mode=request.amount_mode,
+        requested_amount=request.requested_amount,
+        maximum_input_amount=request.maximum_input_amount,
         taker_address=taker_address,
         base_token=base,
         quote_token=quote,
+        native_token=native_token,
+        registry_tokens=registry_tokens,
         route_capability=capability,
         slippage_bps=int(request.slippage_bps),
     )
@@ -2451,7 +2517,7 @@ async def robinhood_chain_buy_swap_refresh(execution_id: str, db: Session = Depe
 
 @router.get("/orderbook")
 async def robinhood_chain_synthetic_orderbook(
-    symbol: str = Query(default=ROBINHOOD_CHAIN_QUOTE_SYMBOL, min_length=1, max_length=32),
+    symbol: str = Query(..., min_length=1, max_length=32),
     depth: int = Query(default=5, ge=1, le=5),
     taker_address: Optional[str] = Query(default=None, min_length=42, max_length=42),
     force_refresh: bool = Query(default=False),
@@ -2518,6 +2584,7 @@ async def robinhood_chain_synthetic_orderbook(
     base_to_quote = direction_capability(base_symbol, quote_symbol)
     quote_to_base = direction_capability(quote_symbol, base_symbol)
 
+    registry_tokens, native_token = _resolve_robinhood_chain_review_identities(db)
     result = await get_robinhood_chain_quote_service().synthetic_orderbook_for_pair(
         symbol=market.get("symbol") or symbol,
         depth=depth,
@@ -2526,6 +2593,8 @@ async def robinhood_chain_synthetic_orderbook(
         quote_token=quote,
         base_to_quote_capability=base_to_quote or {},
         quote_to_base_capability=quote_to_base or {},
+        native_token=native_token,
+        registry_tokens=registry_tokens,
         force_refresh=bool(force_refresh),
     )
     db.rollback()

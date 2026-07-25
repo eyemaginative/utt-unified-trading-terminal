@@ -495,25 +495,34 @@ export async function getRobinhoodChainRegistryMarkets({ apiBase, timeout_ms = 3
   return res.data;
 }
 
+function requireRobinhoodChainReviewRequest(payload = {}) {
+  const symbol = String(payload?.symbol || "").trim().toUpperCase().replace(/[\/_]/g, "-");
+  const side = String(payload?.side || "").trim().toLowerCase();
+  const amountMode = String(payload?.amount_mode || "").trim().toLowerCase();
+  const requestedAmount = String(payload?.requested_amount || "").trim();
+  if (!symbol || !["buy", "sell"].includes(side) || !["exact_input", "exact_output"].includes(amountMode) || !requestedAmount) {
+    throw new Error("Robinhood Chain review requests require symbol, side, amount_mode, and requested_amount.");
+  }
+  return { ...payload, symbol, side, amount_mode: amountMode, requested_amount: requestedAmount };
+}
+
 export async function getRobinhoodChainSyntheticOrderbook({
-  symbol = "ETH-USDG",
+  symbol,
   depth = 5,
   force_refresh = false,
   timeout_ms = 45000,
 } = {}) {
+  const requestedSymbol = String(symbol || "").trim().toUpperCase().replace(/[\/_]/g, "-");
+  if (!requestedSymbol) throw new Error("Robinhood Chain synthetic orderbook requires an explicit symbol.");
   const res = await http.get(`/api/robinhood_chain/orderbook`, {
-    params: cleanParams({ symbol, depth, force_refresh }),
+    params: cleanParams({ symbol: requestedSymbol, depth, force_refresh }),
     timeout: timeout_ms,
   });
   return res.data;
 }
 
 export async function getRobinhoodChainIndicativeQuote(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
-  const body = {
-    provider: "0x",
-    symbol: "ETH-USDG",
-    ...payload,
-  };
+  const body = { provider: "0x", ...requireRobinhoodChainReviewRequest(payload) };
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {
     const res = await http.post(`/api/robinhood_chain/quotes/indicative`, body, { timeout: timeout_ms });
@@ -526,9 +535,8 @@ export async function getRobinhoodChainIndicativeQuote(payload = {}, { apiBase, 
 export async function getRobinhoodChainFirmQuotePlan(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
   const body = {
     provider: "0x",
-    symbol: "ETH-USDG",
     slippage_bps: 100,
-    ...payload,
+    ...requireRobinhoodChainReviewRequest(payload),
   };
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {

@@ -355,6 +355,11 @@ const DEFAULT_VISIBLE = {
 const LS_POLL_ENABLED = "utt_poll_enabled_v1";
 const LS_POLL_SECONDS = "utt_poll_seconds_v1";
 
+// Serialize heavy SQLite-writing fan-outs across balances, venue-order refresh,
+// and the background ledger sync. Task-specific locks allowed these writers to
+// overlap after more venues were added.
+const SQLITE_HEAVY_WRITE_TASK_KEY = "sqlite-heavy-write-v1";
+
 
 // All Orders: Ledger sync settings (shared with TerminalTablesWidget)
 const LS_AO_LEDGER_SYNC_ON_SYNCLOAD_KEY = "utt_ao_ledger_sync_on_syncload_v1";
@@ -4459,15 +4464,11 @@ export default function App() {
       };
 
       if (liveRefresh) {
-        if (isAllVenuesView) {
-          await runCrossTabHeavyTask(
-            "balances:all-venues",
-            performLiveBalanceRefresh,
-            { leaseMs: 180000, waitMs: 45000 }
-          );
-        } else {
-          await performLiveBalanceRefresh();
-        }
+        await runCrossTabHeavyTask(
+          SQLITE_HEAVY_WRITE_TASK_KEY,
+          performLiveBalanceRefresh,
+          { leaseMs: 180000, waitMs: 45000 }
+        );
       }
 
       let baseItems = [];
@@ -5183,7 +5184,12 @@ export default function App() {
           console.warn("Solana two-stage ingest failed:", e);
         }
 
-        if (scopeNorm === "LOCAL") return [];
+        if (scopeNorm === "LOCAL") {
+          if (opts?.includeLedgerSync) {
+            await doLedgerSyncFromLocalStorage({ silent: true, reloadAllOrders: false });
+          }
+          return [];
+        }
 
         const now = Date.now();
         const errors = [];
@@ -5230,10 +5236,14 @@ export default function App() {
           // eslint-disable-next-line no-await-in-loop
           await safeRefreshOne(vv);
         }
+
+        if (opts?.includeLedgerSync) {
+          await doLedgerSyncFromLocalStorage({ silent: true, reloadAllOrders: false });
+        }
         return errors;
       };
 
-      const syncKey = `all-orders:${wantsAllVenues ? "all" : v || "all"}`;
+      const syncKey = SQLITE_HEAVY_WRITE_TASK_KEY;
       const syncResult = await runCrossTabHeavyTask(
         syncKey,
         performHeavyOrderSync,
@@ -5283,7 +5293,7 @@ function readStrLS(key, defaultVal) {
   return String(raw);
 }
 
-async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
+async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = true } = {}) {
   if (typeof window === "undefined") return null;
   if (ledgerSyncInFlightRef.current) return null;
 
@@ -5323,10 +5333,12 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
     }
 
     // Reload All Orders so computed fields (e.g., realized/tax/net-after-tax) populate.
-    try {
-      await doLoadAllOrders();
-    } catch {
-      // ignore
+    if (reloadAllOrders) {
+      try {
+        await doLoadAllOrders();
+      } catch {
+        // ignore
+      }
     }
 
     return data;
@@ -5820,12 +5832,9 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
         else if (tab === "localOrders") {
           if (venue !== ALL_VENUES_VALUE) await doLoadOrders();
         } else if (tab === "allOrders") {
-          const alreadySyncing = !!syncInFlightRef.current;
-          const syncResult = await doSyncAndLoadAllOrders();
-          // Only the tab that performed the heavy venue sync may run the follow-up ledger sync.
-          if (!alreadySyncing && syncResult?.performedSync !== false) {
-            await doLedgerSyncFromLocalStorage({ silent: true });
-          }
+          // Venue-order writes and ledger writes stay inside the same shared
+          // SQLite-heavy task lease used by all-venue balance refresh.
+          await doSyncAndLoadAllOrders({ includeLedgerSync: true });
         }
       } finally {
         pollInFlightRef.current = false;
@@ -5865,7 +5874,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true } = {}) {
         // Best-effort refresh snapshots for all balances-capable venues. Only one
         // browser tab performs the heavy fan-out; followers read the resulting snapshots.
         await runCrossTabHeavyTask(
-          "balances:all-venues",
+          SQLITE_HEAVY_WRITE_TASK_KEY,
           async () => {
             for (const v of balancesVenueCandidates) {
               try {

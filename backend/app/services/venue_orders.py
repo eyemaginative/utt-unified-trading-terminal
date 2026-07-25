@@ -118,6 +118,10 @@ def clear_venue_cooldown(db: Session, venue: str) -> None:
         row.blocked_until = None
         row.reason = None
         db.commit()
+    else:
+        # db.get() autobegins even when no row exists. End that read transaction
+        # before the venue-order upsert phase begins.
+        db.rollback()
 
 
 def _norm_status(s: Optional[str]) -> str:
@@ -248,6 +252,14 @@ def refresh_venue_orders(db: Session, venue: str, force: bool = False) -> int:
     except Exception:
         open_ids_for_detail = []
 
+    # SQLAlchemy autobegins on the reads above. Release that transaction before
+    # any exchange HTTP calls so a slow/newly added venue cannot retain a pooled
+    # SQLite transaction while another request is trying to write balances.
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
     now = now_utc()
     now = _safe_dt(now) or datetime.utcnow()
     try:
@@ -305,6 +317,12 @@ def refresh_venue_orders(db: Session, venue: str, force: bool = False) -> int:
 
     upsert_count = 0
     skipped_filled_noexec = 0
+    pending_changes = 0
+    try:
+        commit_batch_size = int(getattr(settings, "venue_orders_commit_batch_size", 25))
+    except Exception:
+        commit_batch_size = 25
+    commit_batch_size = max(1, min(250, commit_batch_size))
 
     for it in items:
         if not isinstance(it, dict):
@@ -424,6 +442,7 @@ def refresh_venue_orders(db: Session, venue: str, force: bool = False) -> int:
             if changed:
                 db.add(existing)
                 upsert_count += 1
+                pending_changes += 1
 
         else:
             created_at = it_created or it_updated or now
@@ -449,12 +468,20 @@ def refresh_venue_orders(db: Session, venue: str, force: bool = False) -> int:
                 captured_at=now,
             )
 
+            # Commit any prior update batch before a potentially racing insert.
+            # If the insert collides, its rollback must not discard earlier updates.
+            if pending_changes:
+                db.commit()
+                pending_changes = 0
+
             try:
                 db.add(row)
                 db.flush()
                 upsert_count += 1
+                pending_changes += 1
             except IntegrityError:
                 db.rollback()
+                pending_changes = 0
 
                 existing2 = db.execute(
                     select(VenueOrderRow).where(
@@ -530,6 +557,12 @@ def refresh_venue_orders(db: Session, venue: str, force: bool = False) -> int:
                     if force or changed:
                         db.add(existing2)
                         upsert_count += 1
+                        pending_changes += 1
+
+        # Keep SQLite writer-lock dwell bounded as venue coverage grows.
+        if pending_changes >= commit_batch_size:
+            db.commit()
+            pending_changes = 0
 
     db.commit()
 

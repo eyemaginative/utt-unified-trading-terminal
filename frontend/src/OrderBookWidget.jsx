@@ -82,11 +82,29 @@ function isUsdValueQuote(asset) {
   return USD_VALUE_QUOTES.has(normalizeOrderBookAsset(asset));
 }
 
-function metricRowAsset(row) {
+function normalizeOrderBookRegistryAsset(value) {
+  const asset = String(value || "").trim().toUpperCase();
+  if (asset === "XBT") return "BTC";
+  if (asset === "BCY" || asset === "BITCRYSTAL") return "BITCRYSTALS";
+  return asset;
+}
+
+function robinhoodChainTokenIsUsdValue(token) {
+  if (!token || typeof token !== "object") return false;
+  if (token?.is_usd_quote === true || token?.is_stablecoin === true || token?.stablecoin === true) return true;
+  const peg = String(token?.peg_currency || token?.peg || token?.stablecoin_peg || "").trim().toUpperCase();
+  const source = String(token?.external_price_source || token?.price_source || "").trim().toLowerCase();
+  const priceId = String(token?.external_price_id || token?.price_source_id || "").trim().toLowerCase();
+  return peg === "USD" || source === "stable" || priceId === "stable";
+}
+
+function metricRowAsset(row, { preserveRegistryIdentity = false } = {}) {
   const raw = String(row?.asset || row?.symbol || row?.pair || "").trim().toUpperCase();
   if (!raw) return "";
   const parts = raw.replace(/[\\/_]/g, "-").split("-").filter(Boolean);
-  return normalizeOrderBookAsset(parts[0] || raw);
+  return preserveRegistryIdentity
+    ? normalizeOrderBookRegistryAsset(parts[0] || raw)
+    : normalizeOrderBookAsset(parts[0] || raw);
 }
 
 function metricRowIsUsdValue(row) {
@@ -96,9 +114,11 @@ function metricRowIsUsdValue(row) {
   return peg === "USD";
 }
 
-function metricRowQuoteUsdContext(row, snapshot, quoteAsset) {
+function metricRowQuoteUsdContext(row, snapshot, quoteAsset, { preserveRegistryIdentity = false } = {}) {
   if (!row || typeof row !== "object") return null;
-  const quote = normalizeOrderBookAsset(quoteAsset);
+  const quote = preserveRegistryIdentity
+    ? normalizeOrderBookRegistryAsset(quoteAsset)
+    : normalizeOrderBookAsset(quoteAsset);
   if (metricRowIsUsdValue(row)) {
     return {
       status: "native_usd",
@@ -116,7 +136,9 @@ function metricRowQuoteUsdContext(row, snapshot, quoteAsset) {
   const stale = Number.isFinite(updatedMs) ? Date.now() - updatedMs > ORDERBOOK_QUOTE_USD_STALE_MS : false;
   return {
     status: "available",
-    quoteAsset: normalizeOrderBookAsset(quoteAsset),
+    quoteAsset: preserveRegistryIdentity
+      ? normalizeOrderBookRegistryAsset(quoteAsset)
+      : normalizeOrderBookAsset(quoteAsset),
     priceUsd,
     source: String(
       row?.price_source ||
@@ -130,10 +152,15 @@ function metricRowQuoteUsdContext(row, snapshot, quoteAsset) {
   };
 }
 
-function readSharedQuoteUsdContext(quoteAsset) {
-  const quote = normalizeOrderBookAsset(quoteAsset);
+function readSharedQuoteUsdContext(
+  quoteAsset,
+  { preserveRegistryIdentity = false, allowSymbolUsdClassification = true } = {}
+) {
+  const quote = preserveRegistryIdentity
+    ? normalizeOrderBookRegistryAsset(quoteAsset)
+    : normalizeOrderBookAsset(quoteAsset);
   if (!quote) return null;
-  if (isUsdValueQuote(quote)) {
+  if (allowSymbolUsdClassification && isUsdValueQuote(quote)) {
     return { status: "native_usd", quoteAsset: quote, priceUsd: 1, source: "USD-valued quote", updatedAt: null, stale: false };
   }
   try {
@@ -142,8 +169,8 @@ function readSharedQuoteUsdContext(quoteAsset) {
     if (!raw) return null;
     const snapshot = JSON.parse(raw);
     const rows = Array.isArray(snapshot?.rows) ? snapshot.rows : [];
-    const row = rows.find((item) => metricRowAsset(item) === quote);
-    return metricRowQuoteUsdContext(row, snapshot, quote);
+    const row = rows.find((item) => metricRowAsset(item, { preserveRegistryIdentity }) === quote);
+    return metricRowQuoteUsdContext(row, snapshot, quote, { preserveRegistryIdentity });
   } catch {
     return null;
   }
@@ -1033,12 +1060,13 @@ export default function OrderBookWidget({
       setQuoteUsdContext(null);
       return undefined;
     }
-    if (isUsdValueQuote(quote)) {
+    const registryUsdQuote = isRobinhoodChainVenue && robinhoodChainTokenIsUsdValue(selectedRobinhoodChainMarket?.quote);
+    if (registryUsdQuote || (!isRobinhoodChainVenue && isUsdValueQuote(quote))) {
       setQuoteUsdContext({
         status: "native_usd",
         quoteAsset: quote,
         priceUsd: 1,
-        source: "USD-valued quote",
+        source: registryUsdQuote ? "Token Registry stable-price metadata" : "USD-valued quote",
         updatedAt: null,
         stale: false,
       });
@@ -1047,7 +1075,10 @@ export default function OrderBookWidget({
 
     const applyShared = () => {
       if (cancelled || quoteUsdReqRef.current !== reqId) return null;
-      const shared = readSharedQuoteUsdContext(quote);
+      const shared = readSharedQuoteUsdContext(quote, {
+        preserveRegistryIdentity: isRobinhoodChainVenue,
+        allowSymbolUsdClassification: !isRobinhoodChainVenue,
+      });
       if (shared) setQuoteUsdContext(shared);
       return shared;
     };
@@ -1076,8 +1107,13 @@ export default function OrderBookWidget({
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const payload = await response.json();
             const rows = Array.isArray(payload?.items) ? payload.items : [];
-            const row = rows.find((item) => metricRowAsset(item) === quote);
-            const next = metricRowQuoteUsdContext(row, { lastUpdated: payload?.updated_at || null }, quote);
+            const row = rows.find((item) => metricRowAsset(item, { preserveRegistryIdentity: isRobinhoodChainVenue }) === quote);
+            const next = metricRowQuoteUsdContext(
+              row,
+              { lastUpdated: payload?.updated_at || null },
+              quote,
+              { preserveRegistryIdentity: isRobinhoodChainVenue }
+            );
             if (cancelled || quoteUsdReqRef.current !== reqId) return;
             if (next) setQuoteUsdContext(next);
             else if (!shared) {
@@ -1112,7 +1148,7 @@ export default function OrderBookWidget({
         window.removeEventListener("storage", onStorage);
       }
     };
-  }, [apiBase, effectiveVenue, obSymbol]);
+  }, [apiBase, effectiveVenue, obSymbol, isRobinhoodChainVenue, selectedRobinhoodChainMarket]);
 
 
   useEffect(() => {
@@ -1459,7 +1495,8 @@ function clampBox(next) {
 
   function orderBookPriceUsd(p) {
     const quote = orderBookQuoteAsset();
-    if (!quote || isUsdValueQuote(quote)) return null;
+    const registryUsdQuote = isRobinhoodChainVenue && robinhoodChainTokenIsUsdValue(selectedRobinhoodChainMarket?.quote);
+    if (!quote || registryUsdQuote || (!isRobinhoodChainVenue && isUsdValueQuote(quote))) return null;
     const px = Number(p);
     const quoteUsd = Number(quoteUsdContext?.priceUsd);
     if (!Number.isFinite(px) || px < 0 || !Number.isFinite(quoteUsd) || quoteUsd <= 0) return null;
@@ -1482,7 +1519,7 @@ function clampBox(next) {
       if (quoteUsdContext?.updatedAt) lines.push(`Updated: ${quoteUsdContext.updatedAt}`);
       if (quoteUsdContext?.stale) lines.push("Status: stale");
       lines.push("Informational only; the native quote price is used for execution.");
-    } else if (quote && !isUsdValueQuote(quote)) {
+    } else if (quote && !(isRobinhoodChainVenue && robinhoodChainTokenIsUsdValue(selectedRobinhoodChainMarket?.quote)) && (!isRobinhoodChainVenue ? !isUsdValueQuote(quote) : true)) {
       lines.push("USD conversion unavailable; native price remains authoritative.");
     }
     return lines.join("\n");
@@ -2391,9 +2428,12 @@ function clampBox(next) {
   const displayedBaseAsset = isRobinhoodChainVenue
     ? String(orderBookMeta?.baseAsset || robinhoodChainPairParts(obSymbol).base).trim().toUpperCase()
     : normalizeOrderBookAsset(orderBookMeta?.baseAsset) || orderBookPairParts(obSymbol).base;
+  const displayedQuoteIsUsdValue = isRobinhoodChainVenue
+    ? robinhoodChainTokenIsUsdValue(selectedRobinhoodChainMarket?.quote)
+    : isUsdValueQuote(displayedQuoteAsset);
   const showDerivedUsd = Boolean(
     displayedQuoteAsset &&
-    !isUsdValueQuote(displayedQuoteAsset) &&
+    !displayedQuoteIsUsdValue &&
     quoteUsdContext?.status !== "native_usd"
   );
   const counterpartyColumnCount = isCounterpartyVenue ? 4 : 2;

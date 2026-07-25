@@ -40,6 +40,7 @@ import {
   refreshRobinhoodChainSwapApproval,
   refreshRobinhoodChainSwap,
   refreshRobinhoodChainExecution,
+  runCrossTabHeavyTask,
 } from "./lib/api";
 import { expandExponential } from "./lib/format";
 
@@ -84,6 +85,24 @@ const ROBINHOOD_CHAIN_BUY_APPROVAL_USDG = "2";
 const ROBINHOOD_CHAIN_BUY_APPROVAL_ATOMIC = 2000000n;
 const ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND = "exact_spend";
 const ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE = "exact_receive";
+const CEX_POST_SUBMIT_SQLITE_TASK_KEY = "sqlite-heavy-write-v1";
+const CEX_POST_SUBMIT_VENUE_TIMEOUT_MS = 30000;
+const CEX_POST_SUBMIT_BALANCE_TIMEOUT_MS = 45000;
+
+async function cexPostSubmitFetch(url, options = {}, timeoutMs = 30000, label = "Post-submit request") {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 30000));
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`${label} timed out after ${Math.ceil((Number(timeoutMs) || 30000) / 1000)} seconds.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function robinhoodChainHexQuantity(value) {
   const raw = typeof value === "bigint" ? value : BigInt(String(value ?? "0"));
@@ -353,42 +372,54 @@ function robinhoodChainWalletErrorMessage(error, fallback) {
 
 function robinhoodChainQuoteRules(symbol, market = null) {
   const normalized = normalizeRobinhoodChainQuoteSymbol(symbol);
-  const legacyExecutionMarket = normalized === "ETH-USDG";
   const databaseRegistered = Boolean(market && normalizeRobinhoodChainQuoteSymbol(market?.symbol) === normalized);
+  const baseDecimals = Number(market?.base?.decimals);
+  const quoteDecimals = Number(market?.quote?.decimals);
+  const capabilities = Array.isArray(market?.capabilities) ? market.capabilities : [];
+  const exactSpendEnabled = capabilities.some((row) => (
+    String(row?.amount_mode || "").trim().toLowerCase() === "exact_input" &&
+    ["available", "live_verified"].includes(String(row?.indicative_status || "").trim().toLowerCase())
+  ));
+  const exactReceiveEnabled = capabilities.some((row) => (
+    String(row?.amount_mode || "").trim().toLowerCase() === "exact_output" &&
+    ["available", "live_verified"].includes(String(row?.indicative_status || "").trim().toLowerCase())
+  ));
+  const mechanism = String(market?.mechanism || "").trim().toLowerCase();
   return {
     venue: "robinhood_chain",
     symbol_canon: normalized,
     symbol_venue: normalized,
     type: "quote",
-    base_increment: "0.00000001",
-    price_increment: "0.000001",
-    qty_decimals: 8,
-    price_decimals: 6,
-    min_qty: "0.00000001",
-    max_qty: "0.002",
-    min_notional: "0.01",
-    max_notional: "5.0",
+    base_increment: Number.isFinite(baseDecimals) ? `1e-${Math.max(0, Math.min(18, baseDecimals))}` : null,
+    price_increment: Number.isFinite(quoteDecimals) ? `1e-${Math.max(0, Math.min(18, quoteDecimals))}` : null,
+    qty_decimals: Number.isFinite(baseDecimals) ? Math.max(0, Math.min(18, baseDecimals)) : 8,
+    price_decimals: Number.isFinite(quoteDecimals) ? Math.max(0, Math.min(18, quoteDecimals)) : 8,
+    min_qty: null,
+    max_qty: null,
+    min_notional: null,
+    max_notional: null,
     supports_post_only: false,
     supported_tifs: [],
     supported_order_types: ["quote"],
-    suggested_symbol: databaseRegistered ? null : "ETH-USDG",
+    suggested_symbol: null,
     quote_only: true,
     synthetic_orderbook: true,
-    swap_oriented: true,
+    swap_oriented: mechanism === "swap",
     amount_modes: [ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND, ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE],
-    exact_spend_enabled: true,
-    exact_receive_enabled: false,
+    exact_spend_enabled: exactSpendEnabled,
+    exact_receive_enabled: exactReceiveEnabled,
     execution_enabled: false,
-    errors: legacyExecutionMarket
-      ? []
-      : databaseRegistered
-        ? ["This database market is R5C.2 discovery/orderbook review only; ticket quoting, planning, and execution remain disabled."]
-        : ["This symbol is not present in the Robinhood Chain database market catalog."],
+    errors: !databaseRegistered
+      ? ["This symbol is not present in the Robinhood Chain database market catalog."]
+      : mechanism !== "swap"
+        ? [`This database market uses ${mechanism || "an unsupported"} mechanism; swap quote and firm-plan review are unavailable.`]
+        : !exactSpendEnabled && !exactReceiveEnabled
+          ? ["No database-verified quote direction is available for this market."]
+          : [],
     warnings: [
-      "Robinhood Chain is swap-oriented: From asset, To asset, and amount mode determine the request.",
-      "Exact-spend ETH→USDG and USDG→ETH are live verified through 0x.",
-      "Exact-receive USDG→ETH is blocked before provider contact after repeated live 0x HTTP 500 responses.",
-      "Native ETH and WETH remain distinct assets. Robinhood Chain uses its dedicated execution gate and remains outside generic LIVE_VENUES.",
+      "Robinhood Chain quote and unsigned-plan review use Token Registry identities and database direction capabilities.",
+      "The persisted probe amount is evidence and the synthetic Order Book seed. Indicative quotes use the configured review-value ceiling; unsigned plans use a separate verified firm-plan ceiling.",
+      "Native and wrapped assets remain distinct. Review does not request MetaMask, sign, broadcast, or enable execution.",
     ],
   };
 }
@@ -403,6 +434,32 @@ function robinhoodChainCapabilityFor(status, fromAsset, toAsset, displayMode) {
     String(row?.to_asset || "").trim().toUpperCase() === to &&
     String(row?.display_mode || "").trim().toLowerCase() === mode
   )) || null;
+}
+
+function robinhoodChainCapabilityAmount(capability, keys = []) {
+  const evidence = capability?.evidence && typeof capability.evidence === "object"
+    ? capability.evidence
+    : {};
+  for (const key of keys) {
+    for (const value of [capability?.[key], evidence?.[key], evidence?.[`verified_${key}`]]) {
+      const amount = Number(value);
+      if (Number.isFinite(amount) && amount > 0) return amount;
+    }
+  }
+  return null;
+}
+
+function robinhoodChainFirmPlanInputCeiling(capability) {
+  const explicit = robinhoodChainCapabilityAmount(
+    capability,
+    ["firm_plan_max_input_amount", "firm_plan_input_ceiling"]
+  );
+  if (explicit !== null) return explicit;
+  const firmStatus = String(capability?.firm_plan_status || "").trim().toLowerCase();
+  if (firmStatus === "live_verified" && capability?.evidence?.live_accepted === true) {
+    return robinhoodChainCapabilityAmount(capability, ["probe_amount"]);
+  }
+  return null;
 }
 
 function robinhoodChainCapabilityTone(capability) {
@@ -3294,6 +3351,7 @@ export default function OrderTicketWidget({
   const [clientOid, setClientOid] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
+  const [postSubmitSyncing, setPostSubmitSyncing] = useState(false);
   const [submitError, setSubmitError] = useState(null);
   const [submitOk, setSubmitOk] = useState(null);
 
@@ -3419,7 +3477,7 @@ export default function OrderTicketWidget({
     const inlineText = counterpartyReadOnly
       ? "Counterparty: compose preview · explicit UniSat PSBT signing · separately gated broadcast"
       : robinhoodChainReadOnly
-        ? "Robinhood Chain: indicative quote + unsigned firm-plan review · signing/broadcast disabled"
+        ? "Robinhood Chain: database-gated indicative quote / unsigned-plan review · signing/broadcast disabled"
         : `${title} · ${inlineParts.join(" · ")}`;
 
     return {
@@ -3454,7 +3512,10 @@ export default function OrderTicketWidget({
   ), [robinhoodChainMarkets, robinhoodChainPair.symbol]);
   const robinhoodChainLegacyExecutionMarket = robinhoodChainPair.symbol === "ETH-USDG";
   const robinhoodChainWethReviewMarket = robinhoodChainPair.symbol === "WETH-USDG";
-  const robinhoodChainReviewQuoteMarket = robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket;
+  const robinhoodChainReviewQuoteMarket = Boolean(
+    robinhoodChainSelectedMarket &&
+    String(robinhoodChainSelectedMarket?.mechanism || "").trim().toLowerCase() === "swap"
+  );
   const robinhoodChainNormalizedSide = String(side || "").trim().toLowerCase();
   const robinhoodChainFromAsset = robinhoodChainNormalizedSide === "sell"
     ? robinhoodChainPair.base
@@ -3537,11 +3598,47 @@ export default function OrderTicketWidget({
   const robinhoodChainQuoteReviewEnabled = Boolean(
     isRobinhoodChainVenue &&
     robinhoodChainReviewQuoteMarket &&
-    String(robinhoodChainSelectedMarket?.mechanism || "").trim().toLowerCase() === "swap" &&
-    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
     robinhoodChainIndicativeAvailable
   );
-  const robinhoodChainFirmPlanReviewEnabled = robinhoodChainQuoteReviewEnabled;
+  const robinhoodChainFirmPlanStatus = String(
+    robinhoodChainSelectedCapability?.firm_plan_status || "not_tested"
+  ).trim().toLowerCase();
+  const robinhoodChainFirmPlanStatusLabel = robinhoodChainFirmPlanStatus.replaceAll("_", " ").toUpperCase();
+  const robinhoodChainFirmPlanAvailable = ["available", "live_verified"].includes(
+    robinhoodChainFirmPlanStatus
+  );
+  const robinhoodChainFirmPlanReviewEnabled = Boolean(
+    robinhoodChainQuoteReviewEnabled && robinhoodChainFirmPlanAvailable
+  );
+  const robinhoodChainConfiguredReviewValueCeilingUsd = Number(
+    robinhoodChainQuoteStatus?.discovery_max_sell_usd
+  );
+  const robinhoodChainInputIdentity = robinhoodChainTokenIdentities[robinhoodChainFromAsset] || null;
+  const robinhoodChainInputIsStable = String(
+    robinhoodChainInputIdentity?.external_price_source || ""
+  ).trim().toLowerCase() === "stable";
+  const robinhoodChainExplicitIndicativeInputCeiling = robinhoodChainCapabilityAmount(
+    robinhoodChainSelectedCapability,
+    ["indicative_max_input_amount", "indicative_input_ceiling"]
+  );
+  const robinhoodChainFirmPlanInputCeilingValue = robinhoodChainFirmPlanInputCeiling(
+    robinhoodChainSelectedCapability
+  );
+  const robinhoodChainProbeEvidenceAmount = robinhoodChainCapabilityAmount(
+    robinhoodChainSelectedCapability,
+    ["probe_amount"]
+  );
+  const robinhoodChainIndicativeCeilingLabel = robinhoodChainExplicitIndicativeInputCeiling !== null
+    ? `${robinhoodChainExplicitIndicativeInputCeiling} ${robinhoodChainFromAsset || "input asset"}`
+    : Number.isFinite(robinhoodChainConfiguredReviewValueCeilingUsd) && robinhoodChainConfiguredReviewValueCeilingUsd > 0
+      ? `$${robinhoodChainConfiguredReviewValueCeilingUsd} configured value`
+      : "configured backend policy";
+  const robinhoodChainFirmPlanCeilingLabel = robinhoodChainFirmPlanInputCeilingValue !== null
+    ? `${robinhoodChainFirmPlanInputCeilingValue} ${robinhoodChainFromAsset || "input asset"}`
+    : "not verified";
+  const robinhoodChainProbeEvidenceLabel = robinhoodChainProbeEvidenceAmount !== null
+    ? `${robinhoodChainProbeEvidenceAmount} ${robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE ? robinhoodChainToAsset : robinhoodChainFromAsset}`
+    : "missing";
   const robinhoodChainMarketReviewAvailable = Boolean(
     robinhoodChainSelectedMarket && (
       robinhoodChainSelectedMarket?.orderbook_enabled === true ||
@@ -3555,16 +3652,12 @@ export default function OrderTicketWidget({
   );
   const robinhoodChainTicketFieldsUnavailable = Boolean(
     isRobinhoodChainVenue &&
-    !robinhoodChainLegacyExecutionMarket &&
     robinhoodChainSelectedMarket &&
-    (
-      robinhoodChainWrapUnwrapReview ||
-      robinhoodChainSelectedMarket?.orderbook_enabled !== true
-    )
+    (!robinhoodChainReviewQuoteMarket || !robinhoodChainIndicativeAvailable)
   );
-  const robinhoodChainRouteDisplayEnabled = robinhoodChainLegacyExecutionMarket
-    ? robinhoodChainCapabilityEnabled
-    : robinhoodChainMarketReviewAvailable;
+  const robinhoodChainRouteDisplayEnabled = Boolean(
+    robinhoodChainQuoteReviewEnabled || robinhoodChainMarketReviewAvailable
+  );
   // R5C.3A keeps both Quantity and Total manually editable. Auto-calc is optional.
   const robinhoodChainBuyQtyLocked = false;
   const robinhoodChainBuyQtyReadOnly = false;
@@ -4002,6 +4095,10 @@ export default function OrderTicketWidget({
     robinhoodChainWalletMatchesSaved
   );
   const robinhoodChainReviewWalletReady = Boolean(
+    robinhoodChainSavedAddress || robinhoodChainConnectedAddress
+  );
+  const robinhoodChainReviewTakerAddress = robinhoodChainSavedAddress || robinhoodChainConnectedAddress;
+  const robinhoodChainExecutionReviewWalletReady = Boolean(
     robinhoodChainWalletState.providerAvailable &&
     robinhoodChainWalletConnected &&
     robinhoodChainWalletOnExpectedChain &&
@@ -6230,6 +6327,8 @@ export default function OrderTicketWidget({
       maxPolls = 5, // hard cap on GETs after refresh
       initialDelayMs = 900, // let venue settle before first GET
       pollBackoffMs = [600, 900, 1300, 1800, 2200], // per-attempt delays
+      requestTimeoutMs = 0,
+      throwOnError = false,
     } = opts;
 
     const v = String(venueOverride || effectiveVenue || "").toLowerCase().trim();
@@ -6281,19 +6380,41 @@ export default function OrderTicketWidget({
 
       const postUrl = `${apiBase}/api/balances/refresh`;
 
-      let rr = await fetch(postUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ venue: v, force: !!force }),
-      });
+      let rr = requestTimeoutMs > 0
+        ? await cexPostSubmitFetch(
+            postUrl,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ venue: v, force: !!force }),
+            },
+            requestTimeoutMs,
+            "Balance refresh"
+          )
+        : await fetch(postUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ venue: v, force: !!force }),
+          });
 
       // compatibility fallback for older schema
       if (rr.status === 422) {
-        rr = await fetch(postUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ input: { venue: v, force: !!force } }),
-        });
+        rr = requestTimeoutMs > 0
+          ? await cexPostSubmitFetch(
+              postUrl,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ input: { venue: v, force: !!force } }),
+              },
+              requestTimeoutMs,
+              "Balance refresh compatibility request"
+            )
+          : await fetch(postUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ input: { venue: v, force: !!force } }),
+            });
       }
 
       // fallback if refresh endpoint was GET-only in older versions
@@ -6302,7 +6423,14 @@ export default function OrderTicketWidget({
         getUrl.searchParams.set("venue", v);
         getUrl.searchParams.set("force", force ? "true" : "false");
         getUrl.searchParams.set("_ts", String(Date.now()));
-        rr = await fetch(getUrl.toString(), { method: "GET", cache: "no-store" });
+        rr = requestTimeoutMs > 0
+          ? await cexPostSubmitFetch(
+              getUrl.toString(),
+              { method: "GET", cache: "no-store" },
+              requestTimeoutMs,
+              "Balance refresh fallback request"
+            )
+          : await fetch(getUrl.toString(), { method: "GET", cache: "no-store" });
       }
 
       if (!rr.ok) {
@@ -6342,7 +6470,9 @@ export default function OrderTicketWidget({
         await new Promise((r) => setTimeout(r, delay));
       }
     } catch (e) {
-      setBalErr(e?.message || "Failed refreshing balances");
+      const message = e?.message || "Failed refreshing balances";
+      setBalErr(message);
+      if (throwOnError) throw (e instanceof Error ? e : new Error(message));
     } finally {
       setBalLoading(false);
     }
@@ -6824,19 +6954,11 @@ export default function OrderTicketWidget({
         fails.push("robinhood_chain_market_review_unavailable");
       } else {
         lines.push(
-          robinhoodChainWethReviewMarket
-            ? exactReceive
-              ? "WETH-USDG exact receive accepts custom review values but remains blocked before provider contact until the route is verified."
-              : `R5C.3A enables a review-only ${robinhoodChainFromAsset}→${robinhoodChainToAsset} exact-spend quote and firm plan. Approval and execution remain disabled.`
-            : side === "sell"
-              ? "RH-CHAIN.10D.2-R5C.3B.1 SELL execution accepts a custom positive ETH amount up to the existing reviewed 0.002 ETH maximum."
-              : exactReceive
-                ? "Exact receive accepts custom review values but remains blocked before provider contact until a direct route is verified."
-                : "Robinhood Chain reverse exact-spend review uses Spend USDG as the input and populates the estimated output from the live quote."
+          exactReceive
+            ? `Review-only exact receive requests ${robinhoodChainToAsset || "output"} and uses the database capability plus its persisted maximum-input evidence.`
+            : `Review-only exact spend uses ${robinhoodChainFromAsset || "input"} → ${robinhoodChainToAsset || "output"} from the selected database capability. Approval and execution remain disabled.`
         );
-        const reviewRouteAvailable = exactReceive
-          ? robinhoodChainCapabilityEnabled
-          : robinhoodChainQuoteReviewEnabled;
+        const reviewRouteAvailable = robinhoodChainQuoteReviewEnabled;
         if (!reviewRouteAvailable) {
           lines.push(
             robinhoodChainSelectedCapability?.reason ||
@@ -6852,10 +6974,6 @@ export default function OrderTicketWidget({
           lines.push(`Enter the maximum ${robinhoodChainFromAsset || "input asset"} total to spend.`);
           fails.push("robinhood_chain_buy_maximum_input_missing");
         }
-        if (side === "buy" && exactReceive && Number(robinhoodChainSlippageBps) !== 100) {
-          lines.push("Robinhood Chain exact-receive slippage remains fixed at 1.00% while the route is blocked.");
-          fails.push("robinhood_chain_buy_slippage_mismatch");
-        }
         if (side === "buy" && !exactReceive && totalQuoteNum === null) {
           lines.push(`Enter the ${robinhoodChainFromAsset || "input asset"} amount to spend for the exact-spend quote.`);
           fails.push("robinhood_chain_buy_exact_spend_missing");
@@ -6864,13 +6982,48 @@ export default function OrderTicketWidget({
           lines.push(`Enter Qty (${robinhoodChainFromAsset || "input asset"}) for a SELL quote.`);
           fails.push("robinhood_chain_sell_qty_missing");
         }
-        if (side === "sell" && qtyNum !== null && qtyNum > 0.002 + 1e-12) {
-          lines.push(`Robinhood Chain ${robinhoodChainFromAsset || "base"} review inputs are capped at 0.002.`);
-          fails.push("robinhood_chain_quote_cap");
+        const requestedReviewAmount = exactReceive
+          ? qtyNum
+          : side === "buy"
+            ? totalQuoteNum
+            : qtyNum;
+        const capabilityProbeAmount = Number(robinhoodChainSelectedCapability?.probe_amount);
+        if (
+          exactReceive &&
+          requestedReviewAmount !== null &&
+          Number.isFinite(capabilityProbeAmount) &&
+          capabilityProbeAmount > 0 &&
+          requestedReviewAmount > capabilityProbeAmount + 1e-12
+        ) {
+          lines.push(
+            `Exact-receive output exceeds the persisted ${robinhoodChainToAsset || "output asset"} probe evidence of ${robinhoodChainSelectedCapability.probe_amount}.`
+          );
+          fails.push("robinhood_chain_quote_exact_output_probe");
         }
-        if (side === "buy" && totalQuoteNum !== null && totalQuoteNum > 5 + 1e-12) {
-          lines.push(`Robinhood Chain ${robinhoodChainFromAsset || "quote"} review inputs are capped at 5.`);
-          fails.push("robinhood_chain_quote_cap");
+        if (
+          !exactReceive &&
+          requestedReviewAmount !== null &&
+          robinhoodChainExplicitIndicativeInputCeiling !== null &&
+          requestedReviewAmount > robinhoodChainExplicitIndicativeInputCeiling + 1e-12
+        ) {
+          lines.push(
+            `Indicative input exceeds the selected direction ceiling of ${robinhoodChainExplicitIndicativeInputCeiling} ${robinhoodChainFromAsset || "input asset"}.`
+          );
+          fails.push("robinhood_chain_quote_indicative_input_ceiling");
+        }
+        if (
+          !exactReceive &&
+          requestedReviewAmount !== null &&
+          robinhoodChainExplicitIndicativeInputCeiling === null &&
+          robinhoodChainInputIsStable &&
+          Number.isFinite(robinhoodChainConfiguredReviewValueCeilingUsd) &&
+          robinhoodChainConfiguredReviewValueCeilingUsd > 0 &&
+          requestedReviewAmount > robinhoodChainConfiguredReviewValueCeilingUsd + 1e-12
+        ) {
+          lines.push(
+            `Indicative review value exceeds the configured $${robinhoodChainConfiguredReviewValueCeilingUsd} ceiling.`
+          );
+          fails.push("robinhood_chain_quote_configured_value_ceiling");
         }
       }
 
@@ -7200,9 +7353,10 @@ export default function OrderTicketWidget({
 
     if (isCounterpartyVenue) return qtyNum !== null && pxNum !== null;
     if (isRobinhoodChainVenue) {
-      if (!robinhoodChainReviewQuoteMarket) return false;
-      if (robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE) return false;
-      if (!robinhoodChainQuoteReviewEnabled) return false;
+      if (!robinhoodChainReviewQuoteMarket || !robinhoodChainQuoteReviewEnabled) return false;
+      if (robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE) {
+        return side === "buy" && qtyNum !== null && totalQuoteNum !== null;
+      }
       return side === "buy" ? totalQuoteNum !== null : qtyNum !== null;
     }
 
@@ -7239,7 +7393,7 @@ export default function OrderTicketWidget({
   return qtyNum !== null && pxNum !== null;
   }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum, counterpartyExecutionMode, counterpartyExpirationBlocks, counterpartyDispenserLot, counterpartyDispenserPriceWithinLimit]);
 
-  const primaryActionDisabled = submitting || robinhoodChainQuoteLoading || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
+  const primaryActionDisabled = submitting || postSubmitSyncing || robinhoodChainQuoteLoading || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
 
   const robinhoodChainQuoteStale = useMemo(() => {
     if (!isRobinhoodChainVenue || !robinhoodChainQuote?.ok) return false;
@@ -7282,10 +7436,27 @@ export default function OrderTicketWidget({
       normalizeRobinhoodChainAmountText(plannedInput) !== normalizeRobinhoodChainAmountText(currentInput) ||
       normalizeRobinhoodChainQuoteSymbol(robinhoodChainFirmPlan?.symbol) !== normalizeRobinhoodChainQuoteSymbol(otSymbol) ||
       Number(robinhoodChainFirmPlan?.slippage_bps) !== Number(robinhoodChainSlippageBps) ||
-      normalizeRobinhoodChainEvmAddress(robinhoodChainFirmPlan?.unsigned_transaction_plan?.from) !== robinhoodChainConnectedAddress ||
+      normalizeRobinhoodChainEvmAddress(robinhoodChainFirmPlan?.unsigned_transaction_plan?.from) !== robinhoodChainReviewTakerAddress ||
       (Number.isFinite(expiresAt) && Date.now() >= expiresAt)
     );
-  }, [isRobinhoodChainVenue, robinhoodChainFirmPlan, side, totalQuote, qty, otSymbol, robinhoodChainSlippageBps, robinhoodChainFirmPlanClock, robinhoodChainConnectedAddress, robinhoodChainEffectiveAmountMode]);
+  }, [isRobinhoodChainVenue, robinhoodChainFirmPlan, side, totalQuote, qty, otSymbol, robinhoodChainSlippageBps, robinhoodChainFirmPlanClock, robinhoodChainReviewTakerAddress, robinhoodChainEffectiveAmountMode]);
+
+  const robinhoodChainCurrentFirmPlanInputAmount = Number(
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
+      ? totalQuote
+      : side === "buy"
+        ? totalQuote
+        : qty
+  );
+  const robinhoodChainFirmPlanAmountWithinCeiling = Boolean(
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE ||
+    (
+      Number.isFinite(robinhoodChainCurrentFirmPlanInputAmount) &&
+      robinhoodChainCurrentFirmPlanInputAmount > 0 &&
+      robinhoodChainFirmPlanInputCeilingValue !== null &&
+      robinhoodChainCurrentFirmPlanInputAmount <= robinhoodChainFirmPlanInputCeilingValue + 1e-12
+    )
+  );
 
   const canBuildRobinhoodChainFirmPlan = Boolean(
     isRobinhoodChainVenue &&
@@ -7295,7 +7466,8 @@ export default function OrderTicketWidget({
     !robinhoodChainQuoteStale &&
     !robinhoodChainQuoteLoading &&
     !robinhoodChainFirmPlanLoading &&
-    robinhoodChainFirmPlanReviewEnabled
+    robinhoodChainFirmPlanReviewEnabled &&
+    robinhoodChainFirmPlanAmountWithinCeiling
   );
 
 
@@ -7380,11 +7552,11 @@ export default function OrderTicketWidget({
   );
   const canPrepareRobinhoodChainSwapExecution = Boolean(
     isRobinhoodChainVenue &&
-    robinhoodChainReviewQuoteMarket &&
+    (robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket) &&
     String(side || "").toLowerCase() === "buy" &&
     robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
     (robinhoodChainLegacyExecutionMarket ? robinhoodChainCapabilityEnabled : robinhoodChainIndicativeAvailable) &&
-    robinhoodChainReviewWalletReady &&
+    robinhoodChainExecutionReviewWalletReady &&
     robinhoodChainFirmPlan?.ok &&
     !robinhoodChainFirmPlanStale &&
     String(robinhoodChainFirmPlan?.amount_mode || "") === "exact_input" &&
@@ -7644,11 +7816,13 @@ export default function OrderTicketWidget({
     setShowSubmitResult(true);
   }
 
-  // UPDATED: refresh balances AFTER submit returns OK (longer window + focus base/quote)
+  // Post-submit synchronization is separate from order submission authority.
+  // A confirmed order never remains in the "Submitting" state while these
+  // best-effort read-only refreshes run.
   async function refreshBalancesAfterSubmit({ venueKey, focusBase, focusQuote } = {}) {
     try {
       const v = String(venueKey || "").toLowerCase().trim();
-      if (!v) return;
+      if (!v) return { ok: false, error: "Missing venue for post-submit balance refresh." };
 
       const focus = [focusBase, focusQuote].filter(Boolean);
 
@@ -7657,34 +7831,39 @@ export default function OrderTicketWidget({
 
       const changed = await refreshAvailBalances({
         venueOverride: v,
-        force: true, // post-submit should be strict
+        force: true,
         focusAssets: focus.length ? focus : null,
         maxPolls: 5,
-        initialDelayMs: 0, // already waited above
+        initialDelayMs: 0,
         pollBackoffMs: [600, 900, 1300, 1800, 2200],
+        requestTimeoutMs: CEX_POST_SUBMIT_BALANCE_TIMEOUT_MS,
+        throwOnError: true,
       });
 
-      // If nothing changed yet, schedule one follow-up pass (non-spammy).
+      // Do not launch another write refresh. A delayed read is enough to pick up
+      // a venue snapshot that settled after the first authoritative refresh.
       if (!changed) {
         setTimeout(() => {
-          refreshAvailBalances({
+          loadAvailBalances({
+            silent: true,
             venueOverride: v,
-            force: false,
             focusAssets: focus.length ? focus : null,
-            maxPolls: 3,
-            initialDelayMs: 0,
-            pollBackoffMs: [900, 1400, 2000],
-          });
+          }).catch(() => {});
         }, 4000);
       }
-    } catch {
-      // Any errors are surfaced by refreshAvailBalances via balErr.
+
+      return { ok: true, changed: !!changed };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error?.message || String(error || "balance refresh failed"),
+      };
     }
   }
 
   async function refreshVenueOrdersAfterSubmit({ venueKey } = {}) {
     const v = String(venueKey || "").toLowerCase().trim();
-    if (!v || !apiBase) return null;
+    if (!v || !apiBase) return { ok: false, error: "Missing venue or API base for venue-order refresh." };
 
     const tok = getAuthToken();
     const headers = { "Content-Type": "application/json" };
@@ -7692,11 +7871,16 @@ export default function OrderTicketWidget({
 
     const base = String(apiBase || "").replace(/\/+$/, "");
     const url = `${base}/api/venue_orders/refresh?force=true`;
-    const resp = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ venue: v }),
-    });
+    const resp = await cexPostSubmitFetch(
+      url,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ venue: v }),
+      },
+      CEX_POST_SUBMIT_VENUE_TIMEOUT_MS,
+      "Venue-order refresh"
+    );
 
     let body = null;
     try {
@@ -7705,20 +7889,80 @@ export default function OrderTicketWidget({
       body = null;
     }
 
-    if (!resp.ok) {
+    if (!resp.ok || body?.ok === false) {
       const detail = body?.detail || body?.error || `venue_orders refresh HTTP ${resp.status}`;
       throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
     }
 
-    // One delayed follow-up helps exchanges whose order list lags the submit ack.
-    setTimeout(() => {
-      fetch(url, { method: "POST", headers, body: JSON.stringify({ venue: v }) }).catch(() => {});
-    }, 1800);
-
     return body || { ok: true, venue: v };
   }
 
-  
+  async function runCexPostSubmitSync({ orderResult, venueKey, focusBase, focusQuote } = {}) {
+    const v = String(venueKey || "").toLowerCase().trim();
+
+    const performSync = async () => {
+      let venueOrders = null;
+      let balances = null;
+
+      try {
+        venueOrders = await refreshVenueOrdersAfterSubmit({ venueKey: v });
+      } catch (error) {
+        venueOrders = {
+          ok: false,
+          error: error?.message || String(error || "venue-order refresh failed"),
+        };
+      }
+
+      balances = await refreshBalancesAfterSubmit({
+        venueKey: v,
+        focusBase,
+        focusQuote,
+      });
+
+      const ok = venueOrders?.ok !== false && balances?.ok !== false;
+      return {
+        status: ok ? "ok" : "error",
+        venue: v,
+        venue_orders: venueOrders,
+        balances,
+      };
+    };
+
+    let taskResult = await runCrossTabHeavyTask(
+      CEX_POST_SUBMIT_SQLITE_TASK_KEY,
+      performSync,
+      { leaseMs: 120000, waitMs: 20000 }
+    );
+
+    // A follower waits for the active writer to finish. Try once more so this
+    // order receives its own bounded refresh instead of silently assuming the
+    // other task covered the same venue.
+    if (!taskResult?.acquired) {
+      taskResult = await runCrossTabHeavyTask(
+        CEX_POST_SUBMIT_SQLITE_TASK_KEY,
+        performSync,
+        { leaseMs: 120000, waitMs: 20000 }
+      );
+    }
+
+    if (!taskResult?.acquired) {
+      return {
+        status: "deferred",
+        venue: v,
+        venue_orders: null,
+        balances: null,
+        error: "Another database refresh remained active; this order was submitted, but its immediate refresh was deferred.",
+      };
+    }
+
+    return taskResult?.value || {
+      status: "error",
+      venue: v,
+      error: "Post-submit synchronization returned no result.",
+    };
+  }
+
+
   async function submitSolanaSwapOrder() {
     const tok = getAuthToken();
 
@@ -8470,89 +8714,114 @@ async function submitLimitOrder() {
     onToast?.({ kind: "warn", msg: "Login required to place orders." });
   }
 
+  let orderAccepted = false;
   setSubmitting(true);
-    setSubmitError(null);
-    setSubmitOk(null);
+  setSubmitError(null);
+  setSubmitOk(null);
 
-    try {
-      const v = String(effectiveVenue || "").toLowerCase().trim();
-      const sym = String(otSymbol || "").trim();
+  try {
+    const v = String(effectiveVenue || "").toLowerCase().trim();
+    const sym = String(otSymbol || "").trim();
 
-      const payload = {
+    const payload = {
+      venue: v,
+      symbol: sym,
+      side,
+      type: "limit",
+      qty: Number(qtyNum),
+      limit_price: Number(pxNum),
+      tif,
+      post_only: !!postOnly,
+      client_order_id: clientOid ? String(clientOid).trim() : undefined,
+    };
+
+    const headers = { "Content-Type": "application/json" };
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+
+    const base = String(apiBase || "").replace(/\/+$/, "");
+    const url = `${base}/api/trade/order`;
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    if (!r.ok) {
+      const txt = await r.text();
+      const errMsg = txt || `HTTP ${r.status}`;
+      throw new Error(errMsg);
+    }
+
+    const j = await r.json();
+    orderAccepted = true;
+    const pendingPayload = {
+      ...(j || {}),
+      post_submit_refresh: {
+        status: "pending",
         venue: v,
-        symbol: sym,
-        side,
-        type: "limit",
-        qty: Number(qtyNum),
-        limit_price: Number(pxNum),
-        tif,
-        post_only: !!postOnly,
-        client_order_id: clientOid ? String(clientOid).trim() : undefined,
-      };
+        venue_orders: null,
+        balances: null,
+      },
+    };
+    setSubmitOk(pendingPayload);
 
-      const headers = { "Content-Type": "application/json" };
-      if (tok) headers.Authorization = `Bearer ${tok}`;
+    // Submission authority ends with the successful /api/trade/order response.
+    // Refresh work has its own explicit state and cannot leave this button on
+    // "Submitting…" after Gemini already accepted the order.
+    setSubmitting(false);
+    setPostSubmitSyncing(true);
+    openSubmitResultModal("ok", pendingPayload, "Order Submitted — Synchronizing Venue State");
 
-      const base = String(apiBase || "").replace(/\/+$/, "");
-      const url = `${base}/api/trade/order`;
-
-      const r = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-      });
-
-      if (!r.ok) {
-        const txt = await r.text();
-        const errMsg = txt || `HTTP ${r.status}`;
-        throw new Error(errMsg);
-      }
-
-      const j = await r.json();
-      const pendingPayload = {
-        ...(j || {}),
-        post_submit_refresh: { status: "pending", venue: v, venue_orders: null },
-      };
-      setSubmitOk(pendingPayload);
-
-      // Show modal instead of inline printing below the widget.
-      openSubmitResultModal("ok", pendingPayload, "Order Submitted — Refreshing Venue State");
-
-      // OKX.5C: force-refresh venue order snapshots immediately after submit so
-      // All Orders can see the real venue_order_id/open/filled state without a manual Sync+Load.
-      try {
-        const venueRefresh = await refreshVenueOrdersAfterSubmit({ venueKey: v });
+    void runCexPostSubmitSync({
+      orderResult: j,
+      venueKey: v,
+      focusBase: baseAsset,
+      focusQuote: quoteAsset,
+    })
+      .then((syncResult) => {
         const refreshedPayload = {
           ...(j || {}),
-          post_submit_refresh: { status: "ok", venue: v, venue_orders: venueRefresh },
+          post_submit_refresh: syncResult,
         };
         setSubmitOk(refreshedPayload);
-        updateSubmitResultModal("ok", refreshedPayload, "Order Submitted — Venue State Refreshed");
-      } catch (refreshErr) {
+
+        if (syncResult?.status === "ok") {
+          updateSubmitResultModal("ok", refreshedPayload, "Order Submitted — Venue State Refreshed");
+        } else if (syncResult?.status === "deferred") {
+          updateSubmitResultModal("ok", refreshedPayload, "Order Submitted — Refresh Deferred");
+          onToast?.({ kind: "warn", msg: "Order submitted. Immediate venue refresh was deferred because another database refresh remained active." });
+        } else {
+          updateSubmitResultModal("ok", refreshedPayload, "Order Submitted — Refresh Needs Retry");
+          onToast?.({ kind: "warn", msg: "Order submitted. One or more read-only refresh steps need retry." });
+        }
+      })
+      .catch((refreshError) => {
         const refreshedPayload = {
           ...(j || {}),
           post_submit_refresh: {
             status: "error",
             venue: v,
-            error: refreshErr?.message || String(refreshErr || "venue refresh failed"),
+            error: refreshError?.message || String(refreshError || "post-submit refresh failed"),
           },
         };
         setSubmitOk(refreshedPayload);
         updateSubmitResultModal("ok", refreshedPayload, "Order Submitted — Refresh Needs Retry");
-      }
+      })
+      .finally(() => {
+        setPostSubmitSyncing(false);
+      });
+  } catch (e) {
+    const msg = e?.message || "Failed to submit order";
+    setSubmitError(msg);
 
-      // UPDATED: capture venue + base/quote at submit time and refresh deterministically.
-      refreshBalancesAfterSubmit({ venueKey: v, focusBase: baseAsset, focusQuote: quoteAsset });
-    } catch (e) {
-      const msg = e?.message || "Failed to submit order";
-      setSubmitError(msg);
-
-      // Show modal for error too (same UX pattern)
-      openSubmitResultModal("error", msg, "Order Submit Failed");
-    } finally {
-      setSubmitting(false);
-    }
+    // Show modal for error too (same UX pattern)
+    openSubmitResultModal("error", msg, "Order Submit Failed");
+  } finally {
+    if (!orderAccepted) setPostSubmitSyncing(false);
+    setSubmitting(false);
   }
+}
 
   async function requestRobinhoodChainQuote(forceRefresh = true) {
     if (!isRobinhoodChainVenue || robinhoodChainQuoteLoading) return;
@@ -8600,9 +8869,13 @@ async function submitLimitOrder() {
           provider: "0x",
           symbol,
           side,
-          quantity: side === "sell" || exactReceive ? String(qty || "").trim() : null,
-          total_quote: side === "buy" && !exactReceive ? String(totalQuote || "").trim() : null,
-          taker_address: robinhoodChainWalletReady ? robinhoodChainConnectedAddress : null,
+          amount_mode: exactReceive ? "exact_output" : "exact_input",
+          requested_amount: exactReceive
+            ? String(qty || "").trim()
+            : side === "buy"
+              ? String(totalQuote || "").trim()
+              : String(qty || "").trim(),
+          taker_address: robinhoodChainReviewTakerAddress || null,
           force_refresh: !!forceRefresh,
         },
         { apiBase, timeout_ms: 30000 }
@@ -8653,15 +8926,13 @@ async function submitLimitOrder() {
   async function requestRobinhoodChainFirmPlan() {
     if (!isRobinhoodChainVenue || robinhoodChainFirmPlanLoading) return;
     if (!canBuildRobinhoodChainFirmPlan) {
-      const msg = !robinhoodChainWalletState.providerAvailable
-        ? "MetaMask is required before building an unsigned plan."
-        : !robinhoodChainWalletConnected
-          ? "Connect MetaMask before building an unsigned plan."
-          : !robinhoodChainWalletOnExpectedChain
-            ? "Switch MetaMask to Robinhood Chain mainnet (chain ID 4663)."
-            : robinhoodChainSavedAddress && !robinhoodChainWalletMatchesSaved
-              ? "The connected MetaMask account must match the saved Robinhood Chain wallet."
-              : `Request a fresh indicative quote for the current ${normalizeRobinhoodChainQuoteSymbol(otSymbol)} input before building an unsigned firm plan.`;
+      const msg = !robinhoodChainReviewTakerAddress
+        ? "Save an ALL / robinhood_chain public wallet address before building an unsigned review plan."
+        : !robinhoodChainFirmPlanReviewEnabled
+          ? "The selected database direction is not verified for unsigned firm-plan review."
+          : !robinhoodChainFirmPlanAmountWithinCeiling
+            ? `The indicative quote is available, but unsigned planning is capped at ${robinhoodChainFirmPlanInputCeilingValue ?? "the verified amount"} ${robinhoodChainFromAsset || "input asset"}.`
+            : `Request a fresh indicative quote for the current ${normalizeRobinhoodChainQuoteSymbol(otSymbol)} input before building an unsigned firm plan.`;
       setRobinhoodChainFirmPlanErrorText(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -8676,18 +8947,19 @@ async function submitLimitOrder() {
           provider: "0x",
           symbol: normalizeRobinhoodChainQuoteSymbol(otSymbol),
           side,
-          quantity: side === "sell" ? String(qty || "").trim() : null,
-          total_quote: side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND
-            ? String(totalQuote || "").trim()
-            : null,
-          exact_output_quantity: side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
+          amount_mode: robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
+            ? "exact_output"
+            : "exact_input",
+          requested_amount: robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
             ? String(qty || "").trim()
-            : null,
-          maximum_total_quote: side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
+            : side === "buy"
+              ? String(totalQuote || "").trim()
+              : String(qty || "").trim(),
+          maximum_input_amount: robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
             ? String(totalQuote || "").trim()
             : null,
-          slippage_bps: side === "buy" ? 100 : Number(robinhoodChainSlippageBps),
-          taker_address: robinhoodChainConnectedAddress,
+          slippage_bps: Number(robinhoodChainSlippageBps),
+          taker_address: robinhoodChainReviewTakerAddress,
         },
         { apiBase, timeout_ms: 30000 }
       );
@@ -10388,7 +10660,7 @@ async function submitLimitOrder() {
       void requestRobinhoodChainQuote(true);
       return;
     }
-    if (submitting) return;
+    if (submitting || postSubmitSyncing) return;
     if (!canSubmit) {
       // Restore prior UX expectation: give an explicit reason instead of "nothing happens".
       const reason =
@@ -10407,7 +10679,7 @@ async function submitLimitOrder() {
       void requestRobinhoodChainQuote(true);
       return;
     }
-    if (submitting) return;
+    if (submitting || postSubmitSyncing) return;
     if (!canSubmit) {
       const reason =
         preTrade?.message ||
@@ -10603,6 +10875,26 @@ async function submitLimitOrder() {
     const q = String(quoteAsset || "").trim();
     return q ? q : "Quote";
   }, [quoteAsset]);
+
+  const robinhoodChainReviewSpendLabel = useMemo(() => {
+    const inputAsset = String(robinhoodChainFromAsset || "").trim().toUpperCase();
+    return inputAsset || totalLabel;
+  }, [robinhoodChainFromAsset, totalLabel]);
+
+  const robinhoodChainReviewSpendAmount = useMemo(() => {
+    if (!isRobinhoodChainVenue) return "";
+    const rawAmount = (
+      robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE ||
+      side === "buy"
+    ) ? totalQuote : qty;
+    return normalizeRobinhoodChainAmountText(rawAmount);
+  }, [
+    isRobinhoodChainVenue,
+    robinhoodChainEffectiveAmountMode,
+    side,
+    totalQuote,
+    qty,
+  ]);
 
   const walletKitButtonLabel = useMemo(() => {
     if (!walletKitConnected) return "Connect Wallet";
@@ -11489,7 +11781,9 @@ async function submitLimitOrder() {
                   title={robinhoodChainLegacyExecutionMarket
                     ? "Exact spend sends sellAmount to the provider. This mode is live verified for ETH→USDG and USDG→ETH."
                     : robinhoodChainWethReviewMarket
-                      ? "R5C.3A enables bounded exact-spend quote and unsigned firm-plan review; approval and execution remain disabled."
+                      ? robinhoodChainFirmPlanReviewEnabled
+                        ? "R5C.3A enables bounded exact-spend indicative quote and unsigned firm-plan review; approval and execution remain disabled."
+                        : `R5C.3A enables exact-spend indicative quote review under the configured review-value ceiling. Probe amount remains evidence only. Unsigned firm-plan review remains disabled while firm_plan_status is ${robinhoodChainFirmPlanStatusLabel}. Approval and execution remain disabled.`
                       : "The database capability is displayed, but ticket provider requests and execution remain disabled."}
                 >
                   EXACT SPEND · {robinhoodChainLegacyExecutionMarket ? "LIVE" : robinhoodChainWethReviewMarket && robinhoodChainQuoteReviewEnabled ? "REVIEW" : robinhoodChainIndicativeAvailable ? "BOOK ONLY" : "BLOCKED"}
@@ -11522,7 +11816,9 @@ async function submitLimitOrder() {
               {!robinhoodChainLegacyExecutionMarket ? (
                 <div style={{ marginTop: 6, color: robinhoodChainMarketReviewAvailable ? "#c4b5fd" : "#fecdd3", fontSize: 10.5, lineHeight: 1.25 }}>
                   {robinhoodChainWethReviewMarket
-                    ? "Synthetic Order Book review plus custom exact-spend indicative quote and unsigned firm-plan review are enabled. Approval, signing, submission, and execution remain locked."
+                    ? robinhoodChainFirmPlanReviewEnabled
+                      ? "Synthetic Order Book review plus custom exact-spend indicative quote and unsigned firm-plan review are enabled. Approval, signing, submission, and execution remain locked."
+                      : `Synthetic Order Book probe sampling plus custom exact-spend indicative quote review are enabled. Unsigned firm-plan review remains disabled while firm_plan_status is ${robinhoodChainFirmPlanStatusLabel}. Approval, signing, submission, and execution remain locked.`
                     : robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap"
                       ? "Dedicated wrap/unwrap mechanism presentation only. No DEX quote, approval, signature, or transaction construction occurs in R5C.3A."
                       : robinhoodChainSelectedMarket?.orderbook_enabled
@@ -11533,6 +11829,14 @@ async function submitLimitOrder() {
                 <div style={{ marginTop: 6, color: "#fecdd3", fontSize: 10.5, lineHeight: 1.25 }}>
                   {robinhoodChainSelectedCapability?.reason || "This route and amount mode has not been live verified."}
                   {" "}No 0x request will be sent, so the provider backoff will not be triggered.
+                </div>
+              )}
+
+              {robinhoodChainReviewQuoteMarket && robinhoodChainSelectedCapability && (
+                <div style={{ marginTop: 6, color: "#bae6fd", fontSize: 10.25, lineHeight: 1.3 }}>
+                  Quote ceiling: <b>{robinhoodChainIndicativeCeilingLabel}</b>
+                  {" · "}Firm-plan ceiling: <b>{robinhoodChainFirmPlanCeilingLabel}</b>
+                  {" · "}Probe evidence / book seed: <b>{robinhoodChainProbeEvidenceLabel}</b>
                 </div>
               )}
 
@@ -11597,7 +11901,7 @@ async function submitLimitOrder() {
               </div>
             )}
             {!robinhoodChainWalletMatchesSaved && robinhoodChainWalletConnected && robinhoodChainSavedAddress && (
-              <div style={{ marginTop: 5, color: "#fde68a", fontSize: 10.5 }}>Connected MetaMask account does not match the saved Robinhood Chain wallet. Unsigned-plan building is blocked.</div>
+              <div style={{ marginTop: 5, color: "#fde68a", fontSize: 10.5 }}>Connected MetaMask account does not match the saved Robinhood Chain wallet. Live execution remains blocked; review-only quote and unsigned-plan requests continue to use the saved public address.</div>
             )}
 
             {robinhoodChainQuoteErrorText && (
@@ -11608,18 +11912,18 @@ async function submitLimitOrder() {
               <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(34, 211, 238, 0.16)", display: "flex", gap: 10, flexWrap: "wrap", fontSize: 10.5, lineHeight: 1.3 }}>
                 <span style={{ color: robinhoodChainQuoteStale ? "#fde68a" : "#bbf7d0", fontWeight: 900 }}>{robinhoodChainQuoteStale ? "QUOTE STALE" : robinhoodChainQuote.cached ? "QUOTE CACHED" : "QUOTE FRESH"}</span>
                 <span>{String(robinhoodChainQuote.side || side).toUpperCase()}: <b>{hideTableData ? "••••" : `${robinhoodChainQuote.input_amount || "—"} ${robinhoodChainQuote.input_asset || ""} → ${robinhoodChainQuote.output_amount || "—"} ${robinhoodChainQuote.output_asset || ""}`}</b></span>
-                <span>USDG/ETH: <b>{hideTableData ? "••••" : robinhoodChainQuote.effective_price || "—"}</b></span>
+                <span>{robinhoodChainQuote.quote_asset || robinhoodChainPair.quote}/{robinhoodChainQuote.base_asset || robinhoodChainPair.base}: <b>{hideTableData ? "••••" : robinhoodChainQuote.effective_price || "—"}</b></span>
                 <span>Min: <b>{hideTableData ? "••••" : `${robinhoodChainQuote.minimum_received || "—"} ${robinhoodChainQuote.minimum_received_asset || ""}`}</b></span>
                 <span>Impact: <b>{robinhoodChainQuote.price_impact_bps ?? "—"} bps</b></span>
                 <span>Route: <b>{Array.isArray(robinhoodChainQuote.route_sources) && robinhoodChainQuote.route_sources.length ? robinhoodChainQuote.route_sources.join(" + ") : robinhoodChainQuote.route_source || "—"}</b></span>
-                <span>Network fee: <b>{hideTableData ? "••••" : robinhoodChainQuote.total_network_fee_eth ? `${robinhoodChainQuote.total_network_fee_eth} ETH` : "—"}</b></span>
+                <span>Network fee: <b>{hideTableData ? "••••" : robinhoodChainQuote.total_network_fee ? `${robinhoodChainQuote.total_network_fee} ${robinhoodChainQuote.total_network_fee_asset || ""}`.trim() : "—"}</b></span>
                 <span>Allowance: <b>{robinhoodChainQuote.allowance_required ? "REQUIRED" : "not required"}</b></span>
               </div>
             ) : (
               <div style={{ marginTop: 5, fontSize: 10.5, color: "#bae6fd" }}>
                 {!robinhoodChainLegacyExecutionMarket
-                  ? robinhoodChainWethReviewMarket
-                    ? `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Custom Quantity and Total are editable; exact-spend quote and unsigned firm-plan review are enabled, while approval and execution remain locked.`
+                  ? robinhoodChainReviewQuoteMarket
+                    ? `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Probe amount is evidence and the synthetic-book seed; indicative quotes use the configured review ceiling and unsigned plans use a separate verified ceiling. Signing, approval, and execution remain locked.`
                     : robinhoodChainWrapUnwrapReview
                       ? `Mechanism-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"} review. Wrap/unwrap preview and transaction construction are not enabled in R5C.3A; no DEX price or stale limit is displayed.`
                       : robinhoodChainTicketFieldsUnavailable
@@ -11650,10 +11954,10 @@ async function submitLimitOrder() {
                     ["Minimum received", `${robinhoodChainFirmPlan.minimum_received || "—"} ${robinhoodChainFirmPlan.minimum_received_asset || ""}`.trim()],
                     ["Maximum spent", `${robinhoodChainFirmPlan.maximum_spent || "—"} ${robinhoodChainFirmPlan.maximum_spent_asset || ""}`.trim()],
                     ["Slippage", `${Number(robinhoodChainFirmPlan.slippage_bps || 0) / 100}%`],
-                    ["Allowance", robinhoodChainFirmPlan.allowance?.applicable === false ? "Not applicable — native ETH input" : robinhoodChainFirmPlan.approval_required ? `Shortfall ${robinhoodChainFirmPlan.allowance?.shortfall || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}` : "Sufficient"],
+                    ["Allowance", robinhoodChainFirmPlan.allowance?.applicable === false ? `Not applicable — native ${robinhoodChainFirmPlan.input_asset || "input"}` : robinhoodChainFirmPlan.approval_required ? `Shortfall ${robinhoodChainFirmPlan.allowance?.shortfall || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}` : "Sufficient"],
                     ["Spender", robinhoodChainFirmPlan.allowance?.spender ? shortenWalletAddress(robinhoodChainFirmPlan.allowance.spender, 8, 6) : "—"],
                     ["Destination", robinhoodChainFirmPlan.unsigned_transaction_plan?.to ? shortenWalletAddress(robinhoodChainFirmPlan.unsigned_transaction_plan.to, 8, 6) : "—"],
-                    ["Tx value", robinhoodChainFirmPlan.unsigned_transaction_plan?.value_eth ? `${robinhoodChainFirmPlan.unsigned_transaction_plan.value_eth} ETH (${robinhoodChainFirmPlan.unsigned_transaction_plan.value_wei} wei)` : `${robinhoodChainFirmPlan.unsigned_transaction_plan?.value_wei ?? "—"} wei`],
+                    ["Tx value", robinhoodChainFirmPlan.unsigned_transaction_plan?.value !== undefined ? `${robinhoodChainFirmPlan.unsigned_transaction_plan.value} ${robinhoodChainFirmPlan.unsigned_transaction_plan.value_asset || ""} (${robinhoodChainFirmPlan.unsigned_transaction_plan.value_atomic ?? "—"} atomic)` : `${robinhoodChainFirmPlan.unsigned_transaction_plan?.value_atomic ?? "—"} atomic`],
                     ["Gas limit", robinhoodChainFirmPlan.unsigned_transaction_plan?.gas_limit || "—"],
                     ["Calldata", robinhoodChainFirmPlan.unsigned_transaction_plan?.calldata_bytes !== undefined ? `${robinhoodChainFirmPlan.unsigned_transaction_plan.calldata_bytes} bytes` : "—"],
                   ].map(([label, value]) => (
@@ -13024,19 +13328,19 @@ async function submitLimitOrder() {
               : robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
                 ? "Maximum Spend"
                 : "Exact Spend"
-            : isCounterpartyDispenserMode ? "Exact Payment" : isCounterpartyLimitOrderMode ? "Trade Commitment" : "Est. Total"} ({totalLabel}): <b>{
+            : isCounterpartyDispenserMode ? "Exact Payment" : isCounterpartyLimitOrderMode ? "Trade Commitment" : "Est. Total"} ({isRobinhoodChainVenue ? robinhoodChainReviewSpendLabel : totalLabel}): <b>{
             isCounterpartyDispenserMode
               ? counterpartyExactDispenserTotalBtc === null
                 ? "—"
                 : fmtNum
                   ? fmtNum(counterpartyExactDispenserTotalBtc)
                   : String(counterpartyExactDispenserTotalBtc)
-              : isRobinhoodChainVenue && side === "buy"
-                ? robinhoodChainTicketFieldsUnavailable || totalQuoteNum === null
+              : isRobinhoodChainVenue
+                ? robinhoodChainTicketFieldsUnavailable || !robinhoodChainReviewSpendAmount
                   ? "—"
                   : hideTableData
                     ? "••••"
-                    : normalizeRobinhoodChainAmountText(totalQuote)
+                    : robinhoodChainReviewSpendAmount
                 : robinhoodChainTicketFieldsUnavailable || notional === null
                   ? "—"
                   : fmtNum
@@ -13104,6 +13408,8 @@ async function submitLimitOrder() {
                         : "Route Mode Blocked"
               : submitting
               ? "Submitting…"
+              : postSubmitSyncing
+                ? "Synchronizing…"
               : isCounterpartyVenue
                 ? isCounterpartyLimitOrderMode
                   ? "Preview Limit Order"
@@ -13157,7 +13463,9 @@ async function submitLimitOrder() {
                   ? "Fetch a fresh 0x firm quote and display a validated unsigned plan. No signature or transaction occurs."
                   : !robinhoodChainFirmPlanReviewEnabled
                     ? robinhoodChainSelectedCapability?.reason || "This route is not enabled for review-only firm planning."
-                    : "Connect the saved MetaMask wallet on chain 4663 and request a fresh matching indicative quote first."}
+                    : !robinhoodChainFirmPlanAmountWithinCeiling
+                      ? `Indicative quoting is available, but the verified unsigned-plan ceiling is ${robinhoodChainFirmPlanInputCeilingValue ?? "unavailable"} ${robinhoodChainFromAsset || "input asset"}.`
+                      : "Save a Robinhood Chain public wallet address and request a fresh matching indicative quote first. No MetaMask request occurs."}
               >
                 {robinhoodChainFirmPlanLoading
                   ? "Building Plan…"
@@ -13184,7 +13492,7 @@ async function submitLimitOrder() {
                   {robinhoodChainExecutionBusy ? "Preparing…" : `Prepare ${robinhoodChainCurrentExecutionAmount || "Custom"} ETH Send`}
                 </button>
               )}
-              {robinhoodChainReviewQuoteMarket && side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
+              {(robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket) && side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
                 <button
                   type="button"
                   style={{
@@ -13351,16 +13659,16 @@ async function submitLimitOrder() {
                 <button
                   type="button"
                   onClick={confirmAndSubmit}
-                  disabled={submitting || !canSubmit}
+                  disabled={submitting || postSubmitSyncing || !canSubmit}
                   style={{
                     ...safeButton,
-                    ...(submitting || !canSubmit ? safeButtonDisabled : {}),
+                    ...(submitting || postSubmitSyncing || !canSubmit ? safeButtonDisabled : {}),
                     padding: "8px 12px",
                     fontWeight: 900,
                     boxShadow: `0 0 0 1px ${sideAccent} inset`,
                   }}
                 >
-                  {submitting ? "Submitting…" : isPolkadotDexVenue ? "Confirm & Sign" : "Confirm & Submit"}
+                  {submitting ? "Submitting…" : postSubmitSyncing ? "Synchronizing…" : isPolkadotDexVenue ? "Confirm & Sign" : "Confirm & Submit"}
                 </button>
               </div>
 

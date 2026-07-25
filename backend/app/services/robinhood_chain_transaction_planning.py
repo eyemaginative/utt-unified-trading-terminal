@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import re
 import time
@@ -18,18 +19,11 @@ EXPECTED_CHAIN_ID = 4663
 EXPECTED_CHAIN_ID_HEX = hex(EXPECTED_CHAIN_ID)
 ZEROX_PROVIDER = "0x"
 ZEROX_FIRM_QUOTE_PATH = "/swap/allowance-holder/quote"
-ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL = "ETH-USDG"
-ROBINHOOD_CHAIN_REVIEW_FIRM_QUOTE_SYMBOLS: Tuple[str, ...] = ("ETH-USDG", "WETH-USDG")
 ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS = 100
 ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS = 10
 ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS = 300
 ROBINHOOD_CHAIN_PLAN_TTL_S = 30
-ROBINHOOD_CHAIN_MAX_ETH_INPUT = Decimal("0.002")
-ROBINHOOD_CHAIN_MAX_USDG_INPUT = Decimal("5")
-ROBINHOOD_CHAIN_EXACT_OUTPUT_BUY_ETH = Decimal("0.001")
-ROBINHOOD_CHAIN_EXACT_OUTPUT_BUY_WEI = "1000000000000000"
-ROBINHOOD_CHAIN_EXACT_OUTPUT_MAX_USDG = Decimal("2")
-ROBINHOOD_CHAIN_EXACT_OUTPUT_MAX_USDG_ATOMIC = "2000000"
+_REVIEW_AVAILABLE_STATUSES = frozenset({"available", "live_verified"})
 ROBINHOOD_CHAIN_MAX_GAS_LIMIT = 2_000_000
 ROBINHOOD_CHAIN_MAX_CALLDATA_BYTES = 131_072
 
@@ -135,13 +129,30 @@ def _safe_token_identity(token: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "symbol": str(token.get("symbol") or "").strip().upper(),
         "contract_address": str(token.get("contract_address") or "").strip(),
-        "decimals": int(token.get("decimals") or 0),
+        "registry_contract_address": token.get("registry_contract_address"),
+        "decimals": int(token.get("decimals")),
         "native": bool(token.get("native")),
+        "asset_kind": str(token.get("asset_kind") or "").strip().lower() or None,
         "identity_source": token.get("identity_source"),
         "registry_status": token.get("registry_status"),
         "registry_id": token.get("registry_id"),
         "registry_venue": token.get("registry_venue"),
     }
+
+
+def _registry_token_map(tokens: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for token in tokens:
+        if not isinstance(token, dict):
+            continue
+        try:
+            identity = _safe_token_identity(token)
+        except (TypeError, ValueError):
+            continue
+        key = _address_key(identity.get("contract_address"))
+        if key and identity.get("registry_id") is not None and key not in out:
+            out[key] = identity
+    return out
 
 
 def _normalize_route(raw: Any) -> Dict[str, Any]:
@@ -181,10 +192,26 @@ def _normalize_fees(raw: Any) -> Dict[str, Any]:
     return out
 
 
-def _network_fee_eth(total_network_fee: Optional[str]) -> Optional[str]:
-    if total_network_fee is None or not str(total_network_fee).isdigit():
-        return None
-    return _decimal_text(Decimal(str(total_network_fee)) / Decimal(10**18))
+def _normalize_network_fee(
+    total_network_fee: Optional[str],
+    *,
+    native_token: Dict[str, Any],
+) -> Dict[str, Optional[str]]:
+    raw = str(total_network_fee or "").strip()
+    try:
+        native = _safe_token_identity(native_token)
+    except (TypeError, ValueError):
+        return {"atomic": raw if raw.isdigit() else None, "amount": None, "asset": None}
+    if not native.get("native") or native.get("registry_id") is None or not raw.isdigit():
+        return {"atomic": raw if raw.isdigit() else None, "amount": None, "asset": None}
+    decimals = int(native["decimals"])
+    if decimals < 0 or decimals > 18:
+        return {"atomic": raw, "amount": None, "asset": None}
+    return {
+        "atomic": raw,
+        "amount": _decimal_text(Decimal(raw) / (Decimal(10) ** decimals)),
+        "asset": native["symbol"],
+    }
 
 
 def _safe_failure(error: str, **context: Any) -> Dict[str, Any]:
@@ -218,8 +245,9 @@ class RobinhoodChainTransactionPlanningService:
 
     This service never asks a wallet to connect, never constructs an approval
     transaction, never signs, never broadcasts, and never writes UTT state.
-    Native ETH input is validated by requiring transaction.value to equal the
-    exact sell amount; ERC-20 input continues to use a fresh eth_call allowance.
+    Native input is identified from Token Registry metadata and validated by requiring
+    transaction.value to equal the exact sell amount; ERC-20 input uses a fresh
+    read-only allowance call for the resolved registry token.
     """
 
     def __init__(
@@ -273,8 +301,10 @@ class RobinhoodChainTransactionPlanningService:
             "provider_configured": provider == ZEROX_PROVIDER and self.api_base.startswith("https://") and credential is not None,
             "api_key_configured": credential is not None,
             "credential_source": credential.get("source") if credential else None,
-            "supported_symbols": list(ROBINHOOD_CHAIN_REVIEW_FIRM_QUOTE_SYMBOLS),
-            "exact_input_only": True,
+            "market_authority": "database",
+            "token_identity_source": "token_registry",
+            "supported_symbols": [],
+            "exact_input_only": False,
             "exact_input_enabled": True,
             "exact_output_enabled": False,
             "provider_declared_exact_output_supported": True,
@@ -282,8 +312,7 @@ class RobinhoodChainTransactionPlanningService:
             "route_capabilities": [],
             "pair_capability_source": "database_router",
             "token_contracts_hardcoded": False,
-            "max_eth_input": _decimal_text(ROBINHOOD_CHAIN_MAX_ETH_INPUT),
-            "max_usdg_input": _decimal_text(ROBINHOOD_CHAIN_MAX_USDG_INPUT),
+            "review_limit_source": "database_direction_capability_probe_evidence",
             "default_slippage_bps": ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
             "minimum_slippage_bps": ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
             "maximum_slippage_bps": ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
@@ -303,20 +332,23 @@ class RobinhoodChainTransactionPlanningService:
 
     @staticmethod
     def _validate_canonical_token(token: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-        identity = _safe_token_identity(token)
-        if identity["symbol"] != symbol:
-            raise ValueError("firm_quote_token_identity_mismatch")
         try:
+            identity = _safe_token_identity(token)
             decimals = int(identity["decimals"])
             actual_contract = validate_evm_address(identity["contract_address"])
         except (TypeError, ValueError) as exc:
             raise ValueError("firm_quote_token_identity_mismatch") from exc
+        if identity["symbol"] != symbol:
+            raise ValueError("firm_quote_token_identity_mismatch")
         if decimals < 0 or decimals > 18:
             raise ValueError("firm_quote_token_identity_mismatch")
-        if symbol == "ETH":
-            if not bool(identity.get("native")) or decimals != 18:
+        if identity.get("identity_source") != "token_registry" or identity.get("registry_id") is None:
+            raise ValueError("firm_quote_token_identity_mismatch")
+        asset_kind = str(identity.get("asset_kind") or "").strip().lower()
+        if bool(identity.get("native")):
+            if asset_kind not in {"", "native"}:
                 raise ValueError("firm_quote_token_identity_mismatch")
-        elif bool(identity.get("native")):
+        elif asset_kind == "native":
             raise ValueError("firm_quote_token_identity_mismatch")
         identity["contract_address"] = actual_contract
         return identity
@@ -339,112 +371,165 @@ class RobinhoodChainTransactionPlanningService:
         trade: Dict[str, Any],
     ) -> bool:
         if not isinstance(capability, dict):
-            return trade.get("symbol") == ROBINHOOD_CHAIN_FIRM_QUOTE_SYMBOL
+            return False
         return (
             str(capability.get("from_asset") or "").strip().upper() == trade["sell_token"]["symbol"]
             and str(capability.get("to_asset") or "").strip().upper() == trade["buy_token"]["symbol"]
-            and str(capability.get("amount_mode") or "").strip().lower() == "exact_input"
+            and str(capability.get("amount_mode") or "").strip().lower() == trade["amount_mode"]
             and str(capability.get("mechanism") or "swap").strip().lower() == "swap"
-            and str(capability.get("indicative_status") or "").strip().lower() in {"available", "live_verified"}
+            and str(capability.get("firm_plan_status") or "").strip().lower() in _REVIEW_AVAILABLE_STATUSES
         )
+
+    @staticmethod
+    def _capability_decimal(capability: Dict[str, Any], key: str) -> Optional[Decimal]:
+        candidates = [capability.get(key)]
+        evidence = capability.get("evidence") if isinstance(capability.get("evidence"), dict) else {}
+        candidates.extend([evidence.get(key), evidence.get(f"verified_{key}")])
+        for candidate in candidates:
+            number = _safe_decimal(candidate)
+            if number is not None and number > 0:
+                return number
+        return None
+
+    @classmethod
+    def _firm_plan_exact_input_ceiling(
+        cls,
+        capability: Dict[str, Any],
+    ) -> Tuple[Optional[Decimal], Optional[str]]:
+        for key in ("firm_plan_max_input_amount", "firm_plan_input_ceiling"):
+            value = cls._capability_decimal(capability, key)
+            if value is not None:
+                return value, "database_direction_capability"
+
+        evidence = capability.get("evidence") if isinstance(capability.get("evidence"), dict) else {}
+        if (
+            str(capability.get("firm_plan_status") or "").strip().lower() == "live_verified"
+            and evidence.get("live_accepted") is True
+        ):
+            verified_execution_amount = cls._capability_decimal(capability, "probe_amount")
+            if verified_execution_amount is not None:
+                return verified_execution_amount, "verified_execution_evidence"
+        return None, None
 
     def _resolve_trade(
         self,
         *,
         symbol: str,
         side: str,
-        quantity: Optional[str],
-        total_quote: Optional[str],
-        exact_output_quantity: Optional[str],
-        maximum_total_quote: Optional[str],
-        eth_token: Optional[Dict[str, Any]] = None,
-        usdg_token: Optional[Dict[str, Any]] = None,
-        base_token: Optional[Dict[str, Any]] = None,
-        quote_token: Optional[Dict[str, Any]] = None,
+        amount_mode: str,
+        requested_amount: str,
+        maximum_input_amount: Optional[str],
+        base_token: Dict[str, Any],
+        quote_token: Dict[str, Any],
+        route_capability: Dict[str, Any],
     ) -> Dict[str, Any]:
         normalized_symbol = self._normalize_symbol(symbol)
-        if normalized_symbol not in ROBINHOOD_CHAIN_REVIEW_FIRM_QUOTE_SYMBOLS:
-            raise ValueError("unsupported_robinhood_chain_quote_symbol")
         parts = [part for part in normalized_symbol.split("-") if part]
         if len(parts) != 2:
             raise ValueError("unsupported_robinhood_chain_quote_symbol")
         base_symbol, quote_symbol = parts
-        resolved_base = base_token if isinstance(base_token, dict) else eth_token
-        resolved_quote = quote_token if isinstance(quote_token, dict) else usdg_token
-        if not isinstance(resolved_base, dict) or not isinstance(resolved_quote, dict):
-            raise ValueError("firm_quote_token_identity_mismatch")
-        base = self._validate_canonical_token(resolved_base, base_symbol)
-        quote = self._validate_canonical_token(resolved_quote, quote_symbol)
+        base = self._validate_canonical_token(base_token, base_symbol)
+        quote = self._validate_canonical_token(quote_token, quote_symbol)
         normalized_side = self._normalize_side(side)
+        normalized_mode = str(amount_mode or "").strip().lower()
+        if normalized_mode not in {"exact_input", "exact_output"}:
+            raise ValueError("invalid_quote_amount_mode")
 
-        exact_output_requested = (
-            normalized_side == "buy"
-            and str(exact_output_quantity or "").strip() != ""
-        )
-        if exact_output_requested:
-            if str(total_quote or "").strip() or str(quantity or "").strip():
-                raise ValueError("conflicting_firm_quote_amounts")
-            buy_atomic, buy_display = _display_amount_to_atomic(exact_output_quantity, base["decimals"])
-            maximum_sell_atomic, maximum_sell_display = _display_amount_to_atomic(
-                maximum_total_quote,
-                quote["decimals"],
+        sell_token, buy_token = (base, quote) if normalized_side == "sell" else (quote, base)
+        capability_trade = {
+            "sell_token": sell_token,
+            "buy_token": buy_token,
+            "amount_mode": normalized_mode,
+        }
+        if not self._review_capability_available(route_capability, capability_trade):
+            raise ValueError("firm_quote_route_capability_unavailable")
+
+        probe_limit = self._capability_decimal(route_capability, "probe_amount")
+
+        if normalized_mode == "exact_input":
+            if str(maximum_input_amount or "").strip():
+                raise ValueError("maximum_input_amount_requires_exact_output")
+            requested_atomic, requested_display = _display_amount_to_atomic(
+                requested_amount,
+                sell_token["decimals"],
             )
-            if Decimal(buy_display) > ROBINHOOD_CHAIN_MAX_ETH_INPUT:
-                raise ValueError("firm_quote_amount_exceeds_cap")
-            if Decimal(maximum_sell_display) > ROBINHOOD_CHAIN_MAX_USDG_INPUT:
-                raise ValueError("firm_quote_amount_exceeds_cap")
-            return {
+            firm_plan_ceiling, firm_plan_ceiling_source = self._firm_plan_exact_input_ceiling(
+                route_capability
+            )
+            if firm_plan_ceiling is None:
+                raise ValueError("firm_quote_input_ceiling_unavailable")
+            if Decimal(requested_display) > firm_plan_ceiling:
+                raise ValueError("firm_quote_input_exceeds_firm_plan_ceiling")
+            trade = {
                 "symbol": normalized_symbol,
                 "side": normalized_side,
-                "amount_mode": "exact_output",
-                "sell_token": quote,
-                "buy_token": base,
+                "amount_mode": normalized_mode,
+                "sell_token": sell_token,
+                "buy_token": buy_token,
+                "sell_amount_atomic": requested_atomic,
+                "sell_amount": requested_display,
+                "maximum_sell_amount_atomic": requested_atomic,
+                "maximum_sell_amount": requested_display,
+                "review_input_ceiling": _decimal_text(firm_plan_ceiling),
+                "firm_plan_input_ceiling": _decimal_text(firm_plan_ceiling),
+                "firm_plan_ceiling_source": firm_plan_ceiling_source,
+                "probe_amount": _decimal_text(probe_limit) if probe_limit is not None else None,
+                "probe_amount_role": "evidence_and_orderbook_seed",
+            }
+        else:
+            buy_atomic, buy_display = _display_amount_to_atomic(
+                requested_amount,
+                buy_token["decimals"],
+            )
+            if probe_limit is None:
+                raise ValueError("firm_quote_probe_evidence_missing")
+            if Decimal(buy_display) > probe_limit:
+                raise ValueError("firm_quote_amount_exceeds_capability_probe")
+            persisted_maximum = (
+                self._capability_decimal(route_capability, "maximum_input_amount")
+                or self._capability_decimal(route_capability, "maximum_input_ceiling")
+            )
+            if persisted_maximum is None:
+                raise ValueError("firm_quote_exact_output_ceiling_unavailable")
+            maximum_sell_atomic, maximum_sell_display = _display_amount_to_atomic(
+                maximum_input_amount,
+                sell_token["decimals"],
+            )
+            if Decimal(maximum_sell_display) > persisted_maximum:
+                raise ValueError("firm_quote_maximum_input_exceeds_capability_ceiling")
+            trade = {
+                "symbol": normalized_symbol,
+                "side": normalized_side,
+                "amount_mode": normalized_mode,
+                "sell_token": sell_token,
+                "buy_token": buy_token,
                 "buy_amount_atomic": buy_atomic,
                 "buy_amount": buy_display,
                 "maximum_sell_amount_atomic": maximum_sell_atomic,
                 "maximum_sell_amount": maximum_sell_display,
+                "review_input_ceiling": _decimal_text(persisted_maximum),
+                "firm_plan_input_ceiling": _decimal_text(persisted_maximum),
+                "firm_plan_ceiling_source": "database_direction_capability",
+                "probe_amount": _decimal_text(probe_limit),
+                "probe_amount_role": "evidence_and_orderbook_seed",
             }
 
-        if str(maximum_total_quote or "").strip():
-            raise ValueError("maximum_total_quote_requires_exact_output")
-        if normalized_side == "sell":
-            sell_token, buy_token = base, quote
-            requested_atomic, requested_display = _display_amount_to_atomic(quantity, base["decimals"])
-            if Decimal(requested_display) > ROBINHOOD_CHAIN_MAX_ETH_INPUT:
-                raise ValueError("firm_quote_amount_exceeds_cap")
-        else:
-            sell_token, buy_token = quote, base
-            requested_atomic, requested_display = _display_amount_to_atomic(total_quote, quote["decimals"])
-            if Decimal(requested_display) > ROBINHOOD_CHAIN_MAX_USDG_INPUT:
-                raise ValueError("firm_quote_amount_exceeds_cap")
-
-        return {
-            "symbol": normalized_symbol,
-            "side": normalized_side,
-            "amount_mode": "exact_input",
-            "sell_token": sell_token,
-            "buy_token": buy_token,
-            "sell_amount_atomic": requested_atomic,
-            "sell_amount": requested_display,
-            "maximum_sell_amount_atomic": requested_atomic,
-            "maximum_sell_amount": requested_display,
-        }
+        return trade
 
     async def firm_quote_plan(
         self,
         *,
         symbol: str,
         side: str,
-        quantity: Optional[str],
-        total_quote: Optional[str],
-        exact_output_quantity: Optional[str] = None,
-        maximum_total_quote: Optional[str] = None,
+        amount_mode: str,
+        requested_amount: str,
+        maximum_input_amount: Optional[str],
         taker_address: str,
-        eth_token: Optional[Dict[str, Any]] = None,
-        usdg_token: Optional[Dict[str, Any]] = None,
-        base_token: Optional[Dict[str, Any]] = None,
-        quote_token: Optional[Dict[str, Any]] = None,
-        route_capability: Optional[Dict[str, Any]] = None,
+        base_token: Dict[str, Any],
+        quote_token: Dict[str, Any],
+        native_token: Dict[str, Any],
+        registry_tokens: List[Dict[str, Any]],
+        route_capability: Dict[str, Any],
         slippage_bps: int = ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
     ) -> Dict[str, Any]:
         provider = str(settings.robinhood_chain_effective_swap_provider() or "").strip().lower()
@@ -460,53 +545,27 @@ class RobinhoodChainTransactionPlanningService:
             trade = self._resolve_trade(
                 symbol=symbol,
                 side=side,
-                quantity=quantity,
-                total_quote=total_quote,
-                exact_output_quantity=exact_output_quantity,
-                maximum_total_quote=maximum_total_quote,
-                eth_token=eth_token,
-                usdg_token=usdg_token,
+                amount_mode=amount_mode,
+                requested_amount=requested_amount,
+                maximum_input_amount=maximum_input_amount,
                 base_token=base_token,
                 quote_token=quote_token,
+                route_capability=route_capability,
             )
         except (ValueError, TypeError) as exc:
-            return _safe_failure(str(exc))
-
-        if trade["amount_mode"] == "exact_input" and not self._review_capability_available(route_capability, trade):
+            normalized_mode = str(amount_mode or "").strip().lower()
+            normalized_side = str(side or "").strip().lower()
+            base_symbol = str((base_token or {}).get("symbol") or "").strip().upper()
+            quote_symbol = str((quote_token or {}).get("symbol") or "").strip().upper()
+            output_asset = (base_symbol if normalized_side == "buy" else quote_symbol) or None
             return _safe_failure(
-                "firm_quote_route_capability_unavailable",
-                symbol=trade["symbol"],
-                input_asset=trade["sell_token"]["symbol"],
-                output_asset=trade["buy_token"]["symbol"],
-                amount_mode=trade["amount_mode"],
-                route_capability=route_capability,
-                provider_contacted=False,
-            )
-
-        if trade["amount_mode"] == "exact_output":
-            capability = {
-                "from_asset": trade["sell_token"]["symbol"],
-                "to_asset": trade["buy_token"]["symbol"],
-                "amount_mode": "exact_output",
-                "display_mode": "exact_receive",
-                "provider": ZEROX_PROVIDER,
-                "indicative_status": "provider_failure",
-                "firm_plan_status": "provider_failure",
-                "execution_status": "held",
-                "enabled": False,
-                "reason": "Exact-receive remains blocked pending direct-router research.",
-                "capability_source": "local_fail_closed_policy",
-            }
-            return _safe_failure(
-                "firm_quote_route_mode_not_live_verified",
-                amount_mode=trade["amount_mode"],
-                display_mode="exact_receive",
-                input_asset=trade["sell_token"]["symbol"],
-                output_asset=trade["buy_token"]["symbol"],
-                requested_output=trade.get("buy_amount"),
-                maximum_input_ceiling=trade.get("maximum_sell_amount"),
-                maximum_input_ceiling_atomic=trade.get("maximum_sell_amount_atomic"),
-                route_capability=capability,
+                str(exc),
+                symbol=self._normalize_symbol(symbol),
+                side=normalized_side or None,
+                amount_mode=normalized_mode or None,
+                display_mode=("exact_receive" if normalized_mode == "exact_output" else "exact_spend"),
+                output_asset=output_asset,
+                route_capability=copy.deepcopy(route_capability) if isinstance(route_capability, dict) else None,
                 provider_contacted=False,
             )
 
@@ -611,7 +670,7 @@ class RobinhoodChainTransactionPlanningService:
                 return _safe_failure("exact_output_firm_quote_amount_mismatch")
             if int(sell_atomic) > int(trade["maximum_sell_amount_atomic"]):
                 return _safe_failure(
-                    "exact_output_firm_quote_exceeds_maximum_usdg",
+                    "exact_output_firm_quote_exceeds_maximum_input",
                     required_input_atomic=sell_atomic,
                     maximum_input_ceiling_atomic=trade["maximum_sell_amount_atomic"],
                 )
@@ -751,24 +810,24 @@ class RobinhoodChainTransactionPlanningService:
         if total_network_fee is None and gas_price is not None:
             total_network_fee = str(int(gas_limit) * int(gas_price))
 
+        network_fee = _normalize_network_fee(total_network_fee, native_token=native_token)
         normalized_fees = _normalize_fees(body.get("fees"))
         zero_x_fee = normalized_fees.get("zeroExFee") if isinstance(normalized_fees.get("zeroExFee"), dict) else None
         zero_x_fee_display = None
         if zero_x_fee and zero_x_fee.get("amount") is not None:
-            fee_token_key = _address_key(zero_x_fee.get("token"))
-            for candidate in (trade["sell_token"], trade["buy_token"]):
-                if fee_token_key == _address_key(candidate.get("contract_address")):
-                    zero_x_fee_display = {
-                        **zero_x_fee,
-                        "asset": candidate.get("symbol"),
-                        "amount_display": _format_atomic_units(
-                            str(zero_x_fee["amount"]),
-                            int(candidate["decimals"]),
-                        ),
-                    }
-                    break
-            if zero_x_fee_display is None:
-                zero_x_fee_display = {**zero_x_fee, "asset": None, "amount_display": None}
+            fee_token = _registry_token_map(registry_tokens).get(_address_key(zero_x_fee.get("token")))
+            if fee_token is not None:
+                zero_x_fee_display = {
+                    **zero_x_fee,
+                    "asset": fee_token.get("symbol"),
+                    "registry_id": fee_token.get("registry_id"),
+                    "amount_display": _format_atomic_units(
+                        str(zero_x_fee["amount"]),
+                        int(fee_token["decimals"]),
+                    ),
+                }
+            else:
+                zero_x_fee_display = {**zero_x_fee, "asset": None, "registry_id": None, "amount_display": None}
 
         fetched_at = utc_now()
         expires_at = fetched_at + timedelta(seconds=ROBINHOOD_CHAIN_PLAN_TTL_S)
@@ -809,7 +868,7 @@ class RobinhoodChainTransactionPlanningService:
             "amount_mode": trade["amount_mode"],
             "route_capability": route_capability,
             "token_identity_source": "token_registry",
-            "pair_capability_source": "database" if isinstance(route_capability, dict) else "legacy",
+            "pair_capability_source": "database",
             "input_asset": trade["sell_token"]["symbol"],
             "input_amount": sell_display,
             "input_amount_atomic": sell_atomic,
@@ -830,9 +889,13 @@ class RobinhoodChainTransactionPlanningService:
                 else sell_atomic
             ),
             "maximum_spent_asset": trade["sell_token"]["symbol"],
-            "maximum_input_ceiling": trade["maximum_sell_amount"],
-            "maximum_input_ceiling_atomic": trade["maximum_sell_amount_atomic"],
+            "maximum_input_ceiling": trade["review_input_ceiling"],
+            "maximum_input_ceiling_atomic": None,
             "maximum_input_ceiling_asset": trade["sell_token"]["symbol"],
+            "firm_plan_input_ceiling": trade.get("firm_plan_input_ceiling"),
+            "firm_plan_ceiling_source": trade.get("firm_plan_ceiling_source"),
+            "probe_amount": trade.get("probe_amount"),
+            "probe_amount_role": trade.get("probe_amount_role"),
             "effective_price": _decimal_text(effective_price),
             "slippage_bps": slippage,
             "observed_minimum_received_protection_bps": _decimal_text(observed_protection_bps),
@@ -842,8 +905,10 @@ class RobinhoodChainTransactionPlanningService:
             "route_sources": route_sources,
             "fees": normalized_fees,
             "zero_x_fee": zero_x_fee_display,
-            "total_network_fee_wei": total_network_fee,
-            "total_network_fee_eth": _network_fee_eth(total_network_fee),
+            "total_network_fee_wei": network_fee["atomic"],
+            "total_network_fee_atomic": network_fee["atomic"],
+            "total_network_fee": network_fee["amount"],
+            "total_network_fee_asset": network_fee["asset"],
             "allowance": {
                 "applicable": not sell_is_native,
                 "read_method": allowance_read_method,
@@ -875,7 +940,9 @@ class RobinhoodChainTransactionPlanningService:
                 "destination_allowlisted": True,
                 "destination_allowlist": sorted(allowed),
                 "value_wei": value_wei,
-                "value_eth": _format_atomic_units(value_wei, 18),
+                "value_atomic": value_wei,
+                "value": _format_atomic_units(value_wei, int(native_token["decimals"])),
+                "value_asset": str(native_token.get("symbol") or "").strip().upper(),
                 "expected_value_wei": str(expected_value_wei),
                 "native_input": sell_is_native,
                 "gas_limit": gas_limit,

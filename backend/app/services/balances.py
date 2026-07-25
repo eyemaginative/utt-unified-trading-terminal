@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, asc
+from sqlalchemy.exc import OperationalError
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -102,6 +103,11 @@ _BAL_USD_CACHE_TTL_SECONDS = max(0.25, _env_float("BAL_USD_CACHE_TTL_SECONDS", 2
 
 # If set, refresh errors are fatal (raise). Default: non-fatal (return message)
 _BAL_REFRESH_FATAL_ERRORS = _env_bool("BAL_REFRESH_FATAL_ERRORS", False)
+
+# SQLite writer contention hardening. These retries apply only to the short
+# balance_snapshots commit, never to the upstream venue request.
+_BAL_DB_LOCK_RETRY_ATTEMPTS = max(1, min(5, _env_int("BAL_DB_LOCK_RETRY_ATTEMPTS", 2)))
+_BAL_DB_LOCK_RETRY_BASE_MS = max(25, min(5000, _env_int("BAL_DB_LOCK_RETRY_BASE_MS", 250)))
 
 # Backward-compatible empty-balances strictness
 _BAL_EMPTY_IS_ERROR = _env_bool("BAL_EMPTY_IS_ERROR", False)
@@ -220,6 +226,71 @@ def _fetch_balances_with_timeout(adapter: Any, timeout_s: int) -> List[dict]:
     return fut.result(timeout=float(timeout_s))
 
 
+def _is_sqlite_locked_error(exc: Exception) -> bool:
+    msg = str(exc or "").strip().lower()
+    return (
+        "database is locked" in msg
+        or "database table is locked" in msg
+        or "sqlite_busy" in msg
+        or "sqlite_locked" in msg
+    )
+
+
+def _persist_balance_snapshot_rows(
+    db: Session,
+    *,
+    venue: str,
+    captured_at: datetime,
+    rows: List[Dict[str, Any]],
+) -> List[BalanceSnapshot]:
+    """Persist one complete venue snapshot with bounded SQLite lock recovery.
+
+    A failed commit is rolled back before fresh ORM rows are constructed for the
+    next attempt. We never reuse objects from a failed SQLAlchemy transaction.
+    """
+    last_error: Optional[Exception] = None
+
+    for attempt in range(_BAL_DB_LOCK_RETRY_ATTEMPTS):
+        out = [
+            BalanceSnapshot(
+                venue=venue,
+                asset=str(row["asset"]),
+                total=float(row["total"]),
+                available=float(row["available"]),
+                hold=float(row["hold"]),
+                captured_at=captured_at,
+            )
+            for row in rows
+        ]
+
+        try:
+            db.add_all(out)
+            db.commit()
+            return out
+        except OperationalError as exc:
+            last_error = exc
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+            if not _is_sqlite_locked_error(exc) or attempt + 1 >= _BAL_DB_LOCK_RETRY_ATTEMPTS:
+                raise
+
+            delay_ms = _BAL_DB_LOCK_RETRY_BASE_MS * (2 ** attempt)
+            time.sleep(float(delay_ms) / 1000.0)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            raise
+
+    if last_error is not None:
+        raise last_error
+    return []
+
+
 def refresh_balances(db: Session, venue: str) -> Tuple[List[BalanceSnapshot], Optional[str]]:
     """
     Read-only ingestion.
@@ -288,7 +359,7 @@ def refresh_balances(db: Session, venue: str) -> Tuple[List[BalanceSnapshot], Op
             return [], msg
 
         ts = now_utc()
-        out: List[BalanceSnapshot] = []
+        normalized_rows: List[Dict[str, Any]] = []
 
         for r in rows:
             asset = (r.get("asset") if isinstance(r, dict) else None) or None
@@ -299,7 +370,7 @@ def refresh_balances(db: Session, venue: str) -> Tuple[List[BalanceSnapshot], Op
             available = r.get("available")
             hold = r.get("hold")
 
-            # Normalize numerics
+            # Normalize numerics before entering the SQLite write transaction.
             try:
                 total_f = float(total) if total is not None else 0.0
             except Exception:
@@ -310,7 +381,7 @@ def refresh_balances(db: Session, venue: str) -> Tuple[List[BalanceSnapshot], Op
             except Exception:
                 avail_f = 0.0
 
-            # Derive hold if missing
+            # Derive hold if missing.
             if hold is None:
                 derived = total_f - avail_f
                 hold_f = derived if derived > 0.0 else 0.0
@@ -320,18 +391,21 @@ def refresh_balances(db: Session, venue: str) -> Tuple[List[BalanceSnapshot], Op
                 except Exception:
                     hold_f = 0.0
 
-            snap = BalanceSnapshot(
-                venue=v,
-                asset=str(asset),
-                total=total_f,
-                available=avail_f,
-                hold=hold_f,
-                captured_at=ts,
+            normalized_rows.append(
+                {
+                    "asset": str(asset),
+                    "total": total_f,
+                    "available": avail_f,
+                    "hold": hold_f,
+                }
             )
-            db.add(snap)
-            out.append(snap)
 
-        db.commit()
+        out = _persist_balance_snapshot_rows(
+            db,
+            venue=v,
+            captured_at=ts,
+            rows=normalized_rows,
+        )
         return out, None
     finally:
         _clear_inflight(v)

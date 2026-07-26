@@ -78,6 +78,7 @@ class RobinhoodChainExecutionAuthorityTests(unittest.TestCase):
         mechanism: str = "swap",
         probe_amount: str | None = "1.25",
         objective_symbol: str | None = None,
+        evidence: dict | None = None,
     ) -> tuple[RobinhoodChainPairObjective, RobinhoodChainPairCapability]:
         if quote_address is None:
             quote_address = self._contract("ef")
@@ -118,7 +119,11 @@ class RobinhoodChainExecutionAuthorityTests(unittest.TestCase):
             execution_status=execution_status,
             enabled=capability_enabled,
             probe_amount=probe_amount,
-            evidence={"live_accepted": execution_status == "live_verified"},
+            evidence=(
+                dict(evidence)
+                if evidence is not None
+                else {"live_accepted": execution_status == "live_verified"}
+            ),
         )
         self.db.add(capability)
         self.db.commit()
@@ -253,6 +258,96 @@ class RobinhoodChainExecutionAuthorityTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "robinhood_chain_execution_objective_identity_mismatch")
 
+    def test_preparation_verified_authority_is_bounded_and_not_live(self) -> None:
+        self._execution_pair(
+            base_symbol="WETH",
+            base_address=self._contract("ab"),
+            base_decimals=18,
+            quote_symbol="USDG",
+            quote_address=self._contract("cd"),
+            quote_decimals=6,
+            side="buy",
+            indicative_status="available",
+            firm_plan_status="available",
+            execution_status="preparation_verified",
+            capability_enabled=True,
+            probe_amount="1",
+            evidence={
+                "preparation_verified": True,
+                "live_accepted": False,
+                "successful_broadcast": False,
+                "symbol": "WETH-USDG",
+                "side": "buy",
+                "amount_mode": "exact_input",
+                "provider": "0x",
+                "from_asset": "USDG",
+                "to_asset": "WETH",
+                "verified_input_amount": "1",
+                "firm_plan_input_ceiling": "1",
+            },
+        )
+        authority = resolve_robinhood_chain_execution_authority(
+            self.db,
+            symbol="WETH-USDG",
+            side="buy",
+            require_execution=True,
+        )
+        self.assertTrue(authority["execution_permitted"])
+        self.assertEqual(authority["authority_level"], "preparation_verified")
+        self.assertTrue(authority["preparation_verified"])
+        self.assertFalse(authority["live_execution_verified"])
+        self.assertTrue(authority["initial_acceptance_wallet_reject_only"])
+        self.assertFalse(authority["successful_broadcast_authorized"])
+        self.assertEqual(authority["execution_ceiling"]["amount"], "1")
+        self.assertEqual(authority["input"]["symbol"], "USDG")
+        self.assertEqual(authority["output"]["symbol"], "WETH")
+        self.assertFalse(authority["output"]["native"])
+        self.assertEqual(assert_robinhood_chain_execution_amount(authority, "1"), "1")
+        with self.assertRaises(RobinhoodChainRegistryAuthorityError) as caught:
+            assert_robinhood_chain_execution_amount(authority, "1.000001")
+        self.assertEqual(caught.exception.code, "robinhood_chain_execution_amount_exceeds_ceiling")
+
+    def test_preparation_status_without_exact_evidence_fails_closed(self) -> None:
+        self._execution_pair(
+            base_symbol="WETH",
+            base_address=self._contract("ab"),
+            base_decimals=18,
+            quote_symbol="USDG",
+            quote_address=self._contract("cd"),
+            quote_decimals=6,
+            side="buy",
+            indicative_status="available",
+            firm_plan_status="available",
+            execution_status="preparation_verified",
+            capability_enabled=True,
+            probe_amount="1",
+            evidence={
+                "preparation_verified": True,
+                "live_accepted": False,
+                "successful_broadcast": False,
+                "symbol": "WETH-USDG",
+                "side": "buy",
+                "amount_mode": "exact_input",
+                "provider": "0x",
+                "from_asset": "USDG",
+                "to_asset": "ETH",
+                "verified_input_amount": "1",
+                "firm_plan_input_ceiling": "1",
+            },
+        )
+        authority = resolve_robinhood_chain_execution_authority(
+            self.db,
+            symbol="WETH-USDG",
+            side="buy",
+        )
+        self.assertFalse(authority["execution_permitted"])
+        self.assertEqual(authority["authority_level"], "blocked")
+        self.assertFalse(authority["preparation_verified"])
+        with self.assertRaises(RobinhoodChainRegistryAuthorityError):
+            resolve_robinhood_chain_execution_authority(
+                self.db, symbol="WETH-USDG", side="buy", require_execution=True
+            )
+
     def test_router_api_and_frontend_use_resolved_execution_authority(self) -> None:
         backend_root = Path(__file__).resolve().parents[1]
         project_root = Path(__file__).resolve().parents[2]
@@ -261,6 +356,7 @@ class RobinhoodChainExecutionAuthorityTests(unittest.TestCase):
         ticket_source = (project_root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
 
         self.assertIn('/execution-authority/resolve', router_source)
+        self.assertIn('/execution-authority/verify-preparation', router_source)
         self.assertIn('_resolve_robinhood_chain_execution_authority_or_http', router_source)
         self.assertNotIn('robinhood_chain_execution_symbol_locked', router_source)
         self.assertNotIn('robinhood_chain_swap_from_asset_locked', router_source)
@@ -268,6 +364,8 @@ class RobinhoodChainExecutionAuthorityTests(unittest.TestCase):
         self.assertIn('getRobinhoodChainExecutionAuthority', ticket_source)
         self.assertIn('robinhoodChainExecutionAuthority?.execution_permitted', ticket_source)
         self.assertIn('robinhoodChainExecutionAdapter', ticket_source)
+        self.assertIn('R5C.4A', ticket_source)
+        self.assertIn('PREP VERIFIED', ticket_source)
 
 
 if __name__ == "__main__":

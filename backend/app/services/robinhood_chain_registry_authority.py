@@ -289,6 +289,7 @@ def assert_native_write_unambiguous(
 
 
 EXECUTION_STATUS_LIVE_VERIFIED = "live_verified"
+EXECUTION_STATUS_PREPARATION_VERIFIED = "preparation_verified"
 EXECUTION_MECHANISM_SWAP = "swap"
 EXECUTION_AMOUNT_MODE_EXACT_INPUT = "exact_input"
 EXECUTION_PROVIDER_ZEROX = "0x"
@@ -358,10 +359,45 @@ def _execution_identity(row: TokenRegistry) -> Dict[str, Any]:
     }
 
 
+def _preparation_authority_matches(
+    *,
+    objective: RobinhoodChainPairObjective,
+    capability: RobinhoodChainPairCapability,
+    symbol: str,
+    side: str,
+    amount_mode: str,
+    provider: str,
+    input_identity: Dict[str, Any],
+    output_identity: Dict[str, Any],
+) -> bool:
+    evidence = capability.evidence if isinstance(capability.evidence, dict) else {}
+    ceiling = str(capability.probe_amount or "").strip()
+    return bool(
+        capability.enabled
+        and str(capability.indicative_status or "").strip().lower() in {"available", EXECUTION_STATUS_LIVE_VERIFIED}
+        and str(capability.firm_plan_status or "").strip().lower() == "available"
+        and str(capability.execution_status or "").strip().lower() == EXECUTION_STATUS_PREPARATION_VERIFIED
+        and evidence.get("preparation_verified") is True
+        and evidence.get("live_accepted") is not True
+        and evidence.get("successful_broadcast") is not True
+        and normalize_execution_symbol(evidence.get("symbol")) == symbol
+        and normalize_execution_side(evidence.get("side")) == side
+        and normalize_execution_amount_mode(evidence.get("amount_mode")) == amount_mode
+        and normalize_execution_provider(evidence.get("provider")) == provider
+        and normalize_registry_symbol(evidence.get("from_asset")) == input_identity["symbol"]
+        and normalize_registry_symbol(evidence.get("to_asset")) == output_identity["symbol"]
+        and str(evidence.get("verified_input_amount") or "").strip() == ceiling
+        and str(evidence.get("firm_plan_input_ceiling") or "").strip() == ceiling
+        and bool(ceiling)
+        and str(objective.symbol or "").strip().upper() == symbol
+    )
+
+
 def _execution_blocking_reasons(
     *,
     objective: RobinhoodChainPairObjective,
     capability: Optional[RobinhoodChainPairCapability],
+    preparation_authority: bool,
 ) -> List[str]:
     reasons: List[str] = []
     if not bool(objective.enabled):
@@ -373,12 +409,20 @@ def _execution_blocking_reasons(
         return reasons
     if not bool(capability.enabled):
         reasons.append("capability_disabled")
-    if str(capability.indicative_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
-        reasons.append("indicative_not_live_verified")
-    if str(capability.firm_plan_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
-        reasons.append("firm_plan_not_live_verified")
-    if str(capability.execution_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
-        reasons.append("execution_not_live_verified")
+    if preparation_authority:
+        if str(capability.indicative_status or "").strip().lower() not in {"available", EXECUTION_STATUS_LIVE_VERIFIED}:
+            reasons.append("indicative_not_preparation_verified")
+        if str(capability.firm_plan_status or "").strip().lower() != "available":
+            reasons.append("firm_plan_not_preparation_verified")
+        if str(capability.execution_status or "").strip().lower() != EXECUTION_STATUS_PREPARATION_VERIFIED:
+            reasons.append("execution_not_preparation_verified")
+    else:
+        if str(capability.indicative_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
+            reasons.append("indicative_not_live_verified")
+        if str(capability.firm_plan_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
+            reasons.append("firm_plan_not_live_verified")
+        if str(capability.execution_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
+            reasons.append("execution_not_live_verified")
     if not str(capability.probe_amount or "").strip():
         reasons.append("execution_ceiling_missing")
     return reasons
@@ -468,9 +512,42 @@ def resolve_robinhood_chain_execution_authority(
         .first()
     )
 
-    reasons = _execution_blocking_reasons(objective=objective, capability=capability)
+    live_execution_verified = bool(
+        capability is not None
+        and bool(capability.enabled)
+        and str(capability.indicative_status or "").strip().lower() == EXECUTION_STATUS_LIVE_VERIFIED
+        and str(capability.firm_plan_status or "").strip().lower() == EXECUTION_STATUS_LIVE_VERIFIED
+        and str(capability.execution_status or "").strip().lower() == EXECUTION_STATUS_LIVE_VERIFIED
+    )
+    preparation_authority = False
+    if capability is not None and not live_execution_verified:
+        try:
+            preparation_authority = _preparation_authority_matches(
+                objective=objective,
+                capability=capability,
+                symbol=normalized_symbol,
+                side=normalized_side,
+                amount_mode=normalized_mode,
+                provider=normalized_provider,
+                input_identity=input_identity,
+                output_identity=output_identity,
+            )
+        except RobinhoodChainRegistryAuthorityError:
+            preparation_authority = False
+    reasons = _execution_blocking_reasons(
+        objective=objective,
+        capability=capability,
+        preparation_authority=preparation_authority,
+    )
     ceiling = str(capability.probe_amount or "").strip() if capability is not None else ""
     adapter = "native_exact_input" if bool(input_identity["native"]) else "erc20_exact_input"
+    authority_level = (
+        EXECUTION_STATUS_LIVE_VERIFIED
+        if live_execution_verified
+        else EXECUTION_STATUS_PREPARATION_VERIFIED
+        if preparation_authority
+        else "blocked"
+    )
     approval = {
         "applicable": not bool(input_identity["native"]),
         "model": "none" if bool(input_identity["native"]) else "finite_exact_input",
@@ -508,8 +585,19 @@ def resolve_robinhood_chain_execution_authority(
         "execution_ceiling": {
             "amount": ceiling or None,
             "asset": input_identity["symbol"],
-            "source": "database_direction_capability_probe_evidence",
+            "source": (
+                "database_confirmed_execution_evidence"
+                if live_execution_verified
+                else "database_preparation_verification_evidence"
+                if preparation_authority
+                else "database_direction_capability_probe_evidence"
+            ),
         },
+        "authority_level": authority_level,
+        "live_execution_verified": live_execution_verified,
+        "preparation_verified": preparation_authority,
+        "initial_acceptance_wallet_reject_only": preparation_authority,
+        "successful_broadcast_authorized": live_execution_verified,
         "execution_permitted": not reasons,
         "blocking_reasons": reasons,
         "provider_contacted": False,
@@ -569,7 +657,7 @@ def assert_robinhood_chain_execution_amount(
     if requested > ceiling:
         raise RobinhoodChainRegistryAuthorityError(
             "robinhood_chain_execution_amount_exceeds_ceiling",
-            "Execution input exceeds the persisted live-verified ceiling.",
+            "Execution input exceeds the persisted verified authority ceiling.",
             requested_amount=raw_amount,
             maximum_input_amount=ceiling_raw,
             input_asset=((authority or {}).get("input") or {}).get("symbol"),

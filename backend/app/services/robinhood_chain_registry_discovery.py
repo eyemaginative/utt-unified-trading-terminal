@@ -30,7 +30,12 @@ from .robinhood_chain_registry_authority import (
     effective_native_row,
     effective_row_by_symbol,
     identity_fields_from_row,
+    resolve_robinhood_chain_execution_authority,
     select_effective_registry_rows,
+)
+from .robinhood_chain_transaction_planning import (
+    ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST,
+    get_robinhood_chain_transaction_planning_service,
 )
 
 
@@ -40,6 +45,13 @@ MECHANISM_SWAP = "swap"
 MECHANISM_WRAP_UNWRAP = "wrap_unwrap"
 PROVIDER_ZEROX = "0x"
 PROVIDER_NATIVE_WRAP = "native_wrap"
+PREPARATION_STATUS = "preparation_verified"
+R5C4A_SYMBOL = "WETH-USDG"
+R5C4A_SIDE = "buy"
+R5C4A_INPUT_ASSET = "USDG"
+R5C4A_OUTPUT_ASSET = "WETH"
+R5C4A_INPUT_AMOUNT = "1"
+R5C4A_SLIPPAGE_BPS = 100
 
 _ERC20_SYMBOL_SELECTOR = "0x95d89b41"
 _ERC20_NAME_SELECTOR = "0x06fdde03"
@@ -181,9 +193,16 @@ class RobinhoodChainRegistryDiscoveryService:
     allowance, or enables execution automatically.
     """
 
-    def __init__(self, *, rpc_client: Any = None, discovery_service: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        rpc_client: Any = None,
+        discovery_service: Any = None,
+        planning_service: Any = None,
+    ) -> None:
         self.rpc_client = rpc_client or get_robinhood_chain_client()
         self.discovery_service = discovery_service or get_robinhood_chain_execution_discovery_service()
+        self.planning_service = planning_service or get_robinhood_chain_transaction_planning_service()
 
     def status(self, db: Session) -> Dict[str, Any]:
         try:
@@ -767,7 +786,9 @@ class RobinhoodChainRegistryDiscoveryService:
         to_symbol = str(to_row.symbol or "").strip().upper()
         display_mode = "exact_spend" if row.amount_mode == AMOUNT_MODE_EXACT_INPUT else row.amount_mode
         reason = None
-        if row.execution_status != "live_verified":
+        if row.execution_status == PREPARATION_STATUS:
+            reason = "Bounded preparation is verified; live execution remains unverified."
+        elif row.execution_status != "live_verified":
             reason = "Review-only discovery does not automatically enable execution."
         return {
             "id": row.id,
@@ -795,6 +816,7 @@ class RobinhoodChainRegistryDiscoveryService:
             "reason": reason,
             "review_only": True,
             "execution_enabled": bool(row.enabled and row.execution_status == "live_verified"),
+            "preparation_enabled": bool(row.enabled and row.execution_status == PREPARATION_STATUS),
         }
 
     def route_capabilities(self, db: Session) -> List[Dict[str, Any]]:
@@ -998,6 +1020,248 @@ class RobinhoodChainRegistryDiscoveryService:
             "execution_enabled": False,
             "signing_enabled": False,
             "broadcast_enabled": False,
+            "automatic_execution_promotion": False,
+            "will_mutate_chain": False,
+        }
+
+    async def verify_preparation_authority(
+        self,
+        db: Session,
+        *,
+        symbol: str,
+        side: str,
+        amount_mode: str,
+        requested_amount: str,
+        taker_address: str,
+        slippage_bps: int,
+        confirm_verify: bool,
+    ) -> Dict[str, Any]:
+        """Verify the first bounded generic BUY preparation route without broadcasting.
+
+        R5C.4A is intentionally locked to USDG -> WETH exact input at 1 USDG.
+        The method may persist validated firm-plan evidence only after explicit
+        confirmation. It never requests a wallet, signs, broadcasts, or claims
+        that a live WETH execution has succeeded.
+        """
+        if confirm_verify is not True:
+            raise ValueError("confirm_r5c4a_preparation_verification_required")
+
+        normalized_symbol = _normalize_market_symbol(symbol)
+        normalized_side = str(side or "").strip().lower()
+        normalized_mode = str(amount_mode or "").strip().lower().replace("exact_spend", AMOUNT_MODE_EXACT_INPUT)
+        normalized_slippage = int(slippage_bps)
+        if (
+            normalized_symbol != R5C4A_SYMBOL
+            or normalized_side != R5C4A_SIDE
+            or normalized_mode != AMOUNT_MODE_EXACT_INPUT
+            or normalized_slippage != R5C4A_SLIPPAGE_BPS
+        ):
+            raise ValueError("r5c4a_preparation_target_locked")
+
+        taker = validate_evm_address(taker_address)
+        objective = (
+            db.query(RobinhoodChainPairObjective)
+            .filter(
+                RobinhoodChainPairObjective.symbol == normalized_symbol,
+                RobinhoodChainPairObjective.enabled.is_(True),
+            )
+            .first()
+        )
+        if objective is None:
+            raise ValueError("robinhood_chain_pair_objective_not_found")
+        if str(objective.mechanism or "").strip().lower() != MECHANISM_SWAP:
+            raise ValueError("r5c4a_swap_mechanism_required")
+
+        base_row, quote_row = self._objective_tokens(db, objective)
+        base_identity = self.token_identity(db, base_row)
+        quote_identity = self.token_identity(db, quote_row)
+        if (
+            str(base_identity.get("symbol") or "").strip().upper() != R5C4A_OUTPUT_ASSET
+            or bool(base_identity.get("native"))
+            or str(quote_identity.get("symbol") or "").strip().upper() != R5C4A_INPUT_ASSET
+            or bool(quote_identity.get("native"))
+        ):
+            raise ValueError("r5c4a_token_registry_identity_mismatch")
+        normalized_amount = _parse_probe_amount(requested_amount, int(quote_identity["decimals"]))
+        if normalized_amount != R5C4A_INPUT_AMOUNT:
+            raise ValueError("r5c4a_preparation_target_locked")
+        self._verified_identity_required(db, int(base_row.id))
+        self._verified_identity_required(db, int(quote_row.id))
+
+        capability = (
+            db.query(RobinhoodChainPairCapability)
+            .filter(
+                RobinhoodChainPairCapability.objective_id == objective.id,
+                RobinhoodChainPairCapability.from_token_registry_id == int(quote_row.id),
+                RobinhoodChainPairCapability.to_token_registry_id == int(base_row.id),
+                RobinhoodChainPairCapability.amount_mode == AMOUNT_MODE_EXACT_INPUT,
+                RobinhoodChainPairCapability.provider == PROVIDER_ZEROX,
+            )
+            .first()
+        )
+        if capability is None:
+            raise ValueError("r5c4a_direction_capability_missing")
+        if str(capability.indicative_status or "").strip().lower() not in {"available", "live_verified"}:
+            raise ValueError("r5c4a_indicative_capability_unavailable")
+        if str(capability.probe_amount or "").strip() != R5C4A_INPUT_AMOUNT:
+            raise ValueError("r5c4a_probe_amount_mismatch")
+
+        existing_evidence = copy.deepcopy(capability.evidence) if isinstance(capability.evidence, dict) else {}
+        if (
+            bool(capability.enabled)
+            and str(capability.firm_plan_status or "").strip().lower() == "available"
+            and str(capability.execution_status or "").strip().lower() == PREPARATION_STATUS
+            and existing_evidence.get("preparation_verified") is True
+            and str(existing_evidence.get("verified_input_amount") or "").strip() == R5C4A_INPUT_AMOUNT
+        ):
+            authority = resolve_robinhood_chain_execution_authority(
+                db,
+                symbol=normalized_symbol,
+                side=normalized_side,
+                amount_mode=normalized_mode,
+                provider=PROVIDER_ZEROX,
+                require_execution=True,
+            )
+            return {
+                "ok": True,
+                "idempotent": True,
+                "tranche": "R5C.4A",
+                "capability": self._capability_dict(db, capability),
+                "execution_authority": authority,
+                "firm_plan": None,
+                "database_mutated": False,
+                "blockchain_read_only": True,
+                "wallet_connection_requested": False,
+                "signing_enabled": False,
+                "broadcast_enabled": False,
+                "successful_broadcast": False,
+                "automatic_execution_promotion": False,
+                "will_mutate_chain": False,
+            }
+
+        transient_capability = self._capability_dict(db, capability)
+        transient_evidence = copy.deepcopy(transient_capability.get("evidence") or {})
+        transient_evidence.update({
+            "firm_plan_input_ceiling": R5C4A_INPUT_AMOUNT,
+            "preparation_verification_requested": True,
+            "live_accepted": False,
+            "successful_broadcast": False,
+        })
+        transient_capability.update({
+            "firm_plan_status": "available",
+            "firm_plan_input_ceiling": R5C4A_INPUT_AMOUNT,
+            "evidence": transient_evidence,
+        })
+        registry_tokens = [
+            self.token_identity(db, row)
+            for row in self.registry_rows(db)
+        ]
+        native_token = self.native_identity(db)
+        plan = await self.planning_service.firm_quote_plan(
+            symbol=normalized_symbol,
+            side=normalized_side,
+            amount_mode=normalized_mode,
+            requested_amount=normalized_amount,
+            maximum_input_amount=None,
+            taker_address=taker,
+            base_token=base_identity,
+            quote_token=quote_identity,
+            native_token=native_token,
+            registry_tokens=registry_tokens,
+            route_capability=transient_capability,
+            slippage_bps=normalized_slippage,
+        )
+        if plan.get("ok") is not True:
+            raise ValueError(str(plan.get("error") or "r5c4a_firm_plan_verification_failed"))
+        allowance = plan.get("allowance") if isinstance(plan.get("allowance"), dict) else {}
+        unsigned = plan.get("unsigned_transaction_plan") if isinstance(plan.get("unsigned_transaction_plan"), dict) else {}
+        if (
+            str(plan.get("symbol") or "").strip().upper() != normalized_symbol
+            or str(plan.get("side") or "").strip().lower() != normalized_side
+            or str(plan.get("amount_mode") or "").strip().lower() != normalized_mode
+            or str(plan.get("input_asset") or "").strip().upper() != R5C4A_INPUT_ASSET
+            or str(plan.get("output_asset") or "").strip().upper() != R5C4A_OUTPUT_ASSET
+            or str(plan.get("input_amount") or "").strip() != R5C4A_INPUT_AMOUNT
+            or allowance.get("applicable") is not True
+            or str((allowance.get("token") or {}).get("symbol") or "").strip().upper() != R5C4A_INPUT_ASSET
+            or allowance.get("spender_allowlisted") is not True
+            or validate_evm_address(str(allowance.get("spender") or "")).lower() not in ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST
+            or unsigned.get("destination_allowlisted") is not True
+            or validate_evm_address(str(unsigned.get("to") or "")).lower() not in ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST
+            or str(unsigned.get("value_wei") or "") != "0"
+            or unsigned.get("native_input") is not False
+            or not str(unsigned.get("calldata_sha256") or "").strip()
+            or int(str(unsigned.get("gas_limit") or "0")) <= 0
+            or int(str(plan.get("minimum_received_atomic") or "0")) <= 0
+        ):
+            raise ValueError("r5c4a_firm_plan_identity_or_safety_mismatch")
+
+        now = utc_now()
+        evidence = existing_evidence
+        evidence.update({
+            "preparation_verified": True,
+            "preparation_status": PREPARATION_STATUS,
+            "symbol": normalized_symbol,
+            "side": normalized_side,
+            "amount_mode": normalized_mode,
+            "provider": PROVIDER_ZEROX,
+            "from_asset": R5C4A_INPUT_ASSET,
+            "to_asset": R5C4A_OUTPUT_ASSET,
+            "verified_input_amount": R5C4A_INPUT_AMOUNT,
+            "firm_plan_input_ceiling": R5C4A_INPUT_AMOUNT,
+            "quote_id": plan.get("quote_id"),
+            "calldata_sha256": unsigned.get("calldata_sha256"),
+            "transaction_destination": unsigned.get("to"),
+            "allowance_spender": allowance.get("spender"),
+            "approval_required": bool(plan.get("approval_required")),
+            "minimum_received": plan.get("minimum_received"),
+            "verified_at": iso_or_none(now),
+            "provider_contacted": True,
+            "read_only": True,
+            "wallet_connection_requested": False,
+            "signing_requested": False,
+            "broadcast_requested": False,
+            "live_accepted": False,
+            "successful_broadcast": False,
+            "automatic_execution_promotion": False,
+        })
+        capability.firm_plan_status = "available"
+        capability.execution_status = PREPARATION_STATUS
+        capability.enabled = True
+        capability.provider_error = {}
+        capability.evidence = evidence
+        capability.last_verified_at = now
+        capability.updated_at = now
+        db.add(capability)
+        db.flush()
+
+        authority = resolve_robinhood_chain_execution_authority(
+            db,
+            symbol=normalized_symbol,
+            side=normalized_side,
+            amount_mode=normalized_mode,
+            provider=PROVIDER_ZEROX,
+            require_execution=True,
+        )
+        if authority.get("authority_level") != PREPARATION_STATUS or authority.get("live_execution_verified") is not False:
+            raise ValueError("r5c4a_preparation_authority_resolution_failed")
+        db.commit()
+        db.refresh(capability)
+        return {
+            "ok": True,
+            "idempotent": False,
+            "tranche": "R5C.4A",
+            "capability": self._capability_dict(db, capability),
+            "execution_authority": authority,
+            "firm_plan": plan,
+            "database_mutated": True,
+            "blockchain_read_only": True,
+            "provider_read_only": True,
+            "wallet_connection_requested": False,
+            "signing_enabled": False,
+            "broadcast_enabled": False,
+            "successful_broadcast": False,
+            "initial_acceptance_wallet_reject_only": True,
             "automatic_execution_promotion": False,
             "will_mutate_chain": False,
         }

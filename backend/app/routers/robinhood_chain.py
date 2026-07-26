@@ -563,6 +563,19 @@ class RobinhoodChainExecutionAuthorityRequest(BaseModel):
     provider: str = Field(default="0x", min_length=1, max_length=32)
 
 
+class RobinhoodChainPreparationVerificationRequest(BaseModel):
+    symbol: str = Field(default="WETH-USDG", min_length=1, max_length=80)
+    side: str = Field(default="buy", min_length=3, max_length=4)
+    amount_mode: str = Field(default="exact_input", min_length=1, max_length=32)
+    requested_amount: str = Field(default="1", min_length=1, max_length=80)
+    slippage_bps: int = Field(default=100, ge=100, le=100)
+    taker_address: Optional[str] = Field(default=None, min_length=42, max_length=42)
+    confirm_verify: bool = Field(
+        default=False,
+        description="Must be true to persist bounded R5C.4A preparation-verification evidence.",
+    )
+
+
 class RobinhoodChainExecutionPrepareRequest(BaseModel):
     symbol: str = Field(default=ROBINHOOD_CHAIN_EXECUTION_SYMBOL, min_length=1, max_length=32)
     side: str = Field(default=ROBINHOOD_CHAIN_EXECUTION_SIDE, min_length=3, max_length=4)
@@ -1955,6 +1968,53 @@ async def robinhood_chain_execution_authority_resolve(
     )
     db.rollback()
     return payload
+
+
+@router.post("/execution-authority/verify-preparation")
+async def robinhood_chain_execution_authority_verify_preparation(
+    request: RobinhoodChainPreparationVerificationRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Persist bounded WETH BUY preparation evidence after a validated firm plan.
+
+    R5C.4A is locked to WETH-USDG BUY, exact input, 1 USDG, and 1% slippage.
+    This endpoint never requests MetaMask, signs, broadcasts, or claims that live
+    WETH execution has been verified.
+    """
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
+    try:
+        return await get_robinhood_chain_registry_discovery_service().verify_preparation_authority(
+            db,
+            symbol=request.symbol,
+            side=request.side,
+            amount_mode=request.amount_mode,
+            requested_amount=request.requested_amount,
+            taker_address=taker,
+            slippage_bps=int(request.slippage_bps),
+            confirm_verify=bool(request.confirm_verify),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        if "not_found" in error or "missing" in error:
+            status_code = 404
+        elif "provider" in error or "firm_plan" in error or "allowance" in error:
+            status_code = 502
+        else:
+            status_code = 409
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error": error,
+                "wallet_connection_requested": False,
+                "signing_enabled": False,
+                "broadcast_enabled": False,
+                "successful_broadcast": False,
+                "automatic_execution_promotion": False,
+            },
+        ) from exc
 
 
 @router.get("/execution/status")

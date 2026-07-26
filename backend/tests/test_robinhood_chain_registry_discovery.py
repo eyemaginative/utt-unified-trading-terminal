@@ -17,6 +17,7 @@ from app.services.robinhood_chain_registry_discovery import (
     AMOUNT_MODE_EXACT_INPUT,
     MECHANISM_SWAP,
     MECHANISM_WRAP_UNWRAP,
+    PREPARATION_STATUS,
     RobinhoodChainRegistryDiscoveryService,
     _parse_probe_amount,
 )
@@ -116,6 +117,56 @@ class _FakeDiscoveryService:
         }
 
 
+class _FakePlanningService:
+    def __init__(self, *, ok: bool = True) -> None:
+        self.ok = bool(ok)
+        self.calls: List[Dict[str, Any]] = []
+
+    async def firm_quote_plan(self, **kwargs: Any) -> Dict[str, Any]:
+        self.calls.append(dict(kwargs))
+        if not self.ok:
+            return {"ok": False, "error": "firm_quote_provider_error"}
+        spender = "0x0000000000001ff3684f28c67538d4d072c22734"
+        return {
+            "ok": True,
+            "symbol": "WETH-USDG",
+            "side": "buy",
+            "amount_mode": "exact_input",
+            "input_asset": "USDG",
+            "input_amount": "1",
+            "input_amount_atomic": "1000000",
+            "output_asset": "WETH",
+            "output_amount": "0.0005",
+            "output_amount_atomic": "500000000000000",
+            "minimum_received": "0.000495",
+            "minimum_received_atomic": "495000000000000",
+            "quote_id": "11" * 32,
+            "approval_required": True,
+            "allowance": {
+                "applicable": True,
+                "read_method": "eth_call",
+                "token": {"symbol": "USDG"},
+                "spender": spender,
+                "spender_allowlisted": True,
+                "current_atomic": "0",
+                "required_atomic": "1000000",
+                "shortfall_atomic": "1000000",
+                "approval_required": True,
+            },
+            "unsigned_transaction_plan": {
+                "to": spender,
+                "destination_allowlisted": True,
+                "value_wei": "0",
+                "native_input": False,
+                "calldata_sha256": "22" * 32,
+                "gas_limit": "300000",
+            },
+            "wallet_connection_requested": False,
+            "signing_enabled": False,
+            "broadcast_enabled": False,
+        }
+
+
 class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -133,9 +184,11 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.db: Session = self.SessionLocal()
         self.fake_rpc = _FakeRpcClient()
         self.fake_discovery = _FakeDiscoveryService()
+        self.fake_planning = _FakePlanningService()
         self.service = RobinhoodChainRegistryDiscoveryService(
             rpc_client=self.fake_rpc,
             discovery_service=self.fake_discovery,
+            planning_service=self.fake_planning,
         )
 
     def tearDown(self) -> None:
@@ -189,6 +242,41 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.db.commit()
+
+    def _r5c4a_capability(self) -> tuple[TokenRegistry, TokenRegistry, RobinhoodChainPairCapability]:
+        self._token("ETH", None, 18)
+        weth = self._token("WETH", "0x" + "31" * 20, 18)
+        usdg = self._token("USDG", "0x" + "41" * 20, 6)
+        self._mark_verified(weth)
+        self._mark_verified(usdg)
+        objective = RobinhoodChainPairObjective(
+            id="r5c4a-objective",
+            base_token_registry_id=int(weth.id),
+            quote_token_registry_id=int(usdg.id),
+            symbol="WETH-USDG",
+            mechanism="swap",
+            enabled=True,
+            review_only=True,
+        )
+        self.db.add(objective)
+        self.db.flush()
+        capability = RobinhoodChainPairCapability(
+            id="r5c4a-capability",
+            objective_id=objective.id,
+            from_token_registry_id=int(usdg.id),
+            to_token_registry_id=int(weth.id),
+            amount_mode="exact_input",
+            provider="0x",
+            indicative_status="available",
+            firm_plan_status="not_tested",
+            execution_status="disabled",
+            enabled=False,
+            probe_amount="1",
+            evidence={"liquidity_available": True, "read_only": True},
+        )
+        self.db.add(capability)
+        self.db.commit()
+        return weth, usdg, capability
 
     def test_status_is_review_only_and_has_no_hardcoded_identity_flags(self) -> None:
         status = self.service.status(self.db)
@@ -472,6 +560,90 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         for row in self.db.query(RobinhoodChainPairCapability).all():
             self.assertFalse(row.enabled)
             self.assertEqual(row.execution_status, "disabled")
+
+    async def test_r5c4a_preparation_verification_requires_explicit_confirmation(self) -> None:
+        self._r5c4a_capability()
+        with self.assertRaisesRegex(ValueError, "confirm_r5c4a_preparation_verification_required"):
+            await self.service.verify_preparation_authority(
+                self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+                requested_amount="1", taker_address="0x" + "51" * 20,
+                slippage_bps=100, confirm_verify=False,
+            )
+        self.assertEqual(self.fake_planning.calls, [])
+
+    async def test_r5c4a_wrong_target_is_blocked_before_provider(self) -> None:
+        self._r5c4a_capability()
+        with self.assertRaisesRegex(ValueError, "r5c4a_preparation_target_locked"):
+            await self.service.verify_preparation_authority(
+                self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+                requested_amount="1.01", taker_address="0x" + "51" * 20,
+                slippage_bps=100, confirm_verify=True,
+            )
+        self.assertEqual(self.fake_planning.calls, [])
+
+    async def test_r5c4a_success_persists_bounded_preparation_not_live_execution(self) -> None:
+        _, _, capability = self._r5c4a_capability()
+        result = await self.service.verify_preparation_authority(
+            self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+            requested_amount="1", taker_address="0x" + "51" * 20,
+            slippage_bps=100, confirm_verify=True,
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["idempotent"])
+        self.assertTrue(result["database_mutated"])
+        self.assertFalse(result["broadcast_enabled"])
+        self.assertFalse(result["successful_broadcast"])
+        self.assertTrue(result["initial_acceptance_wallet_reject_only"])
+        self.assertEqual(len(self.fake_planning.calls), 1)
+        call = self.fake_planning.calls[0]
+        self.assertEqual(call["symbol"], "WETH-USDG")
+        self.assertEqual(call["requested_amount"], "1")
+        self.assertEqual(call["base_token"]["symbol"], "WETH")
+        self.assertFalse(call["base_token"]["native"])
+        self.assertEqual(call["quote_token"]["symbol"], "USDG")
+        self.db.refresh(capability)
+        self.assertTrue(capability.enabled)
+        self.assertEqual(capability.firm_plan_status, "available")
+        self.assertEqual(capability.execution_status, PREPARATION_STATUS)
+        self.assertEqual(capability.probe_amount, "1")
+        self.assertTrue(capability.evidence["preparation_verified"])
+        self.assertFalse(capability.evidence["live_accepted"])
+        self.assertFalse(capability.evidence["successful_broadcast"])
+        authority = result["execution_authority"]
+        self.assertEqual(authority["authority_level"], PREPARATION_STATUS)
+        self.assertTrue(authority["execution_permitted"])
+        self.assertFalse(authority["live_execution_verified"])
+        self.assertFalse(authority["successful_broadcast_authorized"])
+
+    async def test_r5c4a_repeat_is_idempotent_without_provider_contact(self) -> None:
+        self._r5c4a_capability()
+        kwargs = dict(
+            symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+            requested_amount="1", taker_address="0x" + "51" * 20,
+            slippage_bps=100, confirm_verify=True,
+        )
+        first = await self.service.verify_preparation_authority(self.db, **kwargs)
+        second = await self.service.verify_preparation_authority(self.db, **kwargs)
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+        self.assertFalse(second["database_mutated"])
+        self.assertIsNone(second["firm_plan"])
+        self.assertEqual(len(self.fake_planning.calls), 1)
+
+    async def test_r5c4a_failed_firm_plan_leaves_capability_disabled(self) -> None:
+        _, _, capability = self._r5c4a_capability()
+        self.service.planning_service = _FakePlanningService(ok=False)
+        with self.assertRaisesRegex(ValueError, "firm_quote_provider_error"):
+            await self.service.verify_preparation_authority(
+                self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+                requested_amount="1", taker_address="0x" + "51" * 20,
+                slippage_bps=100, confirm_verify=True,
+            )
+        self.db.refresh(capability)
+        self.assertFalse(capability.enabled)
+        self.assertEqual(capability.firm_plan_status, "not_tested")
+        self.assertEqual(capability.execution_status, "disabled")
+        self.assertFalse((capability.evidence or {}).get("preparation_verified", False))
 
     def test_explicit_historical_evidence_can_sync_arbitrary_registry_pair(self) -> None:
         base = self._token("OMEGA", "0x" + "c0" * 20, 18)

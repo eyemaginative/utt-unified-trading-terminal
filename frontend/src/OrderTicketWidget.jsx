@@ -11755,11 +11755,13 @@ async function submitLimitOrder() {
                 ? "Robinhood Chain swap review: USDG to native ETH. Exact spend is live verified; exact receive remains held for direct-router research."
                 : `Robinhood Chain swap execution: native ETH to USDG with a custom exact-spend amount up to ${ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH} ETH.`
               : robinhoodChainWethReviewMarket
-                ? "WETH-USDG: exact-spend quote, unsigned firm plan, and finite USDG approval lifecycle are enabled. WETH swap preparation and submission remain locked in R5C.3C."
+                ? robinhoodChainExecutionAuthorized
+                  ? "WETH-USDG R5C.4A: bounded 1 USDG exact-spend preparation is verified. MetaMask remains an explicit separate request; initial acceptance requires deliberate wallet rejection and no successful WETH broadcast."
+                  : "WETH-USDG: exact-spend indicative review is available. Bounded R5C.4A preparation authority must be explicitly verified before unsigned planning and wallet handoff are enabled."
                 : `${robinhoodChainPair.symbol || "Robinhood Chain market"}: ${robinhoodChainMarketStatusLabel(robinhoodChainSelectedMarket)}. Review remains locked.`}
           >
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10.5, fontWeight: 900 }}>
-              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-SWAP · {Array.isArray(robinhoodChainSelectedMarket?.providers) && robinhoodChainSelectedMarket.providers.length ? robinhoodChainSelectedMarket.providers.join("+") : "DB"} · {robinhoodChainFromAsset || "?"} ▸ {robinhoodChainToAsset || "?"} · {robinhoodChainLegacyExecutionMarket ? (side === "sell" ? "10D.2-R5C.3B.1" : "10D.2-R5B") : robinhoodChainWethReviewMarket ? "10D.2-R5C.3B" : "10D.2-R5C.2"}</span>
+              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-SWAP · {Array.isArray(robinhoodChainSelectedMarket?.providers) && robinhoodChainSelectedMarket.providers.length ? robinhoodChainSelectedMarket.providers.join("+") : "DB"} · {robinhoodChainFromAsset || "?"} ▸ {robinhoodChainToAsset || "?"} · {robinhoodChainLegacyExecutionMarket ? (side === "sell" ? "10D.2-R5C.3B.1" : "10D.2-R5B") : robinhoodChainWethReviewMarket ? "R5C.4A" : "10D.2-R5C.2"}</span>
               <span style={{ color: robinhoodChainWalletState.providerAvailable ? "#bbf7d0" : "#fde68a" }}>
                 MetaMask {robinhoodChainWalletState.providerAvailable ? "detected" : "unavailable"}
               </span>
@@ -11774,9 +11776,11 @@ async function submitLimitOrder() {
               </span>
               <span style={{ color: (robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket) && (side === "buy" ? (robinhoodChainWethReviewMarket ? robinhoodChainSwapSendGate?.send_enabled : robinhoodChainBuySendGate?.send_enabled) : robinhoodChainSendGate?.send_enabled) ? "#bbf7d0" : "#c4b5fd" }}>
                 {robinhoodChainWethReviewMarket
-                  ? robinhoodChainSwapSendGate?.send_enabled
-                    ? "APPROVAL SEND GATE READY · SWAP LOCKED"
-                    : "APPROVAL SEND GATE BLOCKED · SWAP LOCKED"
+                  ? robinhoodChainExecutionAuthorized
+                    ? robinhoodChainSwapSendGate?.send_enabled
+                      ? "PREPARATION VERIFIED · EXPLICIT WALLET GATE READY"
+                      : "PREPARATION VERIFIED · WALLET GATE BLOCKED"
+                    : "R5C.4A PREPARATION AUTHORITY BLOCKED"
                   : !robinhoodChainLegacyExecutionMarket
                     ? "R5C.2 EXECUTION LOCKED"
                     : (side === "buy" ? robinhoodChainBuySendGate?.send_enabled : robinhoodChainSendGate?.send_enabled)
@@ -11812,8 +11816,10 @@ async function submitLimitOrder() {
                 <span style={{ color: robinhoodChainRouteDisplayEnabled ? "#bbf7d0" : "#fecdd3", fontWeight: 900 }}>
                   {robinhoodChainLegacyExecutionMarket
                     ? (robinhoodChainCapabilityEnabled ? "ROUTE ENABLED" : "ROUTE BLOCKED")
-                    : robinhoodChainWethReviewMarket && robinhoodChainQuoteReviewEnabled
-                      ? "QUOTE REVIEW ENABLED"
+                    : robinhoodChainWethReviewMarket && robinhoodChainExecutionAuthorized
+                      ? "BOUNDED PREPARATION ENABLED"
+                      : robinhoodChainWethReviewMarket && robinhoodChainQuoteReviewEnabled
+                        ? "QUOTE REVIEW ENABLED"
                       : robinhoodChainMarketReviewAvailable ? "MARKET REVIEW" : "MARKET BLOCKED"}
                 </span>
                 <span style={{ color: "#c4b5fd" }}>
@@ -11857,12 +11863,14 @@ async function submitLimitOrder() {
                   title={robinhoodChainLegacyExecutionMarket
                     ? "Exact spend sends sellAmount to the provider. This mode is live verified for ETH→USDG and USDG→ETH."
                     : robinhoodChainWethReviewMarket
-                      ? robinhoodChainFirmPlanReviewEnabled
-                        ? "R5C.3A enables bounded exact-spend indicative quote and unsigned firm-plan review; approval and execution remain disabled."
-                        : `R5C.3A enables exact-spend indicative quote review under the configured review-value ceiling. Probe amount remains evidence only. Unsigned firm-plan review remains disabled while firm_plan_status is ${robinhoodChainFirmPlanStatusLabel}. Approval and execution remain disabled.`
+                      ? robinhoodChainExecutionAuthorized
+                        ? "R5C.4A preparation authority is verified at the persisted 1 USDG ceiling. Unsigned planning and finite-approval lifecycle preparation are enabled; live WETH execution is not verified."
+                        : robinhoodChainFirmPlanReviewEnabled
+                          ? "Bounded exact-spend indicative and unsigned-plan review are available. Execution preparation remains blocked until R5C.4A authority verification succeeds."
+                          : `Exact-spend indicative review is available. Unsigned firm-plan review remains disabled while firm_plan_status is ${robinhoodChainFirmPlanStatusLabel}; no wallet request can occur.`
                       : "The database capability is displayed, but ticket provider requests and execution remain disabled."}
                 >
-                  EXACT SPEND · {robinhoodChainLegacyExecutionMarket ? "LIVE" : robinhoodChainWethReviewMarket && robinhoodChainQuoteReviewEnabled ? "REVIEW" : robinhoodChainIndicativeAvailable ? "BOOK ONLY" : "BLOCKED"}
+                  EXACT SPEND · {robinhoodChainLegacyExecutionMarket ? "LIVE" : robinhoodChainWethReviewMarket && robinhoodChainExecutionAuthorized ? "PREP VERIFIED" : robinhoodChainWethReviewMarket && robinhoodChainQuoteReviewEnabled ? "REVIEW" : robinhoodChainIndicativeAvailable ? "BOOK ONLY" : "BLOCKED"}
                 </button>
                 <button
                   type="button"
@@ -12006,7 +12014,9 @@ async function submitLimitOrder() {
               <div style={{ marginTop: 5, fontSize: 10.5, color: "#bae6fd" }}>
                 {!robinhoodChainLegacyExecutionMarket
                   ? robinhoodChainReviewQuoteMarket
-                    ? `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Probe amount is evidence and the synthetic-book seed; indicative quotes use the configured review ceiling and unsigned plans use a separate verified ceiling. Signing, approval, and execution remain locked.`
+                    ? robinhoodChainWethReviewMarket && robinhoodChainExecutionAuthorized
+                      ? `R5C.4A bounded preparation ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted ceiling is ${robinhoodChainExecutionCeilingAmount || "1"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"}; wallet handoff remains explicit and initial acceptance is wallet-reject only.`
+                      : `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Probe amount is evidence and the synthetic-book seed; indicative quotes use the configured review ceiling and unsigned plans use a separate verified ceiling. Signing, approval, and execution remain locked.`
                     : robinhoodChainWrapUnwrapReview
                       ? `Mechanism-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"} review. Wrap/unwrap preview and transaction construction are not enabled in R5C.3A; no DEX price or stale limit is displayed.`
                       : robinhoodChainTicketFieldsUnavailable

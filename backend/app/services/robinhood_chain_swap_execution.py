@@ -38,7 +38,7 @@ from .robinhood_chain_transaction_planning import (
 
 
 ROBINHOOD_CHAIN_SWAP_TRANCHE = "RH-CHAIN.10D.2-R5B"
-ROBINHOOD_CHAIN_WETH_SWAP_TRANCHE = "RH-CHAIN.10D.2-R5C.3C"
+ROBINHOOD_CHAIN_WETH_SWAP_TRANCHE = "R5C.4A"
 ROBINHOOD_CHAIN_SWAP_FROM_ASSET = "USDG"
 ROBINHOOD_CHAIN_SWAP_TO_ASSET = "ETH"
 ROBINHOOD_CHAIN_SWAP_APPROVAL_TO_ASSETS = frozenset({"ETH", "WETH"})
@@ -171,12 +171,40 @@ def _validated_execution_authority(
     if str(authority_output.get("symbol") or "").strip().upper() != str(output_asset or "").strip().upper():
         raise ValueError("robinhood_chain_swap_execution_output_authority_mismatch")
     capability = authority.get("capability") if isinstance(authority.get("capability"), dict) else {}
-    if (
-        capability.get("enabled") is not True
-        or str(capability.get("firm_plan_status") or "").strip().lower() != "live_verified"
-        or str(capability.get("execution_status") or "").strip().lower() != "live_verified"
-    ):
-        raise ValueError("robinhood_chain_swap_execution_capability_not_live_verified")
+    authority_level = str(authority.get("authority_level") or "").strip().lower()
+    evidence = capability.get("evidence") if isinstance(capability.get("evidence"), dict) else {}
+    live_verified = bool(
+        authority_level == "live_verified"
+        and capability.get("enabled") is True
+        and str(capability.get("firm_plan_status") or "").strip().lower() == "live_verified"
+        and str(capability.get("execution_status") or "").strip().lower() == "live_verified"
+        and authority.get("live_execution_verified") is True
+    )
+    preparation_ceiling = str((authority.get("execution_ceiling") or {}).get("amount") or "").strip()
+    preparation_verified = bool(
+        authority_level == "preparation_verified"
+        and capability.get("enabled") is True
+        and str(capability.get("firm_plan_status") or "").strip().lower() == "available"
+        and str(capability.get("execution_status") or "").strip().lower() == "preparation_verified"
+        and evidence.get("preparation_verified") is True
+        and evidence.get("live_accepted") is not True
+        and evidence.get("successful_broadcast") is not True
+        and str(evidence.get("symbol") or "").strip().upper() == str(authority.get("symbol") or "").strip().upper()
+        and str(evidence.get("side") or "").strip().lower() == "buy"
+        and str(evidence.get("amount_mode") or "").strip().lower() == ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE
+        and str(evidence.get("provider") or "").strip().lower() == "0x"
+        and str(evidence.get("from_asset") or "").strip().upper() == str(input_asset or "").strip().upper()
+        and str(evidence.get("to_asset") or "").strip().upper() == str(output_asset or "").strip().upper()
+        and str(evidence.get("verified_input_amount") or "").strip() == preparation_ceiling
+        and str(evidence.get("firm_plan_input_ceiling") or "").strip() == preparation_ceiling
+        and bool(preparation_ceiling)
+        and authority.get("preparation_verified") is True
+        and authority.get("live_execution_verified") is False
+        and authority.get("initial_acceptance_wallet_reject_only") is True
+        and authority.get("successful_broadcast_authorized") is False
+    )
+    if not live_verified and not preparation_verified:
+        raise ValueError("robinhood_chain_swap_execution_capability_not_verified")
     return {
         "symbol": str(authority.get("symbol") or "").strip().upper(),
         "side": str(authority.get("side") or "").strip().lower(),
@@ -184,6 +212,11 @@ def _validated_execution_authority(
         "provider": str(authority.get("provider") or "").strip().lower(),
         "objective_id": str((authority.get("objective") or {}).get("id") or ""),
         "capability_id": str(capability.get("id") or ""),
+        "authority_level": authority_level,
+        "live_execution_verified": live_verified,
+        "preparation_verified": preparation_verified,
+        "initial_acceptance_wallet_reject_only": preparation_verified,
+        "successful_broadcast_authorized": live_verified,
         "execution_ceiling": dict(authority.get("execution_ceiling") or {}),
         "input": dict(authority_input),
         "output": dict(authority_output),
@@ -489,7 +522,7 @@ def serialize_swap_execution(row: RobinhoodChainSwapExecution) -> Dict[str, Any]
 
 
 class RobinhoodChainSwapExecutionService:
-    """Generalized exact-spend browser-wallet lifecycle for USDG -> native ETH.
+    """Generalized exact-spend browser-wallet lifecycle for USDG -> ETH or WETH.
 
     The backend validates and persists plans, claims, hashes, receipts, and
     reconciliation. It never signs or broadcasts; MetaMask remains the only
@@ -566,6 +599,16 @@ class RobinhoodChainSwapExecutionService:
             input_asset=str(usdg_token.get("symbol") or ROBINHOOD_CHAIN_SWAP_FROM_ASSET),
             output_asset=output_asset,
         )
+        if execution_authority is not None:
+            authority_ceiling_raw = str((execution_authority.get("execution_ceiling") or {}).get("amount") or "").strip()
+            try:
+                authority_ceiling = Decimal(authority_ceiling_raw)
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError("robinhood_chain_swap_execution_ceiling_missing") from exc
+            if not authority_ceiling.is_finite() or authority_ceiling <= 0:
+                raise ValueError("robinhood_chain_swap_execution_ceiling_missing")
+            if Decimal(input_display) > authority_ceiling:
+                raise ValueError("robinhood_chain_swap_input_exceeds_verified_authority_ceiling")
         now = utc_now()
         existing = (
             db.query(RobinhoodChainSwapExecution)
@@ -578,7 +621,7 @@ class RobinhoodChainSwapExecutionService:
                 RobinhoodChainSwapExecution.status.in_([
                     "approval_prepared", "allowance_sufficient", "approval_send_claimed",
                     "approval_pending", "approval_confirmed", "swap_prepared",
-                    "swap_send_claimed", "swap_pending", "confirmed",
+                    "swap_send_claimed", "swap_pending",
                 ]),
             )
             .order_by(RobinhoodChainSwapExecution.created_at.desc())
@@ -588,7 +631,7 @@ class RobinhoodChainSwapExecutionService:
             _validate_row(existing)
             active_after_claim = {
                 "approval_send_claimed", "approval_pending", "approval_confirmed",
-                "swap_prepared", "swap_send_claimed", "swap_pending", "confirmed",
+                "swap_prepared", "swap_send_claimed", "swap_pending",
             }
             if str(existing.status or "") in active_after_claim or _as_utc(existing.plan_expires_at) > now:
                 return {

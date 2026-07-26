@@ -27,6 +27,11 @@ from ..services.robinhood_chain_execution_discovery import (
 from ..services.robinhood_chain_registry_discovery import (
     get_robinhood_chain_registry_discovery_service,
 )
+from ..services.robinhood_chain_registry_authority import (
+    RobinhoodChainRegistryAuthorityError,
+    assert_robinhood_chain_execution_amount,
+    resolve_robinhood_chain_execution_authority,
+)
 from ..services.robinhood_chain_quotes import (
     ROBINHOOD_CHAIN_QUOTE_PROVIDER,
     get_robinhood_chain_quote_service,
@@ -292,6 +297,66 @@ def _resolve_robinhood_chain_review_market(
     return market, base, quote, capability
 
 
+def _execution_authority_http_detail(exc: RobinhoodChainRegistryAuthorityError) -> Dict[str, Any]:
+    detail = {
+        "error": exc.code,
+        "message": exc.message,
+        "provider_contacted": False,
+        "automatic_execution_promotion": False,
+    }
+    detail.update(exc.context)
+    return detail
+
+
+def _resolve_robinhood_chain_execution_authority_or_http(
+    db: Session,
+    *,
+    symbol: str,
+    side: str,
+    amount_mode: str = "exact_input",
+    provider: str = "0x",
+    require_execution: bool = False,
+) -> Dict[str, Any]:
+    try:
+        return resolve_robinhood_chain_execution_authority(
+            db,
+            symbol=symbol,
+            side=side,
+            amount_mode=amount_mode,
+            provider=provider,
+            require_execution=require_execution,
+        )
+    except RobinhoodChainRegistryAuthorityError as exc:
+        status_code = 404 if "not_found" in exc.code else 409
+        if exc.code.startswith("invalid_") or "not_supported" in exc.code:
+            status_code = 400
+        raise HTTPException(status_code=status_code, detail=_execution_authority_http_detail(exc)) from exc
+
+
+def _assert_robinhood_chain_execution_amount_or_http(
+    authority: Dict[str, Any],
+    amount: Any,
+) -> str:
+    try:
+        return assert_robinhood_chain_execution_amount(authority, amount)
+    except RobinhoodChainRegistryAuthorityError as exc:
+        raise HTTPException(status_code=409, detail=_execution_authority_http_detail(exc)) from exc
+
+
+def _assert_persisted_swap_execution_authority(
+    db: Session,
+    execution: Dict[str, Any],
+) -> Dict[str, Any]:
+    return _resolve_robinhood_chain_execution_authority_or_http(
+        db,
+        symbol=str(execution.get("symbol") or ""),
+        side=str(execution.get("side") or ""),
+        amount_mode=str(execution.get("amount_mode") or "exact_input"),
+        provider=str(execution.get("provider") or "0x"),
+        require_execution=True,
+    )
+
+
 def _resolve_robinhood_chain_review_identities(
     db: Session,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -491,6 +556,13 @@ class RobinhoodChainFirmQuotePlanRequest(BaseModel):
     )
 
 
+class RobinhoodChainExecutionAuthorityRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=80)
+    side: str = Field(min_length=3, max_length=4)
+    amount_mode: str = Field(default="exact_input", min_length=1, max_length=32)
+    provider: str = Field(default="0x", min_length=1, max_length=32)
+
+
 class RobinhoodChainExecutionPrepareRequest(BaseModel):
     symbol: str = Field(default=ROBINHOOD_CHAIN_EXECUTION_SYMBOL, min_length=1, max_length=32)
     side: str = Field(default=ROBINHOOD_CHAIN_EXECUTION_SIDE, min_length=3, max_length=4)
@@ -555,6 +627,8 @@ class RobinhoodChainBuySwapPrepareRequest(BaseModel):
 
 
 class RobinhoodChainSwapExecutionPrepareRequest(BaseModel):
+    symbol: str = Field(default="ETH-USDG", min_length=1, max_length=80)
+    side: str = Field(default="buy", min_length=3, max_length=4)
     from_asset: str = Field(default=ROBINHOOD_CHAIN_SWAP_FROM_ASSET, min_length=1, max_length=32)
     to_asset: str = Field(
         default=ROBINHOOD_CHAIN_SWAP_TO_ASSET,
@@ -1865,6 +1939,24 @@ async def robinhood_chain_firm_quote_plan(
     raise HTTPException(status_code=_quote_failure_status(result), detail=result)
 
 
+@router.post("/execution-authority/resolve")
+async def robinhood_chain_execution_authority_resolve(
+    request: RobinhoodChainExecutionAuthorityRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Resolve persisted execution authority without provider contact or mutation."""
+    payload = _resolve_robinhood_chain_execution_authority_or_http(
+        db,
+        symbol=request.symbol,
+        side=request.side,
+        amount_mode=request.amount_mode,
+        provider=request.provider,
+        require_execution=False,
+    )
+    db.rollback()
+    return payload
+
+
 @router.get("/execution/status")
 async def robinhood_chain_execution_status() -> Dict[str, Any]:
     """Return the dedicated RH-CHAIN.10D.1 browser-wallet execution gate."""
@@ -1887,24 +1979,42 @@ async def robinhood_chain_execution_prepare(
     if not bool(settings.robinhood_chain_effective_enabled()):
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
 
-    if str(request.symbol or "").strip().upper() != ROBINHOOD_CHAIN_EXECUTION_SYMBOL:
-        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_execution_symbol_locked"})
-    if str(request.side or "").strip().lower() != ROBINHOOD_CHAIN_EXECUTION_SIDE:
-        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_execution_side_locked"})
+    authority = _resolve_robinhood_chain_execution_authority_or_http(
+        db,
+        symbol=request.symbol,
+        side=request.side,
+        amount_mode="exact_input",
+        provider="0x",
+        require_execution=True,
+    )
+    if str(authority.get("execution_adapter") or "") != "native_exact_input":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "robinhood_chain_native_execution_adapter_required",
+                "authority": authority,
+                "provider_contacted": False,
+            },
+        )
+    normalized_authority_amount = _assert_robinhood_chain_execution_amount_or_http(
+        authority,
+        request.quantity,
+    )
     try:
-        _, normalized_quantity, _ = normalize_robinhood_chain_execution_quantity(request.quantity)
+        _, normalized_quantity, _ = normalize_robinhood_chain_execution_quantity(normalized_authority_amount)
     except ValueError as exc:
         raise HTTPException(
-            status_code=400,
+            status_code=409,
             detail={
                 "error": str(exc),
-                "maximum_quantity_eth": str(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH),
+                "execution_ceiling": authority.get("execution_ceiling"),
+                "provider_contacted": False,
             },
         ) from exc
 
     taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
-    eth = _resolve_execution_discovery_token(db, "ETH")
-    usdg = _resolve_execution_discovery_token(db, "USDG")
+    eth = dict(authority.get("input") or {})
+    usdg = dict(authority.get("output") or {})
     try:
         result = await get_robinhood_chain_execution_service().prepare(
             db,
@@ -2061,49 +2171,64 @@ async def robinhood_chain_swap_execution_prepare(
 ) -> Dict[str, Any]:
     if not bool(settings.robinhood_chain_effective_enabled()):
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
-    if str(request.from_asset).strip().upper() != ROBINHOOD_CHAIN_SWAP_FROM_ASSET:
-        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_swap_from_asset_locked"})
-    to_asset = str(request.to_asset).strip().upper()
-    if to_asset not in ROBINHOOD_CHAIN_SWAP_APPROVAL_TO_ASSETS:
+    authority = _resolve_robinhood_chain_execution_authority_or_http(
+        db,
+        symbol=request.symbol,
+        side=request.side,
+        amount_mode=request.amount_mode,
+        provider="0x",
+        require_execution=True,
+    )
+    if str(authority.get("execution_adapter") or "") != "erc20_exact_input":
         raise HTTPException(
-            status_code=400,
+            status_code=409,
             detail={
-                "error": "robinhood_chain_swap_to_asset_locked",
-                "allowed_to_assets": sorted(ROBINHOOD_CHAIN_SWAP_APPROVAL_TO_ASSETS),
+                "error": "robinhood_chain_erc20_execution_adapter_required",
+                "authority": authority,
+                "provider_contacted": False,
             },
         )
-    if str(request.amount_mode).strip().lower() not in {ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE, ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE}:
-        raise HTTPException(status_code=400, detail={"error": "robinhood_chain_swap_amount_mode_locked"})
-    market_symbol = f"{to_asset}-USDG"
-    market, base_token, quote_token, capability = _resolve_robinhood_chain_review_market(
-        db,
-        symbol=market_symbol,
-        side="buy",
-        amount_mode="exact_input",
-    )
+    from_asset = str(request.from_asset or "").strip().upper()
+    to_asset = str(request.to_asset or "").strip().upper()
+    input_token = dict(authority.get("input") or {})
+    output_token = dict(authority.get("output") or {})
     if (
-        str(base_token.get("symbol") or "").strip().upper() != to_asset
-        or str(quote_token.get("symbol") or "").strip().upper() != ROBINHOOD_CHAIN_SWAP_FROM_ASSET
+        from_asset != str(input_token.get("symbol") or "").strip().upper()
+        or to_asset != str(output_token.get("symbol") or "").strip().upper()
     ):
         raise HTTPException(
             status_code=409,
             detail={
                 "error": "robinhood_chain_swap_market_identity_mismatch",
-                "symbol": market.get("symbol"),
+                "symbol": authority.get("symbol"),
+                "input_asset": input_token.get("symbol"),
+                "output_asset": output_token.get("symbol"),
                 "provider_contacted": False,
             },
         )
+    normalized_input_amount = _assert_robinhood_chain_execution_amount_or_http(
+        authority,
+        request.exact_input_amount,
+    )
+    capability = dict(authority.get("capability") or {})
+    capability.update({
+        "from_asset": input_token.get("symbol"),
+        "to_asset": output_token.get("symbol"),
+        "amount_mode": authority.get("amount_mode"),
+        "mechanism": authority.get("mechanism"),
+        "execution_authority": authority,
+    })
     taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
     try:
         return await get_robinhood_chain_swap_execution_service().prepare(
             db,
             taker_address=taker,
-            exact_input_amount=request.exact_input_amount,
+            exact_input_amount=normalized_input_amount,
             slippage_bps=int(request.slippage_bps),
-            eth_token=base_token if to_asset == "ETH" else None,
-            usdg_token=quote_token,
+            eth_token=output_token if bool(output_token.get("native")) else None,
+            usdg_token=input_token,
             to_asset=to_asset,
-            to_token=base_token,
+            to_token=output_token,
             route_capability=capability,
             confirm_prepare=bool(request.confirm_prepare),
         )
@@ -2196,26 +2321,25 @@ async def robinhood_chain_swap_execution_prepare_fresh_swap(
         execution = current.get("execution") if isinstance(current, dict) else None
         if not isinstance(execution, dict):
             raise ValueError("robinhood_chain_swap_execution_not_found")
-        to_asset = str(execution.get("to_asset") or "").strip().upper()
-        if to_asset == "WETH":
-            market, base_token, quote_token, capability = _resolve_robinhood_chain_review_market(
-                db,
-                symbol="WETH-USDG",
-                side="buy",
-                amount_mode="exact_input",
-            )
-            if str(market.get("symbol") or "").strip().upper() != "WETH-USDG":
-                raise ValueError("robinhood_chain_swap_fresh_market_identity_mismatch")
-            return await service.prepare_swap(
-                db, execution_id=execution_id, wallet_address=request.wallet_address,
-                eth_token=None, usdg_token=quote_token, output_token=base_token,
-                route_capability=capability,
-                confirm_prepare=bool(request.confirm_prepare),
-            )
+        authority = _assert_persisted_swap_execution_authority(db, execution)
+        if str(authority.get("execution_adapter") or "") != "erc20_exact_input":
+            raise ValueError("robinhood_chain_erc20_execution_adapter_required")
+        input_token = dict(authority.get("input") or {})
+        output_token = dict(authority.get("output") or {})
+        capability = dict(authority.get("capability") or {})
+        capability.update({
+            "from_asset": input_token.get("symbol"),
+            "to_asset": output_token.get("symbol"),
+            "amount_mode": authority.get("amount_mode"),
+            "mechanism": authority.get("mechanism"),
+            "execution_authority": authority,
+        })
         return await service.prepare_swap(
             db, execution_id=execution_id, wallet_address=request.wallet_address,
-            eth_token=_resolve_execution_discovery_token(db, "ETH"),
-            usdg_token=_resolve_execution_discovery_token(db, "USDG"),
+            eth_token=output_token if bool(output_token.get("native")) else None,
+            usdg_token=input_token,
+            output_token=output_token,
+            route_capability=capability,
             confirm_prepare=bool(request.confirm_prepare),
         )
     except (ValueError, KeyError) as exc:

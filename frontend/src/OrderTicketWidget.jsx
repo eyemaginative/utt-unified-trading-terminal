@@ -14,6 +14,7 @@ import {
   getRobinhoodChainBuyExecution,
   getRobinhoodChainBuyExecutionStatus,
   getRobinhoodChainExecution,
+  getRobinhoodChainExecutionAuthority,
   getRobinhoodChainExecutionStatus,
   getRobinhoodChainFirmQuotePlan,
   getRobinhoodChainIndicativeQuote,
@@ -3368,6 +3369,10 @@ export default function OrderTicketWidget({
   const [robinhoodChainMarketsLoading, setRobinhoodChainMarketsLoading] = useState(false);
   const [robinhoodChainMarketsError, setRobinhoodChainMarketsError] = useState("");
   const robinhoodChainMarketsReqRef = useRef(0);
+  const [robinhoodChainExecutionAuthority, setRobinhoodChainExecutionAuthority] = useState(null);
+  const [robinhoodChainExecutionAuthorityLoading, setRobinhoodChainExecutionAuthorityLoading] = useState(false);
+  const [robinhoodChainExecutionAuthorityError, setRobinhoodChainExecutionAuthorityError] = useState("");
+  const robinhoodChainExecutionAuthorityReqRef = useRef(0);
   const [robinhoodChainAmountMode, setRobinhoodChainAmountMode] = useState(ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND);
   const [robinhoodChainQuote, setRobinhoodChainQuote] = useState(null);
   const [robinhoodChainQuoteLoading, setRobinhoodChainQuoteLoading] = useState(false);
@@ -3658,6 +3663,71 @@ export default function OrderTicketWidget({
   const robinhoodChainRouteDisplayEnabled = Boolean(
     robinhoodChainQuoteReviewEnabled || robinhoodChainMarketReviewAvailable
   );
+  const robinhoodChainExecutionAuthorityCapabilityKey = [
+    robinhoodChainSelectedCapability?.id,
+    robinhoodChainSelectedCapability?.enabled,
+    robinhoodChainSelectedCapability?.firm_plan_status,
+    robinhoodChainSelectedCapability?.execution_status,
+    robinhoodChainSelectedCapability?.last_verified_at,
+  ].map((value) => String(value ?? "")).join("|");
+  const robinhoodChainExecutionAuthorized = Boolean(
+    robinhoodChainExecutionAuthority?.execution_permitted === true &&
+    normalizeRobinhoodChainQuoteSymbol(robinhoodChainExecutionAuthority?.symbol) === robinhoodChainPair.symbol &&
+    String(robinhoodChainExecutionAuthority?.side || "").trim().toLowerCase() === robinhoodChainNormalizedSide &&
+    String(robinhoodChainExecutionAuthority?.amount_mode || "").trim().toLowerCase() === "exact_input"
+  );
+  const robinhoodChainExecutionAdapter = robinhoodChainExecutionAuthorized
+    ? String(robinhoodChainExecutionAuthority?.execution_adapter || "").trim().toLowerCase()
+    : "";
+  const robinhoodChainExecutionCeilingAmount = Number(
+    robinhoodChainExecutionAuthority?.execution_ceiling?.amount
+  );
+  const robinhoodChainExecutionCeilingAsset = String(
+    robinhoodChainExecutionAuthority?.execution_ceiling?.asset || robinhoodChainFromAsset || ""
+  ).trim().toUpperCase();
+  const robinhoodChainExecutionInputDecimals = Number.isFinite(Number(robinhoodChainExecutionAuthority?.input?.decimals))
+    ? Math.max(0, Math.min(18, Number(robinhoodChainExecutionAuthority.input.decimals)))
+    : 18;
+
+  useEffect(() => {
+    if (!isRobinhoodChainVenue || !robinhoodChainPair.symbol || robinhoodChainEffectiveAmountMode !== ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND) {
+      setRobinhoodChainExecutionAuthority(null);
+      setRobinhoodChainExecutionAuthorityLoading(false);
+      setRobinhoodChainExecutionAuthorityError("");
+      return undefined;
+    }
+
+    const reqId = ++robinhoodChainExecutionAuthorityReqRef.current;
+    let cancelled = false;
+    (async () => {
+      try {
+        setRobinhoodChainExecutionAuthorityLoading(true);
+        setRobinhoodChainExecutionAuthorityError("");
+        const payload = await getRobinhoodChainExecutionAuthority(
+          {
+            symbol: robinhoodChainPair.symbol,
+            side: robinhoodChainNormalizedSide,
+            amount_mode: "exact_input",
+          },
+          { apiBase, timeout_ms: 30000 }
+        );
+        if (cancelled || robinhoodChainExecutionAuthorityReqRef.current !== reqId) return;
+        setRobinhoodChainExecutionAuthority(payload || null);
+      } catch (error) {
+        if (cancelled || robinhoodChainExecutionAuthorityReqRef.current !== reqId) return;
+        setRobinhoodChainExecutionAuthority(null);
+        setRobinhoodChainExecutionAuthorityError(robinhoodChainQuoteError(error));
+      } finally {
+        if (!cancelled && robinhoodChainExecutionAuthorityReqRef.current === reqId) {
+          setRobinhoodChainExecutionAuthorityLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isRobinhoodChainVenue, robinhoodChainPair.symbol, robinhoodChainNormalizedSide, robinhoodChainEffectiveAmountMode, robinhoodChainExecutionAuthorityCapabilityKey, apiBase]);
+
   // R5C.3A keeps both Quantity and Total manually editable. Auto-calc is optional.
   const robinhoodChainBuyQtyLocked = false;
   const robinhoodChainBuyQtyReadOnly = false;
@@ -7474,12 +7544,15 @@ export default function OrderTicketWidget({
   const robinhoodChainCurrentExecutionAmount = normalizeRobinhoodChainAmountText(qty);
   const robinhoodChainCurrentExecutionAmountWei = robinhoodChainDecimalToAtomic(
     robinhoodChainCurrentExecutionAmount,
-    18
+    robinhoodChainExecutionInputDecimals
   );
+  const robinhoodChainCurrentExecutionAmountNumber = Number(robinhoodChainCurrentExecutionAmount);
   const robinhoodChainCurrentExecutionAmountValid = Boolean(
     robinhoodChainCurrentExecutionAmountWei !== null &&
     robinhoodChainCurrentExecutionAmountWei > 0n &&
-    robinhoodChainCurrentExecutionAmountWei <= ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI
+    Number.isFinite(robinhoodChainCurrentExecutionAmountNumber) &&
+    Number.isFinite(robinhoodChainExecutionCeilingAmount) &&
+    robinhoodChainCurrentExecutionAmountNumber <= robinhoodChainExecutionCeilingAmount + 1e-12
   );
   const robinhoodChainPreparedRow = robinhoodChainPreparedExecution?.execution || null;
   const robinhoodChainPreparedPlan = robinhoodChainPreparedExecution?.unsigned_transaction_plan || null;
@@ -7488,15 +7561,15 @@ export default function OrderTicketWidget({
   );
   const robinhoodChainPreparedAmountWei = robinhoodChainDecimalToAtomic(
     robinhoodChainPreparedAmount,
-    18
+    robinhoodChainExecutionInputDecimals
   );
   const robinhoodChainPreparedExpiresAt = Date.parse(
     String(robinhoodChainPreparedRow?.plan_expires_at || robinhoodChainPreparedExecution?.plan_expires_at || "")
   );
   const robinhoodChainPreparedTicketMismatch = Boolean(
     robinhoodChainPreparedRow && (
-      normalizeRobinhoodChainQuoteSymbol(robinhoodChainPreparedRow?.symbol) !== "ETH-USDG" ||
-      String(robinhoodChainPreparedRow?.side || "").trim().toLowerCase() !== "sell" ||
+      normalizeRobinhoodChainQuoteSymbol(robinhoodChainPreparedRow?.symbol) !== robinhoodChainPair.symbol ||
+      String(robinhoodChainPreparedRow?.side || "").trim().toLowerCase() !== robinhoodChainNormalizedSide ||
       robinhoodChainPreparedAmount !== robinhoodChainCurrentExecutionAmount ||
       robinhoodChainPreparedAmountWei === null ||
       String(robinhoodChainPreparedRow?.input_amount_atomic || "") !== robinhoodChainPreparedAmountWei.toString() ||
@@ -7515,7 +7588,8 @@ export default function OrderTicketWidget({
   );
   const canPrepareRobinhoodChainExecution = Boolean(
     isRobinhoodChainVenue &&
-    robinhoodChainLegacyExecutionMarket &&
+    robinhoodChainExecutionAuthorized &&
+    robinhoodChainExecutionAdapter === "native_exact_input" &&
     robinhoodChainWalletReady &&
     robinhoodChainFirmPlan?.ok &&
     !robinhoodChainFirmPlanStale &&
@@ -7552,15 +7626,15 @@ export default function OrderTicketWidget({
   );
   const canPrepareRobinhoodChainSwapExecution = Boolean(
     isRobinhoodChainVenue &&
-    (robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket) &&
+    robinhoodChainExecutionAuthorized &&
+    robinhoodChainExecutionAdapter === "erc20_exact_input" &&
     String(side || "").toLowerCase() === "buy" &&
     robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
-    (robinhoodChainLegacyExecutionMarket ? robinhoodChainCapabilityEnabled : robinhoodChainIndicativeAvailable) &&
     robinhoodChainExecutionReviewWalletReady &&
     robinhoodChainFirmPlan?.ok &&
     !robinhoodChainFirmPlanStale &&
     String(robinhoodChainFirmPlan?.amount_mode || "") === "exact_input" &&
-    String(robinhoodChainFirmPlan?.input_asset || "") === "USDG" &&
+    String(robinhoodChainFirmPlan?.input_asset || "").trim().toUpperCase() === robinhoodChainFromAsset &&
     String(robinhoodChainFirmPlan?.output_asset || "") === robinhoodChainToAsset &&
     !robinhoodChainSwapBusy
   );
@@ -9000,7 +9074,7 @@ async function submitLimitOrder() {
   async function prepareRobinhoodChainLiveExecution() {
     const executionAmount = robinhoodChainCurrentExecutionAmount;
     if (!canPrepareRobinhoodChainExecution) {
-      const msg = `A fresh matching custom ETH SELL plan greater than 0 and no more than ${ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH} ETH, connected saved wallet, and chain 4663 are required.`;
+      const msg = `A fresh matching ${robinhoodChainFromAsset || "native input"} exact-spend plan within the persisted ${robinhoodChainExecutionCeilingAmount || "unavailable"} ${robinhoodChainExecutionCeilingAsset || "input"} execution ceiling, connected saved wallet, and chain 4663 are required.`;
       setRobinhoodChainExecutionError(msg);
       onToast?.({ kind: "warn", msg });
       return;
@@ -9011,8 +9085,8 @@ async function submitLimitOrder() {
     try {
       const data = await prepareRobinhoodChainExecution(
         {
-          symbol: "ETH-USDG",
-          side: "sell",
+          symbol: robinhoodChainPair.symbol,
+          side: robinhoodChainNormalizedSide,
           quantity: executionAmount,
           slippage_bps: Number(robinhoodChainSlippageBps),
           taker_address: robinhoodChainConnectedAddress,
@@ -9469,9 +9543,11 @@ async function submitLimitOrder() {
     try {
       const data = await prepareRobinhoodChainSwapExecution(
         {
-          from_asset: "USDG",
+          symbol: robinhoodChainPair.symbol,
+          side: robinhoodChainNormalizedSide,
+          from_asset: robinhoodChainFromAsset,
           to_asset: robinhoodChainToAsset,
-          amount_mode: "exact_spend",
+          amount_mode: "exact_input",
           exact_input_amount: String(robinhoodChainFirmPlan?.input_amount || totalQuote || ""),
           slippage_bps: Number(robinhoodChainSlippageBps),
           taker_address: robinhoodChainConnectedAddress,
@@ -9482,9 +9558,9 @@ async function submitLimitOrder() {
       setRobinhoodChainSwapPrepared(data);
       setRobinhoodChainSwapExecutionStatus(data?.review_gate || robinhoodChainSwapExecutionStatus);
       setRobinhoodChainWalletNotice(
-        robinhoodChainToAsset === "WETH"
-          ? "Finite USDG approval prepared for WETH review. Swap preparation remains a separate explicit R5C.3C action; no MetaMask request occurred."
-          : "Finite exact-spend approval prepared for review only. No MetaMask request occurred."
+        data?.execution?.approval_required
+          ? `Finite ${robinhoodChainFromAsset || "input-token"} approval prepared for explicit review. No MetaMask request occurred.`
+          : "Allowance-sufficient exact-spend execution review prepared. No MetaMask request occurred."
       );
     } catch (error) {
       setRobinhoodChainSwapPrepared(null);
@@ -11837,6 +11913,7 @@ async function submitLimitOrder() {
                   Quote ceiling: <b>{robinhoodChainIndicativeCeilingLabel}</b>
                   {" · "}Firm-plan ceiling: <b>{robinhoodChainFirmPlanCeilingLabel}</b>
                   {" · "}Probe evidence / book seed: <b>{robinhoodChainProbeEvidenceLabel}</b>
+                  {" · "}Execution: <b>{robinhoodChainExecutionAuthorized ? `${robinhoodChainExecutionCeilingAmount} ${robinhoodChainExecutionCeilingAsset}` : "BLOCKED"}</b>
                 </div>
               )}
 
@@ -11904,6 +11981,12 @@ async function submitLimitOrder() {
               <div style={{ marginTop: 5, color: "#fde68a", fontSize: 10.5 }}>Connected MetaMask account does not match the saved Robinhood Chain wallet. Live execution remains blocked; review-only quote and unsigned-plan requests continue to use the saved public address.</div>
             )}
 
+            {robinhoodChainExecutionAuthorityError && (
+              <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>{hideTableData ? "Execution authority lookup failed closed." : robinhoodChainExecutionAuthorityError}</div>
+            )}
+            {robinhoodChainExecutionAuthorityLoading && (
+              <div style={{ marginTop: 5, color: "#a5f3fc", fontSize: 10.5 }}>Resolving database execution authority…</div>
+            )}
             {robinhoodChainQuoteErrorText && (
               <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>{hideTableData ? "Latest indicative quote request failed." : robinhoodChainQuoteErrorText}</div>
             )}
@@ -13473,7 +13556,7 @@ async function submitLimitOrder() {
                     ? "Refresh Unsigned Plan"
                     : "Build Unsigned Plan"}
               </button>
-              {robinhoodChainLegacyExecutionMarket && side === "sell" && (
+              {robinhoodChainExecutionAdapter === "native_exact_input" && side === "sell" && (
                 <button
                   type="button"
                   style={{
@@ -13487,12 +13570,12 @@ async function submitLimitOrder() {
                   }}
                   disabled={!canPrepareRobinhoodChainExecution}
                   onClick={prepareRobinhoodChainLiveExecution}
-                  title={`Create a dedicated prepared execution record and a fresh ${robinhoodChainCurrentExecutionAmount || "custom"} ETH plan. The amount must be positive and no more than ${ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH} ETH. This still does not open MetaMask or send a transaction.`}
+                  title={`Create a capability-authorized native-input execution record for ${robinhoodChainCurrentExecutionAmount || "custom"} ${robinhoodChainFromAsset || "input"}. The persisted execution ceiling is ${robinhoodChainExecutionCeilingAmount || "unavailable"} ${robinhoodChainExecutionCeilingAsset || "input"}. This does not open MetaMask or send a transaction.`}
                 >
-                  {robinhoodChainExecutionBusy ? "Preparing…" : `Prepare ${robinhoodChainCurrentExecutionAmount || "Custom"} ETH Send`}
+                  {robinhoodChainExecutionBusy ? "Preparing…" : `Prepare ${robinhoodChainCurrentExecutionAmount || "Custom"} ${robinhoodChainFromAsset || "Native"} Send`}
                 </button>
               )}
-              {(robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket) && side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
+              {robinhoodChainExecutionAdapter === "erc20_exact_input" && side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
                 <button
                   type="button"
                   style={{
@@ -13507,16 +13590,14 @@ async function submitLimitOrder() {
                   }}
                   disabled={!canPrepareRobinhoodChainSwapExecution}
                   onClick={prepareRobinhoodChainSwapExecutionReview}
-                  title={robinhoodChainWethReviewMarket
-                    ? "Persist a plan-bound finite USDG approval lifecycle for WETH. No MetaMask request occurs until the separate approval send action; WETH swap remains locked in R5C.3C."
-                    : "Persist a plan-bound finite USDG approval and exact-spend swap review record. No MetaMask request, signature, or broadcast occurs."}
+                  title={`Persist the capability-authorized ${robinhoodChainFromAsset || "ERC-20"} exact-input lifecycle. Any required approval is finite and bound to the reviewed amount. No MetaMask request, signature, or broadcast occurs.`}
                 >
                   {robinhoodChainSwapBusy
-                    ? robinhoodChainWethReviewMarket ? "Preparing R5C.3B Approval…" : "Preparing R5B Review…"
+                    ? "Preparing Execution Review…"
                     : robinhoodChainSwapPrepared?.execution
-                      ? robinhoodChainWethReviewMarket ? "Refresh Finite Approval Review" : "Refresh Exact-Spend Review"
+                      ? "Refresh Exact-Spend Review"
                       : robinhoodChainFirmPlan?.approval_required
-                        ? `Prepare Finite ${String(robinhoodChainFirmPlan?.input_amount || totalQuote || "")} USDG Approval`
+                        ? `Prepare Finite ${String(robinhoodChainFirmPlan?.input_amount || totalQuote || "")} ${robinhoodChainFromAsset || "Input"} Approval`
                         : "Prepare Allowance-Sufficient Review"}
                 </button>
               )}

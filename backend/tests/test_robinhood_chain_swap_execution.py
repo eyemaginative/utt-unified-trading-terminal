@@ -24,6 +24,9 @@ from app.services.robinhood_chain_swap_execution import (  # noqa: E402
     ROBINHOOD_CHAIN_SWAP_USDG_CONTRACT,
     RobinhoodChainSwapExecutionService,
 )
+from app.services.robinhood_chain_transaction_planning import (  # noqa: E402
+    RobinhoodChainTransactionPlanningService,
+)
 
 
 TAKER = "0x70c1ddd03bc4cb74efac3f12a41465d028ae490c"
@@ -337,6 +340,56 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(endpoint_keywords <= service_keywords)
         self.assertIn("exact_input_amount", endpoint_keywords)
         self.assertIn("confirm_prepare", endpoint_keywords)
+
+    def test_registry_planner_calls_match_current_signature(self):
+        service_path = (
+            BACKEND_ROOT / "app" / "services" / "robinhood_chain_swap_execution.py"
+        )
+        tree = ast.parse(
+            service_path.read_text(encoding="utf-8"),
+            filename=str(service_path),
+        )
+        planner_keywords = (
+            set(
+                inspect.signature(
+                    RobinhoodChainTransactionPlanningService.firm_quote_plan
+                ).parameters
+            )
+            - {"self"}
+        )
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "firm_quote_plan"
+        ]
+        registry_calls = []
+        for call in calls:
+            keywords = {keyword.arg for keyword in call.keywords if keyword.arg}
+            if "requested_amount" in keywords:
+                registry_calls.append(keywords)
+
+        self.assertEqual(len(registry_calls), 2)
+        required = {
+            "symbol",
+            "side",
+            "amount_mode",
+            "requested_amount",
+            "maximum_input_amount",
+            "taker_address",
+            "base_token",
+            "quote_token",
+            "native_token",
+            "registry_tokens",
+            "route_capability",
+            "slippage_bps",
+        }
+        for keywords in registry_calls:
+            self.assertTrue(keywords <= planner_keywords)
+            self.assertTrue(required <= keywords)
+            self.assertNotIn("quantity", keywords)
+            self.assertNotIn("total_quote", keywords)
 
     def test_router_exposes_separate_approval_and_swap_stage_routes(self):
         source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
@@ -928,15 +981,18 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "erc20_output_balance_delta_mismatch"):
             await self.service.refresh_swap(self.db, execution_id=execution_id)
 
-    def test_router_weth_prepare_uses_database_capability_and_token_registry_identity(self):
+    def test_router_swap_prepare_uses_execution_authority_and_token_registry_identity(self):
         source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
-        self.assertIn('market_symbol = f"{to_asset}-USDG"', source)
-        self.assertIn("_resolve_robinhood_chain_review_market", source)
+        self.assertIn("_resolve_robinhood_chain_execution_authority_or_http", source)
+        self.assertIn("symbol=request.symbol", source)
+        self.assertIn('if str(authority.get("execution_adapter") or "") != "erc20_exact_input"', source)
+        self.assertIn('input_token = dict(authority.get("input") or {})', source)
+        self.assertIn('output_token = dict(authority.get("output") or {})', source)
+        self.assertIn("robinhood_chain_swap_market_identity_mismatch", source)
         self.assertIn("to_asset=to_asset", source)
-        self.assertIn("to_token=base_token", source)
+        self.assertIn("to_token=output_token", source)
         self.assertIn("route_capability=capability", source)
-        self.assertIn('symbol="WETH-USDG"', source)
-        self.assertIn("output_token=base_token", source)
+        self.assertIn("output_token=output_token", source)
         self.assertIn("additional_erc20_assets=[output_asset]", source)
 
     async def test_evm_rpc_supports_read_only_historical_balance_tags(self):
@@ -963,6 +1019,46 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][0:2], ("eth_getBalance", [TAKER, "0x10"]))
         self.assertEqual(calls[1][0], "eth_call")
         self.assertEqual(calls[1][1][1], "0x10")
+
+    async def test_blocked_execution_authority_fails_before_provider(self):
+        blocked_capability = {
+            "from_asset": "USDG",
+            "to_asset": "ETH",
+            "amount_mode": "exact_input",
+            "mechanism": "swap",
+            "execution_authority": {
+                "symbol": "ETH-USDG",
+                "side": "buy",
+                "amount_mode": "exact_input",
+                "provider": "0x",
+                "execution_adapter": "erc20_exact_input",
+                "execution_permitted": False,
+                "blocking_reasons": ["execution_not_live_verified"],
+                "input": USDG,
+                "output": ETH,
+                "capability": {
+                    "id": "blocked-capability",
+                    "enabled": False,
+                    "firm_plan_status": "not_tested",
+                    "execution_status": "disabled",
+                },
+                "execution_ceiling": {"amount": "2", "asset": "USDG"},
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_execution_authority_blocked"):
+            await self.service.prepare(
+                self.db,
+                taker_address=TAKER,
+                exact_input_amount="2",
+                slippage_bps=100,
+                eth_token=ETH,
+                usdg_token=USDG,
+                to_asset="ETH",
+                to_token=ETH,
+                route_capability=blocked_capability,
+                confirm_prepare=True,
+            )
+        self.assertEqual(self.planning.calls, [])
 
     def test_all_orders_excludes_approval_only_and_maps_swap_rows(self):
         source = (BACKEND_ROOT / "app" / "services" / "all_orders.py").read_text(encoding="utf-8")

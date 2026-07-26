@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -21,6 +22,9 @@ from .robinhood_chain_execution import (
     validate_claim_id,
     validate_execution_saved_wallet,
     validate_transaction_hash,
+)
+from .robinhood_chain_registry_discovery import (
+    get_robinhood_chain_registry_discovery_service,
 )
 from .robinhood_chain_transaction_planning import (
     EXPECTED_CHAIN_ID,
@@ -112,6 +116,79 @@ def _display_to_atomic(value: Any, decimals: int) -> tuple[str, str]:
 def _hash_payload(payload: Dict[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _planning_service_uses_registry_contract(planning_service: Any) -> bool:
+    """Detect the registry-authoritative firm-plan interface."""
+    try:
+        parameters = inspect.signature(planning_service.firm_quote_plan).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return (
+        "amount_mode" in parameters
+        and "requested_amount" in parameters
+        and "native_token" in parameters
+        and "registry_tokens" in parameters
+        and "route_capability" in parameters
+    )
+
+
+def _resolve_swap_planning_registry_context(db: Session) -> Dict[str, Any]:
+    """Resolve fee and registry identities needed by the current firm planner."""
+    service = get_robinhood_chain_registry_discovery_service()
+    native_token = service.native_identity(db)
+    registry_tokens: List[Dict[str, Any]] = [
+        service.token_identity(db, row)
+        for row in service.registry_rows(db)
+    ]
+    return {
+        "native_token": native_token,
+        "registry_tokens": registry_tokens,
+    }
+
+
+def _validated_execution_authority(
+    route_capability: Optional[Dict[str, Any]],
+    *,
+    input_asset: str,
+    output_asset: str,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(route_capability, dict):
+        return None
+    authority = route_capability.get("execution_authority")
+    if authority is None:
+        return None
+    if not isinstance(authority, dict):
+        raise ValueError("robinhood_chain_swap_execution_authority_invalid")
+    if authority.get("execution_permitted") is not True:
+        raise ValueError("robinhood_chain_swap_execution_authority_blocked")
+    if str(authority.get("execution_adapter") or "") != "erc20_exact_input":
+        raise ValueError("robinhood_chain_swap_execution_adapter_mismatch")
+    authority_input = authority.get("input") if isinstance(authority.get("input"), dict) else {}
+    authority_output = authority.get("output") if isinstance(authority.get("output"), dict) else {}
+    if str(authority_input.get("symbol") or "").strip().upper() != str(input_asset or "").strip().upper():
+        raise ValueError("robinhood_chain_swap_execution_input_authority_mismatch")
+    if str(authority_output.get("symbol") or "").strip().upper() != str(output_asset or "").strip().upper():
+        raise ValueError("robinhood_chain_swap_execution_output_authority_mismatch")
+    capability = authority.get("capability") if isinstance(authority.get("capability"), dict) else {}
+    if (
+        capability.get("enabled") is not True
+        or str(capability.get("firm_plan_status") or "").strip().lower() != "live_verified"
+        or str(capability.get("execution_status") or "").strip().lower() != "live_verified"
+    ):
+        raise ValueError("robinhood_chain_swap_execution_capability_not_live_verified")
+    return {
+        "symbol": str(authority.get("symbol") or "").strip().upper(),
+        "side": str(authority.get("side") or "").strip().lower(),
+        "amount_mode": str(authority.get("amount_mode") or "").strip().lower(),
+        "provider": str(authority.get("provider") or "").strip().lower(),
+        "objective_id": str((authority.get("objective") or {}).get("id") or ""),
+        "capability_id": str(capability.get("id") or ""),
+        "execution_ceiling": dict(authority.get("execution_ceiling") or {}),
+        "input": dict(authority_input),
+        "output": dict(authority_output),
+        "automatic_execution_promotion": False,
+    }
 
 
 def _validated_output_token(token: Dict[str, Any], symbol: str) -> Dict[str, Any]:
@@ -484,6 +561,11 @@ class RobinhoodChainSwapExecutionService:
             raise ValueError("robinhood_chain_swap_usdg_decimals_mismatch")
         if bool(usdg_token.get("native")):
             raise ValueError("robinhood_chain_swap_input_must_be_erc20")
+        execution_authority = _validated_execution_authority(
+            route_capability,
+            input_asset=str(usdg_token.get("symbol") or ROBINHOOD_CHAIN_SWAP_FROM_ASSET),
+            output_asset=output_asset,
+        )
         now = utc_now()
         existing = (
             db.query(RobinhoodChainSwapExecution)
@@ -525,19 +607,37 @@ class RobinhoodChainSwapExecutionService:
             existing.updated_at = _utc_naive(now)
             db.commit()
 
-        plan = await self.planning_service.firm_quote_plan(
-            symbol=trade_symbol,
-            side=ROBINHOOD_CHAIN_SWAP_SIDE,
-            quantity=None,
-            total_quote=input_display,
-            exact_output_quantity=None,
-            maximum_total_quote=None,
-            taker_address=wallet,
-            base_token=output_token,
-            quote_token=usdg_token,
-            route_capability=route_capability,
-            slippage_bps=slippage,
-        )
+        if _planning_service_uses_registry_contract(self.planning_service):
+            planning_context = _resolve_swap_planning_registry_context(db)
+            plan = await self.planning_service.firm_quote_plan(
+                symbol=trade_symbol,
+                side=ROBINHOOD_CHAIN_SWAP_SIDE,
+                amount_mode=ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE,
+                requested_amount=input_display,
+                maximum_input_amount=None,
+                taker_address=wallet,
+                base_token=output_token,
+                quote_token=usdg_token,
+                native_token=planning_context["native_token"],
+                registry_tokens=planning_context["registry_tokens"],
+                route_capability=route_capability or {},
+                slippage_bps=slippage,
+            )
+        else:
+            # Compatibility for unchanged legacy execution test doubles.
+            plan = await self.planning_service.firm_quote_plan(
+                symbol=trade_symbol,
+                side=ROBINHOOD_CHAIN_SWAP_SIDE,
+                quantity=None,
+                total_quote=input_display,
+                exact_output_quantity=None,
+                maximum_total_quote=None,
+                taker_address=wallet,
+                base_token=output_token,
+                quote_token=usdg_token,
+                route_capability=route_capability,
+                slippage_bps=slippage,
+            )
         if plan.get("ok") is not True:
             raise ValueError(str(plan.get("error") or "robinhood_chain_swap_firm_plan_failed"))
         if str(plan.get("amount_mode") or "") != ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE:
@@ -667,6 +767,7 @@ class RobinhoodChainSwapExecutionService:
             swap_status="review_only" if output_asset in ROBINHOOD_CHAIN_SWAP_STAGE_ENABLED_TO_ASSETS else "locked_r5c3c",
             route={
                 **dict(plan.get("route") or {}),
+                "execution_authority": execution_authority,
                 "approval_scope": {
                     "tranche": ROBINHOOD_CHAIN_WETH_SWAP_TRANCHE if output_asset == "WETH" else ROBINHOOD_CHAIN_SWAP_TRANCHE,
                     "approval_only": output_asset not in ROBINHOOD_CHAIN_SWAP_STAGE_ENABLED_TO_ASSETS,
@@ -965,12 +1066,37 @@ class RobinhoodChainSwapExecutionService:
             raise ValueError("robinhood_chain_swap_fresh_allowance_insufficient")
 
         trade_symbol = ROBINHOOD_CHAIN_SWAP_SYMBOLS_BY_TO_ASSET[output_asset]
-        plan = await self.planning_service.firm_quote_plan(
-            symbol=trade_symbol, side=ROBINHOOD_CHAIN_SWAP_SIDE, quantity=None,
-            total_quote=row.exact_input_amount, exact_output_quantity=None, maximum_total_quote=None,
-            taker_address=row.wallet_address, base_token=resolved_output_token, quote_token=usdg_token,
-            route_capability=route_capability, slippage_bps=int(row.slippage_bps),
-        )
+        if _planning_service_uses_registry_contract(self.planning_service):
+            planning_context = _resolve_swap_planning_registry_context(db)
+            plan = await self.planning_service.firm_quote_plan(
+                symbol=trade_symbol,
+                side=ROBINHOOD_CHAIN_SWAP_SIDE,
+                amount_mode=ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE,
+                requested_amount=row.exact_input_amount,
+                maximum_input_amount=None,
+                taker_address=row.wallet_address,
+                base_token=resolved_output_token,
+                quote_token=usdg_token,
+                native_token=planning_context["native_token"],
+                registry_tokens=planning_context["registry_tokens"],
+                route_capability=route_capability or {},
+                slippage_bps=int(row.slippage_bps),
+            )
+        else:
+            # Compatibility for unchanged legacy execution test doubles.
+            plan = await self.planning_service.firm_quote_plan(
+                symbol=trade_symbol,
+                side=ROBINHOOD_CHAIN_SWAP_SIDE,
+                quantity=None,
+                total_quote=row.exact_input_amount,
+                exact_output_quantity=None,
+                maximum_total_quote=None,
+                taker_address=row.wallet_address,
+                base_token=resolved_output_token,
+                quote_token=usdg_token,
+                route_capability=route_capability,
+                slippage_bps=int(row.slippage_bps),
+            )
         if plan.get("ok") is not True:
             raise ValueError(str(plan.get("error") or "robinhood_chain_swap_fresh_plan_failed"))
         if (

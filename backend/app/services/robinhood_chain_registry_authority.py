@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy.orm import Session
 
-from ..models import TokenRegistry
+from ..models import RobinhoodChainPairCapability, RobinhoodChainPairObjective, TokenRegistry
 from .evm_rpc import validate_evm_address
 
 
@@ -284,3 +286,293 @@ def assert_native_write_unambiguous(
                 conflicting_symbol=existing_symbol,
                 conflicting_venue=existing_venue,
             )
+
+
+EXECUTION_STATUS_LIVE_VERIFIED = "live_verified"
+EXECUTION_MECHANISM_SWAP = "swap"
+EXECUTION_AMOUNT_MODE_EXACT_INPUT = "exact_input"
+EXECUTION_PROVIDER_ZEROX = "0x"
+ZEROX_NATIVE_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+
+def normalize_execution_symbol(value: Any) -> str:
+    symbol = str(value or "").strip().upper().replace("/", "-")
+    parts = [part.strip() for part in symbol.split("-") if part.strip()]
+    if len(parts) != 2:
+        raise RobinhoodChainRegistryAuthorityError(
+            "invalid_robinhood_chain_execution_symbol",
+            "Robinhood Chain execution requires one BASE-QUOTE market symbol.",
+            symbol=symbol,
+        )
+    return f"{normalize_registry_symbol(parts[0])}-{normalize_registry_symbol(parts[1])}"
+
+
+def normalize_execution_side(value: Any) -> str:
+    side = str(value or "").strip().lower()
+    if side not in {"buy", "sell"}:
+        raise RobinhoodChainRegistryAuthorityError(
+            "invalid_robinhood_chain_execution_side",
+            "Robinhood Chain execution side must be buy or sell.",
+            side=value,
+        )
+    return side
+
+
+def normalize_execution_amount_mode(value: Any) -> str:
+    amount_mode = str(value or "").strip().lower().replace("exact_spend", "exact_input")
+    if amount_mode != EXECUTION_AMOUNT_MODE_EXACT_INPUT:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_amount_mode_not_supported",
+            "RH-REG.AUTH.1C authorizes exact-input execution only.",
+            amount_mode=value,
+        )
+    return amount_mode
+
+
+def normalize_execution_provider(value: Any) -> str:
+    provider = str(value or EXECUTION_PROVIDER_ZEROX).strip().lower()
+    if provider == "zerox":
+        provider = EXECUTION_PROVIDER_ZEROX
+    if provider != EXECUTION_PROVIDER_ZEROX:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_provider_not_supported",
+            "RH-REG.AUTH.1C authorizes the persisted 0x swap provider only.",
+            provider=value,
+        )
+    return provider
+
+
+def _execution_identity(row: TokenRegistry) -> Dict[str, Any]:
+    identity = identity_fields_from_row(row)
+    registry_contract_address = identity["address"]
+    return {
+        "registry_id": int(row.id),
+        "registry_venue": normalize_registry_venue(getattr(row, "venue", None)),
+        "identity_source": "token_registry",
+        "symbol": identity["symbol"],
+        "contract_address": ZEROX_NATIVE_TOKEN if identity["native"] else registry_contract_address,
+        "registry_contract_address": registry_contract_address,
+        "decimals": identity["decimals"],
+        "native": identity["native"],
+        "asset_kind": identity["asset_kind"],
+    }
+
+
+def _execution_blocking_reasons(
+    *,
+    objective: RobinhoodChainPairObjective,
+    capability: Optional[RobinhoodChainPairCapability],
+) -> List[str]:
+    reasons: List[str] = []
+    if not bool(objective.enabled):
+        reasons.append("objective_disabled")
+    if str(objective.mechanism or "").strip().lower() != EXECUTION_MECHANISM_SWAP:
+        reasons.append("mechanism_not_supported")
+    if capability is None:
+        reasons.append("direction_capability_missing")
+        return reasons
+    if not bool(capability.enabled):
+        reasons.append("capability_disabled")
+    if str(capability.indicative_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
+        reasons.append("indicative_not_live_verified")
+    if str(capability.firm_plan_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
+        reasons.append("firm_plan_not_live_verified")
+    if str(capability.execution_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
+        reasons.append("execution_not_live_verified")
+    if not str(capability.probe_amount or "").strip():
+        reasons.append("execution_ceiling_missing")
+    return reasons
+
+
+def resolve_robinhood_chain_execution_authority(
+    db: Session,
+    *,
+    symbol: Any,
+    side: Any,
+    amount_mode: Any = EXECUTION_AMOUNT_MODE_EXACT_INPUT,
+    provider: Any = EXECUTION_PROVIDER_ZEROX,
+    require_execution: bool = False,
+) -> Dict[str, Any]:
+    """Resolve one execution direction from database capability and Token Registry identity.
+
+    This resolver never contacts a provider and never mutates capability state. The
+    persisted probe amount is treated only as the currently verified execution
+    ceiling; indicative and firm-plan ceilings remain independently enforced by
+    their existing quote/planning services.
+    """
+    normalized_symbol = normalize_execution_symbol(symbol)
+    normalized_side = normalize_execution_side(side)
+    normalized_mode = normalize_execution_amount_mode(amount_mode)
+    normalized_provider = normalize_execution_provider(provider)
+
+    objective = (
+        db.query(RobinhoodChainPairObjective)
+        .filter(RobinhoodChainPairObjective.symbol == normalized_symbol)
+        .order_by(RobinhoodChainPairObjective.updated_at.desc())
+        .first()
+    )
+    if objective is None:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_objective_not_found",
+            "The requested market is not present in the Robinhood Chain pair-objective database.",
+            symbol=normalized_symbol,
+            provider_contacted=False,
+        )
+
+    token_ids = {
+        int(objective.base_token_registry_id),
+        int(objective.quote_token_registry_id),
+    }
+    token_rows = (
+        db.query(TokenRegistry)
+        .filter(TokenRegistry.id.in_(token_ids))
+        .all()
+    )
+    token_by_id = {int(row.id): row for row in token_rows}
+    base_row = token_by_id.get(int(objective.base_token_registry_id))
+    quote_row = token_by_id.get(int(objective.quote_token_registry_id))
+    if base_row is None or quote_row is None:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_registry_identity_missing",
+            "The requested market does not resolve to both Token Registry identities.",
+            symbol=normalized_symbol,
+            base_token_registry_id=int(objective.base_token_registry_id),
+            quote_token_registry_id=int(objective.quote_token_registry_id),
+            provider_contacted=False,
+        )
+
+    base_identity = _execution_identity(base_row)
+    quote_identity = _execution_identity(quote_row)
+    expected_symbol = f"{base_identity['symbol']}-{quote_identity['symbol']}"
+    if expected_symbol != normalized_symbol:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_objective_identity_mismatch",
+            "The pair-objective symbol does not match its Token Registry identities.",
+            symbol=normalized_symbol,
+            expected_symbol=expected_symbol,
+            provider_contacted=False,
+        )
+
+    input_identity = base_identity if normalized_side == "sell" else quote_identity
+    output_identity = quote_identity if normalized_side == "sell" else base_identity
+    capability = (
+        db.query(RobinhoodChainPairCapability)
+        .filter(
+            RobinhoodChainPairCapability.objective_id == objective.id,
+            RobinhoodChainPairCapability.from_token_registry_id == int(input_identity["registry_id"]),
+            RobinhoodChainPairCapability.to_token_registry_id == int(output_identity["registry_id"]),
+            RobinhoodChainPairCapability.amount_mode == normalized_mode,
+            RobinhoodChainPairCapability.provider == normalized_provider,
+        )
+        .order_by(RobinhoodChainPairCapability.updated_at.desc())
+        .first()
+    )
+
+    reasons = _execution_blocking_reasons(objective=objective, capability=capability)
+    ceiling = str(capability.probe_amount or "").strip() if capability is not None else ""
+    adapter = "native_exact_input" if bool(input_identity["native"]) else "erc20_exact_input"
+    approval = {
+        "applicable": not bool(input_identity["native"]),
+        "model": "none" if bool(input_identity["native"]) else "finite_exact_input",
+        "token": input_identity,
+        "unlimited_approval_enabled": False,
+    }
+    payload = {
+        "ok": True,
+        "venue": ROBINHOOD_CHAIN_VENUE,
+        "network": ROBINHOOD_CHAIN,
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "amount_mode": normalized_mode,
+        "provider": normalized_provider,
+        "mechanism": str(objective.mechanism or "").strip().lower(),
+        "objective": {
+            "id": str(objective.id),
+            "enabled": bool(objective.enabled),
+            "review_only": bool(objective.review_only),
+        },
+        "capability": None if capability is None else {
+            "id": str(capability.id),
+            "enabled": bool(capability.enabled),
+            "indicative_status": str(capability.indicative_status or "").strip().lower(),
+            "firm_plan_status": str(capability.firm_plan_status or "").strip().lower(),
+            "execution_status": str(capability.execution_status or "").strip().lower(),
+            "probe_amount": ceiling or None,
+            "evidence": copy.deepcopy(capability.evidence) if isinstance(capability.evidence, dict) else {},
+            "last_verified_at": capability.last_verified_at.isoformat() if capability.last_verified_at else None,
+        },
+        "input": input_identity,
+        "output": output_identity,
+        "approval": approval,
+        "execution_adapter": adapter,
+        "execution_ceiling": {
+            "amount": ceiling or None,
+            "asset": input_identity["symbol"],
+            "source": "database_direction_capability_probe_evidence",
+        },
+        "execution_permitted": not reasons,
+        "blocking_reasons": reasons,
+        "provider_contacted": False,
+        "automatic_execution_promotion": False,
+        "will_mutate": False,
+    }
+
+    if require_execution and reasons:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_authority_blocked",
+            "The persisted direction capability does not authorize execution preparation.",
+            authority=payload,
+            blocking_reasons=reasons,
+            provider_contacted=False,
+        )
+    return payload
+
+
+def assert_robinhood_chain_execution_amount(
+    authority: Dict[str, Any],
+    amount: Any,
+) -> str:
+    raw_amount = str(amount or "").strip()
+    try:
+        requested = Decimal(raw_amount)
+    except (InvalidOperation, ValueError) as exc:
+        raise RobinhoodChainRegistryAuthorityError(
+            "invalid_robinhood_chain_execution_amount",
+            "Execution input amount must be a positive decimal.",
+            amount=amount,
+            provider_contacted=False,
+        ) from exc
+    if not requested.is_finite() or requested <= 0:
+        raise RobinhoodChainRegistryAuthorityError(
+            "invalid_robinhood_chain_execution_amount",
+            "Execution input amount must be a positive decimal.",
+            amount=amount,
+            provider_contacted=False,
+        )
+    ceiling_raw = str(((authority or {}).get("execution_ceiling") or {}).get("amount") or "").strip()
+    try:
+        ceiling = Decimal(ceiling_raw)
+    except (InvalidOperation, ValueError) as exc:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_ceiling_missing",
+            "No verified execution ceiling is persisted for this direction.",
+            authority=authority,
+            provider_contacted=False,
+        ) from exc
+    if not ceiling.is_finite() or ceiling <= 0:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_ceiling_missing",
+            "No verified execution ceiling is persisted for this direction.",
+            authority=authority,
+            provider_contacted=False,
+        )
+    if requested > ceiling:
+        raise RobinhoodChainRegistryAuthorityError(
+            "robinhood_chain_execution_amount_exceeds_ceiling",
+            "Execution input exceeds the persisted live-verified ceiling.",
+            requested_amount=raw_amount,
+            maximum_input_amount=ceiling_raw,
+            input_asset=((authority or {}).get("input") or {}).get("symbol"),
+            provider_contacted=False,
+        )
+    return format(requested, "f")

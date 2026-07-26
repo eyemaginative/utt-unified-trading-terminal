@@ -547,6 +547,23 @@ export async function getRobinhoodChainFirmQuotePlan(payload = {}, { apiBase, ti
   return res.data;
 }
 
+export async function getRobinhoodChainExecutionAuthority(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
+  const symbol = String(payload?.symbol || "").trim().toUpperCase().replace(/[\/_]/g, "-");
+  const side = String(payload?.side || "").trim().toLowerCase();
+  const amountMode = String(payload?.amount_mode || "exact_input").trim().toLowerCase().replace("exact_spend", "exact_input");
+  if (!symbol || !["buy", "sell"].includes(side) || amountMode !== "exact_input") {
+    throw new Error("Robinhood Chain execution authority requires symbol, buy/sell side, and exact_input mode.");
+  }
+  const body = { symbol, side, amount_mode: amountMode, provider: "0x" };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/execution-authority/resolve`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/execution-authority/resolve`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
 export async function getRobinhoodChainExecutionStatus({ apiBase, timeout_ms = 30000 } = {}) {
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {
@@ -666,6 +683,8 @@ export async function getRobinhoodChainSwapExecutionStatus({ apiBase, timeout_ms
 
 export async function prepareRobinhoodChainSwapExecution(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
   const body = {
+    symbol: "ETH-USDG",
+    side: "buy",
     from_asset: "USDG",
     to_asset: "ETH",
     amount_mode: "exact_spend",

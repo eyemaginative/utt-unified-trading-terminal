@@ -389,11 +389,23 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
                     confirm_send_claim=True,
                 )
 
-    def test_router_normalizes_custom_quantity_and_passes_it_to_service(self):
+    def test_router_authorizes_then_normalizes_custom_quantity_and_passes_it_to_service(self):
         source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
-        self.assertIn("normalize_robinhood_chain_execution_quantity(request.quantity)", source)
+        self.assertIn(
+            "normalized_authority_amount = _assert_robinhood_chain_execution_amount_or_http(",
+            source,
+        )
+        self.assertIn(
+            "normalize_robinhood_chain_execution_quantity(normalized_authority_amount)",
+            source,
+        )
+        self.assertNotIn(
+            "normalize_robinhood_chain_execution_quantity(request.quantity)",
+            source,
+        )
         self.assertIn("quantity=normalized_quantity", source)
-        self.assertIn('"maximum_quantity_eth"', source)
+        self.assertIn('"execution_ceiling"', source)
+        self.assertNotIn('"maximum_quantity_eth"', source)
         self.assertNotIn('"robinhood_chain_execution_amount_locked"', source)
 
     async def test_post_confirmation_balance_snapshot_helper_force_refreshes_eth_and_usdg(self):

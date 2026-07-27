@@ -3428,6 +3428,61 @@ export default function OrderTicketWidget({
   const robinhoodChainSwapApprovalSendRef = useRef(false);
   const robinhoodChainSwapSendRef = useRef(false);
   const robinhoodChainSwapConfirmedBalanceRefreshRef = useRef("");
+  const robinhoodChainReviewContextVersionRef = useRef(0);
+  const robinhoodChainAuthorityContextRef = useRef("");
+  const robinhoodChainWalletContextRef = useRef("");
+
+  function invalidateRobinhoodChainCurrentReview(reason = "context_changed") {
+    robinhoodChainReviewContextVersionRef.current += 1;
+    robinhoodChainQuoteReqRef.current += 1;
+    robinhoodChainFirmPlanReqRef.current += 1;
+
+    setShowConfirm(false);
+    setSubmitError(null);
+    setSubmitOk(null);
+    setShowSubmitResult(false);
+    setSubmitResultKind(null);
+    setSubmitResultPayload(null);
+    setSubmitResultText("");
+    setSubmitResultTitle("");
+
+    setRobinhoodChainQuote(null);
+    setRobinhoodChainQuoteErrorText("");
+    setRobinhoodChainQuoteLoading(false);
+    setRobinhoodChainFirmPlan(null);
+    setRobinhoodChainFirmPlanErrorText("");
+    setRobinhoodChainFirmPlanLoading(false);
+
+    setRobinhoodChainPreparedExecution(null);
+    setRobinhoodChainExecutionConfirmed(false);
+    setRobinhoodChainExecutionError("");
+    setRobinhoodChainSubmissionRecovery(null);
+
+    setRobinhoodChainBuyPrepared(null);
+    setRobinhoodChainBuyApprovalReviewed(false);
+    setRobinhoodChainBuySwapReviewed(false);
+    setRobinhoodChainBuyError("");
+
+    setRobinhoodChainSwapPrepared(null);
+    setRobinhoodChainSwapApprovalReviewed(false);
+    setRobinhoodChainSwapReviewed(false);
+    setRobinhoodChainSwapError("");
+
+    setRobinhoodChainWalletNotice("");
+
+    return reason;
+  }
+
+  function robinhoodChainReviewContextIsCurrent(version) {
+    return robinhoodChainReviewContextVersionRef.current === version;
+  }
+
+  function selectOrderSide(nextSide) {
+    const normalized = String(nextSide || "").trim().toLowerCase() === "sell" ? "sell" : "buy";
+    if (normalized === side) return;
+    if (isRobinhoodChainVenue) invalidateRobinhoodChainCurrentReview("side_changed");
+    setSide(normalized);
+  }
 
   const venueLabel = hideVenueNames ? "••••" : String(effectiveVenue || "");
   const tradeGate = venueTradeGate && typeof venueTradeGate === "object" ? venueTradeGate : null;
@@ -3688,6 +3743,30 @@ export default function OrderTicketWidget({
   const robinhoodChainExecutionInputDecimals = Number.isFinite(Number(robinhoodChainExecutionAuthority?.input?.decimals))
     ? Math.max(0, Math.min(18, Number(robinhoodChainExecutionAuthority.input.decimals)))
     : 18;
+
+  useEffect(() => {
+    if (!isRobinhoodChainVenue) {
+      robinhoodChainAuthorityContextRef.current = "";
+      return;
+    }
+    const nextKey = [
+      robinhoodChainPair.symbol,
+      robinhoodChainNormalizedSide,
+      robinhoodChainEffectiveAmountMode,
+      robinhoodChainExecutionAuthorityCapabilityKey,
+    ].join("|");
+    const previousKey = robinhoodChainAuthorityContextRef.current;
+    robinhoodChainAuthorityContextRef.current = nextKey;
+    if (previousKey && previousKey !== nextKey) {
+      invalidateRobinhoodChainCurrentReview("authority_context_changed");
+    }
+  }, [
+    isRobinhoodChainVenue,
+    robinhoodChainPair.symbol,
+    robinhoodChainNormalizedSide,
+    robinhoodChainEffectiveAmountMode,
+    robinhoodChainExecutionAuthorityCapabilityKey,
+  ]);
 
   useEffect(() => {
     if (!isRobinhoodChainVenue || !robinhoodChainPair.symbol || robinhoodChainEffectiveAmountMode !== ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND) {
@@ -3988,20 +4067,8 @@ export default function OrderTicketWidget({
     const normalized = nextMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
       ? ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
       : ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND;
+    invalidateRobinhoodChainCurrentReview("amount_mode_changed");
     setRobinhoodChainAmountMode(normalized);
-    robinhoodChainQuoteReqRef.current += 1;
-    robinhoodChainFirmPlanReqRef.current += 1;
-    setRobinhoodChainQuote(null);
-    setRobinhoodChainQuoteErrorText("");
-    setRobinhoodChainFirmPlan(null);
-    setRobinhoodChainFirmPlanErrorText("");
-    setRobinhoodChainBuyPrepared(null);
-    setRobinhoodChainSwapPrepared(null);
-    setRobinhoodChainSwapError("");
-    setRobinhoodChainSwapApprovalReviewed(false);
-    setRobinhoodChainSwapReviewed(false);
-    setRobinhoodChainBuyApprovalReviewed(false);
-    setRobinhoodChainBuySwapReviewed(false);
     if (normalized === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE) {
       setRobinhoodChainSlippageBps(100);
     } else if (!String(totalQuote || "").trim() || Number(totalQuote) > 5) {
@@ -4010,6 +4077,7 @@ export default function OrderTicketWidget({
   }
 
   function disconnectRobinhoodChainWalletFromUtt() {
+    invalidateRobinhoodChainCurrentReview("wallet_disconnected");
     robinhoodChainWalletReqRef.current += 1;
     setRobinhoodChainWalletState((current) => ({
       ...current,
@@ -4032,10 +4100,12 @@ export default function OrderTicketWidget({
 
     const onAccountsChanged = () => {
       if (!active) return;
+      invalidateRobinhoodChainCurrentReview("wallet_account_changed");
       void readRobinhoodChainWalletState({ requestAccounts: false, reason: "accountsChanged" });
     };
     const onChainChanged = () => {
       if (!active) return;
+      invalidateRobinhoodChainCurrentReview("wallet_chain_changed");
       void readRobinhoodChainWalletState({ requestAccounts: false, reason: "chainChanged" });
     };
 
@@ -4176,6 +4246,28 @@ export default function OrderTicketWidget({
   );
 
   useEffect(() => {
+    if (!isRobinhoodChainVenue) {
+      robinhoodChainWalletContextRef.current = "";
+      return;
+    }
+    const nextKey = [
+      robinhoodChainConnectedAddress,
+      normalizeRobinhoodChainEvmChainId(robinhoodChainWalletState.chainId),
+      robinhoodChainSavedAddress,
+    ].join("|");
+    const previousKey = robinhoodChainWalletContextRef.current;
+    robinhoodChainWalletContextRef.current = nextKey;
+    if (previousKey && previousKey !== nextKey) {
+      invalidateRobinhoodChainCurrentReview("wallet_context_changed");
+    }
+  }, [
+    isRobinhoodChainVenue,
+    robinhoodChainConnectedAddress,
+    robinhoodChainWalletState.chainId,
+    robinhoodChainSavedAddress,
+  ]);
+
+  useEffect(() => {
     // A venue/market change must never leave a review or submission surface
     // attached to the previously selected market.
     setShowConfirm(false);
@@ -4189,25 +4281,7 @@ export default function OrderTicketWidget({
   }, [effectiveVenue, otSymbol]);
 
   useEffect(() => {
-    robinhoodChainQuoteReqRef.current += 1;
-    robinhoodChainFirmPlanReqRef.current += 1;
-    setRobinhoodChainQuote(null);
-    setRobinhoodChainQuoteErrorText("");
-    setRobinhoodChainQuoteLoading(false);
-    setRobinhoodChainFirmPlan(null);
-    setRobinhoodChainFirmPlanErrorText("");
-    setRobinhoodChainFirmPlanLoading(false);
-    setRobinhoodChainPreparedExecution(null);
-    setRobinhoodChainExecutionConfirmed(false);
-    setRobinhoodChainExecutionError("");
-    setRobinhoodChainBuyPrepared(null);
-    setRobinhoodChainBuyApprovalReviewed(false);
-    setRobinhoodChainBuySwapReviewed(false);
-    setRobinhoodChainBuyError("");
-    setRobinhoodChainSwapPrepared(null);
-    setRobinhoodChainSwapError("");
-    setRobinhoodChainSwapApprovalReviewed(false);
-    setRobinhoodChainSwapReviewed(false);
+    if (isRobinhoodChainVenue) invalidateRobinhoodChainCurrentReview("venue_market_or_side_changed");
     if (isRobinhoodChainVenue) {
       setRobinhoodChainAmountMode(ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND);
       if (robinhoodChainTicketFieldsUnavailable) {
@@ -4240,7 +4314,8 @@ export default function OrderTicketWidget({
       const nextSide = bookSide === "ask" ? "buy" : bookSide === "bid" ? "sell" : null;
       if (!nextSide) return;
 
-      setSide(nextSide);
+      invalidateRobinhoodChainCurrentReview("orderbook_selection_changed");
+      selectOrderSide(nextSide);
       const exactPrice = String(row?.price || "").trim();
       const exactBase = String(row?.size || row?.base_quantity || "").trim();
       const exactInput = String(row?.input_amount || "").trim();
@@ -9103,6 +9178,7 @@ async function submitLimitOrder() {
       onToast?.({ kind: "warn", msg });
       return;
     }
+    const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
     setRobinhoodChainExecutionBusy(true);
     setRobinhoodChainExecutionError("");
     setRobinhoodChainExecutionConfirmed(false);
@@ -9118,6 +9194,7 @@ async function submitLimitOrder() {
         },
         { apiBase, timeout_ms: 45000 }
       );
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       if (!data?.ok || !data?.execution || !data?.unsigned_transaction_plan) {
         throw new Error(data?.error || "Execution preparation returned an incomplete response.");
       }
@@ -9138,6 +9215,7 @@ async function submitLimitOrder() {
           : "Execution prepared in review mode. Live send gate remains blocked.",
       });
     } catch (error) {
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       const msg = robinhoodChainQuoteError(error);
       setRobinhoodChainPreparedExecution(null);
       setRobinhoodChainExecutionError(msg);
@@ -9448,8 +9526,7 @@ async function submitLimitOrder() {
         rejected ? "Robinhood Chain Order Rejected" : "Robinhood Chain Order Failed"
       );
     } finally {
-      robinhoodChainExecutionSendRef.current = false;
-      setRobinhoodChainExecutionBusy(false);
+        setRobinhoodChainExecutionBusy(false);
     }
   }
 
@@ -9562,6 +9639,7 @@ async function submitLimitOrder() {
 
   async function prepareRobinhoodChainSwapExecutionReview() {
     if (!canPrepareRobinhoodChainSwapExecution || robinhoodChainSwapBusy) return;
+    const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
     setRobinhoodChainSwapBusy(true);
     setRobinhoodChainSwapError("");
     try {
@@ -9579,6 +9657,7 @@ async function submitLimitOrder() {
         },
         { apiBase, timeout_ms: 60000 }
       );
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       setRobinhoodChainSwapPrepared(data);
       setRobinhoodChainSwapExecutionStatus(data?.review_gate || robinhoodChainSwapExecutionStatus);
       setRobinhoodChainWalletNotice(
@@ -9587,6 +9666,7 @@ async function submitLimitOrder() {
           : "Allowance-sufficient exact-spend execution review prepared. No MetaMask request occurred."
       );
     } catch (error) {
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       setRobinhoodChainSwapPrepared(null);
       setRobinhoodChainSwapError(robinhoodChainQuoteError(error));
     } finally {
@@ -9856,8 +9936,7 @@ async function submitLimitOrder() {
       );
       onToast?.({ kind: "warn", msg });
     } finally {
-      robinhoodChainSwapApprovalSendRef.current = false;
-      setRobinhoodChainSwapBusy(false);
+        setRobinhoodChainSwapBusy(false);
     }
   }
 
@@ -10180,8 +10259,7 @@ async function submitLimitOrder() {
       );
       onToast?.({ kind: "warn", msg });
     } finally {
-      robinhoodChainSwapSendRef.current = false;
-      setRobinhoodChainSwapBusy(false);
+        setRobinhoodChainSwapBusy(false);
     }
   }
 
@@ -10254,6 +10332,7 @@ async function submitLimitOrder() {
       onToast?.({ kind: "warn", msg });
       return;
     }
+    const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
     setRobinhoodChainBuyBusy(true);
     setRobinhoodChainBuyError("");
     setRobinhoodChainBuyApprovalReviewed(false);
@@ -10272,6 +10351,7 @@ async function submitLimitOrder() {
         },
         { apiBase, timeout_ms: 60000 }
       );
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       if (!data?.ok || !data?.execution) {
         throw new Error(data?.error || "Approval preparation returned an incomplete response.");
       }
@@ -10287,6 +10367,7 @@ async function submitLimitOrder() {
             : "Finite 2.00 USDG approval prepared in review mode. The dedicated live gate remains blocked.",
       });
     } catch (error) {
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       const msg = robinhoodChainQuoteError(error);
       setRobinhoodChainBuyPrepared(null);
       setRobinhoodChainBuyError(msg);
@@ -10486,8 +10567,7 @@ async function submitLimitOrder() {
       setRobinhoodChainBuyError(msg);
       onToast?.({ kind: "warn", msg });
     } finally {
-      robinhoodChainBuyApprovalSendRef.current = false;
-      setRobinhoodChainBuyBusy(false);
+        setRobinhoodChainBuyBusy(false);
     }
   }
 
@@ -10721,8 +10801,7 @@ async function submitLimitOrder() {
       setRobinhoodChainBuyError(msg);
       onToast?.({ kind: "warn", msg });
     } finally {
-      robinhoodChainBuySwapSendRef.current = false;
-      setRobinhoodChainBuyBusy(false);
+        setRobinhoodChainBuyBusy(false);
     }
   }
 
@@ -11630,7 +11709,7 @@ async function submitLimitOrder() {
                 ...(side === "buy" ? sideBtnActive : null),
                 boxShadow: side === "buy" ? `0 0 0 1px ${sideAccent} inset` : undefined,
               }}
-              onClick={() => setSide("buy")}
+              onClick={() => selectOrderSide("buy")}
               type="button"
             >
               Buy
@@ -11641,7 +11720,7 @@ async function submitLimitOrder() {
                 ...(side === "sell" ? sideBtnActive : null),
                 boxShadow: side === "sell" ? `0 0 0 1px ${sideAccent} inset` : undefined,
               }}
-              onClick={() => setSide("sell")}
+              onClick={() => selectOrderSide("sell")}
               type="button"
             >
               Sell
@@ -12735,6 +12814,7 @@ async function submitLimitOrder() {
                   : "Order quantity"}
               onChange={(e) => {
                 lastEditedRef.current = "qty";
+                if (isRobinhoodChainVenue) invalidateRobinhoodChainCurrentReview("quantity_changed");
                 setQty(sanitizeDecimalInput(e.target.value));
               }}
               inputMode="decimal"
@@ -12838,6 +12918,7 @@ async function submitLimitOrder() {
               onChange={(e) => {
                 lastEditedRef.current = "total";
                 const cleaned = sanitizeDecimalInput(e.target.value);
+                if (isRobinhoodChainVenue) invalidateRobinhoodChainCurrentReview("total_changed");
                 setTotalQuote(cleaned);
 
                 // DEX / Robinhood Chain quote-only: keep Total→Qty responsive when rules are local.
@@ -13569,11 +13650,8 @@ async function submitLimitOrder() {
                   disabled={side === "buy"}
                   title={side === "buy" ? "RH-CHAIN.10D.2 BUY slippage is locked to 1.00%." : "Select SELL slippage."}
                   onChange={(event) => {
+                    invalidateRobinhoodChainCurrentReview("slippage_changed");
                     setRobinhoodChainSlippageBps(Number(event.target.value));
-                    robinhoodChainFirmPlanReqRef.current += 1;
-                    setRobinhoodChainFirmPlan(null);
-                    setRobinhoodChainFirmPlanErrorText("");
-                    setRobinhoodChainFirmPlanLoading(false);
                   }}
                   style={{ ...darkSelectStyle, minWidth: 82, padding: "4px 6px" }}
                 >

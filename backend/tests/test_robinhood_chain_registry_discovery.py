@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
 from typing import Any, Dict, List
 
 from sqlalchemy import create_engine, text
@@ -127,30 +128,42 @@ class _FakePlanningService:
         if not self.ok:
             return {"ok": False, "error": "firm_quote_provider_error"}
         spender = "0x0000000000001ff3684f28c67538d4d072c22734"
+        side = str(kwargs.get("side") or "buy").strip().lower()
+        base = dict(kwargs.get("base_token") or {})
+        quote = dict(kwargs.get("quote_token") or {})
+        input_token = base if side == "sell" else quote
+        output_token = quote if side == "sell" else base
+        input_amount = str(kwargs.get("requested_amount") or "")
+        input_decimals = int(input_token.get("decimals") or 0)
+        input_atomic = str(int(Decimal(input_amount) * (Decimal(10) ** input_decimals)))
+        output_amount = "0.25" if side == "sell" else "0.0005"
+        output_decimals = int(output_token.get("decimals") or 0)
+        output_atomic = str(int(Decimal(output_amount) * (Decimal(10) ** output_decimals)))
+        minimum_atomic = str(int(Decimal(output_atomic) * Decimal("0.99")))
         return {
             "ok": True,
-            "symbol": "WETH-USDG",
-            "side": "buy",
+            "symbol": str(kwargs.get("symbol") or "WETH-USDG"),
+            "side": side,
             "amount_mode": "exact_input",
-            "input_asset": "USDG",
-            "input_amount": "1",
-            "input_amount_atomic": "1000000",
-            "output_asset": "WETH",
-            "output_amount": "0.0005",
-            "output_amount_atomic": "500000000000000",
-            "minimum_received": "0.000495",
-            "minimum_received_atomic": "495000000000000",
+            "input_asset": str(input_token.get("symbol") or ""),
+            "input_amount": input_amount,
+            "input_amount_atomic": input_atomic,
+            "output_asset": str(output_token.get("symbol") or ""),
+            "output_amount": output_amount,
+            "output_amount_atomic": output_atomic,
+            "minimum_received": str(Decimal(minimum_atomic) / (Decimal(10) ** output_decimals)),
+            "minimum_received_atomic": minimum_atomic,
             "quote_id": "11" * 32,
             "approval_required": True,
             "allowance": {
                 "applicable": True,
                 "read_method": "eth_call",
-                "token": {"symbol": "USDG"},
+                "token": {"symbol": str(input_token.get("symbol") or "")},
                 "spender": spender,
                 "spender_allowlisted": True,
                 "current_atomic": "0",
-                "required_atomic": "1000000",
-                "shortfall_atomic": "1000000",
+                "required_atomic": input_atomic,
+                "shortfall_atomic": input_atomic,
                 "approval_required": True,
             },
             "unsigned_transaction_plan": {
@@ -272,6 +285,41 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             execution_status="disabled",
             enabled=False,
             probe_amount="1",
+            evidence={"liquidity_available": True, "read_only": True},
+        )
+        self.db.add(capability)
+        self.db.commit()
+        return weth, usdg, capability
+
+    def _r5c4b_capability(self) -> tuple[TokenRegistry, TokenRegistry, RobinhoodChainPairCapability]:
+        self._token("ETH", None, 18)
+        weth = self._token("WETH", "0x" + "31" * 20, 18)
+        usdg = self._token("USDG", "0x" + "41" * 20, 6)
+        self._mark_verified(weth)
+        self._mark_verified(usdg)
+        objective = RobinhoodChainPairObjective(
+            id="r5c4b-objective",
+            base_token_registry_id=int(weth.id),
+            quote_token_registry_id=int(usdg.id),
+            symbol="WETH-USDG",
+            mechanism="swap",
+            enabled=True,
+            review_only=True,
+        )
+        self.db.add(objective)
+        self.db.flush()
+        capability = RobinhoodChainPairCapability(
+            id="r5c4b-capability",
+            objective_id=objective.id,
+            from_token_registry_id=int(weth.id),
+            to_token_registry_id=int(usdg.id),
+            amount_mode="exact_input",
+            provider="0x",
+            indicative_status="available",
+            firm_plan_status="not_tested",
+            execution_status="disabled",
+            enabled=False,
+            probe_amount="0.0001",
             evidence={"liquidity_available": True, "read_only": True},
         )
         self.db.add(capability)
@@ -620,6 +668,85 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         kwargs = dict(
             symbol="WETH-USDG", side="buy", amount_mode="exact_input",
             requested_amount="1", taker_address="0x" + "51" * 20,
+            slippage_bps=100, confirm_verify=True,
+        )
+        first = await self.service.verify_preparation_authority(self.db, **kwargs)
+        second = await self.service.verify_preparation_authority(self.db, **kwargs)
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+        self.assertFalse(second["database_mutated"])
+        self.assertIsNone(second["firm_plan"])
+        self.assertEqual(len(self.fake_planning.calls), 1)
+
+    async def test_r5c4b_preparation_verification_requires_explicit_confirmation(self) -> None:
+        self._r5c4b_capability()
+        with self.assertRaisesRegex(ValueError, "confirm_r5c4b_preparation_verification_required"):
+            await self.service.verify_preparation_authority(
+                self.db, symbol="WETH-USDG", side="sell", amount_mode="exact_input",
+                requested_amount="0.0001", taker_address="0x" + "51" * 20,
+                slippage_bps=100, confirm_verify=False,
+            )
+        self.assertEqual(self.fake_planning.calls, [])
+
+    async def test_r5c4b_wrong_amount_is_blocked_before_provider(self) -> None:
+        self._r5c4b_capability()
+        with self.assertRaisesRegex(ValueError, "r5c4b_preparation_target_locked"):
+            await self.service.verify_preparation_authority(
+                self.db, symbol="WETH-USDG", side="sell", amount_mode="exact_input",
+                requested_amount="0.0002", taker_address="0x" + "51" * 20,
+                slippage_bps=100, confirm_verify=True,
+            )
+        self.assertEqual(self.fake_planning.calls, [])
+
+    async def test_r5c4b_success_persists_bounded_sell_preparation_not_live_execution(self) -> None:
+        _, _, capability = self._r5c4b_capability()
+        result = await self.service.verify_preparation_authority(
+            self.db, symbol="WETH-USDG", side="sell", amount_mode="exact_input",
+            requested_amount="0.0001", taker_address="0x" + "51" * 20,
+            slippage_bps=100, confirm_verify=True,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tranche"], "R5C.4B")
+        self.assertFalse(result["idempotent"])
+        self.assertTrue(result["database_mutated"])
+        self.assertFalse(result["broadcast_enabled"])
+        self.assertFalse(result["successful_broadcast"])
+        self.assertTrue(result["initial_acceptance_wallet_reject_only"])
+        self.assertEqual(len(self.fake_planning.calls), 1)
+        call = self.fake_planning.calls[0]
+        self.assertEqual(call["symbol"], "WETH-USDG")
+        self.assertEqual(call["side"], "sell")
+        self.assertEqual(call["requested_amount"], "0.0001")
+        self.assertEqual(call["base_token"]["symbol"], "WETH")
+        self.assertEqual(call["quote_token"]["symbol"], "USDG")
+        self.db.refresh(capability)
+        self.assertTrue(capability.enabled)
+        self.assertEqual(capability.firm_plan_status, "available")
+        self.assertEqual(capability.execution_status, PREPARATION_STATUS)
+        self.assertEqual(capability.probe_amount, "0.0001")
+        self.assertEqual(capability.evidence["tranche"], "R5C.4B")
+        self.assertEqual(capability.evidence["side"], "sell")
+        self.assertEqual(capability.evidence["from_asset"], "WETH")
+        self.assertEqual(capability.evidence["to_asset"], "USDG")
+        self.assertEqual(capability.evidence["verified_input_amount"], "0.0001")
+        self.assertTrue(capability.evidence["preparation_verified"])
+        self.assertFalse(capability.evidence["live_accepted"])
+        self.assertFalse(capability.evidence["successful_broadcast"])
+        authority = result["execution_authority"]
+        self.assertEqual(authority["authority_level"], PREPARATION_STATUS)
+        self.assertEqual(authority["side"], "sell")
+        self.assertEqual(authority["input"]["symbol"], "WETH")
+        self.assertEqual(authority["output"]["symbol"], "USDG")
+        self.assertEqual(authority["execution_ceiling"]["amount"], "0.0001")
+        self.assertTrue(authority["execution_permitted"])
+        self.assertFalse(authority["live_execution_verified"])
+        self.assertFalse(authority["successful_broadcast_authorized"])
+
+    async def test_r5c4b_repeat_is_idempotent_without_provider_contact(self) -> None:
+        self._r5c4b_capability()
+        kwargs = dict(
+            symbol="WETH-USDG", side="sell", amount_mode="exact_input",
+            requested_amount="0.0001", taker_address="0x" + "51" * 20,
             slippage_bps=100, confirm_verify=True,
         )
         first = await self.service.verify_preparation_authority(self.db, **kwargs)

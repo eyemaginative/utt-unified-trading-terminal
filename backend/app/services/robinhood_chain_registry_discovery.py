@@ -52,6 +52,12 @@ R5C4A_INPUT_ASSET = "USDG"
 R5C4A_OUTPUT_ASSET = "WETH"
 R5C4A_INPUT_AMOUNT = "1"
 R5C4A_SLIPPAGE_BPS = 100
+R5C4B_SYMBOL = "WETH-USDG"
+R5C4B_SIDE = "sell"
+R5C4B_INPUT_ASSET = "WETH"
+R5C4B_OUTPUT_ASSET = "USDG"
+R5C4B_INPUT_AMOUNT = "0.0001"
+R5C4B_SLIPPAGE_BPS = 100
 
 _ERC20_SYMBOL_SELECTOR = "0x95d89b41"
 _ERC20_NAME_SELECTOR = "0x06fdde03"
@@ -1036,27 +1042,45 @@ class RobinhoodChainRegistryDiscoveryService:
         slippage_bps: int,
         confirm_verify: bool,
     ) -> Dict[str, Any]:
-        """Verify the first bounded generic BUY preparation route without broadcasting.
+        """Verify one explicitly bounded generic WETH preparation direction.
 
-        R5C.4A is intentionally locked to USDG -> WETH exact input at 1 USDG.
-        The method may persist validated firm-plan evidence only after explicit
-        confirmation. It never requests a wallet, signs, broadcasts, or claims
-        that a live WETH execution has succeeded.
+        R5C.4A remains locked to USDG -> WETH exact input at 1 USDG.
+        R5C.4B adds WETH -> USDG exact input at 0.0001 WETH. The method
+        may persist validated firm-plan evidence only after explicit confirmation.
+        It never requests a wallet, signs, broadcasts, or claims live execution.
         """
-        if confirm_verify is not True:
-            raise ValueError("confirm_r5c4a_preparation_verification_required")
-
         normalized_symbol = _normalize_market_symbol(symbol)
         normalized_side = str(side or "").strip().lower()
         normalized_mode = str(amount_mode or "").strip().lower().replace("exact_spend", AMOUNT_MODE_EXACT_INPUT)
         normalized_slippage = int(slippage_bps)
-        if (
-            normalized_symbol != R5C4A_SYMBOL
-            or normalized_side != R5C4A_SIDE
-            or normalized_mode != AMOUNT_MODE_EXACT_INPUT
-            or normalized_slippage != R5C4A_SLIPPAGE_BPS
-        ):
-            raise ValueError("r5c4a_preparation_target_locked")
+
+        if normalized_symbol == R5C4A_SYMBOL and normalized_side == R5C4A_SIDE:
+            target = {
+                "tranche": "R5C.4A",
+                "error_prefix": "r5c4a",
+                "input_asset": R5C4A_INPUT_ASSET,
+                "output_asset": R5C4A_OUTPUT_ASSET,
+                "input_amount": R5C4A_INPUT_AMOUNT,
+                "slippage_bps": R5C4A_SLIPPAGE_BPS,
+            }
+        elif normalized_symbol == R5C4B_SYMBOL and normalized_side == R5C4B_SIDE:
+            target = {
+                "tranche": "R5C.4B",
+                "error_prefix": "r5c4b",
+                "input_asset": R5C4B_INPUT_ASSET,
+                "output_asset": R5C4B_OUTPUT_ASSET,
+                "input_amount": R5C4B_INPUT_AMOUNT,
+                "slippage_bps": R5C4B_SLIPPAGE_BPS,
+            }
+        else:
+            prefix = "r5c4a" if normalized_side == R5C4A_SIDE else "r5c4b"
+            raise ValueError(f"{prefix}_preparation_target_locked")
+
+        error_prefix = str(target["error_prefix"])
+        if confirm_verify is not True:
+            raise ValueError(f"confirm_{error_prefix}_preparation_verification_required")
+        if normalized_mode != AMOUNT_MODE_EXACT_INPUT or normalized_slippage != int(target["slippage_bps"]):
+            raise ValueError(f"{error_prefix}_preparation_target_locked")
 
         taker = validate_evm_address(taker_address)
         objective = (
@@ -1070,21 +1094,27 @@ class RobinhoodChainRegistryDiscoveryService:
         if objective is None:
             raise ValueError("robinhood_chain_pair_objective_not_found")
         if str(objective.mechanism or "").strip().lower() != MECHANISM_SWAP:
-            raise ValueError("r5c4a_swap_mechanism_required")
+            raise ValueError(f"{error_prefix}_swap_mechanism_required")
 
         base_row, quote_row = self._objective_tokens(db, objective)
         base_identity = self.token_identity(db, base_row)
         quote_identity = self.token_identity(db, quote_row)
+        input_row, input_identity = (
+            (base_row, base_identity) if normalized_side == "sell" else (quote_row, quote_identity)
+        )
+        output_row, output_identity = (
+            (quote_row, quote_identity) if normalized_side == "sell" else (base_row, base_identity)
+        )
         if (
-            str(base_identity.get("symbol") or "").strip().upper() != R5C4A_OUTPUT_ASSET
-            or bool(base_identity.get("native"))
-            or str(quote_identity.get("symbol") or "").strip().upper() != R5C4A_INPUT_ASSET
-            or bool(quote_identity.get("native"))
+            str(input_identity.get("symbol") or "").strip().upper() != str(target["input_asset"])
+            or bool(input_identity.get("native"))
+            or str(output_identity.get("symbol") or "").strip().upper() != str(target["output_asset"])
+            or bool(output_identity.get("native"))
         ):
-            raise ValueError("r5c4a_token_registry_identity_mismatch")
-        normalized_amount = _parse_probe_amount(requested_amount, int(quote_identity["decimals"]))
-        if normalized_amount != R5C4A_INPUT_AMOUNT:
-            raise ValueError("r5c4a_preparation_target_locked")
+            raise ValueError(f"{error_prefix}_token_registry_identity_mismatch")
+        normalized_amount = _parse_probe_amount(requested_amount, int(input_identity["decimals"]))
+        if normalized_amount != str(target["input_amount"]):
+            raise ValueError(f"{error_prefix}_preparation_target_locked")
         self._verified_identity_required(db, int(base_row.id))
         self._verified_identity_required(db, int(quote_row.id))
 
@@ -1092,19 +1122,19 @@ class RobinhoodChainRegistryDiscoveryService:
             db.query(RobinhoodChainPairCapability)
             .filter(
                 RobinhoodChainPairCapability.objective_id == objective.id,
-                RobinhoodChainPairCapability.from_token_registry_id == int(quote_row.id),
-                RobinhoodChainPairCapability.to_token_registry_id == int(base_row.id),
+                RobinhoodChainPairCapability.from_token_registry_id == int(input_row.id),
+                RobinhoodChainPairCapability.to_token_registry_id == int(output_row.id),
                 RobinhoodChainPairCapability.amount_mode == AMOUNT_MODE_EXACT_INPUT,
                 RobinhoodChainPairCapability.provider == PROVIDER_ZEROX,
             )
             .first()
         )
         if capability is None:
-            raise ValueError("r5c4a_direction_capability_missing")
+            raise ValueError(f"{error_prefix}_direction_capability_missing")
         if str(capability.indicative_status or "").strip().lower() not in {"available", "live_verified"}:
-            raise ValueError("r5c4a_indicative_capability_unavailable")
-        if str(capability.probe_amount or "").strip() != R5C4A_INPUT_AMOUNT:
-            raise ValueError("r5c4a_probe_amount_mismatch")
+            raise ValueError(f"{error_prefix}_indicative_capability_unavailable")
+        if str(capability.probe_amount or "").strip() != str(target["input_amount"]):
+            raise ValueError(f"{error_prefix}_probe_amount_mismatch")
 
         existing_evidence = copy.deepcopy(capability.evidence) if isinstance(capability.evidence, dict) else {}
         if (
@@ -1112,7 +1142,10 @@ class RobinhoodChainRegistryDiscoveryService:
             and str(capability.firm_plan_status or "").strip().lower() == "available"
             and str(capability.execution_status or "").strip().lower() == PREPARATION_STATUS
             and existing_evidence.get("preparation_verified") is True
-            and str(existing_evidence.get("verified_input_amount") or "").strip() == R5C4A_INPUT_AMOUNT
+            and str(existing_evidence.get("verified_input_amount") or "").strip() == str(target["input_amount"])
+            and str(existing_evidence.get("side") or "").strip().lower() == normalized_side
+            and str(existing_evidence.get("from_asset") or "").strip().upper() == str(target["input_asset"])
+            and str(existing_evidence.get("to_asset") or "").strip().upper() == str(target["output_asset"])
         ):
             authority = resolve_robinhood_chain_execution_authority(
                 db,
@@ -1125,7 +1158,7 @@ class RobinhoodChainRegistryDiscoveryService:
             return {
                 "ok": True,
                 "idempotent": True,
-                "tranche": "R5C.4A",
+                "tranche": target["tranche"],
                 "capability": self._capability_dict(db, capability),
                 "execution_authority": authority,
                 "firm_plan": None,
@@ -1142,14 +1175,14 @@ class RobinhoodChainRegistryDiscoveryService:
         transient_capability = self._capability_dict(db, capability)
         transient_evidence = copy.deepcopy(transient_capability.get("evidence") or {})
         transient_evidence.update({
-            "firm_plan_input_ceiling": R5C4A_INPUT_AMOUNT,
+            "firm_plan_input_ceiling": target["input_amount"],
             "preparation_verification_requested": True,
             "live_accepted": False,
             "successful_broadcast": False,
         })
         transient_capability.update({
             "firm_plan_status": "available",
-            "firm_plan_input_ceiling": R5C4A_INPUT_AMOUNT,
+            "firm_plan_input_ceiling": target["input_amount"],
             "evidence": transient_evidence,
         })
         registry_tokens = [
@@ -1172,18 +1205,18 @@ class RobinhoodChainRegistryDiscoveryService:
             slippage_bps=normalized_slippage,
         )
         if plan.get("ok") is not True:
-            raise ValueError(str(plan.get("error") or "r5c4a_firm_plan_verification_failed"))
+            raise ValueError(str(plan.get("error") or f"{error_prefix}_firm_plan_verification_failed"))
         allowance = plan.get("allowance") if isinstance(plan.get("allowance"), dict) else {}
         unsigned = plan.get("unsigned_transaction_plan") if isinstance(plan.get("unsigned_transaction_plan"), dict) else {}
         if (
             str(plan.get("symbol") or "").strip().upper() != normalized_symbol
             or str(plan.get("side") or "").strip().lower() != normalized_side
             or str(plan.get("amount_mode") or "").strip().lower() != normalized_mode
-            or str(plan.get("input_asset") or "").strip().upper() != R5C4A_INPUT_ASSET
-            or str(plan.get("output_asset") or "").strip().upper() != R5C4A_OUTPUT_ASSET
-            or str(plan.get("input_amount") or "").strip() != R5C4A_INPUT_AMOUNT
+            or str(plan.get("input_asset") or "").strip().upper() != str(target["input_asset"])
+            or str(plan.get("output_asset") or "").strip().upper() != str(target["output_asset"])
+            or str(plan.get("input_amount") or "").strip() != str(target["input_amount"])
             or allowance.get("applicable") is not True
-            or str((allowance.get("token") or {}).get("symbol") or "").strip().upper() != R5C4A_INPUT_ASSET
+            or str((allowance.get("token") or {}).get("symbol") or "").strip().upper() != str(target["input_asset"])
             or allowance.get("spender_allowlisted") is not True
             or validate_evm_address(str(allowance.get("spender") or "")).lower() not in ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST
             or unsigned.get("destination_allowlisted") is not True
@@ -1194,21 +1227,22 @@ class RobinhoodChainRegistryDiscoveryService:
             or int(str(unsigned.get("gas_limit") or "0")) <= 0
             or int(str(plan.get("minimum_received_atomic") or "0")) <= 0
         ):
-            raise ValueError("r5c4a_firm_plan_identity_or_safety_mismatch")
+            raise ValueError(f"{error_prefix}_firm_plan_identity_or_safety_mismatch")
 
         now = utc_now()
         evidence = existing_evidence
         evidence.update({
             "preparation_verified": True,
             "preparation_status": PREPARATION_STATUS,
+            "tranche": target["tranche"],
             "symbol": normalized_symbol,
             "side": normalized_side,
             "amount_mode": normalized_mode,
             "provider": PROVIDER_ZEROX,
-            "from_asset": R5C4A_INPUT_ASSET,
-            "to_asset": R5C4A_OUTPUT_ASSET,
-            "verified_input_amount": R5C4A_INPUT_AMOUNT,
-            "firm_plan_input_ceiling": R5C4A_INPUT_AMOUNT,
+            "from_asset": target["input_asset"],
+            "to_asset": target["output_asset"],
+            "verified_input_amount": target["input_amount"],
+            "firm_plan_input_ceiling": target["input_amount"],
             "quote_id": plan.get("quote_id"),
             "calldata_sha256": unsigned.get("calldata_sha256"),
             "transaction_destination": unsigned.get("to"),
@@ -1244,13 +1278,13 @@ class RobinhoodChainRegistryDiscoveryService:
             require_execution=True,
         )
         if authority.get("authority_level") != PREPARATION_STATUS or authority.get("live_execution_verified") is not False:
-            raise ValueError("r5c4a_preparation_authority_resolution_failed")
+            raise ValueError(f"{error_prefix}_preparation_authority_resolution_failed")
         db.commit()
         db.refresh(capability)
         return {
             "ok": True,
             "idempotent": False,
-            "tranche": "R5C.4A",
+            "tranche": target["tranche"],
             "capability": self._capability_dict(db, capability),
             "execution_authority": authority,
             "firm_plan": plan,

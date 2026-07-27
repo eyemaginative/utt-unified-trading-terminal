@@ -307,6 +307,62 @@ class RobinhoodChainExecutionAuthorityTests(unittest.TestCase):
             assert_robinhood_chain_execution_amount(authority, "1.000001")
         self.assertEqual(caught.exception.code, "robinhood_chain_execution_amount_exceeds_ceiling")
 
+    def test_r5c4b_sell_preparation_authority_is_finite_and_not_live(self) -> None:
+        self._execution_pair(
+            base_symbol="WETH",
+            base_address=self._contract("ab"),
+            base_decimals=18,
+            quote_symbol="USDG",
+            quote_address=self._contract("cd"),
+            quote_decimals=6,
+            side="sell",
+            indicative_status="available",
+            firm_plan_status="available",
+            execution_status="preparation_verified",
+            capability_enabled=True,
+            probe_amount="0.0001",
+            evidence={
+                "preparation_verified": True,
+                "live_accepted": False,
+                "successful_broadcast": False,
+                "tranche": "R5C.4B",
+                "symbol": "WETH-USDG",
+                "side": "sell",
+                "amount_mode": "exact_input",
+                "provider": "0x",
+                "from_asset": "WETH",
+                "to_asset": "USDG",
+                "verified_input_amount": "0.0001",
+                "firm_plan_input_ceiling": "0.0001",
+            },
+        )
+        authority = resolve_robinhood_chain_execution_authority(
+            self.db,
+            symbol="WETH-USDG",
+            side="sell",
+            require_execution=True,
+        )
+        self.assertTrue(authority["execution_permitted"])
+        self.assertEqual(authority["execution_adapter"], "erc20_exact_input")
+        self.assertEqual(authority["authority_level"], "preparation_verified")
+        self.assertTrue(authority["preparation_verified"])
+        self.assertFalse(authority["live_execution_verified"])
+        self.assertTrue(authority["initial_acceptance_wallet_reject_only"])
+        self.assertFalse(authority["successful_broadcast_authorized"])
+        self.assertEqual(authority["execution_ceiling"]["amount"], "0.0001")
+        self.assertEqual(authority["execution_ceiling"]["asset"], "WETH")
+        self.assertEqual(authority["input"]["symbol"], "WETH")
+        self.assertFalse(authority["input"]["native"])
+        self.assertEqual(authority["input"]["decimals"], 18)
+        self.assertEqual(authority["output"]["symbol"], "USDG")
+        self.assertTrue(authority["approval"]["applicable"])
+        self.assertEqual(authority["approval"]["model"], "finite_exact_input")
+        self.assertFalse(authority["approval"]["unlimited_approval_enabled"])
+        self.assertEqual(assert_robinhood_chain_execution_amount(authority, "0.0001"), "0.0001")
+        with self.assertRaises(RobinhoodChainRegistryAuthorityError) as caught:
+            assert_robinhood_chain_execution_amount(authority, "0.000100000000000001")
+        self.assertEqual(caught.exception.code, "robinhood_chain_execution_amount_exceeds_ceiling")
+
     def test_preparation_status_without_exact_evidence_fails_closed(self) -> None:
         self._execution_pair(
             base_symbol="WETH",
@@ -365,6 +421,10 @@ class RobinhoodChainExecutionAuthorityTests(unittest.TestCase):
         self.assertIn('robinhoodChainExecutionAuthority?.execution_permitted', ticket_source)
         self.assertIn('robinhoodChainExecutionAdapter', ticket_source)
         self.assertIn('R5C.4A', ticket_source)
+        self.assertIn('R5C.4B', ticket_source)
+        self.assertIn('robinhoodChainR5C4BSell', ticket_source)
+        self.assertIn('expectedApprovalToken', ticket_source)
+        self.assertIn('Successful WETH to USDG broadcast is not authorized', ticket_source)
         self.assertIn('PREP VERIFIED', ticket_source)
 
 

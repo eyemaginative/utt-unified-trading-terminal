@@ -6,6 +6,7 @@ import inspect
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -122,6 +123,62 @@ def weth_preparation_authority_capability():
     }
 
 
+def weth_sell_preparation_authority_capability():
+    evidence = {
+        "preparation_verified": True,
+        "live_accepted": False,
+        "successful_broadcast": False,
+        "tranche": "R5C.4B",
+        "symbol": "WETH-USDG",
+        "side": "sell",
+        "amount_mode": "exact_input",
+        "provider": "0x",
+        "from_asset": "WETH",
+        "to_asset": "USDG",
+        "verified_input_amount": "0.0001",
+        "firm_plan_input_ceiling": "0.0001",
+    }
+    authority = {
+        "symbol": "WETH-USDG",
+        "side": "sell",
+        "amount_mode": "exact_input",
+        "provider": "0x",
+        "execution_adapter": "erc20_exact_input",
+        "execution_permitted": True,
+        "authority_level": "preparation_verified",
+        "preparation_verified": True,
+        "live_execution_verified": False,
+        "initial_acceptance_wallet_reject_only": True,
+        "successful_broadcast_authorized": False,
+        "input": WETH,
+        "output": USDG,
+        "objective": {"id": "weth-usdg-objective"},
+        "capability": {
+            "id": "weth-usdg-sell-preparation-capability",
+            "enabled": True,
+            "indicative_status": "available",
+            "firm_plan_status": "available",
+            "execution_status": "preparation_verified",
+            "probe_amount": "0.0001",
+            "evidence": evidence,
+        },
+        "execution_ceiling": {"amount": "0.0001", "asset": "WETH"},
+    }
+    return {
+        "from_asset": "WETH",
+        "to_asset": "USDG",
+        "amount_mode": "exact_input",
+        "mechanism": "swap",
+        "indicative_status": "available",
+        "firm_plan_status": "available",
+        "execution_status": "preparation_verified",
+        "enabled": True,
+        "probe_amount": "0.0001",
+        "evidence": evidence,
+        "execution_authority": authority,
+    }
+
+
 class FakePlanningService:
     def __init__(self, allowance_atomic: int = 0) -> None:
         self.allowance_atomic = int(allowance_atomic)
@@ -132,33 +189,44 @@ class FakePlanningService:
     async def firm_quote_plan(self, **kwargs):
         self.calls.append(dict(kwargs))
         self.counter += 1
-        input_amount = str(kwargs["total_quote"])
-        input_atomic = str(int(float(input_amount) * 1_000_000))
-        output_token = kwargs.get("base_token") or kwargs.get("eth_token") or ETH
+        side = str(kwargs.get("side") or "buy").strip().lower()
+        base_token = dict(kwargs.get("base_token") or kwargs.get("eth_token") or ETH)
+        quote_token = dict(kwargs.get("quote_token") or USDG)
+        input_token = base_token if side == "sell" else quote_token
+        output_token = quote_token if side == "sell" else base_token
+        input_amount = str(kwargs.get("quantity") if side == "sell" else kwargs.get("total_quote"))
+        input_decimals = int(input_token.get("decimals") or 0)
+        input_atomic = str(int(Decimal(input_amount) * (Decimal(10) ** input_decimals)))
         output_asset = self.output_asset_override or str(output_token.get("symbol") or "ETH").upper()
-        output_atomic = str(int(float(input_amount) * 530_000_000_000_000))
-        minimum_atomic = str(int(int(output_atomic) * 0.99))
+        if side == "sell":
+            output_amount = Decimal("0.25")
+        else:
+            output_amount = Decimal(input_amount) * Decimal("0.00053")
+        output_decimals = int(output_token.get("decimals") or 0)
+        output_atomic = str(int(output_amount * (Decimal(10) ** output_decimals)))
+        minimum_atomic = str(int(Decimal(output_atomic) * Decimal("0.99")))
         fetched = datetime.now(timezone.utc) + timedelta(milliseconds=self.counter)
         expires = fetched + timedelta(seconds=30)
         digest = hashlib.sha256(bytes.fromhex(SWAP_CALLDATA[2:])).hexdigest()
         return {
             "ok": True,
             "chain_id": 4663,
-            "symbol": str(kwargs.get("symbol") or f"{output_asset}-USDG"),
-            "side": "buy",
+            "symbol": str(kwargs.get("symbol") or f"{base_token.get('symbol')}-{quote_token.get('symbol')}"),
+            "side": side,
             "amount_mode": "exact_input",
-            "input_asset": "USDG",
+            "input_asset": str(input_token.get("symbol") or "").upper(),
             "input_amount": input_amount,
             "input_amount_atomic": input_atomic,
             "output_asset": output_asset,
-            "output_amount": str(int(output_atomic) / 10**18),
+            "output_amount": str(Decimal(output_atomic) / (Decimal(10) ** output_decimals)),
             "output_amount_atomic": output_atomic,
-            "minimum_received": str(int(minimum_atomic) / 10**18),
+            "minimum_received": str(Decimal(minimum_atomic) / (Decimal(10) ** output_decimals)),
             "minimum_received_atomic": minimum_atomic,
             "slippage_bps": int(kwargs["slippage_bps"]),
             "allowance": {
                 "applicable": True,
                 "read_method": "eth_call",
+                "token": {"symbol": str(input_token.get("symbol") or "").upper()},
                 "spender": SPENDER,
                 "spender_allowlisted": True,
                 "current_atomic": str(self.allowance_atomic),
@@ -185,6 +253,7 @@ class FakePlanningService:
                 "destination_allowlisted": True,
             },
         }
+
 
 
 class FakeRpcClient:
@@ -349,6 +418,24 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             to_asset="WETH",
             to_token=WETH,
             route_capability=WETH_CAPABILITY,
+            confirm_prepare=True,
+        )
+
+    async def prepare_weth_sell(self, amount="0.0001"):
+        return await self.service.prepare(
+            self.db,
+            taker_address=TAKER,
+            exact_input_amount=amount,
+            slippage_bps=100,
+            eth_token=None,
+            usdg_token=USDG,
+            side="sell",
+            from_asset="WETH",
+            from_token=WETH,
+            to_asset="USDG",
+            to_token=USDG,
+            symbol="WETH-USDG",
+            route_capability=weth_sell_preparation_authority_capability(),
             confirm_prepare=True,
         )
 
@@ -1121,6 +1208,103 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(self.planning.calls, [])
 
+    async def test_r5c4b_sell_preparation_builds_finite_weth_approval_and_locks_swap(self):
+        result = await self.prepare_weth_sell()
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["idempotent"])
+        self.assertTrue(result["approval_required"])
+        row = result["execution"]
+        self.assertEqual(row["tranche"], "R5C.4B")
+        self.assertEqual(row["symbol"], "WETH-USDG")
+        self.assertEqual(row["side"], "sell")
+        self.assertEqual(row["from_asset"], "WETH")
+        self.assertEqual(row["to_asset"], "USDG")
+        self.assertEqual(row["exact_input_amount"], "0.0001")
+        self.assertEqual(row["exact_input_amount_atomic"], "100000000000000")
+        self.assertFalse(row["from_native"])
+        self.assertFalse(row["to_native"])
+        self.assertTrue(row["approval_only"])
+        self.assertFalse(row["swap_stage_enabled"])
+        self.assertFalse(row["swap_execution_enabled"])
+        self.assertEqual(row["swap_stage_locked_reason"], "R5C.4B successful broadcast not authorized")
+        self.assertEqual(row["allowance"]["token_address"].lower(), WETH["contract_address"].lower())
+        self.assertEqual(row["approval"]["transaction_to"].lower(), WETH["contract_address"].lower())
+        self.assertEqual(row["approval"]["amount"], "0.0001")
+        self.assertEqual(row["approval"]["amount_atomic"], "100000000000000")
+        self.assertEqual(row["approval"]["transaction_value_wei"], "0")
+        self.assertTrue(row["approval"]["finite_approval"])
+        self.assertFalse(row["approval"]["unlimited_approval"])
+        self.assertIsNone(result.get("unsigned_transaction_plan"))
+        approval = result["approval_transaction_plan"]
+        self.assertEqual(approval["token"].lower(), WETH["contract_address"].lower())
+        self.assertEqual(approval["to"].lower(), WETH["contract_address"].lower())
+        self.assertEqual(approval["approval_amount_atomic"], "100000000000000")
+        self.assertEqual(approval["value_wei"], "0")
+        self.assertTrue(approval["finite_approval"])
+        self.assertFalse(approval["unlimited_approval"])
+        self.assertFalse(approval["wallet_connection_requested"])
+        self.assertFalse(approval["signing_requested"])
+        self.assertFalse(approval["broadcast_requested"])
+        stored = row["swap"]["route"]["execution_authority"]
+        self.assertEqual(stored["authority_level"], "preparation_verified")
+        self.assertEqual(stored["side"], "sell")
+        self.assertEqual(stored["input"]["symbol"], "WETH")
+        self.assertEqual(stored["output"]["symbol"], "USDG")
+        self.assertTrue(stored["initial_acceptance_wallet_reject_only"])
+        self.assertFalse(stored["successful_broadcast_authorized"])
+        call = self.planning.calls[0]
+        self.assertEqual(call["side"], "sell")
+        self.assertEqual(call["quantity"], "0.0001")
+        self.assertIsNone(call["total_quote"])
+        self.assertEqual(call["base_token"]["symbol"], "WETH")
+        self.assertEqual(call["quote_token"]["symbol"], "USDG")
+
+    async def test_r5c4b_sell_amount_is_exactly_locked_before_provider(self):
+        with self.assertRaisesRegex(ValueError, "r5c4b_exact_input_amount_locked"):
+            await self.prepare_weth_sell("0.000100000000000001")
+        self.assertEqual(self.planning.calls, [])
+
+    async def test_r5c4b_first_wallet_rejection_is_terminal_hash_free_and_no_swap_opens(self):
+        prepared = await self.prepare_weth_sell()
+        execution_id = prepared["execution"]["id"]
+        with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
+            claimed = self.service.claim_approval_send(
+                self.db,
+                execution_id=execution_id,
+                wallet_address=TAKER,
+                plan_hash=prepared["execution"]["approval"]["plan_hash"],
+                claim_id=APPROVAL_CLAIM,
+                confirm_send_claim=True,
+            )
+        self.assertEqual(claimed["execution"]["status"], "approval_send_claimed")
+        rejected = self.service.record_submission_failure(
+            self.db,
+            execution_id=execution_id,
+            stage="approval",
+            wallet_address=TAKER,
+            claim_id=APPROVAL_CLAIM,
+            reason="wallet_rejected",
+            message="deliberate R5C.4B acceptance rejection",
+            confirm_failure=True,
+        )
+        row = rejected["execution"]
+        self.assertEqual(row["status"], "approval_wallet_rejected")
+        self.assertIsNone(row["approval"]["tx_hash"])
+        self.assertIsNone(row["swap"]["tx_hash"])
+        self.assertTrue(row["approval_only"])
+        self.assertFalse(row["swap_stage_enabled"])
+        self.assertFalse(row["automatic_second_transaction"])
+        with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
+            with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_stage_locked"):
+                await self.service.claim_swap_send(
+                    self.db,
+                    execution_id=execution_id,
+                    wallet_address=TAKER,
+                    plan_hash="11" * 32,
+                    claim_id=SWAP_CLAIM,
+                    confirm_send_claim=True,
+                )
+
     def test_router_swap_prepare_uses_execution_authority_and_token_registry_identity(self):
         source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
         self.assertIn("_resolve_robinhood_chain_execution_authority_or_http", source)
@@ -1130,6 +1314,10 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('input_token = dict(authority.get("input") or {})', source)
         self.assertIn('output_token = dict(authority.get("output") or {})', source)
         self.assertIn("robinhood_chain_swap_market_identity_mismatch", source)
+        self.assertIn("side=str(authority.get(\"side\") or request.side)", source)
+        self.assertIn("symbol=str(authority.get(\"symbol\") or request.symbol)", source)
+        self.assertIn("from_asset=from_asset", source)
+        self.assertIn("from_token=input_token", source)
         self.assertIn("to_asset=to_asset", source)
         self.assertIn("to_token=output_token", source)
         self.assertIn("route_capability=capability", source)

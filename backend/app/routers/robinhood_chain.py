@@ -572,7 +572,7 @@ class RobinhoodChainPreparationVerificationRequest(BaseModel):
     taker_address: Optional[str] = Field(default=None, min_length=42, max_length=42)
     confirm_verify: bool = Field(
         default=False,
-        description="Must be true to persist bounded R5C.4A preparation-verification evidence.",
+        description="Must be true to persist bounded R5C.4A or R5C.4B preparation-verification evidence.",
     )
 
 
@@ -647,7 +647,7 @@ class RobinhoodChainSwapExecutionPrepareRequest(BaseModel):
         default=ROBINHOOD_CHAIN_SWAP_TO_ASSET,
         min_length=1,
         max_length=32,
-        description="Approval-review output asset. R5C.3B accepts ETH or WETH; WETH swap execution remains locked.",
+        description="Registry-authoritative exact-input output asset. R5C.4B permits bounded WETH-to-USDG preparation only; successful broadcast remains unauthorized.",
     )
     amount_mode: str = Field(default=ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE, min_length=1, max_length=32)
     exact_input_amount: str = Field(default=str(ROBINHOOD_CHAIN_SWAP_DEFAULT_USDG), min_length=1, max_length=80)
@@ -1975,11 +1975,11 @@ async def robinhood_chain_execution_authority_verify_preparation(
     request: RobinhoodChainPreparationVerificationRequest,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Persist bounded WETH BUY preparation evidence after a validated firm plan.
+    """Persist bounded WETH preparation evidence after a validated firm plan.
 
-    R5C.4A is locked to WETH-USDG BUY, exact input, 1 USDG, and 1% slippage.
-    This endpoint never requests MetaMask, signs, broadcasts, or claims that live
-    WETH execution has been verified.
+    R5C.4A remains locked to WETH-USDG BUY at 1 USDG. R5C.4B adds
+    WETH-USDG SELL at exactly 0.0001 WETH. This endpoint never requests
+    MetaMask, signs, broadcasts, or claims live execution verification.
     """
     if not bool(settings.robinhood_chain_effective_enabled()):
         raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
@@ -2287,6 +2287,10 @@ async def robinhood_chain_swap_execution_prepare(
             slippage_bps=int(request.slippage_bps),
             eth_token=output_token if bool(output_token.get("native")) else None,
             usdg_token=input_token,
+            side=str(authority.get("side") or request.side),
+            symbol=str(authority.get("symbol") or request.symbol),
+            from_asset=from_asset,
+            from_token=input_token,
             to_asset=to_asset,
             to_token=output_token,
             route_capability=capability,

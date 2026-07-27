@@ -7624,18 +7624,42 @@ export default function OrderTicketWidget({
   const robinhoodChainSwapPlanStale = Boolean(
     Number.isFinite(robinhoodChainSwapExpiresAt) && Date.now() >= robinhoodChainSwapExpiresAt
   );
+  const robinhoodChainCurrentSwapInputAmount = normalizeRobinhoodChainAmountText(
+    robinhoodChainNormalizedSide === "sell" ? qty : totalQuote
+  );
+  const robinhoodChainCurrentSwapInputAtomic = robinhoodChainDecimalToAtomic(
+    robinhoodChainCurrentSwapInputAmount,
+    robinhoodChainExecutionInputDecimals
+  );
+  const robinhoodChainR5C4BSell = Boolean(
+    robinhoodChainWethReviewMarket &&
+    robinhoodChainNormalizedSide === "sell" &&
+    robinhoodChainFromAsset === "WETH" &&
+    robinhoodChainToAsset === "USDG"
+  );
+  const robinhoodChainCurrentSwapAmountAuthorized = Boolean(
+    robinhoodChainCurrentSwapInputAtomic !== null &&
+    robinhoodChainCurrentSwapInputAtomic > 0n &&
+    Number.isFinite(robinhoodChainExecutionCeilingAmount) &&
+    Number(robinhoodChainCurrentSwapInputAmount) > 0 &&
+    Number(robinhoodChainCurrentSwapInputAmount) <= robinhoodChainExecutionCeilingAmount + 1e-12 &&
+    (!robinhoodChainR5C4BSell || robinhoodChainCurrentSwapInputAmount === "0.0001")
+  );
   const canPrepareRobinhoodChainSwapExecution = Boolean(
     isRobinhoodChainVenue &&
     robinhoodChainExecutionAuthorized &&
     robinhoodChainExecutionAdapter === "erc20_exact_input" &&
-    String(side || "").toLowerCase() === "buy" &&
+    ["buy", "sell"].includes(robinhoodChainNormalizedSide) &&
     robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
     robinhoodChainExecutionReviewWalletReady &&
+    robinhoodChainCurrentSwapAmountAuthorized &&
     robinhoodChainFirmPlan?.ok &&
     !robinhoodChainFirmPlanStale &&
     String(robinhoodChainFirmPlan?.amount_mode || "") === "exact_input" &&
     String(robinhoodChainFirmPlan?.input_asset || "").trim().toUpperCase() === robinhoodChainFromAsset &&
-    String(robinhoodChainFirmPlan?.output_asset || "") === robinhoodChainToAsset &&
+    String(robinhoodChainFirmPlan?.output_asset || "").trim().toUpperCase() === robinhoodChainToAsset &&
+    normalizeRobinhoodChainAmountText(robinhoodChainFirmPlan?.input_amount) === robinhoodChainCurrentSwapInputAmount &&
+    String(robinhoodChainFirmPlan?.input_amount_atomic || "") === robinhoodChainCurrentSwapInputAtomic?.toString() &&
     !robinhoodChainSwapBusy
   );
 
@@ -9548,7 +9572,7 @@ async function submitLimitOrder() {
           from_asset: robinhoodChainFromAsset,
           to_asset: robinhoodChainToAsset,
           amount_mode: "exact_input",
-          exact_input_amount: String(robinhoodChainFirmPlan?.input_amount || totalQuote || ""),
+          exact_input_amount: String(robinhoodChainFirmPlan?.input_amount || (robinhoodChainNormalizedSide === "sell" ? qty : totalQuote) || ""),
           slippage_bps: Number(robinhoodChainSlippageBps),
           taker_address: robinhoodChainConnectedAddress,
           confirm_prepare: true,
@@ -9630,6 +9654,9 @@ async function submitLimitOrder() {
     const planFrom = normalizeRobinhoodChainEvmAddress(plan?.from);
     const planTo = normalizeRobinhoodChainEvmAddress(plan?.to);
     const planToken = normalizeRobinhoodChainEvmAddress(plan?.token);
+    const expectedApprovalToken = normalizeRobinhoodChainEvmAddress(
+      row?.allowance?.token_address || row?.from_contract_address
+    );
     const planSpender = normalizeRobinhoodChainEvmAddress(plan?.spender);
     const planData = String(plan?.calldata || "").trim();
     const gasLimit = BigInt(String(plan?.gas_limit || "0"));
@@ -9643,8 +9670,9 @@ async function submitLimitOrder() {
       String(row?.status || "") !== "approval_prepared" ||
       Number(plan?.chain_id) !== ROBINHOOD_CHAIN_NETWORK.chainIdDecimal ||
       planFrom !== robinhoodChainConnectedAddress ||
-      planTo !== robinhoodChainUsdgContract ||
-      planToken !== robinhoodChainUsdgContract ||
+      !expectedApprovalToken ||
+      planTo !== expectedApprovalToken ||
+      planToken !== expectedApprovalToken ||
       planSpender !== normalizeRobinhoodChainEvmAddress(row?.allowance?.spender) ||
       String(plan?.approval_amount_atomic || "") !== expectedAtomic ||
       plan?.finite_approval !== true ||
@@ -9691,9 +9719,9 @@ async function submitLimitOrder() {
       if (balanceWei < maximumFeeWei) throw new Error("Insufficient ETH for the reviewed approval gas maximum.");
 
       const review = [
-        `${String(row?.to_asset || "").toUpperCase() === "WETH" ? "RH-CHAIN.10D.2-R5C.3B" : "RH-CHAIN.10D.2-R5B"} · STAGE 1 FINITE APPROVAL`,
+        `${String(row?.tranche || "").toUpperCase() === "R5C.4B" ? "R5C.4B" : String(row?.to_asset || "").toUpperCase() === "WETH" ? "RH-CHAIN.10D.2-R5C.3B" : "RH-CHAIN.10D.2-R5B"} · STAGE 1 FINITE APPROVAL`,
         "",
-        `Approve exactly ${row?.approval?.amount || row?.exact_input_amount} USDG — not unlimited`,
+        `Approve exactly ${row?.approval?.amount || row?.exact_input_amount} ${row?.from_asset || "INPUT"} — not unlimited`,
         `Token: ${planToken}`,
         `Spender: ${planSpender}`,
         `From: ${activeAddress}`,
@@ -9704,9 +9732,11 @@ async function submitLimitOrder() {
         `Maximum approval fee: ${robinhoodChainFormatAtomicUnits(maximumFeeWei, 18)} ETH`,
         `Plan hash: ${planHash}`,
         "",
-        String(row?.to_asset || "").toUpperCase() === "WETH"
-          ? "This opens one MetaMask approval request only. A fresh WETH swap plan and a separate explicit MetaMask request are still required."
-          : "This opens one MetaMask approval request only. No swap request will open automatically.",
+        String(row?.tranche || "").toUpperCase() === "R5C.4B"
+          ? "R5C.4B acceptance requires rejecting this first explicit MetaMask approval request. Successful WETH to USDG broadcast is not authorized, and no swap request can open automatically."
+          : String(row?.to_asset || "").toUpperCase() === "WETH"
+            ? "This opens one MetaMask approval request only. A fresh WETH swap plan and a separate explicit MetaMask request are still required."
+            : "This opens one MetaMask approval request only. No swap request will open automatically.",
       ].join("\n");
       if (!window.confirm(review)) {
         setRobinhoodChainSwapError("Approval canceled before a send claim or MetaMask request was created.");
@@ -11756,12 +11786,16 @@ async function submitLimitOrder() {
                 : `Robinhood Chain swap execution: native ETH to USDG with a custom exact-spend amount up to ${ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH} ETH.`
               : robinhoodChainWethReviewMarket
                 ? robinhoodChainExecutionAuthorized
-                  ? "WETH-USDG R5C.4A: bounded 1 USDG exact-spend preparation is verified. MetaMask remains an explicit separate request; initial acceptance requires deliberate wallet rejection and no successful WETH broadcast."
-                  : "WETH-USDG: exact-spend indicative review is available. Bounded R5C.4A preparation authority must be explicitly verified before unsigned planning and wallet handoff are enabled."
+                  ? robinhoodChainNormalizedSide === "sell"
+                    ? "WETH-USDG R5C.4B: bounded 0.0001 WETH exact-input preparation is verified. Initial acceptance requires deliberate rejection of the first explicit finite WETH approval request; successful WETH to USDG broadcast is not authorized."
+                    : "WETH-USDG R5C.4A: bounded 1 USDG exact-spend preparation is verified. MetaMask remains an explicit separate request; initial acceptance requires deliberate wallet rejection and no successful WETH broadcast."
+                  : robinhoodChainNormalizedSide === "sell"
+                    ? "WETH-USDG SELL: indicative review is available. Bounded R5C.4B preparation authority must be explicitly verified before finite WETH approval review is enabled."
+                    : "WETH-USDG: exact-spend indicative review is available. Bounded R5C.4A preparation authority must be explicitly verified before unsigned planning and wallet handoff are enabled."
                 : `${robinhoodChainPair.symbol || "Robinhood Chain market"}: ${robinhoodChainMarketStatusLabel(robinhoodChainSelectedMarket)}. Review remains locked.`}
           >
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10.5, fontWeight: 900 }}>
-              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-SWAP · {Array.isArray(robinhoodChainSelectedMarket?.providers) && robinhoodChainSelectedMarket.providers.length ? robinhoodChainSelectedMarket.providers.join("+") : "DB"} · {robinhoodChainFromAsset || "?"} ▸ {robinhoodChainToAsset || "?"} · {robinhoodChainLegacyExecutionMarket ? (side === "sell" ? "10D.2-R5C.3B.1" : "10D.2-R5B") : robinhoodChainWethReviewMarket ? "R5C.4A" : "10D.2-R5C.2"}</span>
+              <span style={{ color: "#67e8f9", letterSpacing: 0.45 }}>RH-SWAP · {Array.isArray(robinhoodChainSelectedMarket?.providers) && robinhoodChainSelectedMarket.providers.length ? robinhoodChainSelectedMarket.providers.join("+") : "DB"} · {robinhoodChainFromAsset || "?"} ▸ {robinhoodChainToAsset || "?"} · {robinhoodChainLegacyExecutionMarket ? (side === "sell" ? "10D.2-R5C.3B.1" : "10D.2-R5B") : robinhoodChainWethReviewMarket ? (robinhoodChainNormalizedSide === "sell" ? "R5C.4B" : "R5C.4A") : "10D.2-R5C.2"}</span>
               <span style={{ color: robinhoodChainWalletState.providerAvailable ? "#bbf7d0" : "#fde68a" }}>
                 MetaMask {robinhoodChainWalletState.providerAvailable ? "detected" : "unavailable"}
               </span>
@@ -11774,13 +11808,13 @@ async function submitLimitOrder() {
               <span style={{ color: robinhoodChainWalletMatchesSaved ? "#bbf7d0" : robinhoodChainCapabilityFallbackActive && !robinhoodChainSavedAddress ? "#67e8f9" : "#fde68a" }}>
                 Saved match {robinhoodChainWalletMatchesSaved ? "YES" : robinhoodChainCapabilityFallbackActive && !robinhoodChainSavedAddress ? "BACKEND VERIFY" : "NO"}
               </span>
-              <span style={{ color: (robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket) && (side === "buy" ? (robinhoodChainWethReviewMarket ? robinhoodChainSwapSendGate?.send_enabled : robinhoodChainBuySendGate?.send_enabled) : robinhoodChainSendGate?.send_enabled) ? "#bbf7d0" : "#c4b5fd" }}>
+              <span style={{ color: (robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket) && (robinhoodChainWethReviewMarket ? robinhoodChainSwapSendGate?.send_enabled : side === "buy" ? robinhoodChainBuySendGate?.send_enabled : robinhoodChainSendGate?.send_enabled) ? "#bbf7d0" : "#c4b5fd" }}>
                 {robinhoodChainWethReviewMarket
                   ? robinhoodChainExecutionAuthorized
                     ? robinhoodChainSwapSendGate?.send_enabled
                       ? "PREPARATION VERIFIED · EXPLICIT WALLET GATE READY"
                       : "PREPARATION VERIFIED · WALLET GATE BLOCKED"
-                    : "R5C.4A PREPARATION AUTHORITY BLOCKED"
+                    : robinhoodChainNormalizedSide === "sell" ? "R5C.4B PREPARATION AUTHORITY BLOCKED" : "R5C.4A PREPARATION AUTHORITY BLOCKED"
                   : !robinhoodChainLegacyExecutionMarket
                     ? "R5C.2 EXECUTION LOCKED"
                     : (side === "buy" ? robinhoodChainBuySendGate?.send_enabled : robinhoodChainSendGate?.send_enabled)
@@ -11864,9 +11898,13 @@ async function submitLimitOrder() {
                     ? "Exact spend sends sellAmount to the provider. This mode is live verified for ETH→USDG and USDG→ETH."
                     : robinhoodChainWethReviewMarket
                       ? robinhoodChainExecutionAuthorized
-                        ? "R5C.4A preparation authority is verified at the persisted 1 USDG ceiling. Unsigned planning and finite-approval lifecycle preparation are enabled; live WETH execution is not verified."
+                        ? robinhoodChainNormalizedSide === "sell"
+                          ? "R5C.4B preparation authority is verified at the persisted 0.0001 WETH ceiling. Finite WETH approval preparation is enabled; successful WETH to USDG broadcast remains unauthorized."
+                          : "R5C.4A preparation authority is verified at the persisted 1 USDG ceiling. Unsigned planning and finite-approval lifecycle preparation are enabled; live WETH execution is not verified."
                         : robinhoodChainFirmPlanReviewEnabled
-                          ? "Bounded exact-spend indicative and unsigned-plan review are available. Execution preparation remains blocked until R5C.4A authority verification succeeds."
+                          ? robinhoodChainNormalizedSide === "sell"
+                            ? "Bounded exact-input indicative and unsigned-plan review are available. SELL preparation remains blocked until R5C.4B authority verification succeeds."
+                            : "Bounded exact-spend indicative and unsigned-plan review are available. Execution preparation remains blocked until R5C.4A authority verification succeeds."
                           : `Exact-spend indicative review is available. Unsigned firm-plan review remains disabled while firm_plan_status is ${robinhoodChainFirmPlanStatusLabel}; no wallet request can occur.`
                       : "The database capability is displayed, but ticket provider requests and execution remain disabled."}
                 >
@@ -12015,7 +12053,9 @@ async function submitLimitOrder() {
                 {!robinhoodChainLegacyExecutionMarket
                   ? robinhoodChainReviewQuoteMarket
                     ? robinhoodChainWethReviewMarket && robinhoodChainExecutionAuthorized
-                      ? `R5C.4A bounded preparation ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted ceiling is ${robinhoodChainExecutionCeilingAmount || "1"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"}; wallet handoff remains explicit and initial acceptance is wallet-reject only.`
+                      ? robinhoodChainNormalizedSide === "sell"
+                        ? `R5C.4B bounded preparation ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted ceiling is ${robinhoodChainExecutionCeilingAmount || "0.0001"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"}; the first finite approval wallet request must be rejected and successful broadcast is not authorized.`
+                        : `R5C.4A bounded preparation ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted ceiling is ${robinhoodChainExecutionCeilingAmount || "1"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"}; wallet handoff remains explicit and initial acceptance is wallet-reject only.`
                       : `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Probe amount is evidence and the synthetic-book seed; indicative quotes use the configured review ceiling and unsigned plans use a separate verified ceiling. Signing, approval, and execution remain locked.`
                     : robinhoodChainWrapUnwrapReview
                       ? `Mechanism-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"} review. Wrap/unwrap preview and transaction construction are not enabled in R5C.3A; no DEX price or stale limit is displayed.`
@@ -12185,7 +12225,7 @@ async function submitLimitOrder() {
               </div>
             )}
 
-            {side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && robinhoodChainSwapRow && (
+            {["buy", "sell"].includes(robinhoodChainNormalizedSide) && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && robinhoodChainSwapRow && (
               <div style={{
                 marginTop: 8,
                 padding: 10,
@@ -12196,8 +12236,8 @@ async function submitLimitOrder() {
                 fontSize: 10.5,
               }}>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", color: "#a5f3fc" }}>
-                  <b>{String(robinhoodChainSwapRow.to_asset || "").toUpperCase() === "WETH" ? "R5C.3C WETH EXACT-SPEND" : robinhoodChainSwapRow.approval_only ? "R5C.3B FINITE APPROVAL" : "R5B EXACT-SPEND EXECUTION"}</b>
-                  <span>FROM USDG ▸ TO {robinhoodChainSwapRow.to_native ? "NATIVE " : ""}{robinhoodChainSwapRow.to_asset || "OUTPUT"}</span>
+                  <b>{String(robinhoodChainSwapRow.tranche || "").toUpperCase() === "R5C.4B" ? "R5C.4B WETH SELL PREPARATION" : String(robinhoodChainSwapRow.to_asset || "").toUpperCase() === "WETH" ? "R5C.3C WETH EXACT-SPEND" : robinhoodChainSwapRow.approval_only ? "R5C.3B FINITE APPROVAL" : "R5B EXACT-SPEND EXECUTION"}</b>
+                  <span>FROM {robinhoodChainSwapRow.from_asset || "INPUT"} ▸ TO {robinhoodChainSwapRow.to_native ? "NATIVE " : ""}{robinhoodChainSwapRow.to_asset || "OUTPUT"}</span>
                   <span>STATUS {String(robinhoodChainSwapRow.status || "prepared").toUpperCase()}</span>
                   <span>AUTOMATIC SECOND TX <b>NO</b></span>
                 </div>
@@ -12209,7 +12249,7 @@ async function submitLimitOrder() {
                 )}
 
                 <div style={{ marginTop: 9, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
-                  <span style={safePill}>Exact spend: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.exact_input_amount} USDG</b></span>
+                  <span style={safePill}>Exact spend: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.exact_input_amount} {robinhoodChainSwapRow.from_asset || "INPUT"}</b></span>
                   <span style={safePill}>Expected: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.expected_output_amount} {robinhoodChainSwapRow.to_asset || "OUTPUT"}</b></span>
                   <span style={safePill}>Minimum: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.minimum_output_amount} {robinhoodChainSwapRow.to_asset || "OUTPUT"}</b></span>
                   <span style={safePill}>Slippage: <b>{Number(robinhoodChainSwapRow.slippage_bps || 0) / 100}%</b></span>
@@ -12233,7 +12273,7 @@ async function submitLimitOrder() {
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                     <b style={{ color: "#fde68a" }}>STAGE 1 · FINITE APPROVAL</b>
                     <span>Status: <b>{String(robinhoodChainSwapRow.approval_status || "prepared").toUpperCase()}</b></span>
-                    <span>Total allowance target: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.amount} USDG</b></span>
+                    <span>Total allowance target: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.amount} {robinhoodChainSwapRow.from_asset || "INPUT"}</b></span>
                     <span>Atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.amount_atomic}</b></span>
                     <span>Current atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.allowance?.current_atomic}</b></span>
                     <span>Shortfall atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.allowance?.shortfall_atomic}</b></span>
@@ -12265,7 +12305,7 @@ async function submitLimitOrder() {
                           checked={robinhoodChainSwapApprovalReviewed}
                           onChange={(event) => setRobinhoodChainSwapApprovalReviewed(event.target.checked)}
                         />
-                        <span>I reviewed the finite total allowance target of {robinhoodChainSwapRow.approval?.amount} USDG</span>
+                        <span>I reviewed the finite total allowance target of {robinhoodChainSwapRow.approval?.amount} {robinhoodChainSwapRow.from_asset || "INPUT"}</span>
                       </label>
                       <button
                         type="button"
@@ -12273,7 +12313,7 @@ async function submitLimitOrder() {
                         disabled={!canSendRobinhoodChainSwapApproval}
                         onClick={sendRobinhoodChainSwapApproval}
                       >
-                        {robinhoodChainSwapBusy ? "Working…" : `Approve ${robinhoodChainSwapRow.approval?.amount} USDG with MetaMask`}
+                        {robinhoodChainSwapBusy ? "Working…" : `Approve ${robinhoodChainSwapRow.approval?.amount} ${robinhoodChainSwapRow.from_asset || "INPUT"} with MetaMask`}
                       </button>
                       {!robinhoodChainSwapSendGate?.send_enabled && (
                         <span style={{ color: "#fde68a" }}>Missing: {(robinhoodChainSwapSendGate?.missing_requirements || []).join(", ") || "dedicated live gate"}</span>
@@ -12299,8 +12339,12 @@ async function submitLimitOrder() {
                     background: "linear-gradient(135deg, rgba(88, 28, 135, 0.22), rgba(8, 47, 73, 0.22))",
                     color: "#ddd6fe",
                   }}>
-                    <b>STAGE 2 · WETH SWAP LOCKED</b>
-                    <div style={{ marginTop: 5 }}>R5C.3B stops after finite USDG approval confirmation. No WETH swap preparation, send claim, MetaMask swap request, or automatic second transaction is available until R5C.3C.</div>
+                    <b>STAGE 2 · {String(robinhoodChainSwapRow.tranche || "").toUpperCase() === "R5C.4B" ? "WETH TO USDG BROADCAST LOCKED" : "WETH SWAP LOCKED"}</b>
+                    <div style={{ marginTop: 5 }}>
+                      {String(robinhoodChainSwapRow.tranche || "").toUpperCase() === "R5C.4B"
+                        ? "R5C.4B initial acceptance stops after the first explicit finite WETH approval wallet request is deliberately rejected. No swap preparation, swap send claim, MetaMask swap request, transaction hash, successful broadcast, or automatic second transaction is authorized."
+                        : "R5C.3B stops after finite USDG approval confirmation. No WETH swap preparation, send claim, MetaMask swap request, or automatic second transaction is available until R5C.3C."}
+                    </div>
                   </div>
                 ) : (
                 <div style={{
@@ -12323,7 +12367,7 @@ async function submitLimitOrder() {
                         disabled={!canPrepareRobinhoodChainFreshSwap}
                         onClick={prepareRobinhoodChainSwapFreshReview}
                       >
-                        {robinhoodChainSwapBusy ? "Preparing…" : `Prepare Fresh ${robinhoodChainSwapRow.exact_input_amount} USDG → ${robinhoodChainSwapRow.to_asset}`}
+                        {robinhoodChainSwapBusy ? "Preparing…" : `Prepare Fresh ${robinhoodChainSwapRow.exact_input_amount} ${robinhoodChainSwapRow.from_asset || "INPUT"} → ${robinhoodChainSwapRow.to_asset}`}
                       </button>
                       <span style={{ color: "#c4b5fd" }}>A fresh plan is mandatory after approval confirmation.</span>
                     </div>
@@ -12375,7 +12419,7 @@ async function submitLimitOrder() {
                   )}
                   {String(robinhoodChainSwapRow.status || "") === "confirmed" && robinhoodChainSwapRow.reconciliation && (
                     <div style={{ marginTop: 7, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
-                      <span style={safePill}>Actual spend: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_input_amount} USDG</b></span>
+                      <span style={safePill}>Actual spend: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_input_amount} {robinhoodChainSwapRow.from_asset || "INPUT"}</b></span>
                       <span style={safePill}>Actual output: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_output_amount} {robinhoodChainSwapRow.actual_output_asset || robinhoodChainSwapRow.to_asset}</b></span>
                       <span style={safePill}>Approval gas: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_approval_network_fee} ETH</b></span>
                       <span style={safePill}>Swap gas: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_network_fee} ETH</b></span>
@@ -13585,7 +13629,7 @@ async function submitLimitOrder() {
                   {robinhoodChainExecutionBusy ? "Preparing…" : `Prepare ${robinhoodChainCurrentExecutionAmount || "Custom"} ${robinhoodChainFromAsset || "Native"} Send`}
                 </button>
               )}
-              {robinhoodChainExecutionAdapter === "erc20_exact_input" && side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
+              {robinhoodChainExecutionAdapter === "erc20_exact_input" && ["buy", "sell"].includes(robinhoodChainNormalizedSide) && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
                 <button
                   type="button"
                   style={{
@@ -13607,7 +13651,7 @@ async function submitLimitOrder() {
                     : robinhoodChainSwapPrepared?.execution
                       ? "Refresh Exact-Spend Review"
                       : robinhoodChainFirmPlan?.approval_required
-                        ? `Prepare Finite ${String(robinhoodChainFirmPlan?.input_amount || totalQuote || "")} ${robinhoodChainFromAsset || "Input"} Approval`
+                        ? `Prepare Finite ${String(robinhoodChainFirmPlan?.input_amount || (robinhoodChainNormalizedSide === "sell" ? qty : totalQuote) || "")} ${robinhoodChainFromAsset || "Input"} Approval`
                         : "Prepare Allowance-Sufficient Review"}
                 </button>
               )}

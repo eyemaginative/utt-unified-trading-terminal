@@ -3384,6 +3384,12 @@ export default function OrderTicketWidget({
   const [robinhoodChainSlippageBps, setRobinhoodChainSlippageBps] = useState(100);
   const [robinhoodChainFirmPlanClock, setRobinhoodChainFirmPlanClock] = useState(0);
   const robinhoodChainFirmPlanReqRef = useRef(0);
+  const [robinhoodChainAutoPreparationPhase, setRobinhoodChainAutoPreparationPhase] = useState("idle");
+  const [robinhoodChainAutoPreparationDetail, setRobinhoodChainAutoPreparationDetail] = useState("");
+  const robinhoodChainAutoQuoteTimerRef = useRef(null);
+  const robinhoodChainAutoPlanTimerRef = useRef(null);
+  const robinhoodChainAutoQuoteAttemptKeyRef = useRef("");
+  const robinhoodChainAutoPlanAttemptKeyRef = useRef("");
   const robinhoodChainWalletReqRef = useRef(0);
   const robinhoodChainMetaMaskProviderRef = useRef(null);
   const [robinhoodChainWalletBusy, setRobinhoodChainWalletBusy] = useState(false);
@@ -3436,6 +3442,18 @@ export default function OrderTicketWidget({
     robinhoodChainReviewContextVersionRef.current += 1;
     robinhoodChainQuoteReqRef.current += 1;
     robinhoodChainFirmPlanReqRef.current += 1;
+    if (robinhoodChainAutoQuoteTimerRef.current !== null) {
+      window.clearTimeout(robinhoodChainAutoQuoteTimerRef.current);
+      robinhoodChainAutoQuoteTimerRef.current = null;
+    }
+    if (robinhoodChainAutoPlanTimerRef.current !== null) {
+      window.clearTimeout(robinhoodChainAutoPlanTimerRef.current);
+      robinhoodChainAutoPlanTimerRef.current = null;
+    }
+    robinhoodChainAutoQuoteAttemptKeyRef.current = "";
+    robinhoodChainAutoPlanAttemptKeyRef.current = "";
+    setRobinhoodChainAutoPreparationPhase("idle");
+    setRobinhoodChainAutoPreparationDetail("");
 
     setShowConfirm(false);
     setSubmitError(null);
@@ -3476,6 +3494,15 @@ export default function OrderTicketWidget({
   function robinhoodChainReviewContextIsCurrent(version) {
     return robinhoodChainReviewContextVersionRef.current === version;
   }
+
+  useEffect(() => () => {
+    if (robinhoodChainAutoQuoteTimerRef.current !== null) {
+      window.clearTimeout(robinhoodChainAutoQuoteTimerRef.current);
+    }
+    if (robinhoodChainAutoPlanTimerRef.current !== null) {
+      window.clearTimeout(robinhoodChainAutoPlanTimerRef.current);
+    }
+  }, []);
 
   function selectOrderSide(nextSide) {
     const normalized = String(nextSide || "").trim().toLowerCase() === "sell" ? "sell" : "buy";
@@ -3863,9 +3890,18 @@ export default function OrderTicketWidget({
       statusError = robinhoodChainQuoteError(error);
     }
 
-    const savedAddress = normalizeRobinhoodChainEvmAddress(status?.wallet?.address);
-    const savedWalletType = String(status?.wallet?.wallet_type || "MetaMask").trim() || "MetaMask";
-    const savedWalletLabel = String(status?.wallet?.label || "").trim();
+    // A transient quote-status timeout must not erase an already known saved
+    // wallet from local UI state. A successful status response remains
+    // authoritative, including an explicit wallet=null result.
+    const savedAddress = status
+      ? normalizeRobinhoodChainEvmAddress(status?.wallet?.address)
+      : normalizeRobinhoodChainEvmAddress(robinhoodChainWalletState.savedAddress);
+    const savedWalletType = status
+      ? String(status?.wallet?.wallet_type || "MetaMask").trim() || "MetaMask"
+      : String(robinhoodChainWalletState.savedWalletType || "MetaMask").trim() || "MetaMask";
+    const savedWalletLabel = status
+      ? String(status?.wallet?.label || "").trim()
+      : String(robinhoodChainWalletState.savedWalletLabel || "").trim();
     const provider = robinhoodChainMetaMaskProviderRef.current || getRobinhoodChainMetaMaskProvider();
     robinhoodChainMetaMaskProviderRef.current = provider;
 
@@ -4228,6 +4264,15 @@ export default function OrderTicketWidget({
     robinhoodChainSavedAddress &&
     robinhoodChainConnectedAddress === robinhoodChainSavedAddress
   );
+  const robinhoodChainSavedWalletBackendVerificationRequired = Boolean(
+    robinhoodChainWalletState.providerAvailable &&
+    robinhoodChainWalletConnected &&
+    robinhoodChainWalletOnExpectedChain &&
+    !robinhoodChainSavedAddress &&
+    robinhoodChainQuoteStatus?.wallet_configured !== false &&
+    robinhoodChainFirmPlan?.ok === true &&
+    normalizeRobinhoodChainEvmAddress(robinhoodChainFirmPlan?.unsigned_transaction_plan?.from) === robinhoodChainConnectedAddress
+  );
   const robinhoodChainWalletReady = Boolean(
     robinhoodChainWalletState.providerAvailable &&
     robinhoodChainWalletConnected &&
@@ -4242,7 +4287,7 @@ export default function OrderTicketWidget({
     robinhoodChainWalletState.providerAvailable &&
     robinhoodChainWalletConnected &&
     robinhoodChainWalletOnExpectedChain &&
-    (robinhoodChainWalletMatchesSaved || (robinhoodChainCapabilityFallbackActive && !robinhoodChainSavedAddress))
+    (robinhoodChainWalletMatchesSaved || robinhoodChainSavedWalletBackendVerificationRequired)
   );
 
   useEffect(() => {
@@ -7615,6 +7660,226 @@ export default function OrderTicketWidget({
     robinhoodChainFirmPlanAmountWithinCeiling
   );
 
+  const robinhoodChainAutoRequestedAmount = normalizeRobinhoodChainAmountText(
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
+      ? qty
+      : side === "buy"
+        ? totalQuote
+        : qty
+  );
+  const robinhoodChainAutoRequestedAmountNumber = Number(robinhoodChainAutoRequestedAmount);
+  const robinhoodChainAutoRequestedAmountValid = Boolean(
+    robinhoodChainAutoRequestedAmount &&
+    Number.isFinite(robinhoodChainAutoRequestedAmountNumber) &&
+    robinhoodChainAutoRequestedAmountNumber > 0
+  );
+  const robinhoodChainAutoQuoteCurrent = Boolean(
+    robinhoodChainQuote?.ok && !robinhoodChainQuoteStale
+  );
+  const robinhoodChainAutoPlanCurrent = Boolean(
+    robinhoodChainFirmPlan?.ok && !robinhoodChainFirmPlanStale
+  );
+  const robinhoodChainAutoQuoteEligible = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainReviewQuoteMarket &&
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
+    robinhoodChainQuoteReviewEnabled &&
+    robinhoodChainFirmPlanReviewEnabled &&
+    robinhoodChainFirmPlanAmountWithinCeiling &&
+    robinhoodChainAutoRequestedAmountValid &&
+    canSubmit &&
+    !robinhoodChainExecutionAuthorityLoading
+  );
+  const robinhoodChainAutoQuoteKey = [
+    normalizeRobinhoodChainQuoteSymbol(otSymbol),
+    robinhoodChainNormalizedSide,
+    robinhoodChainEffectiveAmountMode,
+    robinhoodChainAutoRequestedAmount,
+    String(robinhoodChainSlippageBps),
+    robinhoodChainExecutionAuthorityCapabilityKey,
+    robinhoodChainReviewTakerAddress,
+    apiBase,
+  ].join("|");
+  const robinhoodChainAutoPlanKey = [
+    robinhoodChainAutoQuoteKey,
+    robinhoodChainQuote?.fetched_at,
+    robinhoodChainQuote?.input_amount,
+    robinhoodChainQuote?.output_amount,
+    robinhoodChainQuote?.effective_price,
+  ].map((value) => String(value ?? "")).join("|");
+
+  useEffect(() => {
+    if (robinhoodChainAutoQuoteTimerRef.current !== null) {
+      window.clearTimeout(robinhoodChainAutoQuoteTimerRef.current);
+      robinhoodChainAutoQuoteTimerRef.current = null;
+    }
+
+    if (!robinhoodChainAutoQuoteEligible) {
+      if (!robinhoodChainAutoQuoteCurrent && !robinhoodChainQuoteLoading) {
+        setRobinhoodChainAutoPreparationPhase("idle");
+        setRobinhoodChainAutoPreparationDetail("");
+      }
+      return undefined;
+    }
+
+    if (robinhoodChainAutoQuoteCurrent || robinhoodChainQuoteLoading) {
+      return undefined;
+    }
+
+    if (robinhoodChainAutoQuoteAttemptKeyRef.current === robinhoodChainAutoQuoteKey) {
+      return undefined;
+    }
+
+    const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
+    setRobinhoodChainAutoPreparationPhase("quote_queued");
+    setRobinhoodChainAutoPreparationDetail("Waiting for the current ticket input to remain stable.");
+
+    robinhoodChainAutoQuoteTimerRef.current = window.setTimeout(() => {
+      robinhoodChainAutoQuoteTimerRef.current = null;
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
+      robinhoodChainAutoQuoteAttemptKeyRef.current = robinhoodChainAutoQuoteKey;
+      void requestRobinhoodChainQuote(false, {
+        automatic: true,
+        reviewContextVersion,
+      });
+    }, 450);
+
+    return () => {
+      if (robinhoodChainAutoQuoteTimerRef.current !== null) {
+        window.clearTimeout(robinhoodChainAutoQuoteTimerRef.current);
+        robinhoodChainAutoQuoteTimerRef.current = null;
+      }
+    };
+  }, [
+    robinhoodChainAutoQuoteEligible,
+    robinhoodChainAutoQuoteCurrent,
+    robinhoodChainQuoteLoading,
+    robinhoodChainAutoQuoteKey,
+  ]);
+
+  useEffect(() => {
+    if (robinhoodChainAutoPlanTimerRef.current !== null) {
+      window.clearTimeout(robinhoodChainAutoPlanTimerRef.current);
+      robinhoodChainAutoPlanTimerRef.current = null;
+    }
+
+    if (!robinhoodChainAutoQuoteCurrent) return undefined;
+
+    if (robinhoodChainAutoPlanCurrent) {
+      setRobinhoodChainAutoPreparationPhase("ready");
+      setRobinhoodChainAutoPreparationDetail("Current-context quote and unsigned plan are ready.");
+      return undefined;
+    }
+
+    if (!robinhoodChainReviewWalletReady) {
+      setRobinhoodChainAutoPreparationPhase("quote_ready");
+      setRobinhoodChainAutoPreparationDetail("Quote ready; a saved public wallet is required for unsigned planning.");
+      return undefined;
+    }
+
+    if (!canBuildRobinhoodChainFirmPlan || robinhoodChainFirmPlanLoading) {
+      return undefined;
+    }
+
+    if (robinhoodChainAutoPlanAttemptKeyRef.current === robinhoodChainAutoPlanKey) {
+      return undefined;
+    }
+
+    const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
+    setRobinhoodChainAutoPreparationPhase("plan_queued");
+    setRobinhoodChainAutoPreparationDetail("Quote ready; preparing the unsigned plan.");
+
+    robinhoodChainAutoPlanTimerRef.current = window.setTimeout(() => {
+      robinhoodChainAutoPlanTimerRef.current = null;
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
+      robinhoodChainAutoPlanAttemptKeyRef.current = robinhoodChainAutoPlanKey;
+      void requestRobinhoodChainFirmPlan({
+        automatic: true,
+        reviewContextVersion,
+      });
+    }, 75);
+
+    return () => {
+      if (robinhoodChainAutoPlanTimerRef.current !== null) {
+        window.clearTimeout(robinhoodChainAutoPlanTimerRef.current);
+        robinhoodChainAutoPlanTimerRef.current = null;
+      }
+    };
+  }, [
+    robinhoodChainAutoQuoteCurrent,
+    robinhoodChainAutoPlanCurrent,
+    robinhoodChainReviewWalletReady,
+    canBuildRobinhoodChainFirmPlan,
+    robinhoodChainFirmPlanLoading,
+    robinhoodChainAutoPlanKey,
+  ]);
+
+  const robinhoodChainAutoPreparationStatus = useMemo(() => {
+    if (!isRobinhoodChainVenue) return null;
+
+    if (robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE) {
+      return { label: "AUTO PREP BLOCKED", color: "#fda4af", detail: "Exact receive remains blocked before provider contact." };
+    }
+    if (!robinhoodChainReviewQuoteMarket || !robinhoodChainQuoteReviewEnabled || !robinhoodChainFirmPlanReviewEnabled) {
+      return { label: "AUTO PREP UNAVAILABLE", color: "#c4b5fd", detail: "This route is not enabled for the paired quote and unsigned-plan workflow." };
+    }
+    if (!robinhoodChainAutoRequestedAmountValid) {
+      return { label: "AUTO PREP WAITING", color: "#fde68a", detail: "Enter a valid exact-spend amount." };
+    }
+    if (!robinhoodChainFirmPlanAmountWithinCeiling) {
+      return { label: "AUTO PREP HELD", color: "#fda4af", detail: `Amount exceeds the verified ${robinhoodChainFirmPlanCeilingLabel} firm-plan ceiling.` };
+    }
+    if (!canSubmit) {
+      return { label: "AUTO PREP HELD", color: "#fda4af", detail: "Current balance, market, or ticket validation blocks preparation." };
+    }
+    if (robinhoodChainQuoteLoading || robinhoodChainAutoPreparationPhase === "quoting") {
+      return { label: "AUTO QUOTE…", color: "#67e8f9", detail: "Preparing a non-mutating indicative quote." };
+    }
+    if (robinhoodChainFirmPlanLoading || robinhoodChainAutoPreparationPhase === "planning") {
+      return { label: "AUTO PLAN…", color: "#c4b5fd", detail: "Preparing a non-mutating unsigned plan." };
+    }
+    if (robinhoodChainAutoPlanCurrent) {
+      return { label: "AUTO PREP READY", color: "#86efac", detail: "Current-context quote and unsigned plan are ready." };
+    }
+    if (robinhoodChainQuoteErrorText && robinhoodChainAutoQuoteAttemptKeyRef.current === robinhoodChainAutoQuoteKey) {
+      return { label: "AUTO QUOTE NEEDS REVIEW", color: "#fda4af", detail: robinhoodChainQuoteErrorText };
+    }
+    if (robinhoodChainFirmPlanErrorText && robinhoodChainAutoPlanAttemptKeyRef.current === robinhoodChainAutoPlanKey) {
+      return { label: "AUTO PLAN NEEDS REVIEW", color: "#fda4af", detail: robinhoodChainFirmPlanErrorText };
+    }
+    if (robinhoodChainAutoQuoteCurrent && !robinhoodChainReviewWalletReady) {
+      return { label: "QUOTE READY · PLAN NEEDS WALLET", color: "#fde68a", detail: "Save or connect a public wallet to prepare the unsigned plan." };
+    }
+    if (robinhoodChainAutoPreparationPhase === "quote_queued") {
+      return { label: "AUTO QUOTE QUEUED", color: "#67e8f9", detail: robinhoodChainAutoPreparationDetail };
+    }
+    if (robinhoodChainAutoPreparationPhase === "plan_queued" || robinhoodChainAutoQuoteCurrent) {
+      return { label: "AUTO PLAN QUEUED", color: "#c4b5fd", detail: robinhoodChainAutoPreparationDetail || "Quote ready; preparing the unsigned plan." };
+    }
+    return { label: "AUTO PREP ARMED", color: "#67e8f9", detail: "A stable valid amount will trigger quote and unsigned-plan preparation." };
+  }, [
+    isRobinhoodChainVenue,
+    robinhoodChainEffectiveAmountMode,
+    robinhoodChainReviewQuoteMarket,
+    robinhoodChainQuoteReviewEnabled,
+    robinhoodChainFirmPlanReviewEnabled,
+    robinhoodChainAutoRequestedAmountValid,
+    robinhoodChainFirmPlanAmountWithinCeiling,
+    robinhoodChainFirmPlanCeilingLabel,
+    canSubmit,
+    robinhoodChainQuoteLoading,
+    robinhoodChainFirmPlanLoading,
+    robinhoodChainAutoPreparationPhase,
+    robinhoodChainAutoPreparationDetail,
+    robinhoodChainAutoPlanCurrent,
+    robinhoodChainAutoQuoteCurrent,
+    robinhoodChainReviewWalletReady,
+    robinhoodChainQuoteErrorText,
+    robinhoodChainFirmPlanErrorText,
+    robinhoodChainAutoQuoteKey,
+    robinhoodChainAutoPlanKey,
+  ]);
+
 
   const robinhoodChainCurrentExecutionAmount = normalizeRobinhoodChainAmountText(qty);
   const robinhoodChainCurrentExecutionAmountWei = robinhoodChainDecimalToAtomic(
@@ -8996,21 +9261,24 @@ async function submitLimitOrder() {
   }
 }
 
-  async function requestRobinhoodChainQuote(forceRefresh = true) {
-    if (!isRobinhoodChainVenue || robinhoodChainQuoteLoading) return;
+  async function requestRobinhoodChainQuote(
+    forceRefresh = true,
+    { automatic = false, reviewContextVersion = robinhoodChainReviewContextVersionRef.current } = {}
+  ) {
+    if (!isRobinhoodChainVenue || robinhoodChainQuoteLoading) return null;
     const symbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
     if (!robinhoodChainReviewQuoteMarket) {
       const msg = "This Robinhood Chain market is not enabled for ticket quote review.";
       setRobinhoodChainQuoteErrorText(msg);
-      onToast?.({ kind: "warn", msg });
-      return;
+      if (!automatic) onToast?.({ kind: "warn", msg });
+      return null;
     }
 
     if (!robinhoodChainQuoteReviewEnabled) {
       const msg = robinhoodChainSelectedCapability?.reason || "This Robinhood Chain route and amount mode is blocked before provider contact.";
       setRobinhoodChainQuoteErrorText(msg);
-      onToast?.({ kind: "warn", msg });
-      return;
+      if (!automatic) onToast?.({ kind: "warn", msg });
+      return null;
     }
 
     const exactReceive = side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE;
@@ -9022,11 +9290,19 @@ async function submitLimitOrder() {
           : `Enter the ${robinhoodChainFromAsset || "input asset"} amount to spend before requesting the quote.`
         : `Enter the ${robinhoodChainFromAsset || "input asset"} quantity to spend before requesting the quote.`;
       setRobinhoodChainQuoteErrorText(msg);
-      onToast?.({ kind: "warn", msg });
-      return;
+      if (!automatic) onToast?.({ kind: "warn", msg });
+      return null;
     }
 
     const reqId = ++robinhoodChainQuoteReqRef.current;
+    if (robinhoodChainAutoQuoteKey) {
+      robinhoodChainAutoQuoteAttemptKeyRef.current = robinhoodChainAutoQuoteKey;
+    }
+    if (robinhoodChainAutoPlanTimerRef.current !== null) {
+      window.clearTimeout(robinhoodChainAutoPlanTimerRef.current);
+      robinhoodChainAutoPlanTimerRef.current = null;
+    }
+    robinhoodChainAutoPlanAttemptKeyRef.current = "";
     setRobinhoodChainQuoteLoading(true);
     setRobinhoodChainQuoteErrorText("");
     robinhoodChainFirmPlanReqRef.current += 1;
@@ -9035,6 +9311,10 @@ async function submitLimitOrder() {
     setRobinhoodChainFirmPlanLoading(false);
     setSubmitError(null);
     setSubmitOk(null);
+    if (automatic) {
+      setRobinhoodChainAutoPreparationPhase("quoting");
+      setRobinhoodChainAutoPreparationDetail("Preparing a non-mutating indicative quote.");
+    }
 
     try {
       const data = await getRobinhoodChainIndicativeQuote(
@@ -9053,7 +9333,10 @@ async function submitLimitOrder() {
         },
         { apiBase, timeout_ms: 30000 }
       );
-      if (robinhoodChainQuoteReqRef.current !== reqId) return;
+      if (
+        robinhoodChainQuoteReqRef.current !== reqId ||
+        !robinhoodChainReviewContextIsCurrent(reviewContextVersion)
+      ) return null;
       if (!data?.ok) throw new Error(data?.error || "Robinhood Chain quote returned ok=false.");
 
       setRobinhoodChainQuote(data);
@@ -9082,22 +9365,41 @@ async function submitLimitOrder() {
         side,
         fetched_at: data?.fetched_at || null,
       });
+      if (automatic) {
+        setRobinhoodChainAutoPreparationPhase("quote_ready");
+        setRobinhoodChainAutoPreparationDetail("Indicative quote ready; unsigned planning will follow when eligible.");
+      }
+      return data;
     } catch (error) {
-      if (robinhoodChainQuoteReqRef.current !== reqId) return;
+      if (
+        robinhoodChainQuoteReqRef.current !== reqId ||
+        !robinhoodChainReviewContextIsCurrent(reviewContextVersion)
+      ) return null;
       const msg = robinhoodChainQuoteError(error);
       setRobinhoodChainQuote(null);
       setRobinhoodChainQuoteErrorText(msg);
       setSubmitError(msg);
-      onToast?.({ kind: "warn", msg });
+      if (automatic) {
+        setRobinhoodChainAutoPreparationPhase("quote_error");
+        setRobinhoodChainAutoPreparationDetail(msg);
+      } else {
+        onToast?.({ kind: "warn", msg });
+      }
+      return null;
     } finally {
-      if (robinhoodChainQuoteReqRef.current === reqId) {
+      if (
+        robinhoodChainQuoteReqRef.current === reqId &&
+        robinhoodChainReviewContextIsCurrent(reviewContextVersion)
+      ) {
         setRobinhoodChainQuoteLoading(false);
       }
     }
   }
 
-  async function requestRobinhoodChainFirmPlan() {
-    if (!isRobinhoodChainVenue || robinhoodChainFirmPlanLoading) return;
+  async function requestRobinhoodChainFirmPlan(
+    { automatic = false, reviewContextVersion = robinhoodChainReviewContextVersionRef.current } = {}
+  ) {
+    if (!isRobinhoodChainVenue || robinhoodChainFirmPlanLoading) return null;
     if (!canBuildRobinhoodChainFirmPlan) {
       const msg = !robinhoodChainReviewTakerAddress
         ? "Save an ALL / robinhood_chain public wallet address before building an unsigned review plan."
@@ -9107,13 +9409,20 @@ async function submitLimitOrder() {
             ? `The indicative quote is available, but unsigned planning is capped at ${robinhoodChainFirmPlanInputCeilingValue ?? "the verified amount"} ${robinhoodChainFromAsset || "input asset"}.`
             : `Request a fresh indicative quote for the current ${normalizeRobinhoodChainQuoteSymbol(otSymbol)} input before building an unsigned firm plan.`;
       setRobinhoodChainFirmPlanErrorText(msg);
-      onToast?.({ kind: "warn", msg });
-      return;
+      if (!automatic) onToast?.({ kind: "warn", msg });
+      return null;
     }
 
     const reqId = ++robinhoodChainFirmPlanReqRef.current;
+    if (robinhoodChainAutoPlanKey) {
+      robinhoodChainAutoPlanAttemptKeyRef.current = robinhoodChainAutoPlanKey;
+    }
     setRobinhoodChainFirmPlanLoading(true);
     setRobinhoodChainFirmPlanErrorText("");
+    if (automatic) {
+      setRobinhoodChainAutoPreparationPhase("planning");
+      setRobinhoodChainAutoPreparationDetail("Preparing a non-mutating unsigned plan.");
+    }
     try {
       const data = await getRobinhoodChainFirmQuotePlan(
         {
@@ -9136,23 +9445,44 @@ async function submitLimitOrder() {
         },
         { apiBase, timeout_ms: 30000 }
       );
-      if (robinhoodChainFirmPlanReqRef.current !== reqId) return;
+      if (
+        robinhoodChainFirmPlanReqRef.current !== reqId ||
+        !robinhoodChainReviewContextIsCurrent(reviewContextVersion)
+      ) return null;
       if (!data?.ok) throw new Error(data?.error || "Robinhood Chain firm plan returned ok=false.");
       setRobinhoodChainFirmPlan(data);
-      onToast?.({
-        kind: data?.approval_required ? "warn" : "ok",
-        msg: data?.approval_required
-          ? `Unsigned ${String(data?.symbol || otSymbol)} plan is review-only. A separate ${String(data?.input_asset || "token")} approval would be required before a later execution tranche.`
-          : "Unsigned Robinhood Chain plan ready for review. No wallet prompt, signature, or broadcast occurred.",
-      });
+      if (automatic) {
+        setRobinhoodChainAutoPreparationPhase("ready");
+        setRobinhoodChainAutoPreparationDetail("Current-context quote and unsigned plan are ready.");
+      } else {
+        onToast?.({
+          kind: data?.approval_required ? "warn" : "ok",
+          msg: data?.approval_required
+            ? `Unsigned ${String(data?.symbol || otSymbol)} plan is review-only. A separate ${String(data?.input_asset || "token")} approval would be required before a later execution tranche.`
+            : "Unsigned Robinhood Chain plan ready for review. No wallet prompt, signature, or broadcast occurred.",
+        });
+      }
+      return data;
     } catch (error) {
-      if (robinhoodChainFirmPlanReqRef.current !== reqId) return;
+      if (
+        robinhoodChainFirmPlanReqRef.current !== reqId ||
+        !robinhoodChainReviewContextIsCurrent(reviewContextVersion)
+      ) return null;
       const msg = robinhoodChainQuoteError(error);
       setRobinhoodChainFirmPlan(null);
       setRobinhoodChainFirmPlanErrorText(msg);
-      onToast?.({ kind: "warn", msg });
+      if (automatic) {
+        setRobinhoodChainAutoPreparationPhase("plan_error");
+        setRobinhoodChainAutoPreparationDetail(msg);
+      } else {
+        onToast?.({ kind: "warn", msg });
+      }
+      return null;
     } finally {
-      if (robinhoodChainFirmPlanReqRef.current === reqId) {
+      if (
+        robinhoodChainFirmPlanReqRef.current === reqId &&
+        robinhoodChainReviewContextIsCurrent(reviewContextVersion)
+      ) {
         setRobinhoodChainFirmPlanLoading(false);
       }
     }
@@ -11884,8 +12214,8 @@ async function submitLimitOrder() {
               <span style={{ color: robinhoodChainWalletOnExpectedChain ? "#bbf7d0" : "#fde68a" }}>
                 Chain {robinhoodChainWalletOnExpectedChain ? "4663" : robinhoodChainWalletState.chainId || "—"}
               </span>
-              <span style={{ color: robinhoodChainWalletMatchesSaved ? "#bbf7d0" : robinhoodChainCapabilityFallbackActive && !robinhoodChainSavedAddress ? "#67e8f9" : "#fde68a" }}>
-                Saved match {robinhoodChainWalletMatchesSaved ? "YES" : robinhoodChainCapabilityFallbackActive && !robinhoodChainSavedAddress ? "BACKEND VERIFY" : "NO"}
+              <span style={{ color: robinhoodChainWalletMatchesSaved ? "#bbf7d0" : robinhoodChainSavedWalletBackendVerificationRequired ? "#67e8f9" : "#fde68a" }}>
+                Saved match {robinhoodChainWalletMatchesSaved ? "YES" : robinhoodChainSavedWalletBackendVerificationRequired ? "BACKEND VERIFY" : "NO"}
               </span>
               <span style={{ color: (robinhoodChainLegacyExecutionMarket || robinhoodChainWethReviewMarket) && (robinhoodChainWethReviewMarket ? robinhoodChainSwapSendGate?.send_enabled : side === "buy" ? robinhoodChainBuySendGate?.send_enabled : robinhoodChainSendGate?.send_enabled) ? "#bbf7d0" : "#c4b5fd" }}>
                 {robinhoodChainWethReviewMarket
@@ -11923,9 +12253,25 @@ async function submitLimitOrder() {
               <span style={{ color: "#c4b5fd" }}>
                 {robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE ? "Exact receive" : "Exact spend"}
               </span>
-              <span style={{ color: robinhoodChainWalletReady ? "#bbf7d0" : "#fde68a", fontWeight: 900 }}>
-                Wallet {robinhoodChainWalletReady ? "READY" : "ACTION REQUIRED"}
+              <span style={{ color: robinhoodChainWalletReady ? "#bbf7d0" : robinhoodChainSavedWalletBackendVerificationRequired ? "#67e8f9" : "#fde68a", fontWeight: 900 }}>
+                Wallet {robinhoodChainWalletReady ? "READY" : robinhoodChainSavedWalletBackendVerificationRequired ? "BACKEND VERIFY" : "ACTION REQUIRED"}
               </span>
+              {robinhoodChainAutoPreparationStatus && (
+                <span
+                  data-rh-ui-norm="auto-preparation-status"
+                  style={{
+                    padding: "3px 6px",
+                    borderRadius: 999,
+                    border: `1px solid ${robinhoodChainAutoPreparationStatus.color}55`,
+                    background: `${robinhoodChainAutoPreparationStatus.color}12`,
+                    color: robinhoodChainAutoPreparationStatus.color,
+                    fontWeight: 900,
+                  }}
+                  title={robinhoodChainAutoPreparationStatus.detail}
+                >
+                  {robinhoodChainAutoPreparationStatus.label}
+                </span>
+              )}
               <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={connectRobinhoodChainMetaMask}>
                 {robinhoodChainWalletConnected ? "Reconnect" : "Connect"}
               </button>
@@ -12141,9 +12487,9 @@ async function submitLimitOrder() {
             {!robinhoodChainWalletError && robinhoodChainWalletNotice && (
               <div style={{ marginTop: 5, color: "#a5f3fc", fontSize: 10.5 }}>{robinhoodChainWalletNotice}</div>
             )}
-            {robinhoodChainCapabilityFallbackActive && robinhoodChainWalletConnected && !robinhoodChainSavedAddress && (
+            {robinhoodChainSavedWalletBackendVerificationRequired && (
               <div style={{ marginTop: 5, color: "#67e8f9", fontSize: 10.5 }}>
-                Quote-status lookup is retrying. The TokenRegistry/database market catalog remains available, and the backend will verify the saved wallet before returning any firm plan or R5B lifecycle record.
+                Quote-status wallet identity is temporarily unavailable. The current unsigned plan matches the connected account; explicit lifecycle preparation will ask the backend to verify that account against the saved Robinhood Chain wallet. No wallet transaction is requested.
               </div>
             )}
             {!robinhoodChainWalletMatchesSaved && robinhoodChainWalletConnected && robinhoodChainSavedAddress && (

@@ -3004,6 +3004,7 @@ const LS_OT_LOCK = "utt_ot_lock_v2";
 // Back-compat storage keys (Total was originally "USD sizing")
 const LS_OT_TOTAL_USD = "utt_ot_total_usd_v1";
 const LS_OT_AUTOQTY = "utt_ot_autoqty_v1";
+const LS_OT_AUTOCALC_AUTHORITY = "utt_ot_autocalc_authority_v1";
 
 // ─────────────────────────────────────────────────────────────
 // Safe environment helpers (prevents “blank UI” from storage/window issues)
@@ -4332,14 +4333,17 @@ export default function OrderTicketWidget({
       if (robinhoodChainTicketFieldsUnavailable) {
         limitEditingRef.current = false;
         limitSourceRef.current = "robinhood_chain_review_unavailable";
-        lastEditedRef.current = "total";
+        markAutoCalcAuthority("total");
         setQty("");
         setLimitPrice("");
         setTotalQuote("");
       } else if (String(side || "").toLowerCase() === "buy") {
+        markAutoCalcAuthority("total");
         setRobinhoodChainSlippageBps(100);
         if (!String(totalQuote || "").trim()) setTotalQuote("1");
         setQty("");
+      } else {
+        markAutoCalcAuthority("qty");
       }
     }
     setSubmitOk((current) => (current?.quote_only ? null : current));
@@ -4642,12 +4646,21 @@ export default function OrderTicketWidget({
   // ─────────────────────────────────────────────────────────────
   const [totalQuote, setTotalQuote] = useState(() => lsGet(LS_OT_TOTAL_USD, "") || "");
   const [autoCalc, setAutoCalc] = useState(() => lsGet(LS_OT_AUTOQTY, "1") !== "0");
+  const [autoCalcAuthority, setAutoCalcAuthority] = useState(() =>
+    lsGet(LS_OT_AUTOCALC_AUTHORITY, "total") === "qty" ? "qty" : "total"
+  );
 
-  const lastEditedRef = useRef("total"); // "total" | "qty"
   const autoCalcWriteGuardRef = useRef({ qty: null, total: null });
+
+  function markAutoCalcAuthority(field) {
+    const nextAuthority = field === "qty" ? "qty" : "total";
+    autoCalcWriteGuardRef.current[nextAuthority === "qty" ? "total" : "qty"] = null;
+    setAutoCalcAuthority(nextAuthority);
+  }
 
   useEffect(() => lsSet(LS_OT_TOTAL_USD, String(totalQuote ?? "")), [totalQuote]);
   useEffect(() => lsSet(LS_OT_AUTOQTY, autoCalc ? "1" : "0"), [autoCalc]);
+  useEffect(() => lsSet(LS_OT_AUTOCALC_AUTHORITY, autoCalcAuthority), [autoCalcAuthority]);
 
   useEffect(() => lsSet(LS_OT_LOCK, "0"), []);
   useEffect(() => lsSet(LS_OT_BOX, JSON.stringify(box)), [box]);
@@ -6887,45 +6900,87 @@ export default function OrderTicketWidget({
     return counterpartySelectedDispenserPrice <= pxNum + 1e-18;
   }, [isCounterpartyDispenserMode, counterpartySelectedDispenserPrice, pxNum]);
 
-  useEffect(() => {
-    if (robinhoodChainTicketFieldsUnavailable) return;
-    if (!autoCalc) return;
+  const robinhoodChainSellTotalAuthorityLocksQuotePair = Boolean(
+    isRobinhoodChainVenue &&
+    String(side || "").toLowerCase() === "sell" &&
+    autoCalc &&
+    autoCalcAuthority === "total"
+  );
+  const robinhoodChainPreserveSellTotalField = Boolean(
+    isRobinhoodChainVenue &&
+    String(side || "").toLowerCase() === "sell" &&
+    (!autoCalc || autoCalcAuthority === "total")
+  );
 
-    if (lastEditedRef.current !== "qty" && lastEditedRef.current !== "total") lastEditedRef.current = "total";
-    const mode = lastEditedRef.current;
+  useEffect(() => {
+    if (robinhoodChainTicketFieldsUnavailable || !autoCalc) return;
+
+    const mode = autoCalcAuthority === "qty" ? "qty" : "total";
 
     if (mode === "total") {
-      if (qtyFromTotal === null) return;
+      const authorityText = String(totalQuote ?? "").trim();
+      const authorityInvalid = authorityText !== "" && totalQuoteNum === null;
+
+      if (authorityText === "" || authorityInvalid) {
+        if (String(qty ?? "") !== "" && autoCalcWriteGuardRef.current.qty !== "") {
+          autoCalcWriteGuardRef.current.qty = "";
+          setQty("");
+        }
+        return;
+      }
+
+      // Keep the last manual Total intact until a usable Limit exists.
+      if (pxNum === null || qtyFromTotal === null) return;
+
       const maxFrac = Number.isFinite(Number(rules?.qty_decimals))
         ? Math.min(Math.max(Math.trunc(Number(rules.qty_decimals)), 0), 18)
         : 18;
       const nextQty = fmtPlain(qtyFromTotal, { maxFrac });
       if (!nextQty) return;
 
-      if (String(nextQty) !== String(qty ?? "")) {
-        if (autoCalcWriteGuardRef.current.qty !== nextQty) {
-          autoCalcWriteGuardRef.current.qty = nextQty;
-          setQty(nextQty);
-        }
+      if (String(nextQty) !== String(qty ?? "") && autoCalcWriteGuardRef.current.qty !== nextQty) {
+        autoCalcWriteGuardRef.current.qty = nextQty;
+        setQty(nextQty);
       }
       return;
     }
 
-    if (mode === "qty") {
-      if (totalFromQty === null) return;
+    const authorityText = String(qty ?? "").trim();
+    const authorityInvalid = authorityText !== "" && qtyNum === null;
 
-      const nextTotal = fmtPlain(totalFromQty, { maxFrac: totalQuoteDecimals });
-      if (!nextTotal) return;
-
-      if (String(nextTotal) !== String(totalQuote ?? "")) {
-        if (autoCalcWriteGuardRef.current.total !== nextTotal) {
-          autoCalcWriteGuardRef.current.total = nextTotal;
-          setTotalQuote(nextTotal);
-        }
+    if (authorityText === "" || authorityInvalid) {
+      if (String(totalQuote ?? "") !== "" && autoCalcWriteGuardRef.current.total !== "") {
+        autoCalcWriteGuardRef.current.total = "";
+        setTotalQuote("");
       }
+      return;
+    }
+
+    // Keep the last manual Quantity intact until a usable Limit exists.
+    if (pxNum === null || totalFromQty === null) return;
+
+    const nextTotal = fmtPlain(totalFromQty, { maxFrac: totalQuoteDecimals });
+    if (!nextTotal) return;
+
+    if (String(nextTotal) !== String(totalQuote ?? "") && autoCalcWriteGuardRef.current.total !== nextTotal) {
+      autoCalcWriteGuardRef.current.total = nextTotal;
+      setTotalQuote(nextTotal);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoCalc, qtyFromTotal, totalFromQty, totalQuoteDecimals, pxNum, rules, robinhoodChainTicketFieldsUnavailable, qty]);
+  }, [
+    autoCalc,
+    autoCalcAuthority,
+    qtyFromTotal,
+    totalFromQty,
+    totalQuoteDecimals,
+    pxNum,
+    qtyNum,
+    totalQuoteNum,
+    rules,
+    robinhoodChainTicketFieldsUnavailable,
+    qty,
+    totalQuote,
+  ]);
 
   useEffect(() => {
     autoCalcWriteGuardRef.current.qty = null;
@@ -9416,7 +9471,10 @@ async function submitLimitOrder() {
       const price = String(data?.effective_price || "").trim();
       const baseQuantity = String(data?.base_quantity || "").trim();
       const quoteQuantity = String(data?.quote_quantity || "").trim();
-      if (price) {
+      const preserveSellTotalAuthorityPair = Boolean(
+        robinhoodChainSellTotalAuthorityLocksQuotePair && pxNum !== null
+      );
+      if (price && !preserveSellTotalAuthorityPair) {
         limitSourceRef.current = "robinhood_chain_quote";
         setLimitPrice(price);
       }
@@ -9428,7 +9486,7 @@ async function submitLimitOrder() {
           if (baseQuantity) setQty(baseQuantity);
           if (data?.input_amount) setTotalQuote(String(data.input_amount));
         }
-      } else if (quoteQuantity) {
+      } else if (quoteQuantity && !robinhoodChainPreserveSellTotalField) {
         setTotalQuote(quoteQuantity);
       }
       setSubmitOk({
@@ -13342,7 +13400,7 @@ async function submitLimitOrder() {
                   ? `Custom ${robinhoodChainToAsset || robinhoodChainFromAsset || "asset"} quantity. Auto-calc may update it when enabled; turn Auto-calc off to keep manual values unchanged.`
                   : "Order quantity"}
               onChange={(e) => {
-                lastEditedRef.current = "qty";
+                markAutoCalcAuthority("qty");
                 if (isRobinhoodChainVenue) invalidateRobinhoodChainCurrentReview("quantity_changed");
                 setQty(sanitizeDecimalInput(e.target.value));
               }}
@@ -13445,23 +13503,10 @@ async function submitLimitOrder() {
                 : totalLabel}
               disabled={robinhoodChainTicketFieldsUnavailable}
               onChange={(e) => {
-                lastEditedRef.current = "total";
+                markAutoCalcAuthority("total");
                 const cleaned = sanitizeDecimalInput(e.target.value);
                 if (isRobinhoodChainVenue) invalidateRobinhoodChainCurrentReview("total_changed");
                 setTotalQuote(cleaned);
-
-                // DEX / Robinhood Chain quote-only: keep Total→Qty responsive when rules are local.
-                if ((isDexSwapVenue || isRobinhoodChainVenue) && autoCalc) {
-                  const t = Number(cleaned);
-                  const p = Number(expandExponential(limitPrice));
-                  if (Number.isFinite(t) && t > 0 && Number.isFinite(p) && p > 0) {
-                    const raw = t / p;
-                    if (Number.isFinite(raw) && raw > 0) {
-                      const nextQty = fmtPlain(raw, { maxFrac: 18 });
-                      if (nextQty) setQty(nextQty);
-                    }
-                  }
-                }
               }}
               inputMode="decimal"
             />
@@ -13492,6 +13537,31 @@ async function submitLimitOrder() {
                 : "Quote unavailable"
               : "Auto-calc"}</span>
           </label>
+
+          {isRobinhoodChainVenue && !robinhoodChainTicketFieldsUnavailable && (
+            <div
+              data-rh-ui-norm="editable-pair-authority"
+              data-auto-calc-enabled={autoCalc ? "true" : "false"}
+              data-auto-calc-authority={autoCalcAuthority}
+              style={{
+                ...safePill,
+                fontSize: 11,
+                color: autoCalc ? "#a5f3fc" : "#d4d4d8",
+                borderColor: autoCalc ? "rgba(34, 211, 238, 0.34)" : "rgba(161, 161, 170, 0.28)",
+              }}
+              title={autoCalc
+                ? autoCalcAuthority === "total" && String(side || "").toLowerCase() === "sell"
+                  ? "Last manual edit: Total. Quantity is derived from the displayed Limit. A provider quote may report a different actual output, but it cannot overwrite the manual Total target or feed its own price back into another automatic quote."
+                  : `Last manual edit: ${autoCalcAuthority === "qty" ? "Quantity" : "Total"}. Only the paired field is derived from Limit.`
+                : `Auto-calc is off. Quantity and Total remain independent. Last manual edit: ${autoCalcAuthority === "qty" ? "Quantity" : "Total"}.`}
+            >
+              {autoCalc
+                ? autoCalcAuthority === "qty"
+                  ? "Quantity → Total"
+                  : "Total → Quantity"
+                : `Manual independent · last ${autoCalcAuthority === "qty" ? "Quantity" : "Total"}`}
+            </div>
+          )}
         </div>
 
         <div style={{ ...rowTightStyle, marginTop: sectionGap }}>

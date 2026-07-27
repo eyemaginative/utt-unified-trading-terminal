@@ -11902,6 +11902,63 @@ async function submitLimitOrder() {
               </span>
             </div>
 
+            <div
+              data-rh-ui-norm="compact-status"
+              style={{
+                marginTop: 7,
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                flexWrap: "wrap",
+                padding: "6px 7px",
+                borderRadius: 8,
+                border: "1px solid rgba(34, 211, 238, 0.20)",
+                background: "rgba(2, 6, 23, 0.26)",
+                fontSize: 10.5,
+              }}
+            >
+              <b style={{ color: "#a5f3fc" }}>
+                {robinhoodChainPair.symbol || "—"} · {robinhoodChainFromAsset || "?"} ▸ {robinhoodChainToAsset || "?"}
+              </b>
+              <span style={{ color: "#c4b5fd" }}>
+                {robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE ? "Exact receive" : "Exact spend"}
+              </span>
+              <span style={{ color: robinhoodChainWalletReady ? "#bbf7d0" : "#fde68a", fontWeight: 900 }}>
+                Wallet {robinhoodChainWalletReady ? "READY" : "ACTION REQUIRED"}
+              </span>
+              <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={connectRobinhoodChainMetaMask}>
+                {robinhoodChainWalletConnected ? "Reconnect" : "Connect"}
+              </button>
+              <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={refreshRobinhoodChainMetaMask}>
+                Refresh
+              </button>
+              {!robinhoodChainWalletOnExpectedChain && (
+                <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={switchRobinhoodChainMetaMaskNetwork}>
+                  Switch / Add Chain
+                </button>
+              )}
+              {robinhoodChainWalletConnected && (
+                <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={disconnectRobinhoodChainWalletFromUtt} title="Clear UTT local state only; MetaMask itself remains unlocked and authorized according to its own settings.">
+                  Disconnect UTT
+                </button>
+              )}
+            </div>
+
+            <details
+              data-rh-ui-norm="advanced-diagnostics"
+              style={{
+                marginTop: 7,
+                padding: "6px 7px",
+                borderRadius: 8,
+                border: "1px solid rgba(192, 132, 252, 0.22)",
+                background: "rgba(15, 23, 42, 0.26)",
+              }}
+            >
+              <summary style={{ cursor: "pointer", color: "#ddd6fe", fontSize: 10.5, fontWeight: 900 }}>
+                Advanced Robinhood Chain diagnostics
+                <span style={{ marginLeft: 7, color: "#94a3b8", fontWeight: 700 }}>registry · routes · provider · wallet</span>
+              </summary>
+              <div style={{ marginTop: 7 }}>
             <div style={{ marginTop: 7, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", fontSize: 9.75 }}>
               <span style={{ padding: "3px 6px", borderRadius: 999, border: "1px solid rgba(34,211,238,0.45)", background: "rgba(8,145,178,0.12)", color: "#a5f3fc", fontWeight: 900 }}>MARKET {robinhoodChainPair.symbol || "—"}</span>
               <span style={{ padding: "3px 6px", borderRadius: 999, border: "1px solid rgba(192,132,252,0.40)", background: "rgba(88,28,135,0.12)", color: "#ddd6fe", fontWeight: 850 }}>MECHANISM {String(robinhoodChainSelectedMarket?.mechanism || "unknown").replaceAll("_", " ").toUpperCase()}</span>
@@ -12073,23 +12130,10 @@ async function submitLimitOrder() {
               {robinhoodChainWalletBalanceAssets.map((asset) => (
                 <span key={asset}>{asset}: <b>{hideTableData ? "••••" : robinhoodChainWalletBalanceValue(asset) ?? "—"}</b></span>
               ))}
-              <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={connectRobinhoodChainMetaMask}>
-                {robinhoodChainWalletConnected ? "Reconnect" : "Connect"}
-              </button>
-              <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={refreshRobinhoodChainMetaMask}>
-                Refresh
-              </button>
-              {!robinhoodChainWalletOnExpectedChain && (
-                <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={switchRobinhoodChainMetaMaskNetwork}>
-                  Switch / Add Chain
-                </button>
-              )}
-              {robinhoodChainWalletConnected && (
-                <button type="button" style={{ ...safeButton, padding: "4px 7px", fontSize: 10.5 }} disabled={robinhoodChainWalletBusy} onClick={disconnectRobinhoodChainWalletFromUtt} title="Clear UTT local state only; MetaMask itself remains unlocked and authorized according to its own settings.">
-                  Disconnect UTT
-                </button>
-              )}
             </div>
+
+              </div>
+            </details>
 
             {robinhoodChainWalletError && (
               <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>{hideTableData ? "Robinhood Chain wallet status unavailable." : robinhoodChainWalletError}</div>
@@ -12327,20 +12371,26 @@ async function submitLimitOrder() {
                   </div>
                 )}
 
-                <div style={{ marginTop: 9, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
+                <div data-rh-ui-norm="compact-lifecycle-summary" style={{ marginTop: 9, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
                   <span style={safePill}>Exact spend: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.exact_input_amount} {robinhoodChainSwapRow.from_asset || "INPUT"}</b></span>
                   <span style={safePill}>Expected: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.expected_output_amount} {robinhoodChainSwapRow.to_asset || "OUTPUT"}</b></span>
                   <span style={safePill}>Minimum: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.minimum_output_amount} {robinhoodChainSwapRow.to_asset || "OUTPUT"}</b></span>
                   <span style={safePill}>Slippage: <b>{Number(robinhoodChainSwapRow.slippage_bps || 0) / 100}%</b></span>
-                  <span style={safePill}>Spender: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.allowance?.spender || "", 8, 6)}</b></span>
-                  {!robinhoodChainSwapRow.approval_only && (
-                    <>
-                      <span style={safePill}>Swap destination: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.transaction_to || "", 8, 6)}</b></span>
-                      <span style={safePill}>Swap TX value: <b>{robinhoodChainSwapRow.swap?.transaction_value_wei || "0"} wei</b></span>
-                    </>
-                  )}
-                  <span style={safePill}>Lifecycle ID: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.id || "", 8, 6)}</b></span>
                 </div>
+
+                <details data-rh-ui-norm="advanced-lifecycle-details" style={{ marginTop: 7 }}>
+                  <summary style={{ cursor: "pointer", color: "#c4b5fd", fontSize: 10, fontWeight: 900 }}>Advanced lifecycle routing details</summary>
+                  <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
+                    <span style={safePill}>Spender: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.allowance?.spender || "", 8, 6)}</b></span>
+                    {!robinhoodChainSwapRow.approval_only && (
+                      <>
+                        <span style={safePill}>Swap destination: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.transaction_to || "", 8, 6)}</b></span>
+                        <span style={safePill}>Swap TX value: <b>{robinhoodChainSwapRow.swap?.transaction_value_wei || "0"} wei</b></span>
+                      </>
+                    )}
+                    <span style={safePill}>Lifecycle ID: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.id || "", 8, 6)}</b></span>
+                  </div>
+                </details>
 
                 <div style={{
                   marginTop: 10,
@@ -12349,33 +12399,38 @@ async function submitLimitOrder() {
                   border: "1px solid rgba(250, 204, 21, 0.38)",
                   background: "linear-gradient(135deg, rgba(113, 63, 18, 0.20), rgba(49, 46, 129, 0.18))",
                 }}>
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <div data-rh-ui-norm="compact-approval-stage" style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                     <b style={{ color: "#fde68a" }}>STAGE 1 · FINITE APPROVAL</b>
                     <span>Status: <b>{String(robinhoodChainSwapRow.approval_status || "prepared").toUpperCase()}</b></span>
                     <span>Total allowance target: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.amount} {robinhoodChainSwapRow.from_asset || "INPUT"}</b></span>
-                    <span>Atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.amount_atomic}</b></span>
-                    <span>Current atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.allowance?.current_atomic}</b></span>
-                    <span>Shortfall atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.allowance?.shortfall_atomic}</b></span>
                     <span>Unlimited: <b>NO</b></span>
                     <span>TX value: <b>{robinhoodChainSwapRow.approval?.transaction_value_wei || "0"} wei</b></span>
                   </div>
-                  <div style={{ marginTop: 7, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
-                    <span style={safePill}>Token: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapApprovalPlan?.token || robinhoodChainSwapRow.allowance?.token_address || "", 8, 6)}</b></span>
-                    <span style={safePill}>Spender: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.allowance?.spender || "", 8, 6)}</b></span>
-                    <span style={safePill}>Approval hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.approval?.calldata_sha256 || "", 10, 8)}</b></span>
-                    <span style={safePill}>Gas maximum: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.gas_limit || "—"}</b></span>
-                  </div>
-                  {robinhoodChainSwapRow.approval?.tx_hash && (
-                    <div style={{ marginTop: 6, color: "#bae6fd" }}>
-                      Approval TX: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.approval.tx_hash, 12, 10)}</b>
-                      {robinhoodChainSwapRow.approval?.receipt_status !== null && robinhoodChainSwapRow.approval?.receipt_status !== undefined && (
-                        <> · Receipt: <b>{String(robinhoodChainSwapRow.approval.receipt_status)}</b></>
-                      )}
-                      {robinhoodChainSwapRow.approval?.allowance_confirmed_atomic && (
-                        <> · Confirmed allowance: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval.allowance_confirmed_atomic}</b></>
-                      )}
+                  <details data-rh-ui-norm="advanced-approval-details" style={{ marginTop: 7 }}>
+                    <summary style={{ cursor: "pointer", color: "#fde68a", fontSize: 10, fontWeight: 900 }}>Advanced approval details</summary>
+                    <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                      <span>Atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.amount_atomic}</b></span>
+                      <span>Current atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.allowance?.current_atomic}</b></span>
+                      <span>Shortfall atomic: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.allowance?.shortfall_atomic}</b></span>
                     </div>
-                  )}
+                    <div style={{ marginTop: 7, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
+                      <span style={safePill}>Token: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapApprovalPlan?.token || robinhoodChainSwapRow.allowance?.token_address || "", 8, 6)}</b></span>
+                      <span style={safePill}>Spender: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.allowance?.spender || "", 8, 6)}</b></span>
+                      <span style={safePill}>Approval calldata hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.approval?.calldata_sha256 || "", 10, 8)}</b></span>
+                      <span style={safePill}>Gas maximum: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.gas_limit || "—"}</b></span>
+                    </div>
+                    {robinhoodChainSwapRow.approval?.tx_hash && (
+                      <div style={{ marginTop: 6, color: "#bae6fd" }}>
+                        Approval TX: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.approval.tx_hash, 12, 10)}</b>
+                        {robinhoodChainSwapRow.approval?.receipt_status !== null && robinhoodChainSwapRow.approval?.receipt_status !== undefined && (
+                          <> · Receipt: <b>{String(robinhoodChainSwapRow.approval.receipt_status)}</b></>
+                        )}
+                        {robinhoodChainSwapRow.approval?.allowance_confirmed_atomic && (
+                          <> · Confirmed allowance: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval.allowance_confirmed_atomic}</b></>
+                        )}
+                      </div>
+                    )}
+                  </details>
                   {String(robinhoodChainSwapRow.status || "") === "approval_prepared" && robinhoodChainSwapApprovalPlan && (
                     <div style={{ marginTop: 7, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                       <label style={{ ...safePill, padding: "5px 7px", gap: 6 }}>
@@ -12410,21 +12465,34 @@ async function submitLimitOrder() {
                 </div>
 
                 {robinhoodChainSwapRow.approval_only ? (
-                  <div style={{
-                    marginTop: 9,
-                    padding: 9,
-                    borderRadius: 9,
-                    border: "1px solid rgba(168, 85, 247, 0.42)",
-                    background: "linear-gradient(135deg, rgba(88, 28, 135, 0.22), rgba(8, 47, 73, 0.22))",
-                    color: "#ddd6fe",
-                  }}>
-                    <b>STAGE 2 · {String(robinhoodChainSwapRow.tranche || "").toUpperCase() === "R5C.4B" ? "WETH TO USDG BROADCAST LOCKED" : "WETH SWAP LOCKED"}</b>
-                    <div style={{ marginTop: 5 }}>
-                      {String(robinhoodChainSwapRow.tranche || "").toUpperCase() === "R5C.4B"
-                        ? "R5C.4B initial acceptance stops after the first explicit finite WETH approval wallet request is deliberately rejected. No swap preparation, swap send claim, MetaMask swap request, transaction hash, successful broadcast, or automatic second transaction is authorized."
-                        : "R5C.3B stops after finite USDG approval confirmation. No WETH swap preparation, send claim, MetaMask swap request, or automatic second transaction is available until R5C.3C."}
+                  <>
+                    <div
+                      data-rh-ui-norm="compact-stage-lock"
+                      style={{
+                        marginTop: 9,
+                        padding: "7px 9px",
+                        borderRadius: 9,
+                        border: "1px solid rgba(168, 85, 247, 0.42)",
+                        background: "linear-gradient(135deg, rgba(88, 28, 135, 0.22), rgba(8, 47, 73, 0.22))",
+                        color: "#ddd6fe",
+                        display: "flex",
+                        gap: 8,
+                        flexWrap: "wrap",
+                        alignItems: "center",
+                      }}
+                    >
+                      <b>STAGE 2 · {String(robinhoodChainSwapRow.tranche || "").toUpperCase() === "R5C.4B" ? "WETH TO USDG BROADCAST LOCKED" : "WETH SWAP LOCKED"}</b>
+                      <span>Successful broadcast authorized: <b>NO</b></span>
                     </div>
-                  </div>
+                    <details data-rh-ui-norm="advanced-stage-lock-details" style={{ marginTop: 6 }}>
+                      <summary style={{ cursor: "pointer", color: "#c4b5fd", fontSize: 10, fontWeight: 900 }}>Advanced Stage 2 lock details</summary>
+                      <div style={{ marginTop: 5, color: "#ddd6fe", fontSize: 10.5 }}>
+                        {String(robinhoodChainSwapRow.tranche || "").toUpperCase() === "R5C.4B"
+                          ? "R5C.4B initial acceptance stops after the first explicit finite WETH approval wallet request is deliberately rejected. No swap preparation, swap send claim, MetaMask swap request, transaction hash, successful broadcast, or automatic second transaction is authorized."
+                          : "R5C.3B stops after finite USDG approval confirmation. No WETH swap preparation, send claim, MetaMask swap request, or automatic second transaction is available until R5C.3C."}
+                      </div>
+                    </details>
+                  </>
                 ) : (
                 <div style={{
                   marginTop: 9,

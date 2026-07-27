@@ -8003,6 +8003,79 @@ export default function OrderTicketWidget({
     !robinhoodChainSwapBusy
   );
 
+  const robinhoodChainFirmPlanApprovalState = (() => {
+    if (robinhoodChainExecutionAdapter === "native_exact_input") return "native_input";
+    if (robinhoodChainExecutionAdapter !== "erc20_exact_input") return "not_applicable";
+    if (!robinhoodChainFirmPlan?.ok || robinhoodChainFirmPlanStale) return "blocked";
+    if (robinhoodChainFirmPlan?.allowance?.applicable === false) return "native_input";
+    if (robinhoodChainFirmPlan?.approval_required === true) return "finite_required";
+    if (robinhoodChainFirmPlan?.approval_required === false) return "allowance_sufficient";
+    return "blocked";
+  })();
+  const robinhoodChainFirmPlanApprovalLabel =
+    robinhoodChainFirmPlanApprovalState === "native_input"
+      ? "NATIVE INPUT · NO ERC-20 APPROVAL"
+      : robinhoodChainFirmPlanApprovalState === "allowance_sufficient"
+        ? "ALLOWANCE SUFFICIENT · APPROVAL SKIPPED"
+        : robinhoodChainFirmPlanApprovalState === "finite_required"
+          ? "FINITE APPROVAL REQUIRED"
+          : "APPROVAL REVIEW HELD";
+  const robinhoodChainFirmPlanApprovalDetail = (() => {
+    if (robinhoodChainFirmPlanApprovalState === "native_input") {
+      return "Native input does not use an ERC-20 approval. The explicit swap/send review remains separate.";
+    }
+    if (robinhoodChainFirmPlanApprovalState === "allowance_sufficient") {
+      return "The current allowance covers this exact spend. No MetaMask approval request is required.";
+    }
+    if (robinhoodChainFirmPlanApprovalState === "finite_required") {
+      const amount = String(robinhoodChainFirmPlan?.input_amount || robinhoodChainCurrentSwapInputAmount || "").trim();
+      return `Exact finite approval ${amount || "—"} ${robinhoodChainFromAsset || "input"}. Unlimited approval remains prohibited.`;
+    }
+    if (!robinhoodChainCurrentSwapInputAmount) return "Enter a valid exact-spend amount before presenting any approval action.";
+    if (!robinhoodChainExecutionAuthorized) return "Execution authority is not verified for this direction.";
+    if (robinhoodChainEffectiveAmountMode !== ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND) return "Exact-receive approval presentation remains blocked.";
+    if (!robinhoodChainCurrentSwapAmountAuthorized) return `The exact-spend amount is outside the persisted ${robinhoodChainExecutionCeilingAmount || "available"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"} authority ceiling.`;
+    if (!robinhoodChainFirmPlan?.ok) return "Waiting for a current unsigned plan before presenting any approval action.";
+    if (robinhoodChainFirmPlanStale) return "The unsigned plan is stale. A fresh current-context plan is required.";
+    if (!robinhoodChainWalletState.providerAvailable || !robinhoodChainWalletConnected || !robinhoodChainWalletOnExpectedChain) return "Wallet action required: connect MetaMask on Robinhood Chain 4663.";
+    if (!robinhoodChainExecutionReviewWalletReady) return "Saved-wallet identity is not ready for explicit backend verification.";
+    return "The current plan is not eligible for an explicit lifecycle review.";
+  })();
+  const robinhoodChainFirmPlanApprovalSummary = robinhoodChainFirmPlanStale
+    ? "STALE — rebuild before later execution"
+    : robinhoodChainFirmPlanApprovalState === "native_input"
+      ? "NATIVE INPUT · NO APPROVAL"
+      : robinhoodChainFirmPlanApprovalState === "allowance_sufficient"
+        ? "ALLOWANCE SUFFICIENT · APPROVAL SKIPPED"
+        : robinhoodChainFirmPlanApprovalState === "finite_required"
+          ? "FINITE APPROVAL REQUIRED"
+          : "APPROVAL STATE UNVERIFIED";
+
+  const robinhoodChainSwapLifecycleStatus = String(robinhoodChainSwapRow?.status || "").trim().toLowerCase();
+  const robinhoodChainSwapLifecycleApprovalRequired = Boolean(
+    robinhoodChainSwapRow && (
+      robinhoodChainSwapRow.approval_required === true ||
+      Boolean(robinhoodChainSwapApprovalPlan) ||
+      [
+        "approval_prepared",
+        "approval_pending",
+        "approval_confirmed",
+        "approval_reverted",
+        "approval_wallet_rejected",
+        "approval_failed",
+      ].includes(robinhoodChainSwapLifecycleStatus)
+    )
+  );
+  const robinhoodChainSwapLifecycleApprovalSkipped = Boolean(
+    robinhoodChainSwapRow &&
+    !robinhoodChainSwapLifecycleApprovalRequired &&
+    (
+      robinhoodChainSwapRow.approval_required === false ||
+      robinhoodChainSwapLifecycleStatus === "allowance_sufficient" ||
+      String(robinhoodChainSwapRow.allowance?.shortfall_atomic || "") === "0"
+    )
+  );
+
   const canSendRobinhoodChainSwapApproval = Boolean(
     robinhoodChainSwapRow &&
     robinhoodChainSwapApprovalPlan &&
@@ -12545,8 +12618,8 @@ async function submitLimitOrder() {
 
             {robinhoodChainFirmPlan?.ok && (
               <details style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(192, 132, 252, 0.18)" }}>
-                <summary style={{ cursor: "pointer", color: robinhoodChainFirmPlanStale ? "#fde68a" : robinhoodChainFirmPlan?.approval_required ? "#fde68a" : "#bbf7d0", fontSize: 10.5, fontWeight: 900 }}>
-                  Unsigned plan · {robinhoodChainFirmPlanStale ? "STALE — rebuild before later execution" : robinhoodChainFirmPlan?.approval_required ? "APPROVAL REQUIRED" : "READY"} · expires {robinhoodChainFirmPlan.plan_expires_at || "—"}
+                <summary style={{ cursor: "pointer", color: robinhoodChainFirmPlanStale || robinhoodChainFirmPlanApprovalState === "finite_required" ? "#fde68a" : robinhoodChainFirmPlanApprovalState === "blocked" ? "#fda4af" : "#bbf7d0", fontSize: 10.5, fontWeight: 900 }}>
+                  Unsigned plan · {robinhoodChainFirmPlanApprovalSummary} · expires {robinhoodChainFirmPlan.plan_expires_at || "—"}
                 </summary>
                 <div style={{ marginTop: 7, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
                   {[
@@ -12738,6 +12811,7 @@ async function submitLimitOrder() {
                   </div>
                 </details>
 
+                {robinhoodChainSwapLifecycleApprovalRequired ? (
                 <div style={{
                   marginTop: 10,
                   padding: 9,
@@ -12809,6 +12883,47 @@ async function submitLimitOrder() {
                     </div>
                   )}
                 </div>
+                ) : robinhoodChainSwapLifecycleApprovalSkipped ? (
+                  <div
+                    data-rh-ui-norm="compact-approval-skipped"
+                    style={{
+                      marginTop: 10,
+                      padding: 9,
+                      borderRadius: 9,
+                      border: "1px solid rgba(74, 222, 128, 0.40)",
+                      background: "linear-gradient(135deg, rgba(20, 83, 45, 0.20), rgba(8, 47, 73, 0.16))",
+                      display: "flex",
+                      gap: 8,
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                    }}
+                  >
+                    <b style={{ color: "#bbf7d0" }}>STAGE 1 · APPROVAL SKIPPED</b>
+                    <span>Status: <b>ALLOWANCE SUFFICIENT</b></span>
+                    <span>MetaMask approval request: <b>NO</b></span>
+                    <span>Unlimited approval: <b>NO</b></span>
+                    <span>The explicit swap review remains separate.</span>
+                  </div>
+                ) : (
+                  <div
+                    data-rh-ui-norm="compact-approval-unverified"
+                    style={{
+                      marginTop: 10,
+                      padding: 9,
+                      borderRadius: 9,
+                      border: "1px solid rgba(251, 113, 133, 0.40)",
+                      background: "rgba(127, 29, 29, 0.16)",
+                      display: "flex",
+                      gap: 8,
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                    }}
+                  >
+                    <b style={{ color: "#fecdd3" }}>STAGE 1 · APPROVAL STATE UNVERIFIED</b>
+                    <span>No approval action is available.</span>
+                    <span>Unlimited approval: <b>NO</b></span>
+                  </div>
+                )}
 
                 {robinhoodChainSwapRow.approval_only ? (
                   <>
@@ -14102,6 +14217,36 @@ async function submitLimitOrder() {
                     ? "Refresh Unsigned Plan"
                     : "Build Unsigned Plan"}
               </button>
+              {(robinhoodChainExecutionAdapter === "native_exact_input" || (robinhoodChainExecutionAdapter === "erc20_exact_input" && ["buy", "sell"].includes(robinhoodChainNormalizedSide) && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND)) && (
+                <div
+                  data-rh-ui-norm="conditional-approval-presentation"
+                  data-approval-state={robinhoodChainFirmPlanApprovalState}
+                  style={{
+                    padding: "7px 9px",
+                    borderRadius: 9,
+                    border: robinhoodChainFirmPlanApprovalState === "finite_required"
+                      ? "1px solid rgba(250, 204, 21, 0.48)"
+                      : robinhoodChainFirmPlanApprovalState === "blocked"
+                        ? "1px solid rgba(251, 113, 133, 0.42)"
+                        : "1px solid rgba(74, 222, 128, 0.42)",
+                    background: robinhoodChainFirmPlanApprovalState === "finite_required"
+                      ? "rgba(113, 63, 18, 0.20)"
+                      : robinhoodChainFirmPlanApprovalState === "blocked"
+                        ? "rgba(127, 29, 29, 0.16)"
+                        : "rgba(20, 83, 45, 0.18)",
+                    display: "flex",
+                    gap: 7,
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                    fontSize: 10.5,
+                  }}
+                >
+                  <b style={{ color: robinhoodChainFirmPlanApprovalState === "finite_required" ? "#fde68a" : robinhoodChainFirmPlanApprovalState === "blocked" ? "#fecdd3" : "#bbf7d0" }}>
+                    {robinhoodChainFirmPlanApprovalLabel}
+                  </b>
+                  <span>{robinhoodChainFirmPlanApprovalDetail}</span>
+                </div>
+              )}
               {robinhoodChainExecutionAdapter === "native_exact_input" && side === "sell" && (
                 <button
                   type="button"
@@ -14122,30 +14267,41 @@ async function submitLimitOrder() {
                 </button>
               )}
               {robinhoodChainExecutionAdapter === "erc20_exact_input" && ["buy", "sell"].includes(robinhoodChainNormalizedSide) && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && (
-                <button
-                  type="button"
-                  style={{
-                    ...safeButton,
-                    ...(!canPrepareRobinhoodChainSwapExecution ? safeButtonDisabled : {}),
-                    padding: "9px 12px",
-                    fontWeight: 900,
-                    border: "1px solid rgba(34, 211, 238, 0.58)",
-                    color: "#cffafe",
-                    background: "linear-gradient(135deg, rgba(8, 145, 178, 0.24), rgba(109, 40, 217, 0.22))",
-                    boxShadow: canPrepareRobinhoodChainSwapExecution ? "0 0 15px rgba(34, 211, 238, 0.14)" : "none",
-                  }}
-                  disabled={!canPrepareRobinhoodChainSwapExecution}
-                  onClick={prepareRobinhoodChainSwapExecutionReview}
-                  title={`Persist the capability-authorized ${robinhoodChainFromAsset || "ERC-20"} exact-input lifecycle. Any required approval is finite and bound to the reviewed amount. No MetaMask request, signature, or broadcast occurs.`}
-                >
-                  {robinhoodChainSwapBusy
-                    ? "Preparing Execution Review…"
-                    : robinhoodChainSwapPrepared?.execution
-                      ? "Refresh Exact-Spend Review"
-                      : robinhoodChainFirmPlan?.approval_required
-                        ? `Prepare Finite ${String(robinhoodChainFirmPlan?.input_amount || (robinhoodChainNormalizedSide === "sell" ? qty : totalQuote) || "")} ${robinhoodChainFromAsset || "Input"} Approval`
-                        : "Prepare Allowance-Sufficient Review"}
-                </button>
+                <>
+                  {canPrepareRobinhoodChainSwapExecution && (
+                    <button
+                      type="button"
+                      data-rh-ui-norm="explicit-approval-or-swap-review-action"
+                      style={{
+                        ...safeButton,
+                        padding: "9px 12px",
+                        fontWeight: 900,
+                        border: "1px solid rgba(34, 211, 238, 0.58)",
+                        color: "#cffafe",
+                        background: "linear-gradient(135deg, rgba(8, 145, 178, 0.24), rgba(109, 40, 217, 0.22))",
+                        boxShadow: "0 0 15px rgba(34, 211, 238, 0.14)",
+                      }}
+                      onClick={prepareRobinhoodChainSwapExecutionReview}
+                      title={robinhoodChainFirmPlanApprovalState === "finite_required"
+                        ? `Persist the capability-authorized ${robinhoodChainFromAsset || "ERC-20"} exact-input lifecycle with an exact finite approval target. No MetaMask request, signature, or broadcast occurs.`
+                        : "Persist the allowance-sufficient exact-spend lifecycle. No approval request, signature, or broadcast occurs."}
+                    >
+                      {robinhoodChainSwapPrepared?.execution
+                        ? "Refresh Exact-Spend Review"
+                        : robinhoodChainFirmPlanApprovalState === "finite_required"
+                          ? `Prepare Finite ${String(robinhoodChainFirmPlan?.input_amount || robinhoodChainCurrentSwapInputAmount || "")} ${robinhoodChainFromAsset || "Input"} Approval`
+                          : "Prepare Exact-Spend Swap Review"}
+                    </button>
+                  )}
+                  {!canPrepareRobinhoodChainSwapExecution && robinhoodChainSwapBusy && (
+                    <span data-rh-ui-norm="approval-action-preparing" style={{ ...safePill, color: "#a5f3fc" }}>Preparing explicit exact-spend review…</span>
+                  )}
+                  {!canPrepareRobinhoodChainSwapExecution && !robinhoodChainSwapBusy && (
+                    <span data-rh-ui-norm="approval-action-held" style={{ ...safePill, color: "#fde68a" }}>
+                      No approval action is shown until the current plan, authority, amount, and wallet gate are ready.
+                    </span>
+                  )}
+                </>
               )}
               {robinhoodChainLegacyExecutionMarket && side === "buy" && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE && (
                 <button

@@ -1078,6 +1078,190 @@ function counterpartySubmitResultTitle(payload, kind, requestedTitle = "") {
   return "Counterparty Compose Request Preview";
 }
 
+// RH-UI.NORM.1F: normalize result classification without changing execution behavior.
+function submitResultStatusView(payload, kind) {
+  const body = payload && typeof payload === "object" ? payload : {};
+  const status = String(
+    body?.status ||
+    body?.execution?.status ||
+    body?.result?.status ||
+    ""
+  ).trim().toLowerCase();
+  const errorText = String(
+    typeof payload === "string"
+      ? payload
+      : body?.error || body?.message || body?.reason || body?.detail || ""
+  ).trim();
+  const blob = `${status} ${errorText}`.toLowerCase();
+
+  const make = (key, label, tone, color, border, background) => ({
+    key,
+    label,
+    tone,
+    color,
+    border,
+    background,
+  });
+
+  if (
+    status === "wallet_rejected" ||
+    /wallet[_\s-]*(rejected|declined)/i.test(blob) ||
+    /metamask request was declined/i.test(blob)
+  ) {
+    return make(
+      "wallet_rejected",
+      "WALLET REJECTED",
+      "error",
+      "#fecdd3",
+      "#9f1239",
+      "#2a0f17"
+    );
+  }
+
+  if (["confirmed", "broadcast", "broadcasted"].includes(status)) {
+    return make("confirmed", "CONFIRMED", "ok", "#bbf7d0", "#1f6f3a", "#0f1a0f");
+  }
+
+  if (["submitted", "approval_submitted", "swap_submitted", "pending"].includes(status)) {
+    return make("submitted", "SUBMITTED", "ok", "#bbf7d0", "#1f6f3a", "#0f1a0f");
+  }
+
+  if (
+    status.includes("provider_error") ||
+    status.includes("provider_failure") ||
+    /provider error|provider failure|timeout|timed out|exceeded|network error/i.test(blob)
+  ) {
+    return make(
+      "provider_error",
+      "PROVIDER ERROR",
+      "error",
+      "#fecdd3",
+      "#7a2b2b",
+      "#160b0b"
+    );
+  }
+
+  if (
+    status.includes("validation") ||
+    status.includes("invalid") ||
+    /validation|invalid request|malformed|does not match the reviewed/i.test(blob)
+  ) {
+    return make(
+      "validation_error",
+      "VALIDATION ERROR",
+      "error",
+      "#fecdd3",
+      "#7a2b2b",
+      "#160b0b"
+    );
+  }
+
+  if (
+    status.includes("preparation_held") ||
+    status.includes("review_held") ||
+    status.includes("blocked") ||
+    /preparation held|review held|authority ceiling|gate is blocked/i.test(blob)
+  ) {
+    return make(
+      "preparation_held",
+      "PREPARATION HELD",
+      "warn",
+      "#fde68a",
+      "#6d5a1f",
+      "#19160d"
+    );
+  }
+
+  if (
+    status.includes("backend_error") ||
+    status.includes("recording_recovery") ||
+    /backend|recording recovery|required recovery/i.test(blob)
+  ) {
+    return make(
+      "backend_error",
+      "BACKEND ERROR",
+      "error",
+      "#fecdd3",
+      "#7a2b2b",
+      "#160b0b"
+    );
+  }
+
+  if (
+    kind === "error" ||
+    status.includes("failed") ||
+    status.includes("reverted") ||
+    body?.ok === false
+  ) {
+    return make(
+      "submission_failed",
+      "SUBMISSION FAILED",
+      "error",
+      "#fecdd3",
+      "#7a2b2b",
+      "#160b0b"
+    );
+  }
+
+  return make("ok", "OK", "ok", "#cdeccd", "#1f6f3a", "#0f1a0f");
+}
+
+function normalizeRobinhoodChainResultCalldataHash(value) {
+  const raw = String(value || "").trim().toLowerCase().replace(/^0x/, "");
+  return /^[0-9a-f]{64}$/.test(raw) ? raw : "";
+}
+
+function robinhoodChainSubmitResultEvidenceView(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  if (!isRobinhoodChainVenueKey(payload?.venue)) return null;
+
+  const type = String(payload?.type || "").trim().toLowerCase();
+  const genericTransactionHash = normalizeRobinhoodChainTransactionHash(
+    payload?.transaction_hash || payload?.tx_hash
+  );
+  const approvalTransactionHash = normalizeRobinhoodChainTransactionHash(
+    payload?.approval_transaction_hash ||
+    payload?.approval?.transaction_hash ||
+    payload?.approval?.tx_hash ||
+    (type.includes("approval") ? genericTransactionHash : "")
+  );
+  const swapTransactionHash = normalizeRobinhoodChainTransactionHash(
+    payload?.swap_transaction_hash ||
+    payload?.swap?.transaction_hash ||
+    payload?.swap?.tx_hash ||
+    (type === "swap" ? genericTransactionHash : "")
+  );
+  const approvalCalldataHash = normalizeRobinhoodChainResultCalldataHash(
+    payload?.approval_calldata_hash ||
+    payload?.approval_calldata_sha256 ||
+    payload?.approval?.calldata_sha256
+  );
+  const swapCalldataHash = normalizeRobinhoodChainResultCalldataHash(
+    payload?.swap_calldata_hash ||
+    payload?.swap_calldata_sha256 ||
+    payload?.swap?.calldata_sha256
+  );
+
+  return {
+    type,
+    status: String(payload?.status || "").trim().toLowerCase(),
+    message: String(payload?.error || payload?.message || payload?.reason || "").trim(),
+    approvalCalldataHash,
+    swapCalldataHash,
+    approvalTransactionHash,
+    swapTransactionHash,
+    automaticSecondTransaction: payload?.automatic_second_transaction === true,
+    automaticRetry: payload?.automatic_retry === true,
+    swapStageEnabled: payload?.swap_stage_enabled === true,
+  };
+}
+
+function isSupersededRobinhoodChainTransientError(value) {
+  return /timeout|timed out|exceeded|aborterror|network error|network request failed/i.test(
+    String(value || "")
+  );
+}
+
 async function counterpartyUniSatMainnetStatus(provider) {
   if (!provider) return { ok: false, label: "UniSat unavailable" };
   try {
@@ -8135,6 +8319,7 @@ export default function OrderTicketWidget({
     robinhoodChainSwapRow &&
     robinhoodChainSwapApprovalPlan &&
     String(robinhoodChainSwapRow.status || "") === "approval_prepared" &&
+    !robinhoodChainSwapPlanStale &&
     robinhoodChainSwapSendGate?.send_enabled === true &&
     robinhoodChainWalletReady &&
     robinhoodChainSwapApprovalReviewed &&
@@ -9389,6 +9574,18 @@ async function submitLimitOrder() {
   }
 }
 
+  function clearRobinhoodChainSupersededTransientErrors() {
+    setRobinhoodChainWalletError((current) => (
+      isSupersededRobinhoodChainTransientError(current) ? "" : current
+    ));
+    setRobinhoodChainExecutionAuthorityError((current) => (
+      isSupersededRobinhoodChainTransientError(current) ? "" : current
+    ));
+    setSubmitError((current) => (
+      isSupersededRobinhoodChainTransientError(current) ? null : current
+    ));
+  }
+
   async function requestRobinhoodChainQuote(
     forceRefresh = true,
     { automatic = false, reviewContextVersion = robinhoodChainReviewContextVersionRef.current } = {}
@@ -9468,6 +9665,7 @@ async function submitLimitOrder() {
       if (!data?.ok) throw new Error(data?.error || "Robinhood Chain quote returned ok=false.");
 
       setRobinhoodChainQuote(data);
+      clearRobinhoodChainSupersededTransientErrors();
       const price = String(data?.effective_price || "").trim();
       const baseQuantity = String(data?.base_quantity || "").trim();
       const quoteQuantity = String(data?.quote_quantity || "").trim();
@@ -9582,6 +9780,7 @@ async function submitLimitOrder() {
       ) return null;
       if (!data?.ok) throw new Error(data?.error || "Robinhood Chain firm plan returned ok=false.");
       setRobinhoodChainFirmPlan(data);
+      clearRobinhoodChainSupersededTransientErrors();
       if (automatic) {
         setRobinhoodChainAutoPreparationPhase("ready");
         setRobinhoodChainAutoPreparationDetail("Current-context quote and unsigned plan are ready.");
@@ -10284,6 +10483,15 @@ async function submitLimitOrder() {
         return;
       }
 
+      const approvalPlanExpiresAt = Date.parse(String(row?.swap?.plan_expires_at || ""));
+      if (Number.isFinite(approvalPlanExpiresAt) && Date.now() >= approvalPlanExpiresAt) {
+        const staleError = new Error(
+          "The finite approval plan expired before the one-time send claim was reserved. Refresh Exact-Spend Review before trying the explicit wallet request again."
+        );
+        staleError.robinhoodChainPreparationHeld = true;
+        throw staleError;
+      }
+
       claimId = createRobinhoodChainClaimId();
       const claim = await claimRobinhoodChainSwapApprovalSend(
         executionId,
@@ -10350,7 +10558,10 @@ async function submitLimitOrder() {
           status: "approval_submitted",
           execution_id: executionId,
           transaction_hash: returnedTxHash,
-          token: "USDG",
+          approval_calldata_hash: storedCalldataHash || null,
+          approval_transaction_hash: returnedTxHash,
+          swap_transaction_hash: row?.swap?.tx_hash || null,
+          token: row?.from_asset || plan?.token_symbol || "INPUT",
           approval_amount: row?.approval?.amount || row?.exact_input_amount || null,
           approval_amount_policy: row?.approval?.amount_policy || row?.allowance?.approval_amount_policy || null,
           spender: planSpender,
@@ -10367,13 +10578,27 @@ async function submitLimitOrder() {
           : "Finite USDG approval submitted. No swap request was opened.",
       });
     } catch (error) {
-      let msg = robinhoodChainWalletErrorMessage(error, "Robinhood Chain finite approval failed.");
+      const httpStatus = Number(error?.response?.status);
+      const claimConflict = Boolean(
+        !sendClaimed &&
+        !returnedTxHash &&
+        (httpStatus === 409 || error?.robinhoodChainPreparationHeld === true)
+      );
+      let msg = error?.response
+        ? robinhoodChainQuoteError(error)
+        : robinhoodChainWalletErrorMessage(error, "Robinhood Chain finite approval failed.");
+      if (claimConflict && msg === "robinhood_chain_swap_approval_plan_expired") {
+        msg = "The finite approval plan expired before the one-time send claim was reserved. Refresh Exact-Spend Review before trying the explicit wallet request again.";
+      } else if (claimConflict && msg === "robinhood_chain_swap_approval_not_claimable") {
+        msg = "This approval lifecycle is no longer claimable. Refresh Exact-Spend Review to create a fresh explicit approval lifecycle.";
+      }
       if (returnedTxHash) {
         msg = `${msg} Transaction ${returnedTxHash} may exist; do not resubmit. RH-CHAIN.10E recovery is not automatic.`;
       } else if (sendClaimed && claimId) {
         msg = await recordRobinhoodChainSwapFailure(executionId, "approval", claimId, error);
       }
       setRobinhoodChainSwapError(msg);
+      if (claimConflict) setRobinhoodChainSwapApprovalReviewed(false);
       const rejected = Number(error?.code) === 4001 || /rejected/i.test(String(msg || ""));
       openSubmitResultModal(
         "error",
@@ -10382,22 +10607,38 @@ async function submitLimitOrder() {
           venue: "robinhood_chain",
           symbol: row?.symbol || `${row?.to_asset || "ETH"}-USDG`,
           type: "erc20_approval",
-          status: rejected ? "wallet_rejected" : returnedTxHash ? "recording_recovery_required" : "approval_failed",
+          status: rejected
+            ? "wallet_rejected"
+            : claimConflict
+              ? "preparation_held"
+              : returnedTxHash
+                ? "recording_recovery_required"
+                : "approval_failed",
           execution_id: executionId || null,
           transaction_hash: returnedTxHash || null,
-          token: "USDG",
+          approval_calldata_hash: storedCalldataHash || null,
+          approval_transaction_hash: returnedTxHash || null,
+          swap_transaction_hash: row?.swap?.tx_hash || null,
+          token: row?.from_asset || plan?.token_symbol || "INPUT",
           approval_amount: row?.approval?.amount || row?.exact_input_amount || null,
           spender: planSpender || null,
           transaction_value_wei: "0",
           error: msg,
+          http_status: Number.isFinite(httpStatus) ? httpStatus : null,
           automatic_second_transaction: false,
+          automatic_retry: false,
           swap_stage_enabled: false,
         },
-        rejected ? "Robinhood Chain Approval Rejected" : "Robinhood Chain Approval Failed"
+        rejected
+          ? "Robinhood Chain Approval Rejected"
+          : claimConflict
+            ? "Robinhood Chain Approval Preparation Held"
+            : "Robinhood Chain Approval Failed"
       );
       onToast?.({ kind: "warn", msg });
     } finally {
-        setRobinhoodChainSwapBusy(false);
+      robinhoodChainSwapApprovalSendRef.current = false;
+      setRobinhoodChainSwapBusy(false);
     }
   }
 
@@ -10674,6 +10915,9 @@ async function submitLimitOrder() {
           status: "submitted",
           execution_id: executionId,
           transaction_hash: returnedTxHash,
+          approval_transaction_hash: row?.approval?.tx_hash || null,
+          swap_calldata_hash: storedCalldataHash || null,
+          swap_transaction_hash: returnedTxHash,
           input_asset: row?.from_asset || "USDG",
           input_amount: row?.exact_input_amount || null,
           expected_output_asset: outputAsset,
@@ -10706,6 +10950,9 @@ async function submitLimitOrder() {
           status: rejected ? "wallet_rejected" : returnedTxHash ? "recording_recovery_required" : "submission_failed",
           execution_id: executionId || null,
           transaction_hash: returnedTxHash || null,
+          approval_transaction_hash: row?.approval?.tx_hash || null,
+          swap_calldata_hash: storedCalldataHash || null,
+          swap_transaction_hash: returnedTxHash || null,
           input_asset: row?.from_asset || "USDG",
           input_amount: row?.exact_input_amount || null,
           expected_output_asset: outputAsset || row?.to_asset || null,
@@ -11723,6 +11970,16 @@ async function submitLimitOrder() {
   const hasLastSubmitResult = useMemo(
     () => submitResultPayload !== null && submitResultKind !== null,
     [submitResultPayload, submitResultKind]
+  );
+
+  const submitResultStatus = useMemo(
+    () => submitResultStatusView(submitResultPayload, submitResultKind),
+    [submitResultPayload, submitResultKind]
+  );
+
+  const robinhoodChainSubmitResultEvidence = useMemo(
+    () => robinhoodChainSubmitResultEvidenceView(submitResultPayload),
+    [submitResultPayload]
   );
 
   const counterpartySigningHandoff = useMemo(
@@ -12899,7 +13156,7 @@ async function submitLimitOrder() {
                     </div>
                     {robinhoodChainSwapRow.approval?.tx_hash && (
                       <div style={{ marginTop: 6, color: "#bae6fd" }}>
-                        Approval TX: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.approval.tx_hash, 12, 10)}</b>
+                        Approval transaction hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.approval.tx_hash, 12, 10)}</b>
                         {robinhoodChainSwapRow.approval?.receipt_status !== null && robinhoodChainSwapRow.approval?.receipt_status !== undefined && (
                           <> · Receipt: <b>{String(robinhoodChainSwapRow.approval.receipt_status)}</b></>
                         )}
@@ -12927,6 +13184,9 @@ async function submitLimitOrder() {
                       >
                         {robinhoodChainSwapBusy ? "Working…" : `Approve ${robinhoodChainSwapRow.approval?.amount} ${robinhoodChainSwapRow.from_asset || "INPUT"} with MetaMask`}
                       </button>
+                      {robinhoodChainSwapPlanStale && (
+                        <span style={{ color: "#fde68a" }}>Approval plan expired. Refresh Exact-Spend Review before requesting MetaMask again.</span>
+                      )}
                       {!robinhoodChainSwapSendGate?.send_enabled && (
                         <span style={{ color: "#fde68a" }}>Missing: {(robinhoodChainSwapSendGate?.missing_requirements || []).join(", ") || "dedicated live gate"}</span>
                       )}
@@ -13045,7 +13305,7 @@ async function submitLimitOrder() {
                         <span style={safePill}>Expected: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.expected_output_amount} {robinhoodChainSwapRow.to_asset}</b></span>
                         <span style={safePill}>Minimum: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.minimum_output_amount} {robinhoodChainSwapRow.to_asset}</b></span>
                         <span style={safePill}>Destination: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapPlan.to || "", 8, 6)}</b></span>
-                        <span style={safePill}>Calldata hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.calldata_sha256 || "", 10, 8)}</b></span>
+                        <span style={safePill}>Swap calldata hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.calldata_sha256 || "", 10, 8)}</b></span>
                         <span style={safePill}>Plan hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.plan_hash || "", 10, 8)}</b></span>
                         <span style={safePill}>Expires: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.swap?.plan_expires_at || "—"}</b></span>
                         <span style={safePill}>TX value: <b>{robinhoodChainSwapPlan.value_wei || "0"} wei</b></span>
@@ -13090,7 +13350,7 @@ async function submitLimitOrder() {
                       <span style={safePill}>Approval gas: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_approval_network_fee} ETH</b></span>
                       <span style={safePill}>Swap gas: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_network_fee} ETH</b></span>
                       <span style={safePill}>Total gas: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.actual_total_network_fee} ETH</b></span>
-                      <span style={safePill}>Swap TX: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.tx_hash || "", 10, 8)}</b></span>
+                      <span style={safePill}>Swap transaction hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.swap?.tx_hash || "", 10, 8)}</b></span>
                     </div>
                   )}
                   {!['approval_confirmed', 'allowance_sufficient', 'swap_prepared', 'swap_pending', 'confirmed'].includes(String(robinhoodChainSwapRow.status || "")) && (
@@ -13129,10 +13389,10 @@ async function submitLimitOrder() {
                     <span>ID: {hideTableData ? "••••" : shortenWalletAddress(robinhoodChainBuyRow.id || "", 8, 6)}</span>
                     <span>Allowance before: {hideTableData ? "••••" : robinhoodChainFormatAtomicUnits(BigInt(String(robinhoodChainBuyRow.approval?.allowance_before_atomic || "0")), 6)} USDG</span>
                     {robinhoodChainBuyRow.approval?.tx_hash && (
-                      <span>Approval TX: {hideTableData ? "••••" : shortenWalletAddress(robinhoodChainBuyRow.approval.tx_hash, 10, 8)}</span>
+                      <span>Approval transaction hash: {hideTableData ? "••••" : shortenWalletAddress(robinhoodChainBuyRow.approval.tx_hash, 10, 8)}</span>
                     )}
                     {robinhoodChainBuyRow.swap?.tx_hash && (
-                      <span>Swap TX: {hideTableData ? "••••" : shortenWalletAddress(robinhoodChainBuyRow.swap.tx_hash, 10, 8)}</span>
+                      <span>Swap transaction hash: {hideTableData ? "••••" : shortenWalletAddress(robinhoodChainBuyRow.swap.tx_hash, 10, 8)}</span>
                     )}
                   </div>
                 )}
@@ -14407,11 +14667,12 @@ async function submitLimitOrder() {
                 openSubmitResultModal(
                   submitResultKind,
                   submitResultPayload,
-                  counterpartySubmitResultTitle(
-                    submitResultPayload,
-                    submitResultKind,
-                    submitResultKind === "error" ? "Order Submit Failed" : "Order Submitted"
-                  )
+                  submitResultTitle ||
+                    counterpartySubmitResultTitle(
+                      submitResultPayload,
+                      submitResultKind,
+                      submitResultKind === "error" ? "Order Submit Failed" : "Order Submitted"
+                    )
                 )
               }
               title="View the last submit result"
@@ -14567,7 +14828,7 @@ async function submitLimitOrder() {
                 maxHeight: "min(78vh, 720px)",
                 overflow: "hidden",
                 borderRadius: 14,
-                border: `1px solid ${submitResultKind === "error" ? "#7a2b2b" : "#1f6f3a"}`,
+                border: `1px solid ${submitResultStatus.border}`,
                 background: "#101010",
                 boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
                 padding: 14,
@@ -14597,8 +14858,11 @@ async function submitLimitOrder() {
                   flexWrap: "wrap",
                 }}
               >
-                <div style={{ fontSize: 12, color: submitResultKind === "error" ? "#ffd2d2" : "#cdeccd" }}>
-                  {submitResultKind === "error" ? "Status: ERROR" : "Status: OK"}
+                <div
+                  data-rh-ui-norm="result-status-classification"
+                  style={{ fontSize: 12, color: submitResultStatus.color, fontWeight: 900 }}
+                >
+                  Status: {submitResultStatus.label}
                 </div>
 
                 <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -14684,6 +14948,63 @@ async function submitLimitOrder() {
                   flex: 1,
                 }}
               >
+                {robinhoodChainSubmitResultEvidence && (
+                  <div
+                    data-rh-ui-norm="robinhood-chain-result-evidence"
+                    style={{
+                      marginBottom: 10,
+                      borderRadius: 12,
+                      border: `1px solid ${submitResultStatus.border}`,
+                      background: submitResultStatus.background,
+                      padding: 10,
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+                      <div style={{ fontSize: 12, fontWeight: 900 }}>Robinhood Chain result evidence</div>
+                      <div style={{ fontSize: 11, fontWeight: 900, color: submitResultStatus.color }}>
+                        {submitResultStatus.label}
+                      </div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "minmax(165px, 0.8fr) minmax(220px, 1.2fr)", gap: "6px 12px", fontSize: 11 }}>
+                      <div style={{ color: "#a9a9a9" }}>Approval calldata hash</div>
+                      <div style={{ wordBreak: "break-all" }}>
+                        {hideTableData
+                          ? "••••"
+                          : robinhoodChainSubmitResultEvidence.approvalCalldataHash || "not prepared"}
+                      </div>
+                      <div style={{ color: "#a9a9a9" }}>Approval transaction hash</div>
+                      <div style={{ wordBreak: "break-all" }}>
+                        {hideTableData
+                          ? "••••"
+                          : robinhoodChainSubmitResultEvidence.approvalTransactionHash || "none / not broadcast"}
+                      </div>
+                      <div style={{ color: "#a9a9a9" }}>Swap calldata hash</div>
+                      <div style={{ wordBreak: "break-all" }}>
+                        {hideTableData
+                          ? "••••"
+                          : robinhoodChainSubmitResultEvidence.swapCalldataHash || "not prepared"}
+                      </div>
+                      <div style={{ color: "#a9a9a9" }}>Swap transaction hash</div>
+                      <div style={{ wordBreak: "break-all" }}>
+                        {hideTableData
+                          ? "••••"
+                          : robinhoodChainSubmitResultEvidence.swapTransactionHash || "none / not broadcast"}
+                      </div>
+                      <div style={{ color: "#a9a9a9" }}>Automatic second transaction</div>
+                      <div>{robinhoodChainSubmitResultEvidence.automaticSecondTransaction ? "YES" : "NO"}</div>
+                      <div style={{ color: "#a9a9a9" }}>Automatic retry</div>
+                      <div>{robinhoodChainSubmitResultEvidence.automaticRetry ? "YES" : "NO"}</div>
+                      <div style={{ color: "#a9a9a9" }}>Swap stage</div>
+                      <div>{robinhoodChainSubmitResultEvidence.swapStageEnabled ? "ENABLED" : "DISABLED"}</div>
+                    </div>
+                    {!hideTableData && robinhoodChainSubmitResultEvidence.message && (
+                      <div style={{ marginTop: 8, fontSize: 10.5, color: submitResultStatus.color, lineHeight: 1.3 }}>
+                        {robinhoodChainSubmitResultEvidence.message}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {counterpartySigningHandoff && (
                   <div
                     style={{
@@ -15124,22 +15445,46 @@ async function submitLimitOrder() {
                   </div>
                 )}
 
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    fontSize: 11,
-                    lineHeight: 1.2,
-                    color: submitResultKind === "error" ? "#ffd2d2" : "#cdeccd",
-                    background: submitResultKind === "error" ? "#160b0b" : "#0f1a0f",
-                    border: submitResultKind === "error" ? "1px solid #4a1f1f" : "1px solid #203a20",
-                    borderRadius: 12,
-                    padding: 10,
-                  }}
-                >
-                  {submitResultText || (hideTableData ? "Result hidden." : "—")}
-                </pre>
+                {robinhoodChainSubmitResultEvidence ? (
+                  <details data-rh-ui-norm="advanced-result-json">
+                    <summary style={{ cursor: "pointer", color: "#c4b5fd", fontSize: 11, fontWeight: 900 }}>
+                      Technical result JSON
+                    </summary>
+                    <pre
+                      style={{
+                        margin: "8px 0 0",
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        fontSize: 11,
+                        lineHeight: 1.2,
+                        color: submitResultStatus.color,
+                        background: submitResultStatus.background,
+                        border: `1px solid ${submitResultStatus.border}`,
+                        borderRadius: 12,
+                        padding: 10,
+                      }}
+                    >
+                      {submitResultText || (hideTableData ? "Result hidden." : "—")}
+                    </pre>
+                  </details>
+                ) : (
+                  <pre
+                    style={{
+                      margin: 0,
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      fontSize: 11,
+                      lineHeight: 1.2,
+                      color: submitResultKind === "error" ? "#ffd2d2" : "#cdeccd",
+                      background: submitResultKind === "error" ? "#160b0b" : "#0f1a0f",
+                      border: submitResultKind === "error" ? "1px solid #4a1f1f" : "1px solid #203a20",
+                      borderRadius: 12,
+                      padding: 10,
+                    }}
+                  >
+                    {submitResultText || (hideTableData ? "Result hidden." : "—")}
+                  </pre>
+                )}
 
                 {!hideTableData && submitOk && submitError && (
                   <div style={{ marginTop: 8, ...safeMuted, fontSize: 11 }}>

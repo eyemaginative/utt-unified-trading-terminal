@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -290,6 +291,7 @@ def assert_native_write_unambiguous(
 
 EXECUTION_STATUS_LIVE_VERIFIED = "live_verified"
 EXECUTION_STATUS_PREPARATION_VERIFIED = "preparation_verified"
+EXECUTION_STATUS_LIVE_AUTHORIZED_PENDING_CONFIRMATION = "live_authorized_pending_confirmation"
 EXECUTION_MECHANISM_SWAP = "swap"
 EXECUTION_AMOUNT_MODE_EXACT_INPUT = "exact_input"
 EXECUTION_PROVIDER_ZEROX = "0x"
@@ -390,6 +392,75 @@ def _preparation_authority_matches(
         and str(evidence.get("firm_plan_input_ceiling") or "").strip() == ceiling
         and bool(ceiling)
         and str(objective.symbol or "").strip().upper() == symbol
+    )
+
+
+def _parse_authorization_time(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _live_authorization_matches(
+    *,
+    objective: RobinhoodChainPairObjective,
+    capability: RobinhoodChainPairCapability,
+    symbol: str,
+    side: str,
+    amount_mode: str,
+    provider: str,
+    input_identity: Dict[str, Any],
+    output_identity: Dict[str, Any],
+) -> bool:
+    evidence = capability.evidence if isinstance(capability.evidence, dict) else {}
+    authorization = evidence.get("live_authorization")
+    if not isinstance(authorization, dict):
+        return False
+    expires_at = _parse_authorization_time(authorization.get("expires_at"))
+    now = datetime.now(timezone.utc)
+    ceiling = str(capability.probe_amount or "").strip()
+    return bool(
+        _preparation_authority_matches(
+            objective=objective,
+            capability=capability,
+            symbol=symbol,
+            side=side,
+            amount_mode=amount_mode,
+            provider=provider,
+            input_identity=input_identity,
+            output_identity=output_identity,
+        )
+        and evidence.get("successful_broadcast_authorized") is True
+        and str(authorization.get("status") or "").strip().lower()
+        == EXECUTION_STATUS_LIVE_AUTHORIZED_PENDING_CONFIRMATION
+        and authorization.get("operator_confirmed") is True
+        and authorization.get("automatic_execution_promotion") is False
+        and str(authorization.get("symbol") or "").strip().upper() == symbol
+        and str(authorization.get("side") or "").strip().lower() == side
+        and str(authorization.get("amount_mode") or "").strip().lower() == amount_mode
+        and str(authorization.get("provider") or "").strip().lower() == provider
+        and str(authorization.get("input_asset") or "").strip().upper() == input_identity["symbol"]
+        and str(authorization.get("output_asset") or "").strip().upper() == output_identity["symbol"]
+        and str(authorization.get("exact_input_amount") or "").strip() == ceiling
+        and str(authorization.get("approval_model") or "").strip().lower()
+        == ("none" if bool(input_identity["native"]) else "finite_exact_input")
+        and authorization.get("unlimited_approval_enabled") is False
+        and str(authorization.get("approval_transaction_value_wei") or "").strip() == "0"
+        and str(authorization.get("swap_transaction_value_wei") or "").strip() == "0"
+        and authorization.get("separate_wallet_requests_required") is True
+        and authorization.get("automatic_second_transaction") is False
+        and authorization.get("automatic_retry") is False
+        and bool(str(authorization.get("wallet_address") or "").strip())
+        and bool(str(authorization.get("authorization_id") or "").strip())
+        and expires_at is not None
+        and expires_at > now
     )
 
 
@@ -520,6 +591,7 @@ def resolve_robinhood_chain_execution_authority(
         and str(capability.execution_status or "").strip().lower() == EXECUTION_STATUS_LIVE_VERIFIED
     )
     preparation_authority = False
+    live_authorized_pending_confirmation = False
     if capability is not None and not live_execution_verified:
         try:
             preparation_authority = _preparation_authority_matches(
@@ -532,8 +604,20 @@ def resolve_robinhood_chain_execution_authority(
                 input_identity=input_identity,
                 output_identity=output_identity,
             )
+            if preparation_authority:
+                live_authorized_pending_confirmation = _live_authorization_matches(
+                    objective=objective,
+                    capability=capability,
+                    symbol=normalized_symbol,
+                    side=normalized_side,
+                    amount_mode=normalized_mode,
+                    provider=normalized_provider,
+                    input_identity=input_identity,
+                    output_identity=output_identity,
+                )
         except RobinhoodChainRegistryAuthorityError:
             preparation_authority = False
+            live_authorized_pending_confirmation = False
     reasons = _execution_blocking_reasons(
         objective=objective,
         capability=capability,
@@ -544,6 +628,8 @@ def resolve_robinhood_chain_execution_authority(
     authority_level = (
         EXECUTION_STATUS_LIVE_VERIFIED
         if live_execution_verified
+        else EXECUTION_STATUS_LIVE_AUTHORIZED_PENDING_CONFIRMATION
+        if live_authorized_pending_confirmation
         else EXECUTION_STATUS_PREPARATION_VERIFIED
         if preparation_authority
         else "blocked"
@@ -588,6 +674,8 @@ def resolve_robinhood_chain_execution_authority(
             "source": (
                 "database_confirmed_execution_evidence"
                 if live_execution_verified
+                else "database_live_authorization_evidence"
+                if live_authorized_pending_confirmation
                 else "database_preparation_verification_evidence"
                 if preparation_authority
                 else "database_direction_capability_probe_evidence"
@@ -595,9 +683,21 @@ def resolve_robinhood_chain_execution_authority(
         },
         "authority_level": authority_level,
         "live_execution_verified": live_execution_verified,
+        "live_authorized_pending_confirmation": live_authorized_pending_confirmation,
         "preparation_verified": preparation_authority,
-        "initial_acceptance_wallet_reject_only": preparation_authority,
-        "successful_broadcast_authorized": live_execution_verified,
+        "initial_acceptance_wallet_reject_only": bool(
+            preparation_authority and not live_authorized_pending_confirmation
+        ),
+        "successful_broadcast_authorized": bool(
+            live_execution_verified or live_authorized_pending_confirmation
+        ),
+        "live_authorization": (
+            copy.deepcopy((capability.evidence or {}).get("live_authorization"))
+            if capability is not None
+            and isinstance(capability.evidence, dict)
+            and isinstance(capability.evidence.get("live_authorization"), dict)
+            else None
+        ),
         "execution_permitted": not reasons,
         "blocking_reasons": reasons,
         "provider_contacted": False,

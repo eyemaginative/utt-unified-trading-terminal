@@ -123,6 +123,47 @@ def weth_preparation_authority_capability():
     }
 
 
+def weth_live_authorized_capability():
+    capability = weth_preparation_authority_capability()
+    authority = capability["execution_authority"]
+    evidence = authority["capability"]["evidence"]
+    authorization = {
+        "status": "live_authorized_pending_confirmation",
+        "tranche": "R5C.5A",
+        "authorization_id": "ee" * 16,
+        "operator_confirmed": True,
+        "authorized_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "symbol": "WETH-USDG",
+        "side": "buy",
+        "amount_mode": "exact_input",
+        "provider": "0x",
+        "input_asset": "USDG",
+        "output_asset": "WETH",
+        "exact_input_amount": "1",
+        "wallet_address": TAKER,
+        "approval_model": "finite_exact_input",
+        "unlimited_approval_enabled": False,
+        "approval_transaction_value_wei": "0",
+        "swap_transaction_value_wei": "0",
+        "separate_wallet_requests_required": True,
+        "automatic_second_transaction": False,
+        "automatic_retry": False,
+        "automatic_execution_promotion": False,
+    }
+    evidence["successful_broadcast_authorized"] = True
+    evidence["live_authorized_pending_confirmation"] = True
+    evidence["live_authorization"] = authorization
+    authority["authority_level"] = "live_authorized_pending_confirmation"
+    authority["live_authorized_pending_confirmation"] = True
+    authority["preparation_verified"] = True
+    authority["live_execution_verified"] = False
+    authority["initial_acceptance_wallet_reject_only"] = False
+    authority["successful_broadcast_authorized"] = True
+    authority["live_authorization"] = authorization
+    return capability
+
+
 def weth_sell_preparation_authority_capability():
     evidence = {
         "preparation_verified": True,
@@ -417,7 +458,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             usdg_token=USDG,
             to_asset="WETH",
             to_token=WETH,
-            route_capability=WETH_CAPABILITY,
+            route_capability=weth_live_authorized_capability(),
             confirm_prepare=True,
         )
 
@@ -673,6 +714,46 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["execution"]["id"], second["execution"]["id"])
         self.assertEqual(len(self.planning.calls), 1)
 
+    async def test_r5c5a_reauthorization_starts_new_lifecycle_before_old_plan_expires(self):
+        first_capability = weth_live_authorized_capability()
+        first = await self.service.prepare(
+            self.db, taker_address=TAKER, exact_input_amount="1", slippage_bps=100,
+            eth_token=None, usdg_token=USDG, to_asset="WETH", to_token=WETH,
+            route_capability=first_capability, confirm_prepare=True,
+        )
+        first_id = first["execution"]["id"]
+
+        renewed_capability = weth_live_authorized_capability()
+        renewed_authorization = renewed_capability["execution_authority"]["live_authorization"]
+        renewed_authorization["authorization_id"] = "ff" * 16
+        renewed_capability["execution_authority"]["capability"]["evidence"][
+            "live_authorization"
+        ]["authorization_id"] = "ff" * 16
+
+        second = await self.service.prepare(
+            self.db, taker_address=TAKER, exact_input_amount="1", slippage_bps=100,
+            eth_token=None, usdg_token=USDG, to_asset="WETH", to_token=WETH,
+            route_capability=renewed_capability, confirm_prepare=True,
+        )
+
+        self.assertFalse(second["idempotent"])
+        self.assertNotEqual(first_id, second["execution"]["id"])
+        self.assertEqual(len(self.planning.calls), 2)
+        self.assertEqual(
+            self.db.get(RobinhoodChainSwapExecution, first_id).status,
+            "expired",
+        )
+        second_row = self.db.get(
+            RobinhoodChainSwapExecution,
+            second["execution"]["id"],
+        )
+        self.assertEqual(
+            second_row.route["execution_authority"]["live_authorization"][
+                "authorization_id"
+            ],
+            "ff" * 16,
+        )
+
     async def test_prepare_starts_new_lifecycle_after_matching_confirmed_execution(self):
         self.planning.allowance_atomic = 2_000_000
         first = await self.prepare_weth()
@@ -695,6 +776,47 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.db.get(RobinhoodChainSwapExecution, first_id).status,
             "confirmed",
         )
+
+    async def test_latest_matching_lifecycle_is_read_only_and_returns_newest_row(self):
+        self.planning.allowance_atomic = 2_000_000
+        first = await self.prepare_weth()
+        first_id = first["execution"]["id"]
+        first_row = self.db.get(RobinhoodChainSwapExecution, first_id)
+        first_row.status = "confirmed"
+        first_row.approval_status = "not_required"
+        first_row.swap_status = "confirmed"
+        first_row.swap_tx_hash = SWAP_TX_HASH
+        self.db.commit()
+        second = await self.prepare_weth()
+        before_count = self.db.query(RobinhoodChainSwapExecution).count()
+
+        restored = self.service.latest(
+            self.db,
+            symbol="WETH-USDG",
+            side="buy",
+            amount_mode="exact_spend",
+            wallet_address=TAKER,
+        )
+
+        self.assertTrue(restored["ok"])
+        self.assertTrue(restored["read_only"])
+        self.assertFalse(restored["will_mutate"])
+        self.assertEqual(restored["lookup"]["kind"], "latest_matching_lifecycle")
+        self.assertEqual(restored["lookup"]["wallet_address"], TAKER)
+        self.assertEqual(restored["execution"]["id"], second["execution"]["id"])
+        self.assertEqual(self.db.query(RobinhoodChainSwapExecution).count(), before_count)
+
+    def test_router_latest_lifecycle_route_precedes_dynamic_execution_route(self):
+        source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
+        latest_route = '@router.get("/swap-execution/latest")'
+        dynamic_route = '@router.get("/swap-execution/{execution_id}")'
+        self.assertIn(latest_route, source)
+        self.assertLess(source.index(latest_route), source.index(dynamic_route))
+        self.assertIn("get_robinhood_chain_swap_execution_service().latest", source)
+        self.assertIn('"read_only": True', source)
+        self.assertIn('"wallet_connection_requested": False', source)
+        self.assertIn('"signing_enabled": False', source)
+        self.assertIn('"broadcast_enabled": False', source)
 
     async def test_sufficient_allowance_returns_no_approval_transaction(self):
         self.planning.allowance_atomic = 2_000_000
@@ -917,7 +1039,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             await self.service.prepare(
                 self.db, taker_address=TAKER, exact_input_amount="1", slippage_bps=100,
                 eth_token=None, usdg_token=USDG, to_asset="WETH", to_token=bad_weth,
-                route_capability=WETH_CAPABILITY, confirm_prepare=True,
+                route_capability=weth_live_authorized_capability(), confirm_prepare=True,
             )
         self.assertEqual(self.planning.calls, [])
 
@@ -937,6 +1059,49 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["allowance"]["approval_amount_policy"], "set_total_required_allowance")
         expected = encode_erc20_approve(SPENDER, 1_000_000)
         self.assertEqual(result["approval_transaction_plan"]["calldata"], expected)
+
+    async def test_r5c5a_preparation_only_authority_cannot_claim_successful_buy_broadcast(self):
+        prepared = await self.service.prepare(
+            self.db,
+            taker_address=TAKER,
+            exact_input_amount="1",
+            slippage_bps=100,
+            eth_token=None,
+            usdg_token=USDG,
+            to_asset="WETH",
+            to_token=WETH,
+            route_capability=weth_preparation_authority_capability(),
+            confirm_prepare=True,
+        )
+        execution_id = prepared["execution"]["id"]
+        with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
+            with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_successful_broadcast_not_authorized"):
+                self.service.claim_approval_send(
+                    self.db, execution_id=execution_id, wallet_address=TAKER,
+                    plan_hash=prepared["execution"]["approval"]["plan_hash"],
+                    claim_id=APPROVAL_CLAIM, confirm_send_claim=True,
+                )
+        row = self.db.get(RobinhoodChainSwapExecution, execution_id)
+        self.assertEqual(row.status, "approval_prepared")
+        self.assertIsNone(row.approval_tx_hash)
+        self.assertIsNone(row.swap_tx_hash)
+
+    async def test_r5c5a_live_authority_wallet_mismatch_fails_before_claim(self):
+        capability = weth_live_authorized_capability()
+        capability["execution_authority"]["live_authorization"]["wallet_address"] = "0x" + "99" * 20
+        capability["execution_authority"]["capability"]["evidence"]["live_authorization"]["wallet_address"] = "0x" + "99" * 20
+        prepared = await self.service.prepare(
+            self.db, taker_address=TAKER, exact_input_amount="1", slippage_bps=100,
+            eth_token=None, usdg_token=USDG, to_asset="WETH", to_token=WETH,
+            route_capability=capability, confirm_prepare=True,
+        )
+        with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
+            with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_live_authority_wallet_mismatch"):
+                self.service.claim_approval_send(
+                    self.db, execution_id=prepared["execution"]["id"], wallet_address=TAKER,
+                    plan_hash=prepared["execution"]["approval"]["plan_hash"],
+                    claim_id=APPROVAL_CLAIM, confirm_send_claim=True,
+                )
 
     async def test_weth_approval_claim_and_wallet_rejection_do_not_open_swap(self):
         prepared = await self.prepare_weth("1")
@@ -983,6 +1148,61 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(refreshed["execution"]["swap_stage_enabled"])
         self.assertFalse(refreshed["execution"]["automatic_second_transaction"])
 
+    async def test_r5c5a_post_approval_reauthorization_rebinds_stage2_without_second_approval(self):
+        prepared = await self.prepare_weth("1")
+        execution_id = prepared["execution"]["id"]
+        original_authorization_id = (
+            prepared["execution"]["swap"]["route"]["execution_authority"]
+            ["live_authorization"]["authorization_id"]
+        )
+        with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
+            self.service.claim_approval_send(
+                self.db, execution_id=execution_id, wallet_address=TAKER,
+                plan_hash=prepared["execution"]["approval"]["plan_hash"],
+                claim_id=APPROVAL_CLAIM, confirm_send_claim=True,
+            )
+        self.service.record_approval_submission(
+            self.db, execution_id=execution_id, tx_hash=APPROVAL_TX_HASH,
+            wallet_address=TAKER, claim_id=APPROVAL_CLAIM, confirm_record=True,
+        )
+        self.rpc.allowance_atomic = 1_000_000
+        self.rpc.approval_amount_atomic = 1_000_000
+        self.rpc.approval_receipt = receipt(APPROVAL_TX_HASH, 1)
+        approved = await self.service.refresh_approval(self.db, execution_id=execution_id)
+        self.assertEqual(approved["execution"]["status"], "approval_confirmed")
+
+        renewed_capability = weth_live_authorized_capability()
+        renewed_authorization = renewed_capability["execution_authority"]["live_authorization"]
+        renewed_authorization["authorization_id"] = "ff" * 16
+        renewed_capability["execution_authority"]["capability"]["evidence"][
+            "live_authorization"
+        ]["authorization_id"] = "ff" * 16
+        self.planning.allowance_atomic = 1_000_000
+
+        swap = await self.service.prepare_swap(
+            self.db, execution_id=execution_id, wallet_address=TAKER,
+            eth_token=None, usdg_token=USDG, output_token=WETH,
+            route_capability=renewed_capability, confirm_prepare=True,
+        )
+
+        self.assertEqual(swap["execution"]["id"], execution_id)
+        self.assertEqual(swap["execution"]["status"], "swap_prepared")
+        self.assertEqual(swap["execution"]["approval"]["tx_hash"], APPROVAL_TX_HASH)
+        self.assertEqual(swap["execution"]["approval"]["receipt_status"], 1)
+        self.assertEqual(swap["execution"]["approval"]["submission_attempts"], 1)
+        self.assertEqual(swap["execution"]["allowance"]["current_atomic"], "1000000")
+        self.assertEqual(swap["execution"]["allowance"]["shortfall_atomic"], "0")
+        self.assertIsNone(swap["execution"]["swap"]["tx_hash"])
+        self.assertFalse(swap["execution"]["swap"]["send_claimed"])
+        self.assertFalse(swap["execution"]["automatic_second_transaction"])
+        rebound_authorization_id = (
+            swap["execution"]["swap"]["route"]["execution_authority"]
+            ["live_authorization"]["authorization_id"]
+        )
+        self.assertNotEqual(rebound_authorization_id, original_authorization_id)
+        self.assertEqual(rebound_authorization_id, "ff" * 16)
+        self.assertEqual(self.planning.calls[-1]["route_capability"], renewed_capability)
+
     async def test_weth_prepare_swap_requires_fresh_allowance_and_weth_plan(self):
         prepared = await self.prepare_weth("1")
         row = self.db.get(RobinhoodChainSwapExecution, prepared["execution"]["id"])
@@ -997,15 +1217,16 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             await self.service.prepare_swap(
                 self.db, execution_id=row.id, wallet_address=TAKER,
                 eth_token=None, usdg_token=USDG, output_token=WETH,
-                route_capability=WETH_CAPABILITY, confirm_prepare=True,
+                route_capability=weth_live_authorized_capability(), confirm_prepare=True,
             )
 
         self.rpc.allowance_atomic = 1_000_000
         self.planning.allowance_atomic = 1_000_000
+        live_capability = weth_live_authorized_capability()
         swap = await self.service.prepare_swap(
             self.db, execution_id=row.id, wallet_address=TAKER,
             eth_token=None, usdg_token=USDG, output_token=WETH,
-            route_capability=WETH_CAPABILITY, confirm_prepare=True,
+            route_capability=live_capability, confirm_prepare=True,
         )
         self.assertEqual(swap["execution"]["status"], "swap_prepared")
         self.assertEqual(swap["execution"]["symbol"], "WETH-USDG")
@@ -1015,7 +1236,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(swap["execution"]["automatic_second_transaction"])
         self.assertEqual(self.planning.calls[-1]["symbol"], "WETH-USDG")
         self.assertEqual(self.planning.calls[-1]["base_token"]["symbol"], "WETH")
-        self.assertEqual(self.planning.calls[-1]["route_capability"], WETH_CAPABILITY)
+        self.assertEqual(self.planning.calls[-1]["route_capability"], live_capability)
 
     async def test_weth_swap_claim_and_wallet_rejection_are_separate_and_hash_free(self):
         prepared = await self.prepare_weth("1")
@@ -1031,7 +1252,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         swap = await self.service.prepare_swap(
             self.db, execution_id=row.id, wallet_address=TAKER,
             eth_token=None, usdg_token=USDG, output_token=WETH,
-            route_capability=WETH_CAPABILITY, confirm_prepare=True,
+            route_capability=weth_live_authorized_capability(), confirm_prepare=True,
         )
         with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
             claimed = await self.service.claim_swap_send(
@@ -1064,7 +1285,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         swap = await self.service.prepare_swap(
             self.db, execution_id=execution_id, wallet_address=TAKER,
             eth_token=None, usdg_token=USDG, output_token=WETH,
-            route_capability=WETH_CAPABILITY, confirm_prepare=True,
+            route_capability=weth_live_authorized_capability(), confirm_prepare=True,
         )
         with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
             await self.service.claim_swap_send(
@@ -1118,7 +1339,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         swap = await self.service.prepare_swap(
             self.db, execution_id=execution_id, wallet_address=TAKER,
             eth_token=None, usdg_token=USDG, output_token=WETH,
-            route_capability=WETH_CAPABILITY, confirm_prepare=True,
+            route_capability=weth_live_authorized_capability(), confirm_prepare=True,
         )
         with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
             await self.service.claim_swap_send(
@@ -1309,6 +1530,8 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
         self.assertIn("_resolve_robinhood_chain_execution_authority_or_http", source)
         self.assertIn("/execution-authority/verify-preparation", source)
+        self.assertIn("/execution-authority/authorize-controlled-buy", source)
+        self.assertIn("require_successful_broadcast=_r5c5a_controlled_buy_execution(execution)", source)
         self.assertIn("symbol=request.symbol", source)
         self.assertIn('if str(authority.get("execution_adapter") or "") != "erc20_exact_input"', source)
         self.assertIn('input_token = dict(authority.get("input") or {})', source)

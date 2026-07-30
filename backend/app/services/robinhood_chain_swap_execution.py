@@ -191,6 +191,19 @@ def _validated_execution_authority(
         and str(capability.get("execution_status") or "").strip().lower() == "live_verified"
         and authority.get("live_execution_verified") is True
     )
+    live_authorized_pending_confirmation = bool(
+        authority_level == "live_authorized_pending_confirmation"
+        and capability.get("enabled") is True
+        and str(capability.get("firm_plan_status") or "").strip().lower() == "available"
+        and str(capability.get("execution_status") or "").strip().lower() == "preparation_verified"
+        and authority.get("preparation_verified") is True
+        and authority.get("live_execution_verified") is False
+        and authority.get("live_authorized_pending_confirmation") is True
+        and authority.get("initial_acceptance_wallet_reject_only") is False
+        and authority.get("successful_broadcast_authorized") is True
+        and isinstance(authority.get("live_authorization"), dict)
+        and bool(str((authority.get("live_authorization") or {}).get("authorization_id") or "").strip())
+    )
     preparation_ceiling = str((authority.get("execution_ceiling") or {}).get("amount") or "").strip()
     preparation_verified = bool(
         authority_level == "preparation_verified"
@@ -214,25 +227,146 @@ def _validated_execution_authority(
         and authority.get("initial_acceptance_wallet_reject_only") is True
         and authority.get("successful_broadcast_authorized") is False
     )
-    if not live_verified and not preparation_verified:
+    if not live_verified and not live_authorized_pending_confirmation and not preparation_verified:
         raise ValueError("robinhood_chain_swap_execution_capability_not_verified")
+    normalized_capability = {
+        "id": str(capability.get("id") or ""),
+        "enabled": capability.get("enabled") is True,
+        "indicative_status": str(capability.get("indicative_status") or "").strip().lower(),
+        "firm_plan_status": str(capability.get("firm_plan_status") or "").strip().lower(),
+        "execution_status": str(capability.get("execution_status") or "").strip().lower(),
+        "probe_amount": str(capability.get("probe_amount") or "").strip(),
+        "evidence": dict(evidence),
+    }
+    normalized_objective = authority.get("objective") if isinstance(authority.get("objective"), dict) else {}
     return {
+        "snapshot_schema": "r5c5a_execution_authority_v1",
         "symbol": str(authority.get("symbol") or "").strip().upper(),
         "side": str(authority.get("side") or "").strip().lower(),
         "amount_mode": str(authority.get("amount_mode") or "").strip().lower(),
         "provider": str(authority.get("provider") or "").strip().lower(),
-        "objective_id": str((authority.get("objective") or {}).get("id") or ""),
-        "capability_id": str(capability.get("id") or ""),
+        "execution_adapter": "erc20_exact_input",
+        "execution_permitted": True,
+        "objective": {"id": str(normalized_objective.get("id") or "")},
+        "objective_id": str(normalized_objective.get("id") or ""),
+        "capability": normalized_capability,
+        "capability_id": str(normalized_capability.get("id") or ""),
         "authority_level": authority_level,
         "live_execution_verified": live_verified,
-        "preparation_verified": preparation_verified,
+        "live_authorized_pending_confirmation": live_authorized_pending_confirmation,
+        "preparation_verified": bool(preparation_verified or live_authorized_pending_confirmation),
         "initial_acceptance_wallet_reject_only": preparation_verified,
-        "successful_broadcast_authorized": live_verified,
+        "successful_broadcast_authorized": bool(live_verified or live_authorized_pending_confirmation),
+        "live_authorization": dict(authority.get("live_authorization") or {}),
         "execution_ceiling": dict(authority.get("execution_ceiling") or {}),
         "input": dict(authority_input),
         "output": dict(authority_output),
         "automatic_execution_promotion": False,
     }
+
+
+def _require_successful_broadcast_authority(
+    row: RobinhoodChainSwapExecution,
+    current_authority: Optional[Dict[str, Any]] = None,
+    *,
+    allow_post_approval_rebind: bool = False,
+) -> Dict[str, Any]:
+    controlled_buy = (
+        str(row.symbol or "").strip().upper() == "WETH-USDG"
+        and str(row.side or "").strip().lower() == "buy"
+        and str(row.from_asset or "").strip().upper() == "USDG"
+        and str(row.to_asset or "").strip().upper() == "WETH"
+    )
+    if not controlled_buy:
+        # R5C.5A is intentionally scoped to the controlled WETH-USDG BUY only.
+        # Preserve the already-accepted ETH BUY and R5C.4B SELL claim behavior.
+        return {}
+    route = _route_copy(row)
+    persisted = route.get("execution_authority")
+    if not isinstance(persisted, dict):
+        if controlled_buy:
+            raise ValueError("robinhood_chain_swap_live_authority_missing")
+        return {}
+    candidate = current_authority if isinstance(current_authority, dict) else persisted
+    validated = _validated_execution_authority(
+        {"execution_authority": candidate},
+        input_asset=str(row.from_asset or ""),
+        output_asset=str(row.to_asset or ""),
+    )
+    if validated is None or validated.get("successful_broadcast_authorized") is not True:
+        raise ValueError("robinhood_chain_swap_successful_broadcast_not_authorized")
+    if str(validated.get("authority_level") or "") not in {
+        "live_authorized_pending_confirmation",
+        "live_verified",
+    }:
+        raise ValueError("robinhood_chain_swap_successful_broadcast_not_authorized")
+    for key in ("symbol", "side", "amount_mode", "provider"):
+        if str(validated.get(key) or "").strip().lower() != str(persisted.get(key) or "").strip().lower():
+            raise ValueError("robinhood_chain_swap_live_authority_context_mismatch")
+    persisted_capability = persisted.get("capability") if isinstance(persisted.get("capability"), dict) else {}
+    persisted_capability_id = str(
+        persisted.get("capability_id")
+        or persisted_capability.get("id")
+        or ""
+    ).strip()
+    if str(validated.get("capability_id") or "").strip() != persisted_capability_id:
+        raise ValueError("robinhood_chain_swap_live_authority_context_mismatch")
+    persisted_objective = persisted.get("objective") if isinstance(persisted.get("objective"), dict) else {}
+    persisted_objective_id = str(
+        persisted.get("objective_id")
+        or persisted_objective.get("id")
+        or ""
+    ).strip()
+    if str(validated.get("objective_id") or "").strip() != persisted_objective_id:
+        raise ValueError("robinhood_chain_swap_live_authority_context_mismatch")
+    if str((validated.get("execution_ceiling") or {}).get("amount") or "").strip() != str(row.exact_input_amount or "").strip():
+        raise ValueError("robinhood_chain_swap_live_authority_amount_mismatch")
+    authorization_wallet = str((validated.get("live_authorization") or {}).get("wallet_address") or "").strip().lower()
+    if authorization_wallet and authorization_wallet != str(row.wallet_address or "").strip().lower():
+        raise ValueError("robinhood_chain_swap_live_authority_wallet_mismatch")
+    persisted_authorization = persisted.get("live_authorization") if isinstance(persisted.get("live_authorization"), dict) else {}
+    current_authorization = validated.get("live_authorization") if isinstance(validated.get("live_authorization"), dict) else {}
+    if str(validated.get("authority_level") or "") == "live_authorized_pending_confirmation":
+        current_authorization_id = str(current_authorization.get("authorization_id") or "").strip()
+        persisted_authorization_id = str(persisted_authorization.get("authorization_id") or "").strip()
+        if not current_authorization_id or current_authorization_id != persisted_authorization_id:
+            approval_lifecycle = _stage_lifecycle(row, "approval")
+            swap_lifecycle = _stage_lifecycle(row, "swap")
+            try:
+                approval_transaction_hash = validate_transaction_hash(row.approval_tx_hash)
+            except (ValueError, TypeError):
+                approval_transaction_hash = ""
+            try:
+                current_allowance_atomic = int(str(row.allowance_current_atomic or "0"))
+                required_allowance_atomic = int(str(row.allowance_required_atomic or "0"))
+                allowance_shortfall_atomic = int(str(row.allowance_shortfall_atomic or "0"))
+            except (TypeError, ValueError):
+                current_allowance_atomic = 0
+                required_allowance_atomic = 0
+                allowance_shortfall_atomic = -1
+            post_approval_rebind_allowed = bool(
+                allow_post_approval_rebind
+                and current_authorization_id
+                and persisted_authorization_id
+                and str(row.exact_input_amount or "").strip() == "1"
+                and str(row.exact_input_amount_atomic or "").strip() == "1000000"
+                and str(row.status or "").strip().lower() in {
+                    "approval_confirmed",
+                    "allowance_sufficient",
+                    "swap_prepared",
+                }
+                and str(row.approval_status or "").strip().lower() == "confirmed"
+                and bool(approval_transaction_hash)
+                and str(approval_lifecycle.get("receipt_status") or "") == "1"
+                and current_allowance_atomic >= required_allowance_atomic > 0
+                and allowance_shortfall_atomic == 0
+                and row.approval_required is False
+                and not swap_lifecycle.get("send_claim_id")
+                and not row.swap_tx_hash
+            )
+            if not post_approval_rebind_allowed:
+                raise ValueError("robinhood_chain_swap_live_authorization_id_mismatch")
+    return validated
 
 
 def _validated_route_token(token: Dict[str, Any], symbol: str) -> Dict[str, Any]:
@@ -313,6 +447,15 @@ def _topic_address(value: Any) -> Optional[str]:
 
 def _route_copy(row: RobinhoodChainSwapExecution) -> Dict[str, Any]:
     return dict(row.route) if isinstance(row.route, dict) else {}
+
+
+def _live_authorization_id(authority: Any) -> str:
+    if not isinstance(authority, dict):
+        return ""
+    authorization = authority.get("live_authorization")
+    if not isinstance(authorization, dict):
+        return ""
+    return str(authorization.get("authorization_id") or "").strip()
 
 
 def _execution_lifecycle(row: RobinhoodChainSwapExecution) -> Dict[str, Any]:
@@ -621,6 +764,56 @@ class RobinhoodChainSwapExecutionService:
             "review_gate": _swap_gate(),
         }
 
+    def latest(
+        self,
+        db: Session,
+        *,
+        symbol: str,
+        side: str,
+        amount_mode: str = ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE,
+        wallet_address: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return the newest matching lifecycle without changing execution state."""
+        normalized_symbol = str(symbol or "").strip().upper().replace("/", "-").replace("_", "-")
+        normalized_side = str(side or "").strip().lower()
+        normalized_mode = str(amount_mode or "").strip().lower().replace("exact_spend", "exact_input")
+        if not normalized_symbol:
+            raise ValueError("robinhood_chain_swap_latest_symbol_required")
+        if normalized_side not in {"buy", "sell"}:
+            raise ValueError("robinhood_chain_swap_latest_side_invalid")
+        if normalized_mode != ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE:
+            raise ValueError("robinhood_chain_swap_latest_amount_mode_invalid")
+
+        query = db.query(RobinhoodChainSwapExecution).filter(
+            RobinhoodChainSwapExecution.symbol == normalized_symbol,
+            RobinhoodChainSwapExecution.side == normalized_side,
+            RobinhoodChainSwapExecution.amount_mode == normalized_mode,
+        )
+        normalized_wallet = ""
+        if str(wallet_address or "").strip():
+            normalized_wallet = validate_evm_address(wallet_address).lower()
+            query = query.filter(RobinhoodChainSwapExecution.wallet_address == normalized_wallet)
+
+        row = query.order_by(
+            RobinhoodChainSwapExecution.created_at.desc(),
+            RobinhoodChainSwapExecution.updated_at.desc(),
+        ).first()
+        if row is None:
+            raise KeyError("robinhood_chain_swap_execution_not_found")
+        payload = self.get(db, str(row.id))
+        payload["lookup"] = {
+            "kind": "latest_matching_lifecycle",
+            "symbol": normalized_symbol,
+            "side": normalized_side,
+            "amount_mode": normalized_mode,
+            "wallet_address": normalized_wallet or None,
+            "read_only": True,
+            "will_mutate": False,
+        }
+        payload["read_only"] = True
+        payload["will_mutate"] = False
+        return payload
+
     async def prepare(
         self,
         db: Session,
@@ -709,7 +902,27 @@ class RobinhoodChainSwapExecutionService:
                 "approval_send_claimed", "approval_pending", "approval_confirmed",
                 "swap_prepared", "swap_send_claimed", "swap_pending",
             }
-            if str(existing.status or "") in active_after_claim or _as_utc(existing.plan_expires_at) > now:
+            existing_status = str(existing.status or "")
+            existing_authority = _route_copy(existing).get("execution_authority")
+            current_authorization_id = _live_authorization_id(execution_authority)
+            existing_authorization_id = _live_authorization_id(existing_authority)
+            controlled_buy_authorization_changed = (
+                direction == ("buy", "USDG", "WETH")
+                and current_authorization_id != existing_authorization_id
+                and bool(current_authorization_id or existing_authorization_id)
+            )
+            if existing_status in active_after_claim:
+                return {
+                    "ok": True,
+                    "idempotent": True,
+                    "approval_required": bool(existing.approval_required),
+                    "execution": serialize_swap_execution(existing),
+                    "approval_transaction_plan": self._approval_plan(existing) if existing.approval_required and not existing.approval_tx_hash else None,
+                    "unsigned_transaction_plan": self._swap_plan(existing),
+                    "send_gate": _swap_gate(),
+                    "review_gate": _swap_gate(),
+                }
+            if not controlled_buy_authorization_changed and _as_utc(existing.plan_expires_at) > now:
                 return {
                     "ok": True,
                     "idempotent": True,
@@ -724,6 +937,7 @@ class RobinhoodChainSwapExecutionService:
             existing.approval_status = "expired"
             existing.swap_status = "expired"
             existing.updated_at = _utc_naive(now)
+            db.add(existing)
             db.commit()
 
         base_token = input_identity if normalized_side == "sell" else output_identity
@@ -985,6 +1199,7 @@ class RobinhoodChainSwapExecutionService:
     def claim_approval_send(
         self, db: Session, *, execution_id: str, wallet_address: str,
         plan_hash: str, claim_id: str, confirm_send_claim: bool,
+        execution_authority: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if confirm_send_claim is not True:
             raise ValueError("confirm_robinhood_chain_swap_approval_send_claim_required")
@@ -993,6 +1208,7 @@ class RobinhoodChainSwapExecutionService:
             raise ValueError("robinhood_chain_swap_send_gate_blocked")
         row = self._get(db, execution_id)
         validate_execution_saved_wallet(row.wallet_address, wallet_address)
+        _require_successful_broadcast_authority(row, execution_authority)
         claim = validate_claim_id(claim_id)
         plan = str(plan_hash or "").strip().lower()
         if not _SHA256_RE.fullmatch(plan) or plan != row.approval_plan_hash:
@@ -1170,6 +1386,25 @@ class RobinhoodChainSwapExecutionService:
         row = self._get(db, execution_id)
         _require_swap_stage_enabled(row)
         validate_execution_saved_wallet(row.wallet_address, wallet_address)
+        current_authority = (
+            route_capability.get("execution_authority")
+            if isinstance(route_capability, dict)
+            and isinstance(route_capability.get("execution_authority"), dict)
+            else None
+        )
+        validated_authority = _require_successful_broadcast_authority(
+            row,
+            current_authority,
+            allow_post_approval_rebind=True,
+        )
+        persisted_authority = _route_copy(row).get("execution_authority")
+        post_approval_authority_rebind = bool(
+            isinstance(persisted_authority, dict)
+            and _live_authorization_id(validated_authority)
+            and _live_authorization_id(persisted_authority)
+            and _live_authorization_id(validated_authority)
+            != _live_authorization_id(persisted_authority)
+        )
         if row.status not in {"approval_confirmed", "allowance_sufficient", "swap_prepared"}:
             raise ValueError("robinhood_chain_swap_approval_not_confirmed")
         swap_lifecycle = _stage_lifecycle(row, "swap")
@@ -1272,6 +1507,11 @@ class RobinhoodChainSwapExecutionService:
             "calldata_sha256": calldata_hash, "plan_expires_at": _as_utc(expires).isoformat(),
         })
         route = _route_copy(row)
+        if post_approval_authority_rebind:
+            # R5C.5A.3A: rebind only after the confirmed approval, live allowance,
+            # and replacement firm plan have all passed. Claim-time validation
+            # still requires this exact current authorization ID.
+            route["execution_authority"] = validated_authority
         route["fills"] = (plan.get("route") or {}).get("fills") or []
         route["firm_plan"] = {
             "quote_id": plan.get("quote_id"),
@@ -1313,6 +1553,7 @@ class RobinhoodChainSwapExecutionService:
     async def claim_swap_send(
         self, db: Session, *, execution_id: str, wallet_address: str,
         plan_hash: str, claim_id: str, confirm_send_claim: bool,
+        execution_authority: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if confirm_send_claim is not True:
             raise ValueError("confirm_robinhood_chain_swap_send_claim_required")
@@ -1322,6 +1563,7 @@ class RobinhoodChainSwapExecutionService:
         row = self._get(db, execution_id)
         _require_swap_stage_enabled(row)
         validate_execution_saved_wallet(row.wallet_address, wallet_address)
+        _require_successful_broadcast_authority(row, execution_authority)
         claim = validate_claim_id(claim_id)
         if str(plan_hash or "").strip().lower() != row.swap_plan_hash:
             raise ValueError("robinhood_chain_swap_plan_hash_mismatch")

@@ -564,6 +564,25 @@ export async function getRobinhoodChainExecutionAuthority(payload = {}, { apiBas
   return res.data;
 }
 
+export async function authorizeRobinhoodChainControlledBuy(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
+  const body = {
+    symbol: "WETH-USDG",
+    side: "buy",
+    amount_mode: "exact_input",
+    requested_amount: "1",
+    provider: "0x",
+    confirm_authorize: true,
+    ...payload,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/execution-authority/authorize-controlled-buy`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/execution-authority/authorize-controlled-buy`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
 export async function getRobinhoodChainExecutionStatus({ apiBase, timeout_ms = 30000 } = {}) {
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {
@@ -699,6 +718,31 @@ export async function prepareRobinhoodChainSwapExecution(payload = {}, { apiBase
     return res.data;
   }
   const res = await axios.post(`${base}/api/robinhood_chain/swap-execution/prepare`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function getRobinhoodChainLatestSwapExecution(
+  { symbol, side, amount_mode = "exact_input", wallet_address } = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const requestedSymbol = String(symbol || "").trim().toUpperCase().replace(/[\/_]/g, "-");
+  const requestedSide = String(side || "").trim().toLowerCase();
+  const requestedMode = String(amount_mode || "exact_input").trim().toLowerCase().replace("exact_spend", "exact_input");
+  if (!requestedSymbol || !["buy", "sell"].includes(requestedSide) || requestedMode !== "exact_input") {
+    throw new Error("Latest Robinhood Chain swap lifecycle lookup requires symbol, buy/sell side, and exact_input mode.");
+  }
+  const params = cleanParams({
+    symbol: requestedSymbol,
+    side: requestedSide,
+    amount_mode: requestedMode,
+    wallet_address,
+  });
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.get(`/api/robinhood_chain/swap-execution/latest`, { params, timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}/api/robinhood_chain/swap-execution/latest`, { params, timeout: timeout_ms });
   return res.data;
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -257,6 +258,103 @@ class RobinhoodChainExecutionAuthorityTests(unittest.TestCase):
                 side="sell",
             )
         self.assertEqual(caught.exception.code, "robinhood_chain_execution_objective_identity_mismatch")
+
+    def test_controlled_live_authorization_is_pending_confirmation_not_live_verified(self) -> None:
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        self._execution_pair(
+            base_symbol="WETH",
+            base_address=self._contract("31"),
+            base_decimals=18,
+            quote_symbol="USDG",
+            quote_address=self._contract("41"),
+            quote_decimals=6,
+            side="buy",
+            indicative_status="available",
+            firm_plan_status="available",
+            execution_status="preparation_verified",
+            probe_amount="1",
+            evidence={
+                "preparation_verified": True,
+                "live_accepted": False,
+                "successful_broadcast": False,
+                "successful_broadcast_authorized": True,
+                "symbol": "WETH-USDG",
+                "side": "buy",
+                "amount_mode": "exact_input",
+                "provider": "0x",
+                "from_asset": "USDG",
+                "to_asset": "WETH",
+                "verified_input_amount": "1",
+                "firm_plan_input_ceiling": "1",
+                "live_authorization": {
+                    "status": "live_authorized_pending_confirmation",
+                    "authorization_id": "ab" * 16,
+                    "operator_confirmed": True,
+                    "expires_at": expires_at,
+                    "symbol": "WETH-USDG",
+                    "side": "buy",
+                    "amount_mode": "exact_input",
+                    "provider": "0x",
+                    "input_asset": "USDG",
+                    "output_asset": "WETH",
+                    "exact_input_amount": "1",
+                    "approval_model": "finite_exact_input",
+                    "unlimited_approval_enabled": False,
+                    "approval_transaction_value_wei": "0",
+                    "swap_transaction_value_wei": "0",
+                    "separate_wallet_requests_required": True,
+                    "automatic_second_transaction": False,
+                    "automatic_retry": False,
+                    "automatic_execution_promotion": False,
+                    "wallet_address": "0x" + "51" * 20,
+                },
+            },
+        )
+        authority = resolve_robinhood_chain_execution_authority(
+            self.db, symbol="WETH-USDG", side="buy", require_execution=True,
+        )
+        self.assertEqual(authority["authority_level"], "live_authorized_pending_confirmation")
+        self.assertTrue(authority["successful_broadcast_authorized"])
+        self.assertTrue(authority["live_authorized_pending_confirmation"])
+        self.assertTrue(authority["preparation_verified"])
+        self.assertFalse(authority["live_execution_verified"])
+        self.assertFalse(authority["initial_acceptance_wallet_reject_only"])
+        self.assertEqual(authority["execution_ceiling"]["amount"], "1")
+        self.assertEqual(authority["execution_ceiling"]["source"], "database_live_authorization_evidence")
+
+    def test_expired_controlled_live_authorization_falls_back_to_preparation_only(self) -> None:
+        expires_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        self._execution_pair(
+            base_symbol="WETH", base_address=self._contract("31"), base_decimals=18,
+            quote_symbol="USDG", quote_address=self._contract("41"), quote_decimals=6,
+            side="buy", indicative_status="available", firm_plan_status="available",
+            execution_status="preparation_verified", probe_amount="1",
+            evidence={
+                "preparation_verified": True, "live_accepted": False, "successful_broadcast": False,
+                "successful_broadcast_authorized": True,
+                "symbol": "WETH-USDG", "side": "buy", "amount_mode": "exact_input",
+                "provider": "0x", "from_asset": "USDG", "to_asset": "WETH",
+                "verified_input_amount": "1", "firm_plan_input_ceiling": "1",
+                "live_authorization": {
+                    "status": "live_authorized_pending_confirmation", "authorization_id": "cd" * 16,
+                    "operator_confirmed": True, "expires_at": expires_at,
+                    "symbol": "WETH-USDG", "side": "buy", "amount_mode": "exact_input",
+                    "provider": "0x", "input_asset": "USDG", "output_asset": "WETH",
+                    "exact_input_amount": "1", "approval_model": "finite_exact_input",
+                    "unlimited_approval_enabled": False,
+                    "approval_transaction_value_wei": "0", "swap_transaction_value_wei": "0",
+                    "separate_wallet_requests_required": True,
+                    "automatic_second_transaction": False, "automatic_retry": False,
+                    "automatic_execution_promotion": False, "wallet_address": "0x" + "51" * 20,
+                },
+            },
+        )
+        authority = resolve_robinhood_chain_execution_authority(
+            self.db, symbol="WETH-USDG", side="buy", require_execution=True,
+        )
+        self.assertEqual(authority["authority_level"], "preparation_verified")
+        self.assertFalse(authority["successful_broadcast_authorized"])
+        self.assertTrue(authority["initial_acceptance_wallet_reject_only"])
 
     def test_preparation_verified_authority_is_bounded_and_not_live(self) -> None:
         self._execution_pair(

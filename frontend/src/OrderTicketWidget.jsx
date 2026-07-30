@@ -10,6 +10,7 @@ import {
   claimRobinhoodChainSwapApprovalSend,
   claimRobinhoodChainSwapSend,
   claimRobinhoodChainExecutionSend,
+  authorizeRobinhoodChainControlledBuy,
   getOrderRules,
   getRobinhoodChainBuyExecution,
   getRobinhoodChainBuyExecutionStatus,
@@ -20,6 +21,8 @@ import {
   getRobinhoodChainIndicativeQuote,
   getRobinhoodChainQuoteStatus,
   getRobinhoodChainRegistryMarkets,
+  getRobinhoodChainLatestSwapExecution,
+  getRobinhoodChainSwapExecution,
   getRobinhoodChainSwapExecutionStatus,
   prepareRobinhoodChainBuyApproval,
   prepareRobinhoodChainSwapExecution,
@@ -76,6 +79,7 @@ const ROBINHOOD_CHAIN_NETWORK = Object.freeze({
   blockExplorerUrls: Object.freeze(["https://robinhoodchain.blockscout.com"]),
 });
 const ROBINHOOD_CHAIN_PENDING_EXECUTION_KEY = "utt_robinhood_chain_pending_execution_v2";
+const ROBINHOOD_CHAIN_SWAP_LIFECYCLE_KEY = "utt_robinhood_chain_swap_lifecycle_v1";
 const ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH = "0.002";
 const ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI = 2000000000000000n;
 const ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH = "0.001";
@@ -174,6 +178,54 @@ function writeRobinhoodChainPendingExecution(value) {
   } catch {
     // Recovery storage is best-effort; backend idempotency remains authoritative.
   }
+}
+
+function readRobinhoodChainSwapLifecycleIdentity() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(ROBINHOOD_CHAIN_SWAP_LIFECYCLE_KEY) || "null");
+    if (!parsed || typeof parsed !== "object") return null;
+    const executionId = String(parsed.executionId || "").trim();
+    const symbol = normalizeRobinhoodChainQuoteSymbol(parsed.symbol);
+    const side = String(parsed.side || "").trim().toLowerCase();
+    const amountMode = String(parsed.amountMode || "exact_input").trim().toLowerCase().replace("exact_spend", "exact_input");
+    const walletAddress = normalizeRobinhoodChainEvmAddress(parsed.walletAddress);
+    if (!executionId || !symbol || !["buy", "sell"].includes(side) || amountMode !== "exact_input") return null;
+    return { executionId, symbol, side, amountMode, walletAddress };
+  } catch {
+    return null;
+  }
+}
+
+function writeRobinhoodChainSwapLifecycleIdentity(value) {
+  try {
+    if (!value) {
+      localStorage.removeItem(ROBINHOOD_CHAIN_SWAP_LIFECYCLE_KEY);
+      return;
+    }
+    const executionId = String(value.executionId || "").trim();
+    const symbol = normalizeRobinhoodChainQuoteSymbol(value.symbol);
+    const side = String(value.side || "").trim().toLowerCase();
+    const amountMode = String(value.amountMode || "exact_input").trim().toLowerCase().replace("exact_spend", "exact_input");
+    const walletAddress = normalizeRobinhoodChainEvmAddress(value.walletAddress);
+    if (!executionId || !symbol || !["buy", "sell"].includes(side) || amountMode !== "exact_input") return;
+    localStorage.setItem(ROBINHOOD_CHAIN_SWAP_LIFECYCLE_KEY, JSON.stringify({
+      executionId, symbol, side, amountMode, walletAddress, savedAt: new Date().toISOString(),
+    }));
+  } catch {
+    // Read-only lifecycle recovery storage is best-effort.
+  }
+}
+
+function formatRobinhoodChainVisiblePrice(value) {
+  const number = Number(String(value ?? "").trim());
+  if (!Number.isFinite(number)) return String(value || "—");
+  const magnitude = Math.abs(number);
+  const maximumFractionDigits = magnitude >= 1 ? 4 : magnitude >= 0.01 ? 6 : 10;
+  return number.toLocaleString("en-US", {
+    useGrouping: true,
+    minimumFractionDigits: 0,
+    maximumFractionDigits,
+  });
 }
 
 const COUNTERPARTY_FEE_TIERS = {
@@ -1116,6 +1168,14 @@ function submitResultStatusView(payload, kind) {
       "#9f1239",
       "#2a0f17"
     );
+  }
+
+  if (
+    isRobinhoodChainVenueKey(body?.venue) &&
+    String(body?.type || "").trim().toLowerCase().includes("approval") &&
+    status === "approval_confirmed"
+  ) {
+    return make("approval_confirmed", "APPROVAL CONFIRMED", "ok", "#bbf7d0", "#1f6f3a", "#0f1a0f");
   }
 
   if (["confirmed", "broadcast", "broadcasted"].includes(status)) {
@@ -3557,6 +3617,8 @@ export default function OrderTicketWidget({
   const [robinhoodChainExecutionAuthority, setRobinhoodChainExecutionAuthority] = useState(null);
   const [robinhoodChainExecutionAuthorityLoading, setRobinhoodChainExecutionAuthorityLoading] = useState(false);
   const [robinhoodChainExecutionAuthorityError, setRobinhoodChainExecutionAuthorityError] = useState("");
+  const [robinhoodChainLiveAuthorizationBusy, setRobinhoodChainLiveAuthorizationBusy] = useState(false);
+  const [robinhoodChainLiveAuthorizationError, setRobinhoodChainLiveAuthorizationError] = useState("");
   const robinhoodChainExecutionAuthorityReqRef = useRef(0);
   const [robinhoodChainAmountMode, setRobinhoodChainAmountMode] = useState(ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND);
   const [robinhoodChainQuote, setRobinhoodChainQuote] = useState(null);
@@ -3616,6 +3678,8 @@ export default function OrderTicketWidget({
   const [robinhoodChainSwapError, setRobinhoodChainSwapError] = useState("");
   const [robinhoodChainSwapApprovalReviewed, setRobinhoodChainSwapApprovalReviewed] = useState(false);
   const [robinhoodChainSwapReviewed, setRobinhoodChainSwapReviewed] = useState(false);
+  const [robinhoodChainSwapRestorationNotice, setRobinhoodChainSwapRestorationNotice] = useState("");
+  const [robinhoodChainLifecycleCopyNotice, setRobinhoodChainLifecycleCopyNotice] = useState("");
   const robinhoodChainSwapApprovalSendRef = useRef(false);
   const robinhoodChainSwapSendRef = useRef(false);
   const robinhoodChainSwapConfirmedBalanceRefreshRef = useRef("");
@@ -3623,7 +3687,8 @@ export default function OrderTicketWidget({
   const robinhoodChainAuthorityContextRef = useRef("");
   const robinhoodChainWalletContextRef = useRef("");
 
-  function invalidateRobinhoodChainCurrentReview(reason = "context_changed") {
+  function invalidateRobinhoodChainCurrentReview(reason = "context_changed", options = {}) {
+    const preserveConfirmedSwapLifecycle = options?.preserveConfirmedSwapLifecycle === true;
     robinhoodChainReviewContextVersionRef.current += 1;
     robinhoodChainQuoteReqRef.current += 1;
     robinhoodChainFirmPlanReqRef.current += 1;
@@ -3666,12 +3731,15 @@ export default function OrderTicketWidget({
     setRobinhoodChainBuySwapReviewed(false);
     setRobinhoodChainBuyError("");
 
-    setRobinhoodChainSwapPrepared(null);
+    if (!preserveConfirmedSwapLifecycle) {
+      setRobinhoodChainSwapPrepared(null);
+    }
     setRobinhoodChainSwapApprovalReviewed(false);
     setRobinhoodChainSwapReviewed(false);
     setRobinhoodChainSwapError("");
 
     setRobinhoodChainWalletNotice("");
+    setRobinhoodChainLiveAuthorizationError("");
 
     return reason;
   }
@@ -3946,6 +4014,22 @@ export default function OrderTicketWidget({
   const robinhoodChainExecutionAdapter = robinhoodChainExecutionAuthorized
     ? String(robinhoodChainExecutionAuthority?.execution_adapter || "").trim().toLowerCase()
     : "";
+  const robinhoodChainExecutionAuthorityLevel = String(
+    robinhoodChainExecutionAuthority?.authority_level || ""
+  ).trim().toLowerCase();
+  const robinhoodChainLiveAuthorizationExpiresAt = Date.parse(String(
+    robinhoodChainExecutionAuthority?.live_authorization?.expires_at || ""
+  ));
+  const robinhoodChainLiveAuthorizationExpired = Boolean(
+    robinhoodChainExecutionAuthorityLevel === "live_authorized_pending_confirmation" &&
+    Number.isFinite(robinhoodChainLiveAuthorizationExpiresAt) &&
+    Date.now() >= robinhoodChainLiveAuthorizationExpiresAt
+  );
+  const robinhoodChainSuccessfulBroadcastAuthorized = Boolean(
+    robinhoodChainExecutionAuthority?.successful_broadcast_authorized === true &&
+    ["live_authorized_pending_confirmation", "live_verified"].includes(robinhoodChainExecutionAuthorityLevel) &&
+    !robinhoodChainLiveAuthorizationExpired
+  );
   const robinhoodChainExecutionCeilingAmount = Number(
     robinhoodChainExecutionAuthority?.execution_ceiling?.amount
   );
@@ -4413,6 +4497,88 @@ export default function OrderTicketWidget({
         if (active) setRobinhoodChainSwapError(robinhoodChainQuoteError(error));
       }
 
+      const storedSwapIdentity = readRobinhoodChainSwapLifecycleIdentity();
+      const expectedSymbol = robinhoodChainPair.symbol;
+      const expectedSide = robinhoodChainNormalizedSide;
+      let restorationWallet = normalizeRobinhoodChainEvmAddress(
+        storedSwapIdentity?.walletAddress || robinhoodChainWalletState.savedAddress
+      );
+      if (!restorationWallet) {
+        try {
+          const quoteStatus = await getRobinhoodChainQuoteStatus({ apiBase, timeout_ms: 30000 });
+          restorationWallet = normalizeRobinhoodChainEvmAddress(quoteStatus?.wallet?.address);
+        } catch {
+          // The exact filtered lookup remains held until the saved public wallet is readable.
+        }
+      }
+      if (
+        expectedSymbol &&
+        ["buy", "sell"].includes(expectedSide) &&
+        robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
+        restorationWallet
+      ) {
+        try {
+          let payload = null;
+          let restorationSource = "latest_matching_lifecycle";
+          if (
+            storedSwapIdentity?.executionId &&
+            storedSwapIdentity.symbol === expectedSymbol &&
+            storedSwapIdentity.side === expectedSide &&
+            storedSwapIdentity.amountMode === "exact_input" &&
+            (!storedSwapIdentity.walletAddress || storedSwapIdentity.walletAddress === restorationWallet)
+          ) {
+            payload = await getRobinhoodChainSwapExecution(
+              storedSwapIdentity.executionId,
+              { apiBase, timeout_ms: 30000 }
+            );
+            restorationSource = "saved_lifecycle_id";
+          } else {
+            payload = await getRobinhoodChainLatestSwapExecution(
+              {
+                symbol: expectedSymbol,
+                side: expectedSide,
+                amount_mode: "exact_input",
+                wallet_address: restorationWallet,
+              },
+              { apiBase, timeout_ms: 30000 }
+            );
+          }
+          const restored = payload?.execution || null;
+          const restoredWallet = normalizeRobinhoodChainEvmAddress(restored?.wallet_address);
+          const restorationMatches = Boolean(
+            restored?.id &&
+            normalizeRobinhoodChainQuoteSymbol(restored?.symbol) === expectedSymbol &&
+            String(restored?.side || "").trim().toLowerCase() === expectedSide &&
+            String(restored?.amount_mode || "").trim().toLowerCase() === "exact_input" &&
+            restoredWallet === restorationWallet
+          );
+          if (!restorationMatches) throw new Error("Restored lifecycle did not match the current market, direction, amount mode, and saved wallet.");
+          if (!active) return;
+          setRobinhoodChainSwapPrepared({
+            ...payload,
+            recovered: true,
+            restoration_source: restorationSource,
+          });
+          setRobinhoodChainSwapRestorationNotice(
+            `Existing ${expectedSymbol} ${expectedSide.toUpperCase()} lifecycle restored read-only. No MetaMask, signature, preparation, claim, broadcast, or evidence mutation occurred.`
+          );
+          writeRobinhoodChainSwapLifecycleIdentity({
+            executionId: restored.id,
+            symbol: restored.symbol,
+            side: restored.side,
+            amountMode: restored.amount_mode,
+            walletAddress: restored.wallet_address,
+          });
+        } catch (error) {
+          const status = Number(error?.response?.status);
+          if (active && status !== 404) {
+            setRobinhoodChainSwapRestorationNotice(
+              `Read-only lifecycle restoration held: ${robinhoodChainQuoteError(error)}`
+            );
+          }
+        }
+      }
+
       const pending = readRobinhoodChainPendingExecution();
       if (!pending?.executionId) return;
       try {
@@ -4438,7 +4604,15 @@ export default function OrderTicketWidget({
     return () => {
       active = false;
     };
-  }, [isRobinhoodChainVenue, apiBase]);
+  }, [
+    isRobinhoodChainVenue,
+    apiBase,
+    robinhoodChainPair.symbol,
+    robinhoodChainNormalizedSide,
+    robinhoodChainEffectiveAmountMode,
+    robinhoodChainExecutionAuthorityCapabilityKey,
+    robinhoodChainWalletState.savedAddress,
+  ]);
 
   const robinhoodChainConnectedAddress = normalizeRobinhoodChainEvmAddress(robinhoodChainWalletState.connectedAddress);
   const robinhoodChainSavedAddress = normalizeRobinhoodChainEvmAddress(robinhoodChainWalletState.savedAddress);
@@ -7461,7 +7635,7 @@ export default function OrderTicketWidget({
       }
       if (robinhoodChainQuote?.ok) {
         lines.push(
-          `Latest quote: ${robinhoodChainQuote.input_amount} ${robinhoodChainQuote.input_asset} → ${robinhoodChainQuote.output_amount} ${robinhoodChainQuote.output_asset} at ${robinhoodChainQuote.effective_price} ${robinhoodChainPair.quote}/${robinhoodChainPair.base}.`
+          `Latest quote: ${robinhoodChainQuote.input_amount} ${robinhoodChainQuote.input_asset} → ${robinhoodChainQuote.output_amount} ${robinhoodChainQuote.output_asset} at ${formatRobinhoodChainVisiblePrice(robinhoodChainQuote.effective_price)} ${robinhoodChainPair.quote}/${robinhoodChainPair.base}.`
         );
       }
       return {
@@ -8203,6 +8377,24 @@ export default function OrderTicketWidget({
   const robinhoodChainSwapPlanStale = Boolean(
     Number.isFinite(robinhoodChainSwapExpiresAt) && Date.now() >= robinhoodChainSwapExpiresAt
   );
+
+  useEffect(() => {
+    if (!isRobinhoodChainVenue || !robinhoodChainSwapRow?.id) return;
+    writeRobinhoodChainSwapLifecycleIdentity({
+      executionId: robinhoodChainSwapRow.id,
+      symbol: robinhoodChainSwapRow.symbol,
+      side: robinhoodChainSwapRow.side,
+      amountMode: robinhoodChainSwapRow.amount_mode,
+      walletAddress: robinhoodChainSwapRow.wallet_address,
+    });
+  }, [
+    isRobinhoodChainVenue,
+    robinhoodChainSwapRow?.id,
+    robinhoodChainSwapRow?.symbol,
+    robinhoodChainSwapRow?.side,
+    robinhoodChainSwapRow?.amount_mode,
+    robinhoodChainSwapRow?.wallet_address,
+  ]);
   const robinhoodChainCurrentSwapInputAmount = normalizeRobinhoodChainAmountText(
     robinhoodChainNormalizedSide === "sell" ? qty : totalQuote
   );
@@ -8223,6 +8415,52 @@ export default function OrderTicketWidget({
     Number(robinhoodChainCurrentSwapInputAmount) > 0 &&
     Number(robinhoodChainCurrentSwapInputAmount) <= robinhoodChainExecutionCeilingAmount + 1e-12 &&
     (!robinhoodChainR5C4BSell || robinhoodChainCurrentSwapInputAmount === "0.0001")
+  );
+  const robinhoodChainR5C5AControlledBuy = Boolean(
+    robinhoodChainWethReviewMarket &&
+    robinhoodChainNormalizedSide === "buy" &&
+    robinhoodChainFromAsset === "USDG" &&
+    robinhoodChainToAsset === "WETH" &&
+    robinhoodChainCurrentSwapInputAmount === "1"
+  );
+  const robinhoodChainPostApprovalAuthorizationRenewal = Boolean(
+    robinhoodChainR5C5AControlledBuy &&
+    robinhoodChainSwapRow &&
+    ["approval_confirmed", "allowance_sufficient", "swap_prepared"].includes(
+      String(robinhoodChainSwapRow.status || "").trim().toLowerCase()
+    ) &&
+    String(robinhoodChainSwapRow.approval_status || "").trim().toLowerCase() === "confirmed" &&
+    normalizeRobinhoodChainTransactionHash(robinhoodChainSwapRow.approval?.tx_hash) &&
+    String(robinhoodChainSwapRow.approval?.receipt_status ?? "") === "1" &&
+    String(robinhoodChainSwapRow.allowance?.required_atomic || "") === "1000000" &&
+    String(robinhoodChainSwapRow.allowance?.current_atomic || "") === "1000000" &&
+    String(robinhoodChainSwapRow.allowance?.shortfall_atomic || "") === "0" &&
+    robinhoodChainSwapRow.allowance?.approval_required === false &&
+    !normalizeRobinhoodChainTransactionHash(robinhoodChainSwapRow.swap?.tx_hash) &&
+    robinhoodChainSwapRow.swap?.send_claimed !== true
+  );
+  const canAuthorizeRobinhoodChainControlledBuy = Boolean(
+    robinhoodChainR5C5AControlledBuy &&
+    (
+      (
+        robinhoodChainExecutionAuthorityLevel === "preparation_verified" &&
+        robinhoodChainExecutionAuthority?.preparation_verified === true &&
+        robinhoodChainExecutionAuthority?.live_execution_verified === false &&
+        robinhoodChainExecutionAuthority?.successful_broadcast_authorized === false
+      ) ||
+      (
+        robinhoodChainExecutionAuthorityLevel === "live_authorized_pending_confirmation" &&
+        robinhoodChainLiveAuthorizationExpired &&
+        robinhoodChainExecutionAuthority?.live_execution_verified === false
+      )
+    ) &&
+    robinhoodChainExecutionReviewWalletReady &&
+    (
+      robinhoodChainPostApprovalAuthorizationRenewal ||
+      (robinhoodChainFirmPlan?.ok && !robinhoodChainFirmPlanStale)
+    ) &&
+    !robinhoodChainExecutionAuthorityLoading &&
+    !robinhoodChainLiveAuthorizationBusy
   );
   const canPrepareRobinhoodChainSwapExecution = Boolean(
     isRobinhoodChainVenue &&
@@ -8280,8 +8518,23 @@ export default function OrderTicketWidget({
     if (!robinhoodChainExecutionReviewWalletReady) return "Saved-wallet identity is not ready for explicit backend verification.";
     return "The current plan is not eligible for an explicit lifecycle review.";
   })();
-  const robinhoodChainFirmPlanApprovalSummary = robinhoodChainFirmPlanStale
-    ? "STALE — rebuild before later execution"
+  const robinhoodChainConfirmedStage2StateActive = Boolean(
+    robinhoodChainSwapRow && [
+      "approval_confirmed",
+      "allowance_sufficient",
+      "swap_prepared",
+      "swap_send_claimed",
+      "swap_pending",
+      "confirmed",
+    ].includes(String(robinhoodChainSwapRow.status || "").trim().toLowerCase())
+  );
+  const robinhoodChainGenericPlanSuperseded = Boolean(
+    robinhoodChainConfirmedStage2StateActive && robinhoodChainFirmPlanStale
+  );
+  const robinhoodChainFirmPlanApprovalSummary = robinhoodChainGenericPlanSuperseded
+    ? "GENERIC TICKET PLAN STALE · CONFIRMED LIFECYCLE PRESERVED"
+    : robinhoodChainFirmPlanStale
+      ? "STALE — rebuild before later execution"
     : robinhoodChainFirmPlanApprovalState === "native_input"
       ? "NATIVE INPUT · NO APPROVAL"
       : robinhoodChainFirmPlanApprovalState === "allowance_sufficient"
@@ -8291,8 +8544,20 @@ export default function OrderTicketWidget({
           : "APPROVAL STATE UNVERIFIED";
 
   const robinhoodChainSwapLifecycleStatus = String(robinhoodChainSwapRow?.status || "").trim().toLowerCase();
+  const robinhoodChainSwapLifecycleApprovalEvidencePresent = Boolean(
+    robinhoodChainSwapRow && (
+      normalizeRobinhoodChainTransactionHash(robinhoodChainSwapRow.approval?.tx_hash) ||
+      ["pending", "confirmed", "reverted"].includes(
+        String(robinhoodChainSwapRow.approval_status || "").trim().toLowerCase()
+      ) ||
+      Number(robinhoodChainSwapRow.approval?.submission_attempts || 0) > 0 ||
+      robinhoodChainSwapRow.approval?.receipt_status !== null &&
+        robinhoodChainSwapRow.approval?.receipt_status !== undefined
+    )
+  );
   const robinhoodChainSwapLifecycleApprovalRequired = Boolean(
     robinhoodChainSwapRow && (
+      robinhoodChainSwapLifecycleApprovalEvidencePresent ||
       robinhoodChainSwapRow.approval_required === true ||
       Boolean(robinhoodChainSwapApprovalPlan) ||
       [
@@ -8321,6 +8586,7 @@ export default function OrderTicketWidget({
     String(robinhoodChainSwapRow.status || "") === "approval_prepared" &&
     !robinhoodChainSwapPlanStale &&
     robinhoodChainSwapSendGate?.send_enabled === true &&
+    (!robinhoodChainR5C5AControlledBuy || robinhoodChainSuccessfulBroadcastAuthorized) &&
     robinhoodChainWalletReady &&
     robinhoodChainSwapApprovalReviewed &&
     !robinhoodChainSwapBusy &&
@@ -8332,6 +8598,7 @@ export default function OrderTicketWidget({
     robinhoodChainSwapRow.swap_stage_enabled === true &&
     ["approval_confirmed", "allowance_sufficient", "swap_prepared"].includes(String(robinhoodChainSwapRow.status || "")) &&
     (String(robinhoodChainSwapRow.status || "") !== "swap_prepared" || !robinhoodChainSwapPlan || robinhoodChainSwapPlanStale) &&
+    (!robinhoodChainR5C5AControlledBuy || robinhoodChainSuccessfulBroadcastAuthorized) &&
     robinhoodChainWalletReady &&
     !robinhoodChainSwapBusy
   );
@@ -8343,6 +8610,7 @@ export default function OrderTicketWidget({
     String(robinhoodChainSwapRow.status || "") === "swap_prepared" &&
     !robinhoodChainSwapPlanStale &&
     robinhoodChainSwapSendGate?.send_enabled === true &&
+    (!robinhoodChainR5C5AControlledBuy || robinhoodChainSuccessfulBroadcastAuthorized) &&
     robinhoodChainWalletReady &&
     robinhoodChainSwapReviewed &&
     !robinhoodChainSwapBusy &&
@@ -10297,6 +10565,86 @@ async function submitLimitOrder() {
     }
   }
 
+  async function authorizeRobinhoodChainR5C5AControlledBuy() {
+    if (!canAuthorizeRobinhoodChainControlledBuy || robinhoodChainLiveAuthorizationBusy) return;
+    const preserveConfirmedSwapLifecycle = robinhoodChainPostApprovalAuthorizationRenewal;
+    const review = [
+      preserveConfirmedSwapLifecycle
+        ? "R5C.5A · RENEW STAGE 2 LIVE AUTHORIZATION"
+        : "R5C.5A · CONTROLLED GENERIC BUY LIVE AUTHORIZATION",
+      "",
+      "Market: WETH-USDG",
+      "Side: BUY",
+      "Spend exactly: 1 USDG",
+      "Receive: WETH",
+      "Approval: finite USDG only",
+      "Approval transaction value: 0 wei",
+      "Swap transaction value: 0 wei",
+      "Wallet: saved Robinhood Chain MetaMask account",
+      "",
+      preserveConfirmedSwapLifecycle
+        ? "The confirmed finite USDG approval and its transaction evidence will be preserved. This renewal authorizes only the separate Stage 2 swap preparation and wallet request."
+        : "This authorizes a successful browser-wallet broadcast pending confirmed receipt and reconciliation.",
+      "It does not open MetaMask, sign, broadcast, repeat the approval, retry, or submit a second transaction.",
+    ].join("\n");
+    if (!window.confirm(review)) {
+      setRobinhoodChainLiveAuthorizationError("Controlled live BUY authorization was canceled. No wallet request occurred.");
+      return;
+    }
+    setRobinhoodChainLiveAuthorizationBusy(true);
+    setRobinhoodChainLiveAuthorizationError("");
+    try {
+      const data = await authorizeRobinhoodChainControlledBuy(
+        {
+          symbol: "WETH-USDG",
+          side: "buy",
+          amount_mode: "exact_input",
+          requested_amount: "1",
+          provider: "0x",
+          taker_address: robinhoodChainConnectedAddress,
+          confirm_authorize: true,
+        },
+        { apiBase, timeout_ms: 30000 }
+      );
+      if (!data?.ok || data?.execution_authority?.successful_broadcast_authorized !== true) {
+        throw new Error(data?.error || "Controlled live BUY authorization was not granted.");
+      }
+      invalidateRobinhoodChainCurrentReview(
+        "r5c5a_live_authority_changed",
+        { preserveConfirmedSwapLifecycle }
+      );
+      setRobinhoodChainExecutionAuthority(data.execution_authority);
+      setRobinhoodChainWalletNotice(
+        preserveConfirmedSwapLifecycle
+          ? "R5C.5A Stage 2 authorization renewed. The confirmed finite 1 USDG approval was preserved; prepare one fresh swap plan before the separate wallet request."
+          : "R5C.5A controlled 1 USDG BUY is authorized pending confirmation. Rebuild the quote, unsigned plan, and lifecycle before any wallet request."
+      );
+      onToast?.({
+        kind: "ok",
+        msg: preserveConfirmedSwapLifecycle
+          ? "Stage 2 authorization renewed. Confirmed approval preserved; no MetaMask request occurred."
+          : "Controlled 1 USDG WETH BUY authorization recorded. No MetaMask request occurred.",
+      });
+    } catch (error) {
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainLiveAuthorizationError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      setRobinhoodChainLiveAuthorizationBusy(false);
+    }
+  }
+
+  async function copyRobinhoodChainLifecycleUuid() {
+    const lifecycleId = String(robinhoodChainSwapRow?.id || "").trim();
+    if (!lifecycleId || !HAS_WINDOW || !navigator?.clipboard?.writeText) return;
+    try {
+      await navigator.clipboard.writeText(lifecycleId);
+      setRobinhoodChainLifecycleCopyNotice("Lifecycle UUID copied.");
+    } catch {
+      setRobinhoodChainLifecycleCopyNotice("Lifecycle UUID copy failed.");
+    }
+  }
+
   async function prepareRobinhoodChainSwapExecutionReview() {
     if (!canPrepareRobinhoodChainSwapExecution || robinhoodChainSwapBusy) return;
     const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
@@ -10670,7 +11018,10 @@ async function submitLimitOrder() {
             status,
             execution_id: data.execution.id,
             transaction_hash: data.execution.approval?.tx_hash || null,
-            token: "USDG",
+            approval_calldata_hash: data.execution.approval?.calldata_sha256 || null,
+            approval_transaction_hash: data.execution.approval?.tx_hash || null,
+            swap_transaction_hash: data.execution.swap?.tx_hash || null,
+            token: data.execution.from_asset || "INPUT",
             approved_allowance_atomic: data.execution.approval?.allowance_confirmed_atomic || data.execution.allowance?.current_atomic || null,
             spender: data.execution.allowance?.spender || data.execution.approval?.spender || null,
             transaction_value_wei: "0",
@@ -10697,7 +11048,10 @@ async function submitLimitOrder() {
             status,
             execution_id: data.execution.id,
             transaction_hash: data.execution.approval?.tx_hash || null,
-            token: "USDG",
+            approval_calldata_hash: data.execution.approval?.calldata_sha256 || null,
+            approval_transaction_hash: data.execution.approval?.tx_hash || null,
+            swap_transaction_hash: data.execution.swap?.tx_hash || null,
+            token: data.execution.from_asset || "INPUT",
             transaction_value_wei: "0",
             automatic_second_transaction: false,
             swap_stage_enabled: false,
@@ -12890,6 +13244,64 @@ async function submitLimitOrder() {
             {robinhoodChainExecutionAuthorityLoading && (
               <div style={{ marginTop: 5, color: "#a5f3fc", fontSize: 10.5 }}>Resolving database execution authority…</div>
             )}
+            {robinhoodChainR5C5AControlledBuy && !robinhoodChainSuccessfulBroadcastAuthorized && (
+              <div
+                data-rh-ui-norm="r5c5a-live-authorization-held"
+                style={{
+                  marginTop: 7,
+                  padding: 8,
+                  borderRadius: 9,
+                  border: "1px solid rgba(250, 204, 21, 0.45)",
+                  background: "linear-gradient(135deg, rgba(113, 63, 18, 0.24), rgba(30, 41, 59, 0.28))",
+                  display: "flex",
+                  gap: 8,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  fontSize: 10.5,
+                }}
+              >
+                <b style={{ color: "#fde68a" }}>
+                  {robinhoodChainPostApprovalAuthorizationRenewal
+                    ? "R5C.5A STAGE 2 AUTHORIZATION EXPIRED"
+                    : "R5C.5A LIVE BUY AUTHORIZATION HELD"}
+                </b>
+                <span>
+                  {robinhoodChainPostApprovalAuthorizationRenewal
+                    ? "Confirmed finite 1 USDG approval retained · renew only the separate swap authority."
+                    : "Exactly 1 USDG · WETH output · finite approval only."}
+                </span>
+                <button
+                  type="button"
+                  style={{ ...safeButton, ...(!canAuthorizeRobinhoodChainControlledBuy ? safeButtonDisabled : {}), padding: "6px 9px", fontWeight: 900 }}
+                  disabled={!canAuthorizeRobinhoodChainControlledBuy}
+                  onClick={authorizeRobinhoodChainR5C5AControlledBuy}
+                >
+                  {robinhoodChainLiveAuthorizationBusy
+                    ? "Authorizing…"
+                    : robinhoodChainPostApprovalAuthorizationRenewal
+                      ? "Renew Stage 2 Authorization"
+                      : "Authorize Controlled 1 USDG BUY"}
+                </button>
+                <span>
+                  {robinhoodChainPostApprovalAuthorizationRenewal
+                    ? "No approval repeat or MetaMask request occurs during renewal."
+                    : "No MetaMask request occurs during authorization."}
+                </span>
+              </div>
+            )}
+            {robinhoodChainR5C5AControlledBuy && robinhoodChainSuccessfulBroadcastAuthorized && (
+              <div
+                data-rh-ui-norm="r5c5a-live-authorization-ready"
+                style={{ marginTop: 7, color: "#bbf7d0", fontSize: 10.5, fontWeight: 850 }}
+              >
+                R5C.5A LIVE AUTHORIZED PENDING CONFIRMATION · exactly 1 USDG BUY · separate approval and swap wallet requests required.
+              </div>
+            )}
+            {robinhoodChainLiveAuthorizationError && (
+              <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>
+                {hideTableData ? "Controlled live authorization failed closed." : robinhoodChainLiveAuthorizationError}
+              </div>
+            )}
             {robinhoodChainQuoteErrorText && (
               <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>{hideTableData ? "Latest indicative quote request failed." : robinhoodChainQuoteErrorText}</div>
             )}
@@ -12898,12 +13310,18 @@ async function submitLimitOrder() {
               <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(34, 211, 238, 0.16)", display: "flex", gap: 10, flexWrap: "wrap", fontSize: 10.5, lineHeight: 1.3 }}>
                 <span style={{ color: robinhoodChainQuoteStale ? "#fde68a" : "#bbf7d0", fontWeight: 900 }}>{robinhoodChainQuoteStale ? "QUOTE STALE" : robinhoodChainQuote.cached ? "QUOTE CACHED" : "QUOTE FRESH"}</span>
                 <span>{String(robinhoodChainQuote.side || side).toUpperCase()}: <b>{hideTableData ? "••••" : `${robinhoodChainQuote.input_amount || "—"} ${robinhoodChainQuote.input_asset || ""} → ${robinhoodChainQuote.output_amount || "—"} ${robinhoodChainQuote.output_asset || ""}`}</b></span>
-                <span>{robinhoodChainQuote.quote_asset || robinhoodChainPair.quote}/{robinhoodChainQuote.base_asset || robinhoodChainPair.base}: <b>{hideTableData ? "••••" : robinhoodChainQuote.effective_price || "—"}</b></span>
+                <span>{robinhoodChainQuote.quote_asset || robinhoodChainPair.quote}/{robinhoodChainQuote.base_asset || robinhoodChainPair.base}: <b>{hideTableData ? "••••" : formatRobinhoodChainVisiblePrice(robinhoodChainQuote.effective_price)}</b></span>
                 <span>Min: <b>{hideTableData ? "••••" : `${robinhoodChainQuote.minimum_received || "—"} ${robinhoodChainQuote.minimum_received_asset || ""}`}</b></span>
                 <span>Impact: <b>{robinhoodChainQuote.price_impact_bps ?? "—"} bps</b></span>
                 <span>Route: <b>{Array.isArray(robinhoodChainQuote.route_sources) && robinhoodChainQuote.route_sources.length ? robinhoodChainQuote.route_sources.join(" + ") : robinhoodChainQuote.route_source || "—"}</b></span>
                 <span>Network fee: <b>{hideTableData ? "••••" : robinhoodChainQuote.total_network_fee ? `${robinhoodChainQuote.total_network_fee} ${robinhoodChainQuote.total_network_fee_asset || ""}`.trim() : "—"}</b></span>
                 <span>Allowance: <b>{robinhoodChainQuote.allowance_required ? "REQUIRED" : "not required"}</b></span>
+                <details data-r5c5a4="raw-price-diagnostics" style={{ flexBasis: "100%", marginTop: 2 }}>
+                  <summary style={{ cursor: "pointer", color: "#c4b5fd", fontSize: 10, fontWeight: 900 }}>Advanced Diagnostics · raw quote precision</summary>
+                  <div style={{ marginTop: 5, color: "#ddd6fe", overflowWrap: "anywhere" }}>
+                    Raw {robinhoodChainQuote.quote_asset || robinhoodChainPair.quote}/{robinhoodChainQuote.base_asset || robinhoodChainPair.base}: <b>{hideTableData ? "••••" : robinhoodChainQuote.effective_price || "—"}</b>
+                  </div>
+                </details>
               </div>
             ) : (
               <div style={{ marginTop: 5, fontSize: 10.5, color: "#bae6fd" }}>
@@ -12912,7 +13330,9 @@ async function submitLimitOrder() {
                     ? robinhoodChainWethReviewMarket && robinhoodChainExecutionAuthorized
                       ? robinhoodChainNormalizedSide === "sell"
                         ? `R5C.4B bounded preparation ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted ceiling is ${robinhoodChainExecutionCeilingAmount || "0.0001"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"}; the first finite approval wallet request must be rejected and successful broadcast is not authorized.`
-                        : `R5C.4A bounded preparation ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted ceiling is ${robinhoodChainExecutionCeilingAmount || "1"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"}; wallet handoff remains explicit and initial acceptance is wallet-reject only.`
+                        : robinhoodChainSuccessfulBroadcastAuthorized
+                          ? `R5C.5A controlled live authorization is active for exactly ${robinhoodChainExecutionCeilingAmount || "1"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"}. Approval and swap remain separate explicit wallet requests; live verification still requires confirmed receipt and reconciliation.`
+                          : `R5C.4A bounded preparation ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. The persisted ceiling is ${robinhoodChainExecutionCeilingAmount || "1"} ${robinhoodChainExecutionCeilingAsset || robinhoodChainFromAsset || "input"}; successful broadcast remains held until explicit R5C.5A authorization.`
                       : `Review-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"}. Probe amount is evidence and the synthetic-book seed; indicative quotes use the configured review ceiling and unsigned plans use a separate verified ceiling. Signing, approval, and execution remain locked.`
                     : robinhoodChainWrapUnwrapReview
                       ? `Mechanism-only ${robinhoodChainFromAsset || "input"}→${robinhoodChainToAsset || "output"} review. Wrap/unwrap preview and transaction construction are not enabled in R5C.3A; no DEX price or stale limit is displayed.`
@@ -12929,6 +13349,12 @@ async function submitLimitOrder() {
 
             {robinhoodChainFirmPlanErrorText && (
               <div style={{ marginTop: 5, color: "#fecdd3", fontSize: 10.5 }}>{hideTableData ? "Latest unsigned-plan request failed." : robinhoodChainFirmPlanErrorText}</div>
+            )}
+
+            {robinhoodChainGenericPlanSuperseded && (
+              <div data-r5c5a4="generic-plan-vs-confirmed-stage2" style={{ marginTop: 6, color: "#fde68a", fontSize: 10.5 }}>
+                The generic ticket plan is stale and separate from the restored confirmed lifecycle. Stage 1 approval and confirmed Stage 2 evidence remain authoritative; no approval repeat is required.
+              </div>
             )}
 
             {robinhoodChainFirmPlan?.ok && (
@@ -13082,6 +13508,12 @@ async function submitLimitOrder() {
               </div>
             )}
 
+            {robinhoodChainSwapRestorationNotice && (
+              <div data-r5c5a4="read-only-lifecycle-restoration" style={{ marginTop: 7, color: robinhoodChainSwapRestorationNotice.includes("held") ? "#fde68a" : "#bbf7d0", fontSize: 10.5 }}>
+                {hideTableData ? "Robinhood Chain lifecycle restoration status available." : robinhoodChainSwapRestorationNotice}
+              </div>
+            )}
+
             {["buy", "sell"].includes(robinhoodChainNormalizedSide) && robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND && robinhoodChainSwapRow && (
               <div style={{
                 marginTop: 8,
@@ -13122,7 +13554,18 @@ async function submitLimitOrder() {
                         <span style={safePill}>Swap TX value: <b>{robinhoodChainSwapRow.swap?.transaction_value_wei || "0"} wei</b></span>
                       </>
                     )}
-                    <span style={safePill}>Lifecycle ID: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.id || "", 8, 6)}</b></span>
+                    <span style={{ ...safePill, gridColumn: "1 / -1", alignItems: "flex-start" }}>
+                      Lifecycle UUID:
+                      <b data-r5c5a4="full-lifecycle-uuid" style={{ wordBreak: "break-all" }}>{hideTableData ? "••••" : robinhoodChainSwapRow.id || "—"}</b>
+                      {!hideTableData && (
+                        <button type="button" style={{ ...safeButton, padding: "3px 6px", fontSize: 9.5 }} onClick={copyRobinhoodChainLifecycleUuid}>
+                          Copy UUID
+                        </button>
+                      )}
+                    </span>
+                    {robinhoodChainLifecycleCopyNotice && (
+                      <span style={{ color: robinhoodChainLifecycleCopyNotice.includes("failed") ? "#fecdd3" : "#bbf7d0" }}>{robinhoodChainLifecycleCopyNotice}</span>
+                    )}
                   </div>
                 </details>
 
@@ -13155,14 +13598,45 @@ async function submitLimitOrder() {
                       <span style={safePill}>Gas maximum: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval?.gas_limit || "—"}</b></span>
                     </div>
                     {robinhoodChainSwapRow.approval?.tx_hash && (
-                      <div style={{ marginTop: 6, color: "#bae6fd" }}>
-                        Approval transaction hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.approval.tx_hash, 12, 10)}</b>
-                        {robinhoodChainSwapRow.approval?.receipt_status !== null && robinhoodChainSwapRow.approval?.receipt_status !== undefined && (
-                          <> · Receipt: <b>{String(robinhoodChainSwapRow.approval.receipt_status)}</b></>
-                        )}
-                        {robinhoodChainSwapRow.approval?.allowance_confirmed_atomic && (
-                          <> · Confirmed allowance: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval.allowance_confirmed_atomic}</b></>
-                        )}
+                      <div style={{ marginTop: 6, color: "#bae6fd", display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
+                        <span>
+                          Approval transaction hash: <b>{hideTableData ? "••••" : shortenWalletAddress(robinhoodChainSwapRow.approval.tx_hash, 12, 10)}</b>
+                          {robinhoodChainSwapRow.approval?.receipt_status !== null && robinhoodChainSwapRow.approval?.receipt_status !== undefined && (
+                            <> · Receipt: <b>{String(robinhoodChainSwapRow.approval.receipt_status)}</b></>
+                          )}
+                          {robinhoodChainSwapRow.approval?.allowance_confirmed_atomic && (
+                            <> · Confirmed allowance: <b>{hideTableData ? "••••" : robinhoodChainSwapRow.approval.allowance_confirmed_atomic}</b></>
+                          )}
+                        </span>
+                        <button
+                          type="button"
+                          data-r5c5a4="approval-confirmed-evidence-action"
+                          style={{ ...safeButton, padding: "4px 7px", fontSize: 9.5 }}
+                          onClick={() => openSubmitResultModal(
+                            "ok",
+                            {
+                              ok: true,
+                              venue: "robinhood_chain",
+                              symbol: robinhoodChainSwapRow.symbol || "WETH-USDG",
+                              side: robinhoodChainSwapRow.side || "buy",
+                              type: "erc20_approval",
+                              status: "approval_confirmed",
+                              execution_id: robinhoodChainSwapRow.id,
+                              transaction_hash: robinhoodChainSwapRow.approval?.tx_hash || null,
+                              approval_calldata_hash: robinhoodChainSwapRow.approval?.calldata_sha256 || null,
+                              approval_transaction_hash: robinhoodChainSwapRow.approval?.tx_hash || null,
+                              swap_transaction_hash: robinhoodChainSwapRow.swap?.tx_hash || null,
+                              approved_allowance_atomic: robinhoodChainSwapRow.approval?.allowance_confirmed_atomic || robinhoodChainSwapRow.allowance?.current_atomic || null,
+                              transaction_value_wei: robinhoodChainSwapRow.approval?.transaction_value_wei || "0",
+                              automatic_second_transaction: false,
+                              automatic_retry: false,
+                              swap_stage_enabled: robinhoodChainSwapRow.swap_stage_enabled === true,
+                            },
+                            "Robinhood Chain Approval Confirmed"
+                          )}
+                        >
+                          View Approval Evidence
+                        </button>
                       </div>
                     )}
                   </details>
@@ -13189,6 +13663,9 @@ async function submitLimitOrder() {
                       )}
                       {!robinhoodChainSwapSendGate?.send_enabled && (
                         <span style={{ color: "#fde68a" }}>Missing: {(robinhoodChainSwapSendGate?.missing_requirements || []).join(", ") || "dedicated live gate"}</span>
+                      )}
+                      {robinhoodChainR5C5AControlledBuy && !robinhoodChainSuccessfulBroadcastAuthorized && (
+                        <span style={{ color: "#fde68a" }}>Successful broadcast authority is held. Authorize the controlled 1 USDG BUY before requesting MetaMask.</span>
                       )}
                     </div>
                   )}
@@ -13285,6 +13762,14 @@ async function submitLimitOrder() {
                     <span>Status: <b>{String(robinhoodChainSwapRow.swap_status || "locked").toUpperCase()}</b></span>
                     <span>Separate wallet request: <b>YES</b></span>
                   </div>
+                  <div data-r5c5a4="short-provider-ttl" style={{ marginTop: 6, color: "#c4b5fd", fontSize: 10 }}>
+                    Provider Stage 2 plans are short-lived, typically about 30 seconds. Prepare one only when ready; expiration never invalidates the confirmed finite Stage 1 approval.
+                  </div>
+                  {(robinhoodChainSwapError || robinhoodChainSwapRow.swap_stage_locked_reason) && (
+                    <div data-r5c5a4="exact-stage2-backend-hold" style={{ marginTop: 6, color: "#fde68a", fontSize: 10.5, overflowWrap: "anywhere" }}>
+                      Stage 2 backend hold reason: <b>{hideTableData ? "••••" : robinhoodChainSwapError || robinhoodChainSwapRow.swap_stage_locked_reason}</b>
+                    </div>
+                  )}
                   {["approval_confirmed", "allowance_sufficient"].includes(String(robinhoodChainSwapRow.status || "")) && (
                     <div style={{ marginTop: 7, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                       <button
@@ -13295,7 +13780,18 @@ async function submitLimitOrder() {
                       >
                         {robinhoodChainSwapBusy ? "Preparing…" : `Prepare Fresh ${robinhoodChainSwapRow.exact_input_amount} ${robinhoodChainSwapRow.from_asset || "INPUT"} → ${robinhoodChainSwapRow.to_asset}`}
                       </button>
-                      <span style={{ color: "#c4b5fd" }}>A fresh plan is mandatory after approval confirmation.</span>
+                      <span style={{ color: "#c4b5fd" }}>A fresh short-lived plan is mandatory after approval confirmation.</span>
+                      {robinhoodChainPostApprovalAuthorizationRenewal && (
+                        <button
+                          type="button"
+                          data-r5c5a4="stage2-renewal-action"
+                          style={{ ...safeButton, ...(!canAuthorizeRobinhoodChainControlledBuy ? safeButtonDisabled : {}), padding: "6px 9px", fontWeight: 900 }}
+                          disabled={!canAuthorizeRobinhoodChainControlledBuy}
+                          onClick={authorizeRobinhoodChainR5C5AControlledBuy}
+                        >
+                          {robinhoodChainLiveAuthorizationBusy ? "Authorizing…" : "Renew Stage 2 Authorization"}
+                        </button>
+                      )}
                     </div>
                   )}
                   {String(robinhoodChainSwapRow.status || "") === "swap_prepared" && robinhoodChainSwapPlan && (
@@ -13329,7 +13825,7 @@ async function submitLimitOrder() {
                         </button>
                         {robinhoodChainSwapPlanStale && (
                           <button type="button" style={{ ...safeButton, padding: "5px 8px" }} disabled={robinhoodChainSwapBusy} onClick={prepareRobinhoodChainSwapFreshReview}>
-                            Rebuild Fresh Plan
+                            Rebuild Short-Lived Stage 2 Plan
                           </button>
                         )}
                       </div>
@@ -14970,7 +15466,7 @@ async function submitLimitOrder() {
                       <div style={{ wordBreak: "break-all" }}>
                         {hideTableData
                           ? "••••"
-                          : robinhoodChainSubmitResultEvidence.approvalCalldataHash || "not prepared"}
+                          : robinhoodChainSubmitResultEvidence.approvalCalldataHash || "unavailable in result payload"}
                       </div>
                       <div style={{ color: "#a9a9a9" }}>Approval transaction hash</div>
                       <div style={{ wordBreak: "break-all" }}>

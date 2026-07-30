@@ -678,6 +678,81 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(second["firm_plan"])
         self.assertEqual(len(self.fake_planning.calls), 1)
 
+    async def test_r5c5a_live_authorization_requires_explicit_confirmation(self) -> None:
+        self._r5c4a_capability()
+        await self.service.verify_preparation_authority(
+            self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+            requested_amount="1", taker_address="0x" + "51" * 20,
+            slippage_bps=100, confirm_verify=True,
+        )
+        with self.assertRaisesRegex(ValueError, "confirm_r5c5a_live_authorization_required"):
+            self.service.authorize_controlled_live_buy(
+                self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+                requested_amount="1", provider="0x", wallet_address="0x" + "51" * 20,
+                confirm_authorize=False,
+            )
+
+    async def test_r5c5a_live_authorization_is_exact_wallet_bound_and_not_live_verified(self) -> None:
+        _, _, capability = self._r5c4a_capability()
+        await self.service.verify_preparation_authority(
+            self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+            requested_amount="1", taker_address="0x" + "51" * 20,
+            slippage_bps=100, confirm_verify=True,
+        )
+        calls_before = len(self.fake_planning.calls)
+        result = self.service.authorize_controlled_live_buy(
+            self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+            requested_amount="1", provider="0x", wallet_address="0x" + "51" * 20,
+            confirm_authorize=True,
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["idempotent"])
+        self.assertTrue(result["database_mutated"])
+        self.assertTrue(result["successful_broadcast_authorized"])
+        self.assertFalse(result["live_execution_verified"])
+        self.assertFalse(result["broadcast_enabled"])
+        self.assertFalse(result["automatic_second_transaction"])
+        self.assertFalse(result["automatic_retry"])
+        self.assertEqual(len(self.fake_planning.calls), calls_before)
+        authority = result["execution_authority"]
+        self.assertEqual(authority["authority_level"], "live_authorized_pending_confirmation")
+        self.assertTrue(authority["successful_broadcast_authorized"])
+        self.assertFalse(authority["live_execution_verified"])
+        self.assertFalse(authority["initial_acceptance_wallet_reject_only"])
+        self.assertEqual(authority["execution_ceiling"]["amount"], "1")
+        self.db.refresh(capability)
+        authorization = capability.evidence["live_authorization"]
+        self.assertEqual(authorization["wallet_address"], ("0x" + "51" * 20).lower())
+        self.assertEqual(authorization["approval_model"], "finite_exact_input")
+        self.assertFalse(authorization["unlimited_approval_enabled"])
+        self.assertEqual(authorization["approval_transaction_value_wei"], "0")
+        self.assertEqual(authorization["swap_transaction_value_wei"], "0")
+        self.assertTrue(authorization["separate_wallet_requests_required"])
+        self.assertFalse(authorization["automatic_execution_promotion"])
+
+        second = self.service.authorize_controlled_live_buy(
+            self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+            requested_amount="1", provider="0x", wallet_address="0x" + "51" * 20,
+            confirm_authorize=True,
+        )
+        self.assertTrue(second["idempotent"])
+        self.assertFalse(second["database_mutated"])
+
+    async def test_r5c5a_wrong_amount_and_sell_direction_remain_locked(self) -> None:
+        self._r5c4a_capability()
+        await self.service.verify_preparation_authority(
+            self.db, symbol="WETH-USDG", side="buy", amount_mode="exact_input",
+            requested_amount="1", taker_address="0x" + "51" * 20,
+            slippage_bps=100, confirm_verify=True,
+        )
+        for side, amount in (("buy", "1.01"), ("sell", "1")):
+            with self.assertRaisesRegex(ValueError, "r5c5a_live_authorization_target_locked"):
+                self.service.authorize_controlled_live_buy(
+                    self.db, symbol="WETH-USDG", side=side, amount_mode="exact_input",
+                    requested_amount=amount, provider="0x", wallet_address="0x" + "51" * 20,
+                    confirm_authorize=True,
+                )
+
     async def test_r5c4b_preparation_verification_requires_explicit_confirmation(self) -> None:
         self._r5c4b_capability()
         with self.assertRaisesRegex(ValueError, "confirm_r5c4b_preparation_verification_required"):
@@ -1041,6 +1116,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "/registry-discovery/objectives",
             "/registry-discovery/markets",
             "/registry-discovery/sync-execution-evidence",
+            "/execution-authority/authorize-controlled-buy",
         ):
             self.assertIn(route, router_source)
 

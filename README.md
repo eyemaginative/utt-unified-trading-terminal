@@ -2,15 +2,19 @@
 
 UTT (Unified Trading Terminal) is a local-first, multi-venue crypto trading terminal built with **FastAPI** on the backend and **React** on the frontend. It is designed to unify centralized exchange (CEX) workflows and selected decentralized exchange (DEX) flows under a single operator-focused interface.
 
+> **Current documented baseline:** this README reflects the codebase through the published Counterparty / UniSat integration series and the R5C.5B controlled Robinhood Chain BUY / SELL lifecycle. Generic custom-pair Robinhood Chain execution remains a later tranche and is not implied by the current live-validated scope.
+
 At a high level, UTT provides one place to:
 
 - connect and manage venue credentials through local profile-managed API-key storage
 - inspect balances, available amounts, holds, priced totals, cost basis, average cost, and gain/loss columns
-- view orderbooks, pseudo-orderbooks, synthetic price-context orderbooks, and manual route orderbooks
+- view CEX orderbooks, DEX pseudo-orderbooks, Counterparty dispenser / protocol-order books, synthetic price-context books, and manual route books
 - submit and track CEX orders, cancel supported venue orders, and monitor venue-native order snapshots
 - trade through supported live-gated CEX adapters such as Coinbase, Crypto.com, Dex-Trade, Gemini, Kraken, Robinhood, and OKX where configured
+- use Counterparty / UniSat workflows for Bitcoin-metaprotocol assets, collectibles, orderbook context, unsigned compose review, explicit PSBT signing, and separately gated broadcast
+- use Robinhood Chain for registry-backed EVM balances, quote discovery, synthetic books, bounded unsigned planning, controlled browser-wallet execution, receipt reconciliation, and All Orders reflection
 - submit and track Solana swaps / limit-style flows and confirmed Hydration manual-route swaps
-- monitor scanners, discovery tools, wallet activity, market-cap data, volume data, and self-custody balances
+- monitor scanners, discovery tools, Ordinals / Counterparty collectibles, wallet activity, market-cap data, volume data, and self-custody balances
 - filter Market Cap and Volume windows by All / Owned / Unowned and by venue/source such as Coinbase, Crypto.com, Dex-Trade, Gemini, Hydration, Kraken, OKX, Robinhood, self-custody, Solana, and Solana-Jupiter
 - work with local ledger, deposits, withdrawals, missing-basis lots, transfer links, FIFO lot-impact previews, and tax-related state
 - preview per-fill basis impact for supported venue fills without mutating FIFO lots
@@ -24,7 +28,7 @@ At a high level, UTT provides one place to:
 
 UTT is a desktop-style browser application today, but architecturally it functions as a local trading workstation:
 
-- **Backend:** FastAPI application providing venue adapters, market/order routes, auth/profile endpoints, wallet and ledger tooling, Solana DEX routing, and Polkadot / Hydration routing
+- **Backend:** FastAPI application providing venue adapters, market/order routes, auth/profile endpoints, wallet and ledger tooling, Counterparty / Bitcoin-metaprotocol services, bounded EVM / Robinhood Chain services, Solana DEX routing, and Polkadot / Hydration routing
 - **Frontend:** React interface providing a modular multi-window trading terminal UI
 - **Storage / local state:** local database and runtime state kept outside of public source control
 - **Secrets model:** local or external environment loading for runtime config, plus profile-managed encrypted credential storage for exchange API keys
@@ -48,6 +52,8 @@ UTT is best understood as a local operator workstation rather than a single exch
 - Server-side pre-trade normalization to venue increments before live order placement.
 - Dry-run / armed / live-venue gate enforcement so live trading cannot occur only because the UI is visible.
 - OKX gated live submit and cancel support using the OKX trade endpoint and cancel endpoint, while leaving withdrawals unsupported.
+- Counterparty read-only market / balance discovery, unsigned compose previews, explicit UniSat `signPsbt`, and separately gated `pushPsbt` broadcast with no backend signing or automatic broadcast.
+- Robinhood Chain registry-backed quote discovery, unsigned transaction planning, bounded exact-input execution authority, finite ERC-20 approval, separate browser-wallet requests, and receipt reconciliation.
 - Solana DEX swap and limit-style flow integration where the selected wallet and route support the requested pair.
 - Hydration manual XYK and confirmed manual Router swap-transaction preparation for known route-registry rows.
 
@@ -55,6 +61,8 @@ UTT is best understood as a local operator workstation rather than a single exch
 
 - CEX orderbooks where venue adapters expose them.
 - DEX pseudo-orderbooks for route-based execution contexts.
+- Counterparty ASSET-BTC dispenser and protocol-order context with exact audit prices, mode separation, USD reference values, and rate-limit-safe fallback behavior.
+- Robinhood Chain pair catalog and provider-backed synthetic books for registry-authorized directional quote context.
 - Hydration manual/live UTTT-HDX pseudo-orderbook generation from live pool reserves.
 - Hydration synthetic orderbook rows for price context only, kept non-tradable unless a safe route exists.
 - CoinGecko-backed market-cap and volume windows through a backend cache layer.
@@ -66,7 +74,9 @@ UTT is best understood as a local operator workstation rather than a single exch
 
 - Per-venue balances with total, available, and hold values.
 - USD pricing enrichment for balances when requested.
-- AppHeader portfolio totals across CEX, Solana DEX, Hydration DEX, and cached self-custody balances where configured.
+- AppHeader portfolio totals across CEX, Counterparty / Bitcoin, Robinhood Chain, Solana DEX, Hydration DEX, and cached self-custody balances where configured.
+- Counterparty asset and BTC balances resolved from the configured Wallet Addresses account, with direct or ASSET-BTC-derived USD valuation when sufficiently authoritative.
+- Robinhood Chain native ETH and Token Registry-authorized ERC-20 balances using bounded EVM RPC reads and cached pricing context.
 - Cost basis and average cost columns on balance rows.
 - Basis status indicators such as OK, partial, missing, unmatched, no lots, and not applicable.
 - Basis lot drilldown from balance rows.
@@ -85,6 +95,8 @@ UTT is best understood as a local operator workstation rather than a single exch
 - Sound and toast-on-fill UI behavior.
 - OKX normalized order economics, including signed-fee normalization and `total_after_fee` calculation for fills.
 - OKX fills-history diagnostics and per-fill basis-preview rows without creating fill records or mutating basis lots.
+- Confirmed Counterparty purchases reflected into All Orders after explicit wallet signing / broadcast evidence exists.
+- Confirmed Robinhood Chain swaps reflected into All Orders with direction-correct BUY / SELL quantity, gross, net, fee, average-price, and limit-rate economics.
 
 ### Ledger, wallet, basis, and transfer workflows
 
@@ -96,6 +108,8 @@ UTT is best understood as a local operator workstation rather than a single exch
 - Dry-run-first handling for ledger materialization and basis impact.
 - Hydration wallet-history ingestion into cached wallet-address transaction rows.
 - Deposit and withdrawal materialization from trusted cached wallet transactions.
+- Counterparty purchase accounting previews that separate acquired asset quantity, BTC consideration, Bitcoin miner fee, historical BTC/USD context, custody scope, and candidate source-lot impact without mutating ledger or FIFO state.
+- Robinhood Chain transaction-history and accounting previews that remain separate from execution and passive balance reads.
 - Internal transfer and bridge planning surfaces that avoid treating transfers as taxable disposals by default.
 
 ### UTTT-specific workflows and use cases
@@ -164,6 +178,97 @@ The OKX adapter is now integrated as a live-gated CEX venue. OKX support include
 - Market Cap and Volume source filtering so OKX-held assets appear under the OKX source filter
 
 OKX live routing remains explicitly guarded. A visible OKX Order Ticket is not enough to place an order. Live OKX submit/cancel requires the backend to be armed, dry-run to be disabled, `LIVE_VENUES` to include `okx`, and `OKX_ENABLE_TRADING=1`. OKX withdrawal support is intentionally not implemented.
+
+
+### Counterparty / UniSat workflow
+
+UTT includes a Bitcoin-metaprotocol integration for Counterparty assets and UniSat browser-wallet workflows. This is separate from the CEX adapters and from the EVM-based Robinhood Chain path.
+
+Current Counterparty / UniSat capabilities include:
+
+- Counterparty mainnet diagnostics and API routing through the `counterparty` venue
+- configured source-address resolution from **Wallet Addresses**, rather than depending on hidden browser state
+- Counterparty asset metadata, balances, sends, dispensers, orders, and orderbook context
+- BTC plus Counterparty asset balances in the main Balances workflow
+- direct Token Registry / Market Metrics USD pricing when a deterministic mapping exists
+- ASSET-BTC-derived reference valuation using visible Counterparty liquidity and BTC/USD when direct USD mapping is unavailable
+- stale-last-good balance fallback and bounded derived-price work
+- Token Registry support for Counterparty asset identity and metadata
+- UniSat account, network, public-key, BTC-balance, and inscription discovery
+- an Ordinals / Counterparty collectibles window with asset metadata and media previews where available
+- read-only market-context previews for Counterparty assets
+- separate **Dispenser Purchase** and **Protocol Order** modes
+- exact dispenser lot-price handling so an indivisible or fixed-lot purchase cannot be silently rescaled
+- unsigned compose previews with selected-book-level identity, source address, expiration, fee tier, and funding requirements
+- Bitcoin fee-tier support and positive miner-fee validation
+- PSBT input enrichment with UTXO metadata before wallet signing is enabled
+- explicit UniSat `signPsbt` handoff only after review and funding checks pass
+- separately confirmed UniSat `pushPsbt` broadcast only when `COUNTERPARTY_LIVE_BROADCAST_ENABLED=1`
+- automatic broadcast disabled in all modes
+- sensitive signed PSBT material retained only in the browser workflow and redacted from ordinary result display
+- confirmed Counterparty purchases reflected into All Orders
+- read-only accounting previews for acquired asset, BTC consideration, miner fee, historical BTC/USD, custody scope, and candidate BTC source-lot impact
+
+Counterparty execution remains review-first. The backend may request public data and build an unsigned compose preview, but it does not hold a Bitcoin private key, sign a PSBT, or broadcast a transaction. Signing and broadcast are separate browser-wallet actions, and broadcast is never automatic.
+
+### Robinhood Chain workflow
+
+UTT includes a dedicated Robinhood Chain integration that is separate from the Robinhood Crypto brokerage adapter. The current chain configuration targets **Robinhood Chain mainnet, chain ID 4663**, and uses a browser EVM wallet such as MetaMask for any signing.
+
+Current Robinhood Chain capabilities include:
+
+- explicit venue registration and chain diagnostics
+- bounded HTTP RPC reads with timeout, cache, concurrency, and error-backoff controls
+- optional WebSocket configuration for future or diagnostic use
+- MetaMask linkage that is initiated only by an explicit operator action
+- native ETH balance reads
+- Token Registry-authorized ERC-20 identity and balance reads
+- unified portfolio pricing for registered Robinhood Chain assets
+- bounded Blockscout-backed transaction-history display
+- read-only transaction and accounting previews
+- 0x-backed indicative quote discovery using a profile-managed API key stored under venue `zerox`
+- registry-driven pair objectives, directional capabilities, token identity, provider identity, and execution authority
+- lazy directional discovery rather than broad N-squared pair probing
+- pair catalogs and synthetic provider-backed orderbook context
+- unsigned exact-input planning with saved-wallet, chain, provider, pair, direction, and amount binding
+- finite ERC-20 approval planning; unlimited approval remains disabled
+- explicit separation between approval and swap wallet requests
+- short-lived provider plans and claim IDs that fail closed when stale, mismatched, or already consumed
+- read-only lifecycle restoration by exact execution ID or latest matching pair / direction / wallet lookup
+- controlled, live-validated WETH-USDG BUY and SELL lifecycles
+- exact on-chain receipt reconciliation, actual input/output calculation, network-fee calculation, and submission-count evidence
+- receipt-log reconciliation for the explicit case where a non-archive RPC serves the transaction and receipt but cannot serve the required historical ERC-20 balance snapshots
+- direction-correct All Orders normalization for both BUY and SELL rows
+
+Current live-validated scope is intentionally narrow:
+
+```text
+WETH-USDG BUY
+  input: USDG
+  output: WETH
+  amount mode: exact input / exact spend
+
+WETH-USDG SELL
+  input: WETH
+  output: USDG
+  amount mode: exact input / exact spend
+```
+
+The current code does **not** imply that every Token Registry pair is live-authorized. Generic custom-pair execution, arbitrary custom-token books, and broader pair acceptance remain later work. Read-only discovery, registry identity, quote context, and unsigned planning do not automatically promote a pair into live execution.
+
+Robinhood Chain safety boundaries include:
+
+- no automatic wallet connection
+- no wallet request during passive quote, balance, lifecycle-restore, or authorization reads
+- no backend private key
+- no backend signing
+- no backend transaction send
+- no automatic approval
+- no unlimited approval
+- no automatic second transaction
+- no automatic retry
+- no execution promotion merely because a provider quote exists
+- no ledger, FIFO, or basis mutation from quote, planning, execution-evidence, or All Orders display paths
 
 ### Solana DEX workflow
 
@@ -266,6 +371,9 @@ Representative components include:
 - `OrderTicketWidget.jsx`
 - `TerminalTablesWidget.jsx`
 - `features/bridge/SpreadBridgeDashboardChip.jsx` for Spread / Bridge planning
+- `features/nfts/NftCollectiblesWindow.jsx` for UniSat Ordinals and Counterparty collectibles
+- `features/wallets/RobinhoodChainHistoryPanel.jsx` and `RobinhoodChainAccountingPreview.jsx`
+- `features/wallets/WalletAddressesWindow.jsx` for chain and custody address management
 - feature windows such as token registry and scanner tooling
 
 ### Security / operational direction
@@ -279,6 +387,8 @@ That includes:
 - avoiding committed database and key files
 - using **Profile → API Keys** for venue credentials instead of tracked env files
 - storing user-entered venue keys in the app’s local encrypted credential store rather than plaintext repository files
+- keeping UniSat and MetaMask signing material inside the browser wallet rather than backend code
+- separating review, authorization, signing, broadcast, receipt reconciliation, and accounting-preview stages
 
 ---
 
@@ -307,6 +417,11 @@ A simplified view of the current repository structure:
 │       ├── app/
 │       ├── components/
 │       ├── features/
+│       │   ├── bridge/
+│       │   ├── nfts/
+│       │   ├── registry/
+│       │   ├── scanners/
+│       │   └── wallets/
 │       ├── hooks/
 │       ├── lib/
 │       ├── utils/
@@ -361,9 +476,12 @@ Current areas of focus include:
 - order book and order ticket integration
 - table, ledger, and order views
 - Solana wallet-manager integration for DEX flows
+- UniSat wallet handoff, Counterparty ticket modes, and collectibles/media windows
+- MetaMask-linked Robinhood Chain balances, quote context, controlled execution review, lifecycle restoration, and result-evidence UI
 - registry, scanner, Market Cap, Volume, and Spread / Bridge planning windows
 - compact Hydration price-status UI that avoids triggering backend refresh or SDK quote paths
-- AppHeader portfolio totals that include cached wallet-address / self-custody balances
+- compact AppHeader tool tabs and consistent safety/status coloring
+- AppHeader portfolio totals that include CEX, Counterparty, Robinhood Chain, cached wallet-address, and other self-custody balances
 
 In practical terms, the frontend favors:
 
@@ -382,6 +500,8 @@ It is responsible for:
 
 - venue adapter access
 - wallet and market routing
+- Counterparty API normalization, compose-preview safety, PSBT handoff metadata, and read-only accounting previews
+- bounded EVM RPC, Blockscout history, 0x quote discovery, registry authority, and Robinhood Chain lifecycle reconciliation
 - order creation and cancellation support
 - unified order views
 - token and symbol resolution
@@ -417,7 +537,32 @@ The exact state of each venue may evolve over time, but the repository currently
   - live-gated submit
   - live-gated cancel from All Orders
   - Market Cap / Volume source filtering
-- Robinhood
+- Robinhood Crypto brokerage adapter
+- Robinhood Chain
+  - chain ID 4663 RPC diagnostics and bounded EVM reads
+  - MetaMask linkage by explicit operator action
+  - native ETH and registered ERC-20 balances
+  - Token Registry-authoritative chain identity
+  - Blockscout transaction history
+  - accounting previews
+  - 0x indicative quote discovery through profile-managed `zerox` credentials
+  - registry-driven pair objectives, capabilities, and execution authority
+  - synthetic provider-backed pair books
+  - unsigned exact-input planning
+  - finite approval plus separate swap requests
+  - controlled WETH-USDG BUY and SELL execution lifecycles
+  - receipt and fee reconciliation, including explicit non-archive RPC fallback
+  - All Orders BUY / SELL normalization and evidence isolation
+- Counterparty / UniSat
+  - Counterparty mainnet asset, balance, send, dispenser, and order discovery
+  - Wallet Addresses-controlled source account
+  - Token Registry support and ASSET-BTC / BTC-USD valuation context
+  - UniSat accounts, inscriptions, collectibles, media previews, and BTC balance
+  - dispenser and protocol-order book modes
+  - unsigned compose previews, funding checks, fee tiers, and PSBT enrichment
+  - explicit `signPsbt` and separately gated `pushPsbt`
+  - confirmed purchase reflection in All Orders
+  - historical BTC/USD, custody-scope, and source-lot accounting previews
 - Solana DEX flows
   - Jupiter
   - Raydium
@@ -728,7 +873,126 @@ select Solana DEX venue
 
 Solana support includes Jupiter-related routing paths, Raydium routing, token registry lookup, mint resolution, and wallet-aware Order Ticket behavior.
 
-### 9) Wallet addresses and self-custody visibility
+
+### 9) Counterparty / UniSat flows
+
+Use the `counterparty` venue for Bitcoin-metaprotocol asset discovery, balances, collectibles, orderbook context, compose review, and explicit UniSat wallet handoff.
+
+Recommended setup:
+
+```text
+Wallet Addresses
+→ create or confirm the Counterparty / Bitcoin source-address row
+→ open UniSat and confirm the intended mainnet account
+→ open Balances or Collectibles
+→ verify the displayed address, BTC balance, and Counterparty assets
+```
+
+Typical read-only workflow:
+
+```text
+select venue: counterparty
+→ select a Counterparty asset / BTC pair
+→ inspect dispenser and protocol-order context
+→ inspect exact BTC price, USD reference, available lots, and warnings
+→ choose Dispenser Purchase or Protocol Order mode
+```
+
+Typical compose and wallet workflow:
+
+```text
+select one visible book level
+→ enter the requested quantity / lot
+→ choose Bitcoin fee tier
+→ build unsigned compose preview
+→ verify source address, selected level, BTC consideration, miner fee, and funding requirements
+→ request UniSat signPsbt explicitly
+→ review the signed-but-not-broadcast result
+→ broadcast only through a second explicit confirmation when COUNTERPARTY_LIVE_BROADCAST_ENABLED=1
+→ verify txid and All Orders reflection
+```
+
+Important Counterparty rules:
+
+- dispenser and protocol-order modes do not silently fall back into each other
+- exact dispenser lot economics are authoritative
+- a zero or missing miner fee is not treated as a safe default
+- PSBT signing remains disabled until input UTXO metadata and funding checks are sufficient
+- UTT never broadcasts automatically
+- backend services never sign or broadcast
+- the signed PSBT is not ordinary persisted application state
+- a confirmed purchase should be reviewed in All Orders before accounting work begins
+
+Accounting review sequence:
+
+```text
+confirmed Counterparty txid
+→ ledger preview
+→ historical BTC/USD evidence
+→ custody-scope preview
+→ source-lot preview
+→ operator review
+```
+
+These accounting paths are previews. They do not automatically create deposits, withdrawals, basis lots, FIFO consumption, or tax records.
+
+### 10) Robinhood Chain flows
+
+Use the `robinhood_chain` venue for chain diagnostics, registered-token balances, quote context, synthetic books, bounded review, and controlled browser-wallet execution.
+
+Recommended read-only setup:
+
+```text
+enable Robinhood Chain runtime configuration
+→ add the intended EVM wallet through Wallet Addresses
+→ add required chain assets to Token Registry
+→ save the 0x API key through Profile → API Keys using venue zerox
+→ open Robinhood Chain balances / history
+→ verify chain ID 4663 and the intended wallet address
+```
+
+Typical quote and review flow:
+
+```text
+select venue: robinhood_chain
+→ select a registry-authorized symbol
+→ inspect the synthetic provider-backed Order Book
+→ review quote status, provider, chain, input/output assets, and amount mode
+→ prepare an unsigned plan only when the pair capability allows it
+```
+
+Current controlled WETH-USDG execution flow:
+
+```text
+select WETH-USDG and BUY or SELL
+→ enter Quantity or Total; Auto-calc may be enabled or disabled
+→ review the exact-input ceiling
+→ create / renew the bounded database-only execution authority
+→ prepare a fresh short-lived provider plan
+→ review destination, calldata hash, plan hash, minimum output, and value
+→ for ERC-20 input, request one finite approval through MetaMask
+→ wait for confirmed allowance
+→ prepare a new fresh swap plan
+→ request one separate swap transaction through MetaMask
+→ refresh the existing lifecycle read-only
+→ verify actual input, actual output, fees, transaction hashes, and submission counts
+→ verify the confirmed row in All Orders
+```
+
+Important Robinhood Chain rules:
+
+- passive reads do not request MetaMask
+- database-only authorization does not request MetaMask
+- provider plans are short-lived and stale plans fail closed
+- approval and swap are separate wallet requests
+- unlimited approval is disabled
+- transaction value for ERC-20 approval and ERC-20 swap is expected to be `0 wei`
+- no automatic retry or automatic second transaction is permitted
+- an accepted lifecycle is restored by read-only lookup rather than recreated
+- current live-validated execution scope is WETH-USDG; arbitrary registry pairs are not automatically authorized
+- All Orders must preserve BUY / SELL direction and pair economics
+
+### 11) Wallet addresses and self-custody visibility
 
 Use wallet-address tooling to register self-custody addresses and include cached wallet balances or history in local views.
 
@@ -744,7 +1008,7 @@ Open wallet/address tooling
 
 Self-custody balances can contribute to AppHeader portfolio totals when cached and available.
 
-### 10) Hydration wallet-history ingestion and ledger materialization
+### 12) Hydration wallet-history ingestion and ledger materialization
 
 Hydration wallet-history ingestion is a dry-run-first workflow.
 
@@ -762,7 +1026,7 @@ coverage dry run
 
 This avoids inventing USD basis and avoids treating internal transfers, bridge-like movements, or LP / Omnipool rows as normal taxable disposals by default.
 
-### 11) Deposits, withdrawals, FIFO lots, and basis
+### 13) Deposits, withdrawals, FIFO lots, and basis
 
 The local ledger tooling is designed for conservative local accounting workflows.
 
@@ -779,7 +1043,7 @@ FIFO lot impact    = explicit preview/apply workflow for eligible withdrawals
 
 Do not apply broad FIFO rebuilds until preview output looks correct.
 
-### 12) Spread / Bridge dashboard
+### 14) Spread / Bridge dashboard
 
 The Spread / Bridge dashboard is a planning dashboard, not an execution bridge.
 
@@ -801,7 +1065,7 @@ open Spread / Bridge
 
 Actual bridge execution and actual basis mutation remain intentionally disabled until a guarded apply path is explicitly implemented and tested.
 
-### 13) Market Cap and Volume windows
+### 15) Market Cap and Volume windows
 
 Use the AppHeader Market Cap and Volume tool tabs to inspect normalized backend-cached market metrics.
 
@@ -854,7 +1118,7 @@ venue_filter_keys
 
 A market-data row can still display as `global` for the market-data venue while also being filterable under OKX or another local source because the price/volume source and the local ownership source are intentionally separate concepts.
 
-### 14) Scanner and discovery tooling
+### 16) Scanner and discovery tooling
 
 Scanner and discovery windows are operator tools for surfacing assets, venue data, or other candidate rows depending on which backend routes are enabled.
 
@@ -868,7 +1132,7 @@ open scanner/discovery window
 → use registry or terminal actions to wire supported assets into trading views
 ```
 
-### 15) Donate window
+### 17) Donate window
 
 The Donate window is an AppHeader utility for public support addresses.
 
@@ -882,7 +1146,7 @@ DEX-wallet-aware Send buttons can hand off supported assets toward the wallet/or
 
 Only public donation addresses belong in the UI. Never put private keys or seed phrases into the donation configuration.
 
-### 16) Local backup and session hygiene
+### 18) Local backup and session hygiene
 
 Use profile/logout backup behavior and local backup tooling to preserve local DB state before major changes.
 
@@ -910,6 +1174,8 @@ Recommended baseline:
 - Windows PowerShell for the Windows-oriented commands below
 - a local Solana wallet extension if using Solana DEX features
 - a Polkadot/Substrate wallet extension such as SubWallet if using Polkadot / Hydration flows
+- UniSat if using Counterparty signing, broadcast, BTC balance, or Ordinals / inscription features
+- MetaMask or another compatible browser EVM wallet if using Robinhood Chain execution features
 - venue access and any required API credentials for the venues you plan to test
 
 ### 1) Clone the repository
@@ -997,6 +1263,52 @@ node app\services\hydration_sidecar.mjs
 If sidecar diagnostics are intentionally enabled, set `UTT_HYDRATION_USE_SIDECAR=1` and/or `UTT_HYDRATION_PRICE_CACHE_USE_SIDECAR=1` in your private env for that local test only.
 
 Hydration asset IDs, decimals, external price IDs, and route/pool metadata are intended to be managed through the Token Registry and Route Registry rather than hardcoded into tracked env files.
+
+
+#### Counterparty / UniSat configuration
+
+Counterparty public data uses the Counterparty API, while wallet control remains in UniSat. A public-safe baseline is:
+
+```env
+COUNTERPARTY_ENABLED=1
+COUNTERPARTY_API_BASE_URL=https://api.counterparty.io:4000
+COUNTERPARTY_NETWORK=mainnet
+COUNTERPARTY_WALLET_PROVIDER=unisat
+
+# Keep broadcast off unless intentionally performing a reviewed live test.
+COUNTERPARTY_LIVE_BROADCAST_ENABLED=0
+```
+
+Additional Counterparty fee, Bitcoin transaction lookup, cache, and timeout controls may be configured in the private env as needed. Do not store a Bitcoin private key, seed phrase, or signed PSBT in the repository.
+
+The configured Counterparty custody address should be managed through **Wallet Addresses**. Browser wallet account discovery is useful for comparison and signing, but passive backend balance and accounting paths should not depend on invisible browser state.
+
+#### Robinhood Chain configuration
+
+Robinhood Chain is separate from the Robinhood Crypto brokerage adapter. A public-safe read-only baseline is:
+
+```env
+ROBINHOOD_CHAIN_ENABLED=1
+ROBINHOOD_CHAIN_RPC_HTTP=https://rpc.mainnet.chain.robinhood.com/
+ROBINHOOD_CHAIN_RPC_WS=
+ROBINHOOD_CHAIN_CHAIN_ID=4663
+
+ROBINHOOD_CHAIN_TIMEOUT_S=15
+ROBINHOOD_CHAIN_CACHE_TTL_S=30
+ROBINHOOD_CHAIN_ERROR_BACKOFF_S=120
+ROBINHOOD_CHAIN_MAX_CONCURRENT=1
+
+ROBINHOOD_CHAIN_EXPLORER_API_BASE=https://robinhoodchain.blockscout.com/api/v2
+ROBINHOOD_CHAIN_SWAP_PROVIDER=0x
+ROBINHOOD_CHAIN_ZEROX_API_BASE=https://api.0x.org
+
+# Keep live execution off unless intentionally performing a bounded test.
+ROBINHOOD_CHAIN_LIVE_EXECUTION_ENABLED=0
+```
+
+Store the 0x API key through **Profile → API Keys** using venue `zerox`. Do not put the key in the README, source files, or tracked env files.
+
+Enabling `ROBINHOOD_CHAIN_LIVE_EXECUTION_ENABLED=1` is not sufficient by itself. Live execution also requires the global trading gates, an accepted registry capability, a matching saved wallet, a fresh provider plan, an explicit database authority, and explicit browser-wallet confirmation for each transaction stage.
 
 ### 3) Create and activate a backend virtual environment
 
@@ -1096,6 +1408,15 @@ Then restart the backend from that same terminal. If any required gate is missin
 
 Do not grant withdrawal permission to OKX API keys for UTT live order testing. The OKX workflow only requires the permissions needed for balances, market data, and trade placement/canceling.
 
+Counterparty and Robinhood Chain use additional venue-specific gates:
+
+```text
+COUNTERPARTY_LIVE_BROADCAST_ENABLED
+ROBINHOOD_CHAIN_LIVE_EXECUTION_ENABLED
+```
+
+These gates do not authorize an automatic transaction. Counterparty still requires explicit UniSat signing and a separate explicit broadcast confirmation. Robinhood Chain still requires a matching execution authority, a fresh provider plan, and a separate explicit MetaMask confirmation for each approval or swap transaction.
+
 ---
 
 ## Installation notes by environment
@@ -1142,6 +1463,126 @@ UTT is intentionally structured so that public source code can live in git while
 - keep wallet and account testing material separate from source control
 
 ---
+
+
+## Counterparty / UniSat notes
+
+Counterparty assets are Bitcoin-controlled metaprotocol assets. UTT therefore treats market discovery, wallet signing, broadcast, and accounting as separate stages.
+
+### Data and custody model
+
+The backend can read public Counterparty data and resolve the configured custody address from Wallet Addresses. UniSat remains the browser wallet for account discovery, inscriptions, signing, and any operator-enabled broadcast.
+
+Relevant concepts:
+
+```text
+configured custody address  = authoritative account used by backend balance/accounting reads
+connected UniSat address    = browser account used for explicit wallet actions
+Counterparty asset quantity = metaprotocol balance
+BTC quantity                = Bitcoin balance and transaction funding
+```
+
+A mismatch between the configured custody address and the connected UniSat address should be treated as a blocking review condition, not silently corrected.
+
+### Market and execution modes
+
+The Counterparty ticket separates:
+
+```text
+Dispenser Purchase
+Protocol Order
+```
+
+A dispenser purchase targets a visible fixed lot and exact BTC payment. A protocol order uses the Counterparty order protocol and may include expiration blocks and different compose semantics. UTT should not silently switch modes because one path is unavailable.
+
+### PSBT and broadcast model
+
+The backend builds or normalizes unsigned compose output and may expose a PSBT handoff when the result is signable. Before `signPsbt` is enabled, UTT checks the source address, selected level, funding requirements, miner fee, and available input metadata.
+
+The browser flow is:
+
+```text
+unsigned compose preview
+→ explicit UniSat signPsbt
+→ signed, not broadcast result
+→ separate explicit pushPsbt confirmation when operator-enabled
+```
+
+`COUNTERPARTY_LIVE_BROADCAST_ENABLED=0` keeps broadcast disabled. When it is `1`, UTT still does not broadcast automatically. Backend code never holds the signing key or submits the transaction.
+
+### Accounting previews
+
+Counterparty accounting previews can separate:
+
+- acquired Counterparty asset quantity
+- dispenser or order BTC consideration
+- Bitcoin miner fee
+- historical BTC/USD observation
+- custody-address scope
+- source UTXO identity and candidate basis-lot coverage
+- transaction-level warnings and unresolved basis conditions
+
+These are review surfaces. They do not automatically mutate the ledger, create lots, consume FIFO, or decide tax treatment.
+
+## Robinhood Chain notes
+
+Robinhood Chain is an EVM chain integration and is intentionally independent from Robinhood brokerage API credentials.
+
+### Identity and registry model
+
+Token identity comes from Token Registry rows and chain metadata rather than frontend symbol assumptions. Pair objectives and directional capabilities bind:
+
+```text
+symbol
+side
+input token
+output token
+amount mode
+provider
+probe / ceiling amount
+wallet
+execution status
+```
+
+A quote or discoverable token does not automatically become an executable pair.
+
+### Wallet and transaction model
+
+Passive chain operations use backend RPC reads. Signing remains in the browser wallet.
+
+For an ERC-20 exact-input swap, the lifecycle may require:
+
+```text
+Stage 1 — finite approval
+Stage 2 — exact-input swap
+```
+
+Each stage has its own claim and explicit browser-wallet request. UTT rejects stale plans, reused claims, wallet mismatches, chain mismatches, destination mismatches, calldata mismatches, amount overruns, and invalid value fields.
+
+Quantity and Total remain manually editable. Auto-calc may synchronize them when enabled, but the backend authority and accepted exact-input ceiling remain the safety boundary.
+
+### Receipt reconciliation
+
+A confirmed receipt is reconciled against saved execution evidence. Preferred reconciliation uses receipt logs plus historical balance cross-checks.
+
+Some Robinhood Chain RPC endpoints serve transactions and receipts but do not retain the historical state needed for before/after token balance calls. For the explicit `metadata is not found` / non-archive condition, UTT can use a receipt-log fallback for ERC-20-to-ERC-20 reconciliation while still requiring:
+
+- exact transaction hash
+- exact sender and destination
+- exact calldata hash
+- zero native transaction value for the controlled ERC-20 swap
+- receipt status `1`
+- exact input-token transfer from the wallet
+- positive output-token transfer to the wallet
+- output at or above the accepted minimum
+- fee calculation from receipt gas fields
+- one approval submission and one swap submission
+
+Historical balances that are available but disagree still fail closed. The fallback is not permission to ignore a real mismatch.
+
+### Current execution boundary
+
+The currently live-validated path is the bounded WETH-USDG exact-input BUY / SELL lifecycle. Generic registry pair discovery and custom-pair Order Book work may exist as preparation or future roadmap items, but arbitrary live custom-token execution is not represented as complete by this README.
 
 ## Solana DEX notes
 
@@ -1376,6 +1817,8 @@ Current work includes:
 
 - venue-aware order book display
 - pseudo-orderbook behavior for DEX routes
+- Counterparty dispenser / protocol-order books with exact BTC and USD context
+- Robinhood Chain synthetic provider-backed books for registry-authorized directional quote context
 - manual/live Hydration UTTT-HDX orderbook generation
 - inline Hydration price-cache status display that does not create an extra notification row
 - router-quote safety gating for generic Hydration SDK pairs
@@ -1386,6 +1829,8 @@ Current work includes:
 Current work includes:
 
 - venue-aware order entry
+- Counterparty dispenser / protocol-order mode selection, compose preview, fee tier, UniSat PSBT signing, and separately gated broadcast
+- Robinhood Chain editable Quantity / Total controls, optional Auto-calc, bounded authority, finite approval, separate swap request, and lifecycle restoration
 - Solana wallet-manager integration
 - Jupiter and Raydium route selection for DEX paths
 - Hydration manual UTTT-HDX sell/exact-in and buy/exact-out transaction preparation
@@ -1430,6 +1875,114 @@ Check:
 - the venue API key was actually added and saved in **Profile → API Keys**
 - the correct venue was configured in the profile
 - no real credentials were placed into tracked files
+
+
+### Counterparty / UniSat data, signing, or broadcast does not work
+
+Check:
+
+- `COUNTERPARTY_ENABLED=1`
+- `COUNTERPARTY_API_BASE_URL` points to the intended Counterparty API
+- `COUNTERPARTY_NETWORK=mainnet` matches the UniSat network
+- the intended Bitcoin address exists in Wallet Addresses
+- the connected UniSat account matches the configured custody address for the transaction under review
+- the selected book row still exists and has the expected dispenser / protocol-order identity
+- the requested quantity matches dispenser lot constraints
+- BTC funding covers consideration plus miner fee
+- the compose preview reports a recognized PSBT
+- required UTXO metadata is present before `signPsbt`
+- `COUNTERPARTY_LIVE_BROADCAST_ENABLED=1` only when intentionally broadcasting
+- broadcast is requested only after a signed-but-not-broadcast result exists
+
+Expected safety behavior:
+
+```text
+compose preview may succeed without signing
+signPsbt requires explicit user approval
+pushPsbt requires a second explicit confirmation
+backend signing remains unavailable
+automatic broadcast remains false
+```
+
+If a broadcast fails, retain the signed transaction result for review and do not blindly repeat the compose/sign/broadcast sequence. Determine whether the transaction was accepted, rejected, or already propagated before trying again.
+
+### Counterparty balances or USD values look incomplete
+
+Check:
+
+- the configured Counterparty Wallet Addresses row
+- Counterparty API balance response
+- Token Registry price metadata for deterministically mapped assets
+- BTC/USD availability
+- ASSET-BTC orderbook liquidity
+- whether the visible value is a best-bid valuation or an ask-only reference
+- stale-fallback warnings and cache age
+
+Ticker-only market-data matches are intentionally not considered authoritative enough for legacy Counterparty asset accounting.
+
+### Robinhood Chain balances, history, or quotes do not load
+
+Check:
+
+- `ROBINHOOD_CHAIN_ENABLED=1`
+- chain ID is `4663`
+- the HTTP RPC URL is reachable
+- the configured wallet address is valid
+- required EVM token contracts and decimals exist in Token Registry
+- the Blockscout API base is reachable for history
+- the 0x API key is saved through **Profile → API Keys** under venue `zerox`
+- the quote provider is not in error backoff
+- the selected pair has a matching registry objective and directional capability
+
+Passive balance, history, quote, and lifecycle reads should not request MetaMask.
+
+### Robinhood Chain approval or swap is blocked
+
+Check:
+
+- global `DRY_RUN`, `ARMED`, and venue live-gate state
+- `ROBINHOOD_CHAIN_LIVE_EXECUTION_ENABLED=1`
+- the execution authority matches symbol, side, provider, wallet, amount mode, and amount ceiling
+- the provider plan is fresh
+- the claim ID has not expired or already been consumed
+- MetaMask is connected to chain ID 4663 and the saved wallet
+- finite allowance is sufficient for Stage 2
+- transaction destination and calldata hash match the accepted plan
+- ERC-20 transaction value is `0 wei`
+- no second request has already been submitted
+
+Do not solve a stale-plan error by resubmitting an approval. A confirmed finite approval remains valid while a new Stage 2 quote / plan is prepared.
+
+### Robinhood Chain receipt refresh returns an RPC historical-state error
+
+A transaction can be confirmed while historical token balance reads fail on a non-archive RPC.
+
+Check:
+
+- direct transaction lookup succeeds
+- direct receipt lookup succeeds
+- receipt status is `1`
+- the exact error is the recognized historical-state-unavailable condition
+- receipt transfer logs contain the exact input and sufficient output
+- saved transaction and calldata hashes match
+- submission counts remain one approval and one swap
+
+The receipt-log fallback applies only to explicit unavailable historical state. It must not hide a historical balance mismatch that the RPC can actually return.
+
+### Robinhood Chain All Orders row has the wrong direction or economics
+
+For a confirmed `WETH-USDG` SELL, expected normalization is:
+
+```text
+side          = sell
+quantity      = actual WETH input
+gross / net   = actual USDG output
+average       = USDG output / WETH input
+limit         = minimum USDG output / exact WETH input
+fee asset     = ETH
+```
+
+For a BUY, quantity remains the acquired WETH output and the displayed rate uses the BUY orientation. If an older frontend cache still shows the wrong side, hard-refresh and refetch All Orders before treating it as a backend defect.
 
 ### Robinhood balances show stale available / hold values
 
@@ -1717,6 +2270,12 @@ The repository includes many execution and accounting surfaces, but several boun
 - UTTT bridge execution is not enabled by the planning dashboard.
 - UTTT basis-transfer mutation is not enabled by the read-only preview endpoint.
 - Generic Hydration SDK polling is not the normal price path and remains disabled unless explicitly enabled for diagnostics.
+- Counterparty backend services do not hold Bitcoin private keys, sign PSBTs, or broadcast transactions.
+- Counterparty broadcast is separately gated and separately confirmed; it is never automatic.
+- Robinhood Chain passive reads and database-only authority changes do not request MetaMask.
+- Robinhood Chain backend services do not sign or send transactions.
+- Robinhood Chain unlimited approval, automatic retry, and automatic second transactions remain disabled.
+- Robinhood Chain live-validated execution is currently bounded to the accepted WETH-USDG BUY / SELL lifecycle; arbitrary custom-pair live execution is not implied.
 - Market Cap / Volume windows are discovery and monitoring tools, not order execution tools.
 
 ---
@@ -1776,7 +2335,9 @@ See the top-level [LICENSE](LICENSE) file for the full license text.
 
 UTT is an actively evolving trading terminal codebase with ongoing work across:
 
-- UI and layout refinement
+- UI and layout refinement, compact AppHeader tooling, and consistent safety-state presentation
+- Counterparty / UniSat mainnet integration, balances, collectibles, market context, dispenser / order modes, unsigned compose review, explicit PSBT signing, separately gated broadcast, All Orders reflection, and BTC accounting previews
+- Robinhood Chain chain-ID-4663 integration, MetaMask linkage, Token Registry identity, balances, history, 0x quote discovery, synthetic books, bounded WETH-USDG BUY / SELL execution, non-archive RPC reconciliation, and direction-correct All Orders economics
 - OKX balances, orderbooks, rules, fills diagnostics, fill basis preview, live-gated submit, live-gated cancel, and Market Cap / Volume source filtering
 - CEX order-economics normalization, fee/net display, and All Orders cancelability
 - balance cost basis, average cost, basis badges, lot drilldowns, 1D gain, and total gain display
@@ -1797,5 +2358,6 @@ UTT is an actively evolving trading terminal codebase with ongoing work across:
 - venue adapter coverage
 - wallet-address and self-custody portfolio visibility
 - unified order and ledger workflows
+- upcoming Robinhood Chain custom-pair registry discovery, synthetic Order Book generalization, and bounded custom-token execution work
 
-Expect active iteration rather than a frozen, final product.
+Expect active iteration rather than a frozen, final product. Current live-validated Robinhood Chain execution should be read as the accepted WETH-USDG bounded workflow, not as universal support for every registry pair.

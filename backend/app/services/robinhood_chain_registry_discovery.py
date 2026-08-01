@@ -49,6 +49,7 @@ PROVIDER_NATIVE_WRAP = "native_wrap"
 PREPARATION_STATUS = "preparation_verified"
 LIVE_AUTHORIZED_PENDING_CONFIRMATION = "live_authorized_pending_confirmation"
 R5C5A_AUTHORIZATION_TTL_MINUTES = 60
+R5C5B_AUTHORIZATION_TTL_MINUTES = 60
 R5C4A_SYMBOL = "WETH-USDG"
 R5C4A_SIDE = "buy"
 R5C4A_INPUT_ASSET = "USDG"
@@ -1481,6 +1482,200 @@ class RobinhoodChainRegistryDiscoveryService:
             "ok": True,
             "idempotent": False,
             "tranche": "R5C.5A",
+            "execution_authority": authority,
+            "capability": self._capability_dict(db, capability),
+            "database_mutated": True,
+            "blockchain_read_only": True,
+            "provider_contacted": False,
+            "wallet_connection_requested": False,
+            "signing_enabled": False,
+            "broadcast_enabled": False,
+            "successful_broadcast_authorized": True,
+            "live_execution_verified": False,
+            "automatic_second_transaction": False,
+            "automatic_retry": False,
+            "automatic_execution_promotion": False,
+            "will_mutate_chain": False,
+        }
+
+    def authorize_controlled_live_sell(
+        self,
+        db: Session,
+        *,
+        symbol: str,
+        side: str,
+        amount_mode: str,
+        requested_amount: str,
+        provider: str,
+        wallet_address: str,
+        confirm_authorize: bool,
+    ) -> Dict[str, Any]:
+        """Authorize one bounded R5C.5B browser-wallet SELL before live verification.
+
+        This mutates database capability evidence only. It never contacts a provider,
+        requests a wallet, signs, or broadcasts. The authorization expires and does
+        not promote the capability to live_verified.
+        """
+        if confirm_authorize is not True:
+            raise ValueError("confirm_r5c5b_live_authorization_required")
+        normalized_symbol = _normalize_market_symbol(symbol)
+        normalized_side = str(side or "").strip().lower()
+        normalized_mode = str(amount_mode or "").strip().lower().replace("exact_spend", AMOUNT_MODE_EXACT_INPUT)
+        normalized_provider = str(provider or "").strip().lower().replace("zerox", PROVIDER_ZEROX)
+        authorized_wallet = validate_evm_address(wallet_address).lower()
+        if (
+            normalized_symbol != R5C4B_SYMBOL
+            or normalized_side != R5C4B_SIDE
+            or normalized_mode != AMOUNT_MODE_EXACT_INPUT
+            or normalized_provider != PROVIDER_ZEROX
+            or str(requested_amount or "").strip() != R5C4B_INPUT_AMOUNT
+        ):
+            raise ValueError("r5c5b_live_authorization_target_locked")
+
+        objective = (
+            db.query(RobinhoodChainPairObjective)
+            .filter(
+                RobinhoodChainPairObjective.symbol == normalized_symbol,
+                RobinhoodChainPairObjective.enabled.is_(True),
+            )
+            .first()
+        )
+        if objective is None:
+            raise ValueError("robinhood_chain_pair_objective_not_found")
+        base_row, quote_row = self._objective_tokens(db, objective)
+        base_identity = self.token_identity(db, base_row)
+        quote_identity = self.token_identity(db, quote_row)
+        input_row, input_identity = base_row, base_identity
+        output_row, output_identity = quote_row, quote_identity
+        if (
+            str(input_identity.get("symbol") or "").strip().upper() != R5C4B_INPUT_ASSET
+            or bool(input_identity.get("native"))
+            or str(output_identity.get("symbol") or "").strip().upper() != R5C4B_OUTPUT_ASSET
+            or bool(output_identity.get("native"))
+        ):
+            raise ValueError("r5c5b_token_registry_identity_mismatch")
+
+        capability = (
+            db.query(RobinhoodChainPairCapability)
+            .filter(
+                RobinhoodChainPairCapability.objective_id == objective.id,
+                RobinhoodChainPairCapability.from_token_registry_id == int(input_row.id),
+                RobinhoodChainPairCapability.to_token_registry_id == int(output_row.id),
+                RobinhoodChainPairCapability.amount_mode == AMOUNT_MODE_EXACT_INPUT,
+                RobinhoodChainPairCapability.provider == PROVIDER_ZEROX,
+            )
+            .first()
+        )
+        if capability is None:
+            raise ValueError("r5c5b_direction_capability_missing")
+        evidence = copy.deepcopy(capability.evidence) if isinstance(capability.evidence, dict) else {}
+        if (
+            not bool(capability.enabled)
+            or str(capability.indicative_status or "").strip().lower() not in {"available", "live_verified"}
+            or str(capability.firm_plan_status or "").strip().lower() != "available"
+            or str(capability.execution_status or "").strip().lower() != PREPARATION_STATUS
+            or str(capability.probe_amount or "").strip() != R5C4B_INPUT_AMOUNT
+            or evidence.get("preparation_verified") is not True
+            or evidence.get("live_accepted") is True
+            or evidence.get("successful_broadcast") is True
+            or str(evidence.get("symbol") or "").strip().upper() != R5C4B_SYMBOL
+            or str(evidence.get("side") or "").strip().lower() != R5C4B_SIDE
+            or str(evidence.get("amount_mode") or "").strip().lower() != AMOUNT_MODE_EXACT_INPUT
+            or str(evidence.get("provider") or "").strip().lower() != PROVIDER_ZEROX
+            or str(evidence.get("from_asset") or "").strip().upper() != R5C4B_INPUT_ASSET
+            or str(evidence.get("to_asset") or "").strip().upper() != R5C4B_OUTPUT_ASSET
+            or str(evidence.get("verified_input_amount") or "").strip() != R5C4B_INPUT_AMOUNT
+            or str(evidence.get("firm_plan_input_ceiling") or "").strip() != R5C4B_INPUT_AMOUNT
+        ):
+            raise ValueError("r5c5b_preparation_authority_required")
+
+        now = utc_now()
+        existing = evidence.get("live_authorization") if isinstance(evidence.get("live_authorization"), dict) else {}
+        existing_expires = None
+        try:
+            existing_expires = datetime.fromisoformat(str(existing.get("expires_at") or "").replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            existing_expires = None
+        if (
+            str(existing.get("status") or "").strip().lower() == LIVE_AUTHORIZED_PENDING_CONFIRMATION
+            and existing.get("operator_confirmed") is True
+            and existing_expires is not None
+            and existing_expires > now
+            and evidence.get("successful_broadcast_authorized") is True
+            and str(existing.get("wallet_address") or "").strip().lower() == authorized_wallet
+        ):
+            authority = resolve_robinhood_chain_execution_authority(
+                db, symbol=normalized_symbol, side=normalized_side,
+                amount_mode=normalized_mode, provider=normalized_provider,
+                require_execution=True,
+            )
+            return {
+                "ok": True,
+                "idempotent": True,
+                "tranche": "R5C.5B",
+                "execution_authority": authority,
+                "capability": self._capability_dict(db, capability),
+                "database_mutated": False,
+                "wallet_connection_requested": False,
+                "signing_enabled": False,
+                "broadcast_enabled": False,
+                "successful_broadcast_authorized": True,
+                "live_execution_verified": False,
+                "automatic_execution_promotion": False,
+                "will_mutate_chain": False,
+            }
+
+        expires_at = now + timedelta(minutes=R5C5B_AUTHORIZATION_TTL_MINUTES)
+        authorization = {
+            "status": LIVE_AUTHORIZED_PENDING_CONFIRMATION,
+            "tranche": "R5C.5B",
+            "authorization_id": uuid.uuid4().hex,
+            "operator_confirmed": True,
+            "authorized_at": iso_or_none(now),
+            "expires_at": iso_or_none(expires_at),
+            "symbol": R5C4B_SYMBOL,
+            "side": R5C4B_SIDE,
+            "amount_mode": AMOUNT_MODE_EXACT_INPUT,
+            "provider": PROVIDER_ZEROX,
+            "input_asset": R5C4B_INPUT_ASSET,
+            "output_asset": R5C4B_OUTPUT_ASSET,
+            "exact_input_amount": R5C4B_INPUT_AMOUNT,
+            "wallet_address": authorized_wallet,
+            "approval_model": "finite_exact_input",
+            "unlimited_approval_enabled": False,
+            "approval_transaction_value_wei": "0",
+            "swap_transaction_value_wei": "0",
+            "separate_wallet_requests_required": True,
+            "automatic_second_transaction": False,
+            "automatic_retry": False,
+            "automatic_execution_promotion": False,
+        }
+        evidence.update({
+            "successful_broadcast_authorized": True,
+            "live_authorized_pending_confirmation": True,
+            "live_authorization": authorization,
+        })
+        capability.evidence = evidence
+        capability.updated_at = now
+        db.add(capability)
+        db.flush()
+        authority = resolve_robinhood_chain_execution_authority(
+            db, symbol=normalized_symbol, side=normalized_side,
+            amount_mode=normalized_mode, provider=normalized_provider,
+            require_execution=True,
+        )
+        if (
+            authority.get("authority_level") != LIVE_AUTHORIZED_PENDING_CONFIRMATION
+            or authority.get("successful_broadcast_authorized") is not True
+            or authority.get("live_execution_verified") is not False
+        ):
+            raise ValueError("r5c5b_live_authorization_resolution_failed")
+        db.commit()
+        db.refresh(capability)
+        return {
+            "ok": True,
+            "idempotent": False,
+            "tranche": "R5C.5B",
             "execution_authority": authority,
             "capability": self._capability_dict(db, capability),
             "database_mutated": True,

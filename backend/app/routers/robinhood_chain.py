@@ -389,6 +389,24 @@ def _r5c5a_controlled_buy_execution(execution: Dict[str, Any]) -> bool:
     )
 
 
+def _r5c5b_controlled_sell_execution(execution: Dict[str, Any]) -> bool:
+    return bool(
+        str(execution.get("symbol") or "").strip().upper() == "WETH-USDG"
+        and str(execution.get("side") or "").strip().lower() == "sell"
+        and str(execution.get("from_asset") or "").strip().upper() == "WETH"
+        and str(execution.get("to_asset") or "").strip().upper() == "USDG"
+        and str(execution.get("amount_mode") or "").strip().lower() == "exact_input"
+        and str(execution.get("exact_input_amount") or "").strip() == "0.0001"
+    )
+
+
+def _controlled_weth_usdg_execution(execution: Dict[str, Any]) -> bool:
+    return bool(
+        _r5c5a_controlled_buy_execution(execution)
+        or _r5c5b_controlled_sell_execution(execution)
+    )
+
+
 def _resolve_robinhood_chain_review_identities(
     db: Session,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -2053,6 +2071,44 @@ async def robinhood_chain_execution_authority_authorize_controlled_buy(
         ) from exc
 
 
+@router.post("/execution-authority/authorize-controlled-sell")
+async def robinhood_chain_execution_authority_authorize_controlled_sell(
+    request: RobinhoodChainControlledLiveAuthorizationRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Authorize one exact 0.0001 WETH SELL without requesting or sending a wallet transaction."""
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(status_code=503, detail="Robinhood Chain configuration is not effective for chain ID 4663")
+    taker = _resolve_robinhood_chain_execution_taker(db, request.taker_address)
+    try:
+        return get_robinhood_chain_registry_discovery_service().authorize_controlled_live_sell(
+            db,
+            symbol=request.symbol,
+            side=request.side,
+            amount_mode=request.amount_mode,
+            requested_amount=request.requested_amount,
+            provider=request.provider,
+            wallet_address=taker,
+            confirm_authorize=bool(request.confirm_authorize),
+        )
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        error = str(exc)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": error,
+                "wallet_connection_requested": False,
+                "signing_enabled": False,
+                "broadcast_enabled": False,
+                "successful_broadcast": False,
+                "automatic_second_transaction": False,
+                "automatic_retry": False,
+                "automatic_execution_promotion": False,
+            },
+        ) from exc
+
+
 @router.post("/execution-authority/verify-preparation")
 async def robinhood_chain_execution_authority_verify_preparation(
     request: RobinhoodChainPreparationVerificationRequest,
@@ -2441,7 +2497,7 @@ async def robinhood_chain_swap_execution_claim_approval_send(
             raise ValueError("robinhood_chain_swap_execution_not_found")
         authority = _assert_persisted_swap_execution_authority(
             db, execution,
-            require_successful_broadcast=_r5c5a_controlled_buy_execution(execution),
+            require_successful_broadcast=_controlled_weth_usdg_execution(execution),
         )
         return service.claim_approval_send(
             db, execution_id=execution_id, wallet_address=request.wallet_address,
@@ -2514,7 +2570,7 @@ async def robinhood_chain_swap_execution_prepare_fresh_swap(
             raise ValueError("robinhood_chain_swap_execution_not_found")
         authority = _assert_persisted_swap_execution_authority(
             db, execution,
-            require_successful_broadcast=_r5c5a_controlled_buy_execution(execution),
+            require_successful_broadcast=_controlled_weth_usdg_execution(execution),
         )
         if str(authority.get("execution_adapter") or "") != "erc20_exact_input":
             raise ValueError("robinhood_chain_erc20_execution_adapter_required")
@@ -2554,7 +2610,7 @@ async def robinhood_chain_swap_execution_claim_swap_send(
             raise ValueError("robinhood_chain_swap_execution_not_found")
         authority = _assert_persisted_swap_execution_authority(
             db, execution,
-            require_successful_broadcast=_r5c5a_controlled_buy_execution(execution),
+            require_successful_broadcast=_controlled_weth_usdg_execution(execution),
         )
         return await service.claim_swap_send(
             db, execution_id=execution_id, wallet_address=request.wallet_address,

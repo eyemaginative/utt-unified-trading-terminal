@@ -487,6 +487,83 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["unsigned_transaction_plan"]["value_wei"], "0")
         self.assertFalse(result["unsigned_transaction_plan"]["native_input"])
 
+
+    async def test_r5c5b_weth_sell_uses_exact_atomic_allowance_and_usdg_output(self) -> None:
+        weth = {
+            "symbol": "WETH",
+            "contract_address": _synthetic_address(505),
+            "registry_contract_address": _synthetic_address(505),
+            "decimals": 18,
+            "native": False,
+            "asset_kind": "erc20",
+            "identity_source": "token_registry",
+            "registry_status": "registered",
+            "registry_id": 505,
+        }
+        usdg = {
+            "symbol": "USDG",
+            "contract_address": _synthetic_address(606),
+            "registry_contract_address": _synthetic_address(606),
+            "decimals": 6,
+            "native": False,
+            "asset_kind": "erc20",
+            "identity_source": "token_registry",
+            "registry_status": "registered",
+            "registry_id": 606,
+        }
+        capability = {
+            "symbol": "WETH-USDG",
+            "mechanism": "swap",
+            "from_asset": "WETH",
+            "to_asset": "USDG",
+            "amount_mode": "exact_input",
+            "display_mode": "exact_spend",
+            "indicative_status": "available",
+            "firm_plan_status": "available",
+            "execution_status": "preparation_verified",
+            "enabled": True,
+            "probe_amount": "0.0001",
+            "firm_plan_input_ceiling": "0.0001",
+            "evidence": {
+                "preparation_verified": True,
+                "firm_plan_input_ceiling": "0.0001",
+            },
+        }
+        service, rpc = self.make_service(allowance_atomic=0)
+        result = await _plan_request(
+            service,
+            symbol="WETH-USDG",
+            side="sell",
+            quantity="0.0001",
+            total_quote=None,
+            taker_address=TAKER,
+            base_token=weth,
+            quote_token=usdg,
+            route_capability=capability,
+            slippage_bps=100,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["side"], "sell")
+        self.assertEqual(result["input_asset"], "WETH")
+        self.assertEqual(result["input_amount"], "0.0001")
+        self.assertEqual(result["input_amount_atomic"], "100000000000000")
+        self.assertEqual(result["output_asset"], "USDG")
+        self.assertEqual(result["allowance"]["token"]["symbol"], "WETH")
+        self.assertEqual(result["allowance"]["required_atomic"], "100000000000000")
+        self.assertEqual(result["allowance"]["shortfall_atomic"], "100000000000000")
+        self.assertTrue(result["approval_required"])
+        self.assertEqual(
+            rpc.allowance_calls[0]["contract"].lower(),
+            weth["contract_address"].lower(),
+        )
+        self.assertEqual(rpc.allowance_calls[0]["decimals"], 18)
+        self.assertEqual(result["unsigned_transaction_plan"]["value_wei"], "0")
+        self.assertFalse(result["unsigned_transaction_plan"]["native_input"])
+        self.assertFalse(result["signing_enabled"])
+        self.assertFalse(result["broadcast_enabled"])
+        self.assertFalse(result["will_mutate"])
+
     async def test_erc20_blocked_capability_fails_before_rpc_or_provider(self) -> None:
         service, rpc = self.make_service(allowance_atomic=0)
         blocked = {**CRED_TO_WGAS, "firm_plan_status": "provider_error"}

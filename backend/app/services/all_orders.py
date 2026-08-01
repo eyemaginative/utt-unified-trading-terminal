@@ -564,16 +564,34 @@ def _to_unified_robinhood_chain_swap_execution(row: RobinhoodChainSwapExecution)
         except Exception:
             return None
 
+    side = str(row.side or "").strip().lower()
+    if side not in {"buy", "sell"}:
+        side = "buy"
+
+    exact_input = _float_or_none(row.exact_input_amount)
     expected_output = _float_or_none(row.expected_output_amount)
     actual_input = _float_or_none(reconciliation.get("input_amount")) if confirmed_reconciled else None
     actual_output = _float_or_none(reconciliation.get("output_amount")) if confirmed_reconciled else None
-    qty = actual_output if actual_output is not None else expected_output
+
+    if side == "sell":
+        qty = actual_input if actual_input is not None else exact_input
+        filled_qty = actual_input if confirmed_reconciled and actual_input is not None else 0.0
+    else:
+        qty = actual_output if actual_output is not None else expected_output
+        filled_qty = actual_output if confirmed_reconciled and actual_output is not None else 0.0
+
     avg_price = _float_or_none(reconciliation.get("average_fill_price")) if confirmed_reconciled else None
     swap_fee = _float_or_none(reconciliation.get("swap_network_fee")) if confirmed_reconciled else None
     approval_fee = _float_or_none(reconciliation.get("approval_network_fee")) if confirmed_reconciled else None
+    minimum_output = _float_or_none(row.minimum_output_amount)
     minimum_limit = None
     try:
-        minimum_limit = float(row.exact_input_amount) / float(row.minimum_output_amount)
+        if exact_input is not None and exact_input > 0 and minimum_output is not None and minimum_output > 0:
+            minimum_limit = (
+                minimum_output / exact_input
+                if side == "sell"
+                else exact_input / minimum_output
+            )
     except Exception:
         minimum_limit = None
     lifecycle = route.get("execution_lifecycle") if isinstance(route.get("execution_lifecycle"), dict) else {}
@@ -604,15 +622,15 @@ def _to_unified_robinhood_chain_swap_execution(row: RobinhoodChainSwapExecution)
         "symbol": row.symbol,
         "symbol_canon": row.symbol,
         "symbol_venue": row.symbol,
-        "side": "buy",
+        "side": side,
         "type": "swap",
-        "cross_asset_buy": True,
+        "cross_asset_buy": side == "buy",
         "amount_mode": "exact_input",
         "display_mode": "exact_spend",
         "status": status,
         "status_bucket": _status_bucket(status),
         "qty": qty,
-        "filled_qty": actual_output if confirmed_reconciled and actual_output is not None else 0.0,
+        "filled_qty": filled_qty,
         "limit_price": minimum_limit,
         "avg_fill_price": avg_price,
         "fee": swap_fee,

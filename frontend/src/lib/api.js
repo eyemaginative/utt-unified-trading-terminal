@@ -583,6 +583,25 @@ export async function authorizeRobinhoodChainControlledBuy(payload = {}, { apiBa
   return res.data;
 }
 
+export async function authorizeRobinhoodChainControlledSell(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
+  const body = {
+    symbol: "WETH-USDG",
+    side: "sell",
+    amount_mode: "exact_input",
+    requested_amount: "0.0001",
+    provider: "0x",
+    confirm_authorize: true,
+    ...payload,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/execution-authority/authorize-controlled-sell`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/execution-authority/authorize-controlled-sell`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
 export async function getRobinhoodChainExecutionStatus({ apiBase, timeout_ms = 30000 } = {}) {
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {

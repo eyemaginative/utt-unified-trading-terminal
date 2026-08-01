@@ -16,6 +16,13 @@ from . import models_lot_journal  # noqa: F401
 # This must happen before Base.metadata.create_all(bind=engine)
 from . import discovery_models  # noqa: F401
 
+# Migrate the raw-SQL credential vault before importing routers/adapters that
+# may resolve Profile-managed credentials during module initialization.
+from .routers.auth import router as auth_router, ensure_api_key_vault_schema
+
+ensure_api_key_vault_schema()
+settings.refresh_vault_backed_fields()
+
 from .routers.health import router as health_router
 from .routers.orders import router as orders_router
 from .routers.balances import router as balances_router
@@ -26,7 +33,6 @@ from .routers.venue_orders import router as venue_orders_router
 from .routers.all_orders import router as all_orders_router
 from .routers.order_views import router as order_views_router
 from .routers.trade import router as trade_router
-from .routers.auth import router as auth_router
 from .routers.venues import router as venues_router
 from .routers import scanners
 from .routers.market_intel import router as market_intel_router

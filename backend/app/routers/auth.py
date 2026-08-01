@@ -34,6 +34,12 @@ except Exception:  # pragma: no cover
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+# Never use a public, predictable token-signing fallback. If no persistent
+# UTT_AUTH_SECRET (or shared-mode password) is configured, use a process-local
+# high-entropy secret so sessions fail closed across backend restarts.
+_PROCESS_AUTH_SECRET = secrets.token_urlsafe(48)
+
+
 
 # -----------------------------
 # Mode selection
@@ -67,8 +73,12 @@ def _auth_required_shared() -> bool:
 # -----------------------------
 
 def _auth_secret() -> str:
-    # Separate signing secret. If unset, fall back to password (dev only).
-    return (os.getenv("UTT_AUTH_SECRET") or _auth_password() or "utt-dev-secret").strip()
+    # Token signing is deliberately separate from API-key-vault encryption.
+    # Shared-password mode may use its configured password. DB-auth installs
+    # should set UTT_AUTH_SECRET for persistence; otherwise sessions are signed
+    # with a process-local secret and become invalid after a backend restart.
+    configured = (os.getenv("UTT_AUTH_SECRET") or _auth_password() or "").strip()
+    return configured or _PROCESS_AUTH_SECRET
 
 
 def _auth_ttl_short_s() -> int:
@@ -163,15 +173,19 @@ def _kms_master_key() -> str:
 
 
 def _fernet() -> Optional[Any]:
+    # Encrypted local secrets require the external, stable KMS master key.
+    # Do not derive encryption from an auth password, auth-token secret, or a
+    # source-code default: those fallbacks can make copied SQLite data unsafe.
     if Fernet is None:
         return None
     mk = _kms_master_key()
-    if not mk:
-        # Dev fallback: derive from auth secret (still server-side). Prefer UTT_KMS_MASTER_KEY.
-        mk = _auth_secret()
-    # Fernet key must be 32 urlsafe-base64 bytes.
+    if len(mk) < 32:
+        return None
     key = base64.urlsafe_b64encode(hashlib.sha256(mk.encode("utf-8")).digest())
-    return Fernet(key)
+    try:
+        return Fernet(key)
+    except Exception:
+        return None
 
 
 def _pw_hash(password: str, salt: bytes) -> bytes:
@@ -210,7 +224,62 @@ def _ensure_auth_tables() -> None:
 # Stored per user; UI can list metadata only.
 # -----------------------------
 
+_API_KEY_KEY_VERSION = 1
+_API_KEY_SCOPE_SOURCE = "operator_declared"
+_API_KEY_MIGRATION_SCOPE_SOURCE = "migration_default_unverified"
+_API_KEY_MIN_MASTER_KEY_CHARS = 32
+
+
+def _api_keys_fernet() -> Optional[Any]:
+    """Return the API-key-vault Fernet instance, or None when unavailable.
+
+    Vault crypto is fail-closed. It never falls back to auth credentials or a
+    source-code constant.
+    """
+    if Fernet is None:
+        return None
+    mk = _kms_master_key()
+    if len(mk) < _API_KEY_MIN_MASTER_KEY_CHARS:
+        return None
+    key = base64.urlsafe_b64encode(hashlib.sha256(mk.encode("utf-8")).digest())
+    try:
+        return Fernet(key)
+    except Exception:
+        return None
+
+
+def _api_keys_vault_status(username: Optional[str] = None) -> dict:
+    owner = (os.getenv("UTT_VAULT_USERNAME") or "").strip()
+    requested_user = (username or "").strip()
+    configured = len(_kms_master_key()) >= _API_KEY_MIN_MASTER_KEY_CHARS
+    return {
+        "master_key_configured": bool(configured),
+        "crypto_available": bool(_api_keys_fernet() is not None),
+        "minimum_master_key_chars": int(_API_KEY_MIN_MASTER_KEY_CHARS),
+        "key_version": int(_API_KEY_KEY_VERSION),
+        "owner_configured": bool(owner),
+        "owner_matches_user": bool(owner and requested_user and owner == requested_user),
+        "scope_verification": "operator_declared",
+    }
+
+
+def _require_api_key_vault_owner(username: str) -> None:
+    owner = (os.getenv("UTT_VAULT_USERNAME") or "").strip()
+    user = (username or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=503,
+            detail="API key vault owner is not configured. Set UTT_VAULT_USERNAME and restart the backend.",
+        )
+    if owner != user:
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated user does not match the configured API key vault owner.",
+        )
+
+
 def _ensure_api_keys_table() -> None:
+    """Create and idempotently migrate the local API-key-vault table."""
     _ensure_auth_tables()
     ddl = """
     CREATE TABLE IF NOT EXISTS utt_api_keys (
@@ -221,30 +290,153 @@ def _ensure_api_keys_table() -> None:
       key_hint TEXT,
       secret_enc TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      disabled_at INTEGER,
+      disabled_reason TEXT,
+      key_version INTEGER NOT NULL DEFAULT 1,
+      scope_read INTEGER NOT NULL DEFAULT 1,
+      scope_trade INTEGER NOT NULL DEFAULT 0,
+      scope_transfer INTEGER NOT NULL DEFAULT 0,
+      scope_withdraw INTEGER NOT NULL DEFAULT 0,
+      scope_source TEXT NOT NULL DEFAULT 'migration_default_unverified'
     );
     """
+    required_columns = (
+        ("enabled", "INTEGER NOT NULL DEFAULT 1"),
+        ("disabled_at", "INTEGER"),
+        ("disabled_reason", "TEXT"),
+        ("key_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("scope_read", "INTEGER NOT NULL DEFAULT 1"),
+        ("scope_trade", "INTEGER NOT NULL DEFAULT 0"),
+        ("scope_transfer", "INTEGER NOT NULL DEFAULT 0"),
+        ("scope_withdraw", "INTEGER NOT NULL DEFAULT 0"),
+        ("scope_source", "TEXT NOT NULL DEFAULT 'migration_default_unverified'"),
+    )
+
     with engine.begin() as conn:
         conn.execute(text(ddl))
+        cols = conn.execute(text("PRAGMA table_info(utt_api_keys)")).mappings().all()
+        names = {str(c.get("name") or "").strip().lower() for c in cols}
+        for name, sql_type in required_columns:
+            if name not in names:
+                conn.execute(text(f"ALTER TABLE utt_api_keys ADD COLUMN {name} {sql_type}"))
+
+        # Normalize legacy rows without touching their ciphertext.
+        conn.execute(
+            text(
+                """
+                UPDATE utt_api_keys
+                SET enabled = COALESCE(enabled, 1),
+                    key_version = COALESCE(key_version, 1),
+                    scope_read = COALESCE(scope_read, 1),
+                    scope_trade = COALESCE(scope_trade, 0),
+                    scope_transfer = COALESCE(scope_transfer, 0),
+                    scope_withdraw = COALESCE(scope_withdraw, 0),
+                    scope_source = COALESCE(NULLIF(TRIM(scope_source), ''), 'migration_default_unverified')
+                """
+            )
+        )
+
+        # Before adding the one-active-row index, deterministically disable all
+        # but the newest active credential in any legacy duplicate group.
+        duplicate_groups = conn.execute(
+            text(
+                """
+                SELECT username, venue
+                FROM utt_api_keys
+                WHERE enabled = 1
+                GROUP BY username, venue
+                HAVING COUNT(*) > 1
+                """
+            )
+        ).mappings().all()
+        migration_now = int(time.time())
+        for group in duplicate_groups:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM utt_api_keys
+                    WHERE username = :u AND venue = :v AND enabled = 1
+                    ORDER BY updated_at DESC, id DESC
+                    """
+                ),
+                {"u": group["username"], "v": group["venue"]},
+            ).mappings().all()
+            stale_ids = [int(r["id"]) for r in rows[1:]]
+            for stale_id in stale_ids:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE utt_api_keys
+                        SET enabled = 0,
+                            disabled_at = :ts,
+                            disabled_reason = 'superseded_during_migration'
+                        WHERE id = :id
+                        """
+                    ),
+                    {"ts": migration_now, "id": stale_id},
+                )
+
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_utt_api_keys_active_user_venue
+                ON utt_api_keys(username, venue)
+                WHERE enabled = 1
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_utt_api_keys_user_enabled
+                ON utt_api_keys(username, enabled, updated_at DESC, id DESC)
+                """
+            )
+        )
+
+
+def ensure_api_key_vault_schema() -> None:
+    """Public startup hook used by app.main before adapters resolve credentials."""
+    _ensure_api_keys_table()
 
 
 def _api_keys_encrypt(payload: dict) -> str:
-    f = _fernet()
+    f = _api_keys_fernet()
     if f is None:
-        raise HTTPException(status_code=500, detail="Server crypto is unavailable (install cryptography).")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "API key vault is unavailable. Configure a stable "
+                "UTT_KMS_MASTER_KEY of at least 32 characters and restart the backend."
+            ),
+        )
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return f.encrypt(raw).decode("utf-8")
 
 
 def _api_keys_decrypt(token: str) -> dict:
-    f = _fernet()
+    f = _api_keys_fernet()
     if f is None:
-        raise HTTPException(status_code=500, detail="Server crypto is unavailable (install cryptography).")
+        return {}
     try:
         raw = f.decrypt((token or "").encode("utf-8"))
-        return json.loads(raw.decode("utf-8"))
+        value = json.loads(raw.decode("utf-8"))
+        return value if isinstance(value, dict) else {}
     except Exception:
         return {}
+
+
+def _api_key_item_from_row(row: dict) -> dict:
+    d = dict(row)
+    d["hint"] = d.pop("key_hint", None)
+    for field in ("enabled", "scope_read", "scope_trade", "scope_transfer", "scope_withdraw"):
+        d[field] = bool(int(d.get(field) or 0))
+    d["status"] = "active" if d["enabled"] else "disabled"
+    d["dangerous_scope"] = bool(d["scope_transfer"] or d["scope_withdraw"])
+    return d
 
 
 def _db_api_keys_list(username: str) -> list[dict]:
@@ -254,66 +446,267 @@ def _db_api_keys_list(username: str) -> list[dict]:
         rows = conn.execute(
             text(
                 """
-                SELECT id, venue, label, key_hint, created_at, updated_at
+                SELECT id, venue, label, key_hint, created_at, updated_at,
+                       enabled, disabled_at, disabled_reason, key_version,
+                       scope_read, scope_trade, scope_transfer, scope_withdraw,
+                       scope_source
                 FROM utt_api_keys
                 WHERE username = :u
-                ORDER BY updated_at DESC, id DESC
+                ORDER BY enabled DESC, updated_at DESC, id DESC
                 """
             ),
             {"u": u},
         ).mappings().all()
-        out = []
-        for r in rows:
-            d = dict(r)
-            # UI expects 'hint' field name
-            d["hint"] = d.pop("key_hint", None)
-            # Keep timestamps as ints for now; UI can render raw or format later
-            out.append(d)
-        return out
+    return [_api_key_item_from_row(dict(r)) for r in rows]
 
 
-def _db_api_keys_upsert(username: str, venue: str, label: Optional[str], api_key: str, api_secret: Optional[str], passphrase: Optional[str]) -> dict:
+def _db_api_keys_summary(username: str) -> dict:
     _ensure_api_keys_table()
     u = (username or "").strip()
-    v = (venue or "").strip()
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT
+                  COUNT(*) AS total_count,
+                  SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS active_count,
+                  SUM(CASE WHEN enabled = 0 THEN 1 ELSE 0 END) AS disabled_count,
+                  SUM(CASE WHEN enabled = 1 AND scope_trade = 1 THEN 1 ELSE 0 END) AS trade_scope_count,
+                  SUM(CASE WHEN enabled = 1 AND scope_transfer = 1 THEN 1 ELSE 0 END) AS transfer_scope_count,
+                  SUM(CASE WHEN enabled = 1 AND scope_withdraw = 1 THEN 1 ELSE 0 END) AS withdrawal_scope_count
+                FROM utt_api_keys
+                WHERE username = :u
+                """
+            ),
+            {"u": u},
+        ).mappings().first() or {}
+    return {
+        "total_count": int(row.get("total_count") or 0),
+        "active_count": int(row.get("active_count") or 0),
+        "disabled_count": int(row.get("disabled_count") or 0),
+        "trade_scope_count": int(row.get("trade_scope_count") or 0),
+        "transfer_scope_count": int(row.get("transfer_scope_count") or 0),
+        "withdrawal_scope_count": int(row.get("withdrawal_scope_count") or 0),
+    }
+
+
+def _db_api_keys_upsert(
+    username: str,
+    venue: str,
+    label: Optional[str],
+    api_key: str,
+    api_secret: Optional[str],
+    passphrase: Optional[str],
+    *,
+    scope_read: bool = True,
+    scope_trade: bool = False,
+    scope_transfer: bool = False,
+    scope_withdraw: bool = False,
+) -> dict:
+    _ensure_api_keys_table()
+    u = (username or "").strip()
+    v = (venue or "").strip().lower()
+    if not u:
+        raise HTTPException(status_code=400, detail="Credential owner is required.")
     if not v:
         raise HTTPException(status_code=400, detail="Venue is required.")
     if not (api_key or "").strip():
         raise HTTPException(status_code=400, detail="API key is required.")
-    hint = ""
+
     ak = (api_key or "").strip()
-    if len(ak) >= 4:
-        hint = f"...{ak[-4:]}"
-    payload = {"api_key": ak, "api_secret": (api_secret or "").strip() or None, "passphrase": (passphrase or "").strip() or None}
+    hint = f"...{ak[-4:]}" if len(ak) >= 4 else None
+    payload = {
+        "api_key": ak,
+        "api_secret": (api_secret or "").strip() or None,
+        "passphrase": (passphrase or "").strip() or None,
+    }
     enc = _api_keys_encrypt(payload)
     now = int(time.time())
+
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                INSERT INTO utt_api_keys (username, venue, label, key_hint, secret_enc, created_at, updated_at)
-                VALUES (:u, :v, :l, :h, :e, :c, :m)
+                UPDATE utt_api_keys
+                SET enabled = 0,
+                    disabled_at = :ts,
+                    disabled_reason = 'replaced'
+                WHERE username = :u AND venue = :v AND enabled = 1
                 """
             ),
-            {"u": u, "v": v, "l": (label or "").strip() or None, "h": hint or None, "e": enc, "c": now, "m": now},
+            {"ts": now, "u": u, "v": v},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO utt_api_keys (
+                    username, venue, label, key_hint, secret_enc,
+                    created_at, updated_at, enabled, disabled_at,
+                    disabled_reason, key_version, scope_read, scope_trade,
+                    scope_transfer, scope_withdraw, scope_source
+                )
+                VALUES (
+                    :u, :v, :l, :h, :e,
+                    :c, :m, 1, NULL,
+                    NULL, :kv, :sr, :st,
+                    :sx, :sw, :ss
+                )
+                """
+            ),
+            {
+                "u": u,
+                "v": v,
+                "l": (label or "").strip() or None,
+                "h": hint,
+                "e": enc,
+                "c": now,
+                "m": now,
+                "kv": int(_API_KEY_KEY_VERSION),
+                "sr": 1 if scope_read else 0,
+                "st": 1 if scope_trade else 0,
+                "sx": 1 if scope_transfer else 0,
+                "sw": 1 if scope_withdraw else 0,
+                "ss": _API_KEY_SCOPE_SOURCE,
+            },
         )
         rid = conn.execute(text("SELECT last_insert_rowid() AS id")).mappings().first()
         key_id = int(rid["id"]) if rid and rid.get("id") is not None else None
-    return {"id": key_id, "venue": v, "label": (label or "").strip() or None, "hint": hint or None, "created_at": now, "updated_at": now}
+
+    return {
+        "id": key_id,
+        "venue": v,
+        "label": (label or "").strip() or None,
+        "hint": hint,
+        "created_at": now,
+        "updated_at": now,
+        "enabled": True,
+        "status": "active",
+        "disabled_at": None,
+        "disabled_reason": None,
+        "key_version": int(_API_KEY_KEY_VERSION),
+        "scope_read": bool(scope_read),
+        "scope_trade": bool(scope_trade),
+        "scope_transfer": bool(scope_transfer),
+        "scope_withdraw": bool(scope_withdraw),
+        "scope_source": _API_KEY_SCOPE_SOURCE,
+        "dangerous_scope": bool(scope_transfer or scope_withdraw),
+    }
 
 
-def _db_api_keys_delete(username: str, key_id: int) -> None:
+def _db_api_keys_disable(username: str, key_id: int, reason: str = "operator_disabled") -> dict:
     _ensure_api_keys_table()
     u = (username or "").strip()
+    now = int(time.time())
     with engine.begin() as conn:
-        res = conn.execute(
-            text("DELETE FROM utt_api_keys WHERE username = :u AND id = :id"),
+        row = conn.execute(
+            text(
+                """
+                SELECT id, enabled, venue
+                FROM utt_api_keys
+                WHERE username = :u AND id = :id
+                """
+            ),
             {"u": u, "id": int(key_id)},
-        )
-        # sqlite rowcount works with SQLAlchemy execute result
-        if hasattr(res, "rowcount") and int(res.rowcount or 0) <= 0:
+        ).mappings().first()
+        if not row:
             raise HTTPException(status_code=404, detail="API key not found.")
-# (removed stray text(ddl) evaluation)
+        already_disabled = not bool(int(row.get("enabled") or 0))
+        if not already_disabled:
+            conn.execute(
+                text(
+                    """
+                    UPDATE utt_api_keys
+                    SET enabled = 0,
+                        disabled_at = :ts,
+                        disabled_reason = :reason
+                    WHERE username = :u AND id = :id AND enabled = 1
+                    """
+                ),
+                {"ts": now, "reason": reason, "u": u, "id": int(key_id)},
+            )
+    return {
+        "id": int(key_id),
+        "venue": str(row.get("venue") or ""),
+        "disabled": not already_disabled,
+        "already_disabled": already_disabled,
+        "disabled_at": None if already_disabled else now,
+        "disabled_reason": reason if not already_disabled else None,
+    }
+
+
+def _db_api_keys_panic_disable(username: str, venue: Optional[str] = None) -> dict:
+    _ensure_api_keys_table()
+    u = (username or "").strip()
+    v = (venue or "").strip().lower() or None
+    now = int(time.time())
+    with engine.begin() as conn:
+        if v:
+            result = conn.execute(
+                text(
+                    """
+                    UPDATE utt_api_keys
+                    SET enabled = 0,
+                        disabled_at = :ts,
+                        disabled_reason = 'venue_panic_disable'
+                    WHERE username = :u AND venue = :v AND enabled = 1
+                    """
+                ),
+                {"ts": now, "u": u, "v": v},
+            )
+        else:
+            result = conn.execute(
+                text(
+                    """
+                    UPDATE utt_api_keys
+                    SET enabled = 0,
+                        disabled_at = :ts,
+                        disabled_reason = 'panic_disable'
+                    WHERE username = :u AND enabled = 1
+                    """
+                ),
+                {"ts": now, "u": u},
+            )
+        disabled_count = int(getattr(result, "rowcount", 0) or 0)
+    return {
+        "disabled_count": disabled_count,
+        "venue": v,
+        "disabled_at": now if disabled_count else None,
+    }
+
+
+def _api_keys_storage_posture() -> dict:
+    repo_root = Path(__file__).resolve().parents[3]
+    db_path = settings.resolved_sqlite_path()
+    backup_dir = settings.resolved_backup_dir()
+
+    def outside_repo(path: Path) -> bool:
+        try:
+            path.resolve().relative_to(repo_root.resolve())
+            return False
+        except Exception:
+            return True
+
+    return {
+        "database_outside_repository": bool(outside_repo(db_path)),
+        "backup_outside_repository": bool(outside_repo(backup_dir)),
+        "database_exists": bool(db_path.exists()),
+        "backup_directory_exists": bool(backup_dir.exists()),
+        "acl_review": "operator_verified_external",
+        "panic_disable_scope": "profile_vault_only",
+        "venue_revocation_still_required": True,
+    }
+
+
+def _refresh_vault_backed_settings_fields() -> None:
+    try:
+        refresh = getattr(settings, "refresh_vault_backed_fields", None)
+        if callable(refresh):
+            refresh()
+    except Exception:
+        # Credential writes/disables remain authoritative in SQLite even if a
+        # legacy in-memory mirror cannot be refreshed.
+        pass
+
 
 
 def _db_get_user(username: str) -> Optional[dict]:
@@ -611,6 +1004,16 @@ class ApiKeyUpsertRequest(BaseModel):
     api_secret: Optional[str] = None
     passphrase: Optional[str] = None
     totp: Optional[str] = None
+    scope_read: bool = True
+    scope_trade: bool = False
+    scope_transfer: bool = False
+    scope_withdraw: bool = False
+    withdrawal_risk_acknowledged: bool = False
+
+
+class ApiKeyPanicDisableRequest(BaseModel):
+    totp: Optional[str] = None
+    venue: Optional[str] = None
 
 
 class BackupPrefsRequest(BaseModel):
@@ -864,31 +1267,50 @@ def auth_password_change(req: ChangePasswordRequest, ident: dict = Depends(requi
 
 
 
+def _require_api_key_step_up(user: str, code: Optional[str]) -> None:
+    if not _db_totp_enabled(user):
+        return
+    value = (code or "").strip()
+    if len(value) < 6:
+        raise HTTPException(status_code=400, detail="Current 2FA code is required.")
+    secret = _db_get_totp_secret(user) or ""
+    if (not secret) or (value not in _totp_now(secret)):
+        raise HTTPException(status_code=401, detail="Invalid 2FA code.")
+
+
 @router.get("/api_keys")
 def api_keys_list(ident: dict = Depends(require_auth)):
-    """Return API key metadata for the current user (never secrets)."""
+    """Return metadata-only credential inventory for the current user."""
     if not _auth_db_enabled():
         raise HTTPException(status_code=501, detail="API keys are only available in DB auth mode (set UTT_AUTH_DB=1).")
     user = (ident.get("user") or "").strip() or "local"
     items = _db_api_keys_list(user)
-    return {"ok": True, "items": items}
+    return {
+        "ok": True,
+        "items": items,
+        "summary": _db_api_keys_summary(user),
+        "vault": _api_keys_vault_status(user),
+        "storage": _api_keys_storage_posture(),
+    }
 
 
 @router.post("/api_keys")
 def api_keys_upsert(req: ApiKeyUpsertRequest, ident: dict = Depends(require_auth)):
-    """Write-only create of an API key bundle (encrypted at rest)."""
+    """Create a new active credential and disable the prior active row."""
     if not _auth_db_enabled():
         raise HTTPException(status_code=501, detail="API keys are only available in DB auth mode (set UTT_AUTH_DB=1).")
     user = (ident.get("user") or "").strip() or "local"
+    _require_api_key_step_up(user, req.totp if req else None)
+    _require_api_key_vault_owner(user)
 
-    # Step-up: require a current TOTP code when 2FA is enabled.
-    if _db_totp_enabled(user):
-        code = ((req.totp or "").strip() if req else "")
-        if len(code) < 6:
-            raise HTTPException(status_code=400, detail="Current 2FA code is required.")
-        secret = _db_get_totp_secret(user) or ""
-        if (not secret) or (code not in _totp_now(secret)):
-            raise HTTPException(status_code=401, detail="Invalid 2FA code.")
+    if bool(req.scope_withdraw) and not bool(req.withdrawal_risk_acknowledged):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Withdrawal scope is critical risk. Confirm the withdrawal-risk "
+                "acknowledgement before saving this credential."
+            ),
+        )
 
     meta = _db_api_keys_upsert(
         username=user,
@@ -897,28 +1319,58 @@ def api_keys_upsert(req: ApiKeyUpsertRequest, ident: dict = Depends(require_auth
         api_key=(req.api_key or "").strip(),
         api_secret=(req.api_secret or None),
         passphrase=(req.passphrase or None),
+        scope_read=bool(req.scope_read),
+        scope_trade=bool(req.scope_trade),
+        scope_transfer=bool(req.scope_transfer),
+        scope_withdraw=bool(req.scope_withdraw),
     )
-    return {"ok": True, "item": meta}
+    _refresh_vault_backed_settings_fields()
+    return {
+        "ok": True,
+        "item": meta,
+        "summary": _db_api_keys_summary(user),
+        "vault": _api_keys_vault_status(user),
+    }
 
 
 @router.delete("/api_keys/{key_id}")
-def api_keys_delete(key_id: int, x_utt_totp: Optional[str] = Header(default=None, alias="X-UTT-TOTP"), ident: dict = Depends(require_auth)):
-    """Delete an API key bundle by id. Metadata-only listing means delete by id is safest."""
+def api_keys_delete(
+    key_id: int,
+    x_utt_totp: Optional[str] = Header(default=None, alias="X-UTT-TOTP"),
+    ident: dict = Depends(require_auth),
+):
+    """Disable a credential while preserving non-secret audit metadata."""
     if not _auth_db_enabled():
         raise HTTPException(status_code=501, detail="API keys are only available in DB auth mode (set UTT_AUTH_DB=1).")
     user = (ident.get("user") or "").strip() or "local"
+    _require_api_key_step_up(user, x_utt_totp)
+    result = _db_api_keys_disable(user, int(key_id))
+    _refresh_vault_backed_settings_fields()
+    return {
+        "ok": True,
+        "item": result,
+        "summary": _db_api_keys_summary(user),
+    }
 
-    if _db_totp_enabled(user):
-        code = (x_utt_totp or "").strip()
-        if len(code) < 6:
-            raise HTTPException(status_code=400, detail="Current 2FA code is required.")
-        secret = _db_get_totp_secret(user) or ""
-        if (not secret) or (code not in _totp_now(secret)):
-            raise HTTPException(status_code=401, detail="Invalid 2FA code.")
 
-    _db_api_keys_delete(user, int(key_id))
-    return {"ok": True}
-
+@router.post("/api_keys/panic_disable")
+def api_keys_panic_disable(req: ApiKeyPanicDisableRequest, ident: dict = Depends(require_auth)):
+    """Atomically disable all active Profile-vault credentials, or one venue."""
+    if not _auth_db_enabled():
+        raise HTTPException(status_code=501, detail="API keys are only available in DB auth mode (set UTT_AUTH_DB=1).")
+    user = (ident.get("user") or "").strip() or "local"
+    _require_api_key_step_up(user, req.totp if req else None)
+    result = _db_api_keys_panic_disable(user, req.venue if req else None)
+    _refresh_vault_backed_settings_fields()
+    return {
+        "ok": True,
+        "result": result,
+        "summary": _db_api_keys_summary(user),
+        "warning": (
+            "Profile-vault credentials are disabled locally. Revoke dangerous "
+            "credentials at each venue and remove any separately configured env credentials."
+        ),
+    }
 
 
 @router.post("/2fa/setup")

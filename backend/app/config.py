@@ -1,6 +1,6 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator
 from typing import List, Set, Optional
 import base64
 import os
@@ -104,6 +104,8 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    _cryptocom_vault_mirrored: bool = PrivateAttr(default=False)
 
     app_host: str = Field(default="127.0.0.1", alias="APP_HOST")
     app_port: int = Field(default=8000, alias="APP_PORT")
@@ -305,22 +307,40 @@ class Settings(BaseSettings):
     counterparty_wallet_provider: Optional[str] = Field(default="unisat", alias="COUNTERPARTY_WALLET_PROVIDER")
 
     def model_post_init(self, __context) -> None:
-        # Vault-first hydration for Crypto.com: some routers/guards check the Settings fields
-        # directly (cryptocom_exchange_api_key/secret). If env secrets are removed, mirror vault
-        # values into these fields after model init.
+        self.refresh_vault_backed_fields()
+
+    def refresh_vault_backed_fields(self) -> None:
+        """Refresh legacy Settings fields mirrored from active vault rows.
+
+        Missing owner, missing KMS, disabled credentials, and schema errors all
+        fail closed. Values that were mirrored from the vault are cleared as
+        soon as the active row disappears; independently configured env values
+        are never cleared by this method.
+        """
         try:
-            if (not (self.cryptocom_exchange_api_key or "").strip()) or (not (self.cryptocom_exchange_api_secret or "").strip()):
+            vc = None
+            try:
+                vc = self.cryptocom_private_creds()
+            except Exception:
                 vc = None
-                try:
-                    vc = self.cryptocom_private_creds()
-                except Exception:
-                    vc = None
-                if isinstance(vc, (list, tuple)) and len(vc) >= 2:
-                    k = (vc[0] or "").strip()
-                    s = (vc[1] or "").strip()
-                    if k and s:
-                        self.cryptocom_exchange_api_key = k
-                        self.cryptocom_exchange_api_secret = s
+
+            valid = isinstance(vc, (list, tuple)) and len(vc) >= 2
+            k = (vc[0] or "").strip() if valid else ""
+            s = (vc[1] or "").strip() if valid else ""
+
+            if k and s:
+                if (
+                    self._cryptocom_vault_mirrored
+                    or not (self.cryptocom_exchange_api_key or "").strip()
+                    or not (self.cryptocom_exchange_api_secret or "").strip()
+                ):
+                    self.cryptocom_exchange_api_key = k
+                    self.cryptocom_exchange_api_secret = s
+                    self._cryptocom_vault_mirrored = True
+            elif self._cryptocom_vault_mirrored:
+                self.cryptocom_exchange_api_key = ""
+                self.cryptocom_exchange_api_secret = ""
+                self._cryptocom_vault_mirrored = False
         except Exception:
             pass
 
@@ -328,38 +348,22 @@ class Settings(BaseSettings):
 # ─────────────────────────────────────────────────────────────
 # API Key Vault credential resolution (DB-backed auth mode)
 #
-# NOTE:
-# - Stored by /api/auth/api_keys in auth.py into sqlite table `utt_api_keys`
-# - secret_enc contains encrypted JSON: {"api_key":..., "api_secret":..., "passphrase":...}
+# Stored by /api/auth/api_keys in sqlite table `utt_api_keys`.
+# Secret bundles are encrypted JSON and are only readable when:
+# - UTT_KMS_MASTER_KEY is configured with at least 32 characters;
+# - an explicit credential owner is supplied through UTT_VAULT_USERNAME
+#   (or directly to _vault_latest_bundle);
+# - the row is active and uses the supported key version.
 #
-# This is intentionally lightweight and avoids importing routers (prevents circular imports).
+# This lightweight reader avoids importing routers/services and fails closed.
 # ─────────────────────────────────────────────────────────────
-
-    # ─────────────────────────────────────────────────────────────
-    # API Key Vault (DB) — lightweight reader for adapters
-    # (avoids importing routers/services to prevent circular imports)
-    #
-    # Vault secret bundle is JSON like: {"api_key":..., "api_secret":..., "passphrase":...}
-    # Encrypted with Fernet key derived from UTT_KMS_MASTER_KEY.
-    # ─────────────────────────────────────────────────────────────
-
-    # ─────────────────────────────────────────────────────────────
-    # API Key Vault (DB) — lightweight reader for adapters
-    # (avoids importing routers/services to prevent circular imports)
-    #
-    # Vault secret bundle is JSON like: {"api_key":..., "api_secret":..., "passphrase":...}
-    # Encrypted with Fernet key derived from UTT_KMS_MASTER_KEY.
-    # ─────────────────────────────────────────────────────────────
 
     def _vault_fernet(self):
         if Fernet is None:
             return None
-
         mk = (os.getenv("UTT_KMS_MASTER_KEY") or "").strip()
-        if not mk:
-            # Dev fallback. Prefer UTT_KMS_MASTER_KEY.
-            mk = (os.getenv("UTT_AUTH_SECRET") or os.getenv("UTT_AUTH_PASSWORD") or "utt-dev-secret").strip()
-
+        if len(mk) < 32:
+            return None
         key = base64.urlsafe_b64encode(hashlib.sha256(mk.encode("utf-8")).digest())
         try:
             return Fernet(key)
@@ -372,110 +376,68 @@ class Settings(BaseSettings):
             return {}
         try:
             raw = f.decrypt((secret_enc or "").encode("utf-8"))
-            return json.loads(raw.decode("utf-8"))
+            value = json.loads(raw.decode("utf-8"))
+            return value if isinstance(value, dict) else {}
         except Exception:
             return {}
 
+    def _vault_owner_username(self, username: Optional[str] = None) -> Optional[str]:
+        explicit = (username or "").strip() if isinstance(username, str) else ""
+        if explicit:
+            return explicit
+        configured = (os.getenv("UTT_VAULT_USERNAME") or "").strip()
+        return configured or None
+
+    def _vault_db_path(self) -> str:
+        db_path = (self.sqlite_path or "").strip()
+        if not db_path:
+            db_path = (os.getenv("SQLITE_PATH") or "").strip()
+        if not db_path:
+            db_path = (
+                os.getenv("UTT_DB_PATH")
+                or os.getenv("UTT_AUTH_DB_PATH")
+                or os.getenv("UTT_DB")
+                or ""
+            ).strip()
+        if not db_path:
+            db_path = str(Path(__file__).resolve().parents[1] / "utt.sqlite")
+        return db_path
+
     def _vault_latest_bundle(self, venue: str, username: Optional[str] = None) -> Optional[dict]:
-        # Username resolution:
-        #  - explicit param first
-        #  - UTT_VAULT_USERNAME env override next
-        #  - fall back to "local" (legacy single-user default)
-        cands: List[str] = []
-        if isinstance(username, str) and username.strip():
-            cands.append(username.strip())
-        env_u = (os.getenv("UTT_VAULT_USERNAME") or "").strip()
-        if env_u:
-            cands.append(env_u)
-        cands.append("local")
-
-        # De-dupe while preserving order
-        seen_u: set[str] = set()
-        users: List[str] = []
-        for u in cands:
-            if u not in seen_u:
-                seen_u.add(u)
-                users.append(u)
-
-        v = (venue or "").strip()
-        if not v:
+        owner = self._vault_owner_username(username)
+        v = (venue or "").strip().lower()
+        if not owner or not v or self._vault_fernet() is None:
             return None
-
-        # DB path resolution:
-        # Prefer the same SQLite file your app is using (SQLITE_PATH / Settings.sqlite_path).
-        db_path = (self.sqlite_path or "").strip()
-        if not db_path:
-            db_path = (os.getenv("SQLITE_PATH") or "").strip()
-
-        # Backward/compat fallbacks (older env var names)
-        if not db_path:
-            db_path = (os.getenv("UTT_DB_PATH") or os.getenv("UTT_AUTH_DB_PATH") or os.getenv("UTT_DB") or "").strip()
-
-        if not db_path:
-            # fallback to repo-local sqlite if present
-            db_path = str(Path(__file__).resolve().parents[1] / "utt.sqlite")
-
-        for u in users:
-            try:
-                conn = sqlite3.connect(db_path)
-                try:
-                    cur = conn.cursor()
-                    cur.execute(
-                        "SELECT secret_enc FROM utt_api_keys WHERE username=? AND venue=? ORDER BY created_at DESC LIMIT 1",
-                        (u, v),
-                    )
-                    row = cur.fetchone()
-                    if not row:
-                        continue
-                    secret_enc = row[0]
-                    if not secret_enc:
-                        continue
-                    bundle = self._vault_decrypt(str(secret_enc))
-                    if isinstance(bundle, dict):
-                        return bundle
-                finally:
-                    conn.close()
-            except Exception:
-                continue
-
-        return None
-
-    def _vault_latest_bundle_any_username(self, venue: str) -> Optional[dict]:
-        """Single-user desktop fallback: read the latest secret bundle for a venue.
-
-        Normal credential readers should prefer _vault_latest_bundle(), which
-        respects username / UTT_VAULT_USERNAME / local.  This fallback is used
-        only by infrastructure-style keys that are app-level rather than
-        exchange-account-level, such as Hydration RPC provider keys.
-        """
-        v = (venue or "").strip()
-        if not v:
-            return None
-
-        db_path = (self.sqlite_path or "").strip()
-        if not db_path:
-            db_path = (os.getenv("SQLITE_PATH") or "").strip()
-        if not db_path:
-            db_path = (os.getenv("UTT_DB_PATH") or os.getenv("UTT_AUTH_DB_PATH") or os.getenv("UTT_DB") or "").strip()
-        if not db_path:
-            db_path = str(Path(__file__).resolve().parents[1] / "utt.sqlite")
 
         try:
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(self._vault_db_path())
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT secret_enc FROM utt_api_keys WHERE venue=? ORDER BY created_at DESC LIMIT 1",
-                    (v,),
+                    """
+                    SELECT secret_enc, key_version
+                    FROM utt_api_keys
+                    WHERE username = ?
+                      AND venue = ?
+                      AND enabled = 1
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (owner, v),
                 )
                 row = cur.fetchone()
                 if not row or not row[0]:
                     return None
+                key_version = int(row[1] or 0)
+                if key_version != 1:
+                    return None
                 bundle = self._vault_decrypt(str(row[0]))
-                return bundle if isinstance(bundle, dict) else None
+                return bundle if isinstance(bundle, dict) and bundle else None
             finally:
                 conn.close()
         except Exception:
+            # Missing migration, missing table/column, locked DB, and decryption
+            # errors all fail closed. Startup migration is owned by app.main.
             return None
 
 
@@ -746,8 +708,6 @@ class Settings(BaseSettings):
         for venue in ("zerox", "0x", "robinhood_chain_0x"):
             bundle = self._vault_latest_bundle(venue)
             if not bundle:
-                bundle = self._vault_latest_bundle_any_username(venue)
-            if not bundle:
                 continue
             api_key = str(bundle.get("api_key") or "").strip()
             if api_key:
@@ -779,8 +739,6 @@ class Settings(BaseSettings):
         """
         for venue in ("polkadot_hydration", "dwellir_hydration", "hydration", "dwellir"):
             bundle = self._vault_latest_bundle(venue)
-            if not bundle:
-                bundle = self._vault_latest_bundle_any_username(venue)
             if not bundle:
                 continue
             api_key = (bundle.get("api_key") or "").strip()

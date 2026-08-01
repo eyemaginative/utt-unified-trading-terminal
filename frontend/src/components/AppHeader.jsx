@@ -1841,6 +1841,26 @@ addDexAccount,
   const [profileKeyApiSecret, setProfileKeyApiSecret] = useState("");
   const [profileKeyPassphrase, setProfileKeyPassphrase] = useState("");
   const [profileKeyTotp, setProfileKeyTotp] = useState("");
+  const [profileKeyScopeRead, setProfileKeyScopeRead] = useState(true);
+  const [profileKeyScopeTrade, setProfileKeyScopeTrade] = useState(false);
+  const [profileKeyScopeTransfer, setProfileKeyScopeTransfer] = useState(false);
+  const [profileKeyScopeWithdraw, setProfileKeyScopeWithdraw] = useState(false);
+  const [profileKeyWithdrawalAck, setProfileKeyWithdrawalAck] = useState(false);
+  const [profileKeysSummary, setProfileKeysSummary] = useState({
+    total_count: 0,
+    active_count: 0,
+    disabled_count: 0,
+    trade_scope_count: 0,
+    transfer_scope_count: 0,
+    withdrawal_scope_count: 0,
+  });
+  const [profileKeysVault, setProfileKeysVault] = useState({
+    master_key_configured: false,
+    crypto_available: false,
+    owner_configured: false,
+    owner_matches_user: false,
+  });
+  const [profileKeysStorage, setProfileKeysStorage] = useState({});
   const [profileBackupBusy, setProfileBackupBusy] = useState(false);
   const [profileBackupMsg, setProfileBackupMsg] = useState("");
   const [profileAutoBackupOnLogout, setProfileAutoBackupOnLogout] = useState(true);
@@ -2304,6 +2324,26 @@ addDexAccount,
     setProfileKeyApiSecret("");
     setProfileKeyPassphrase("");
     setProfileKeyTotp("");
+    setProfileKeyScopeRead(true);
+    setProfileKeyScopeTrade(false);
+    setProfileKeyScopeTransfer(false);
+    setProfileKeyScopeWithdraw(false);
+    setProfileKeyWithdrawalAck(false);
+    setProfileKeysSummary({
+      total_count: 0,
+      active_count: 0,
+      disabled_count: 0,
+      trade_scope_count: 0,
+      transfer_scope_count: 0,
+      withdrawal_scope_count: 0,
+    });
+    setProfileKeysVault({
+      master_key_configured: false,
+      crypto_available: false,
+      owner_configured: false,
+      owner_matches_user: false,
+    });
+    setProfileKeysStorage({});
     setProfileBackupBusy(false);
     setProfileBackupPrefBusy(false);
     setProfileBackupMsg("");
@@ -2486,6 +2526,14 @@ addDexAccount,
     const tok = String(authToken || "").trim();
     if (!tok) {
       setProfileKeysItems([]);
+      setProfileKeysSummary({
+        total_count: 0,
+        active_count: 0,
+        disabled_count: 0,
+        trade_scope_count: 0,
+        transfer_scope_count: 0,
+        withdrawal_scope_count: 0,
+      });
       return;
     }
     setProfileKeysBusy(true);
@@ -2503,6 +2551,9 @@ addDexAccount,
         return;
       }
       setProfileKeysItems(Array.isArray(data?.items) ? data.items : []);
+      setProfileKeysSummary(data?.summary && typeof data.summary === "object" ? data.summary : {});
+      setProfileKeysVault(data?.vault && typeof data.vault === "object" ? data.vault : {});
+      setProfileKeysStorage(data?.storage && typeof data.storage === "object" ? data.storage : {});
     } catch (e) {
       setProfileKeysItems([]);
       setProfileKeysMsg(`API keys load failed: ${String(e?.message || e)}`);
@@ -2526,6 +2577,11 @@ addDexAccount,
     const api_secret = String(profileKeyApiSecret || "").trim();
     const passphrase = String(profileKeyPassphrase || "").trim();
     const totp = String(profileKeyTotp || "").trim();
+    const scope_read = Boolean(profileKeyScopeRead);
+    const scope_trade = Boolean(profileKeyScopeTrade);
+    const scope_transfer = Boolean(profileKeyScopeTransfer);
+    const scope_withdraw = Boolean(profileKeyScopeWithdraw);
+    const withdrawal_risk_acknowledged = Boolean(profileKeyWithdrawalAck);
 
     if (!venue) {
       setProfileKeysMsg("Venue is required.");
@@ -2537,6 +2593,10 @@ addDexAccount,
     }
     if (authTotpEnabled && totp.length < 6) {
       setProfileKeysMsg("2FA code is required to save API keys.");
+      return;
+    }
+    if (scope_withdraw && !withdrawal_risk_acknowledged) {
+      setProfileKeysMsg("Withdrawal scope requires the critical-risk acknowledgement.");
       return;
     }
 
@@ -2556,6 +2616,11 @@ addDexAccount,
           api_secret: api_secret || null,
           passphrase: passphrase || null,
           totp: totp || null,
+          scope_read,
+          scope_trade,
+          scope_transfer,
+          scope_withdraw,
+          withdrawal_risk_acknowledged,
         }),
       });
       const ct = String(r.headers.get("content-type") || "");
@@ -2569,7 +2634,12 @@ addDexAccount,
       setProfileKeyApiSecret("");
       setProfileKeyPassphrase("");
       setProfileKeyTotp("");
-      setProfileKeysMsg("Saved.");
+      setProfileKeyScopeRead(true);
+      setProfileKeyScopeTrade(false);
+      setProfileKeyScopeTransfer(false);
+      setProfileKeyScopeWithdraw(false);
+      setProfileKeyWithdrawalAck(false);
+      setProfileKeysMsg("Saved. Any prior active credential for this venue was disabled.");
       await callProfileApiKeysList();
     } catch (e) {
       setProfileKeysMsg(`API key save failed: ${String(e?.message || e)}`);
@@ -2588,7 +2658,7 @@ addDexAccount,
     }
     const totp = String(profileKeyTotp || "").trim();
     if (authTotpEnabled && totp.length < 6) {
-      setProfileKeysMsg("2FA code is required to delete API keys.");
+      setProfileKeysMsg("2FA code is required to disable API keys.");
       return;
     }
 
@@ -2605,18 +2675,75 @@ addDexAccount,
       const ct = String(r.headers.get("content-type") || "");
       const data = ct.includes("application/json") ? await r.json() : { ok: false, detail: await r.text() };
       if (!r.ok || !data?.ok) {
-        setProfileKeysMsg(data?.detail || `API key delete failed (${r.status}).`);
+        setProfileKeysMsg(data?.detail || `API key disable failed (${r.status}).`);
         return;
       }
-      setProfileKeysMsg("Deleted.");
+      setProfileKeysMsg(data?.item?.already_disabled ? "Already disabled." : "Disabled locally. Revoke it at the venue if necessary.");
       await callProfileApiKeysList();
     } catch (e) {
-      setProfileKeysMsg(`API key delete failed: ${String(e?.message || e)}`);
+      setProfileKeysMsg(`API key disable failed: ${String(e?.message || e)}`);
     } finally {
       setProfileKeysBusy(false);
     }
   };
 
+
+  const callProfileApiKeysPanicDisable = async () => {
+    const base = tgTrimApiBase(API_BASE);
+    const url = `${base}/api/auth/api_keys/panic_disable`;
+    const tok = String(authToken || "").trim();
+    if (!tok) {
+      setProfileKeysMsg("Login required.");
+      return;
+    }
+    const totp = String(profileKeyTotp || "").trim();
+    if (authTotpEnabled && totp.length < 6) {
+      setProfileKeysMsg("2FA code is required for panic disable.");
+      return;
+    }
+    const activeCount = Number(profileKeysSummary?.active_count || 0);
+    if (activeCount <= 0) {
+      setProfileKeysMsg("No active Profile-vault credentials are currently enabled.");
+      return;
+    }
+    const confirmed = window.confirm(
+      `Disable all ${activeCount} active Profile-vault credential${activeCount === 1 ? "" : "s"} now? ` +
+      "This stops local vault resolution but does not revoke keys at the venues."
+    );
+    if (!confirmed) return;
+
+    setProfileKeysBusy(true);
+    setProfileKeysMsg("");
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${tok}`,
+        },
+        body: JSON.stringify({
+          totp: totp || null,
+          venue: null,
+        }),
+      });
+      const ct = String(r.headers.get("content-type") || "");
+      const data = ct.includes("application/json") ? await r.json() : { ok: false, detail: await r.text() };
+      if (!r.ok || !data?.ok) {
+        setProfileKeysMsg(data?.detail || `Panic disable failed (${r.status}).`);
+        return;
+      }
+      setProfileKeyTotp("");
+      const disabledCount = Number(data?.result?.disabled_count || 0);
+      setProfileKeysMsg(
+        `Panic disable completed: ${disabledCount} credential${disabledCount === 1 ? "" : "s"} disabled locally. Revoke dangerous keys at each venue.`
+      );
+      await callProfileApiKeysList();
+    } catch (e) {
+      setProfileKeysMsg(`Panic disable failed: ${String(e?.message || e)}`);
+    } finally {
+      setProfileKeysBusy(false);
+    }
+  };
 
 
   const enableProfile2fa = async () => {
@@ -6198,9 +6325,74 @@ const autoFitBanner = async () => {
               </div>
               <div style={{ height: 1, background: "rgba(255,255,255,0.08)" }} />
               <div>
-                <div style={{ fontWeight: 800, marginBottom: 6 }}>API Keys (write-only)</div>
-                <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
-                  Keys entered here will be encrypted at rest and will <b>never</b> be displayed again in the UI. Save your secrets before submitting.
+                <div style={{ fontWeight: 800, marginBottom: 6 }}>API Credentials (write-only vault)</div>
+                <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10, lineHeight: 1.35 }}>
+                  Secrets are encrypted locally and are <b>never displayed again</b>. Credential scopes below are
+                  operator-declared intent, not proof of the permissions actually granted at the venue.
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                    gap: 6,
+                    padding: "8px 10px",
+                    marginBottom: 10,
+                    borderRadius: 10,
+                    border: "1px solid rgba(255,255,255,0.10)",
+                    background: "rgba(255,255,255,0.03)",
+                    fontSize: 11,
+                  }}
+                >
+                  <div>
+                    Vault crypto:{" "}
+                    <b style={{ color: profileKeysVault?.crypto_available ? "var(--utt-ok, #65d08a)" : "var(--utt-danger, #ff6b6b)" }}>
+                      {profileKeysVault?.crypto_available ? "READY" : "UNAVAILABLE"}
+                    </b>
+                  </div>
+                  <div>
+                    Explicit owner:{" "}
+                    <b style={{ color: profileKeysVault?.owner_matches_user ? "var(--utt-ok, #65d08a)" : "var(--utt-danger, #ff6b6b)" }}>
+                      {profileKeysVault?.owner_matches_user
+                        ? "MATCHED"
+                        : profileKeysVault?.owner_configured
+                          ? "MISMATCH"
+                          : "MISSING"}
+                    </b>
+                  </div>
+                  <div>
+                    Active: <b>{Number(profileKeysSummary?.active_count || 0)}</b>
+                    {" • "}Disabled: <b>{Number(profileKeysSummary?.disabled_count || 0)}</b>
+                  </div>
+                  <div>
+                    Dangerous active scopes:{" "}
+                    <b style={{ color: Number(profileKeysSummary?.withdrawal_scope_count || 0) > 0 ? "var(--utt-danger, #ff6b6b)" : "inherit" }}>
+                      {Number(profileKeysSummary?.transfer_scope_count || 0)} transfer / {Number(profileKeysSummary?.withdrawal_scope_count || 0)} withdrawal
+                    </b>
+                  </div>
+                  <div>
+                    DB outside repo: <b>{profileKeysStorage?.database_outside_repository ? "YES" : "NO / UNKNOWN"}</b>
+                  </div>
+                  <div>
+                    Backup outside repo: <b>{profileKeysStorage?.backup_outside_repository ? "YES" : "NO / UNKNOWN"}</b>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    padding: "9px 10px",
+                    marginBottom: 10,
+                    borderRadius: 10,
+                    border: "1px solid rgba(247,185,85,0.45)",
+                    background: "rgba(247,185,85,0.08)",
+                    fontSize: 12,
+                    lineHeight: 1.35,
+                  }}
+                >
+                  <b>Safer default:</b> create read-only venue credentials with withdrawal permission disabled.
+                  Trade, transfer, and withdrawal scopes must be declared explicitly. Disabling a credential here
+                  stops Profile-vault resolution only; it does not revoke the credential at the exchange and does
+                  not disable separately configured environment credentials.
                 </div>
 
                 <div style={{ display: "grid", gridTemplateColumns: "150px 1fr", gap: 8, alignItems: "center" }}>
@@ -6208,41 +6400,118 @@ const autoFitBanner = async () => {
                   <input
                     value={profileKeyVenue}
                     onChange={(e) => setProfileKeyVenue(e.target.value)}
-                    placeholder="coinbase / kraken / solana_dex / etc"
+                    placeholder="coinbase / kraken / zerox / etc"
                     style={textInputStyle}
+                    autoComplete="off"
                   />
 
                   <div style={{ fontSize: 12, opacity: 0.75 }}>Label (optional)</div>
                   <input
                     value={profileKeyLabel}
                     onChange={(e) => setProfileKeyLabel(e.target.value)}
-                    placeholder="e.g. trading / read-only"
+                    placeholder="e.g. read-only / trading"
                     style={textInputStyle}
+                    autoComplete="off"
                   />
 
                   <div style={{ fontSize: 12, opacity: 0.75 }}>API key</div>
                   <input
+                    type="password"
                     value={profileKeyApiKey}
                     onChange={(e) => setProfileKeyApiKey(e.target.value)}
                     placeholder="paste key"
                     style={textInputStyle}
+                    autoComplete="new-password"
                   />
 
                   <div style={{ fontSize: 12, opacity: 0.75 }}>API secret</div>
                   <input
+                    type="password"
                     value={profileKeyApiSecret}
                     onChange={(e) => setProfileKeyApiSecret(e.target.value)}
                     placeholder="paste secret"
                     style={textInputStyle}
+                    autoComplete="new-password"
                   />
 
                   <div style={{ fontSize: 12, opacity: 0.75 }}>Passphrase</div>
                   <input
+                    type="password"
                     value={profileKeyPassphrase}
                     onChange={(e) => setProfileKeyPassphrase(e.target.value)}
                     placeholder="(if required by venue)"
                     style={textInputStyle}
+                    autoComplete="new-password"
                   />
+
+                  <div style={{ fontSize: 12, opacity: 0.75 }}>Declared scopes</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center", fontSize: 12 }}>
+                    <label style={{ display: "inline-flex", gap: 5, alignItems: "center" }}>
+                      <input
+                        type="checkbox"
+                        checked={profileKeyScopeRead}
+                        onChange={(e) => setProfileKeyScopeRead(Boolean(e.target.checked))}
+                      />
+                      Read
+                    </label>
+                    <label style={{ display: "inline-flex", gap: 5, alignItems: "center" }}>
+                      <input
+                        type="checkbox"
+                        checked={profileKeyScopeTrade}
+                        onChange={(e) => setProfileKeyScopeTrade(Boolean(e.target.checked))}
+                      />
+                      Trade
+                    </label>
+                    <label style={{ display: "inline-flex", gap: 5, alignItems: "center" }}>
+                      <input
+                        type="checkbox"
+                        checked={profileKeyScopeTransfer}
+                        onChange={(e) => setProfileKeyScopeTransfer(Boolean(e.target.checked))}
+                      />
+                      Transfer
+                    </label>
+                    <label style={{ display: "inline-flex", gap: 5, alignItems: "center", color: "var(--utt-danger, #ff6b6b)", fontWeight: 800 }}>
+                      <input
+                        type="checkbox"
+                        checked={profileKeyScopeWithdraw}
+                        onChange={(e) => {
+                          const checked = Boolean(e.target.checked);
+                          setProfileKeyScopeWithdraw(checked);
+                          if (!checked) setProfileKeyWithdrawalAck(false);
+                        }}
+                      />
+                      Withdrawal
+                    </label>
+                  </div>
+
+                  {profileKeyScopeWithdraw && (
+                    <>
+                      <div style={{ fontSize: 12, color: "var(--utt-danger, #ff6b6b)", fontWeight: 800 }}>Critical acknowledgement</div>
+                      <label
+                        style={{
+                          display: "flex",
+                          alignItems: "flex-start",
+                          gap: 7,
+                          padding: "8px 10px",
+                          borderRadius: 8,
+                          border: "1px solid rgba(255,107,107,0.45)",
+                          background: "rgba(255,107,107,0.08)",
+                          fontSize: 12,
+                          lineHeight: 1.3,
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={profileKeyWithdrawalAck}
+                          onChange={(e) => setProfileKeyWithdrawalAck(Boolean(e.target.checked))}
+                        />
+                        <span>
+                          I understand that withdrawal-enabled credentials can move funds. UTT recommends revoking
+                          withdrawal permission at the venue and using a separate, least-privilege key.
+                        </span>
+                      </label>
+                    </>
+                  )}
 
                   {authTotpEnabled && (
                     <>
@@ -6252,19 +6521,31 @@ const autoFitBanner = async () => {
                         onChange={(e) => setProfileKeyTotp(e.target.value)}
                         placeholder="6-digit code"
                         style={textInputStyle}
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
                       />
                     </>
                   )}
                 </div>
 
-                <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 10, alignItems: "center" }}>
                   <button
                     type="button"
                     onClick={callProfileApiKeysSave}
-                    disabled={profileKeysBusy}
-                    style={{ ...softBtnStyle, opacity: profileKeysBusy ? 0.6 : 1 }}
+                    disabled={profileKeysBusy || !profileKeysVault?.crypto_available || !profileKeysVault?.owner_matches_user}
+                    style={{
+                      ...softBtnStyle,
+                      opacity: profileKeysBusy || !profileKeysVault?.crypto_available || !profileKeysVault?.owner_matches_user ? 0.6 : 1,
+                    }}
+                    title={
+                      !profileKeysVault?.crypto_available
+                        ? "Configure UTT_KMS_MASTER_KEY and restart the backend"
+                        : !profileKeysVault?.owner_matches_user
+                          ? "Configure UTT_VAULT_USERNAME to exactly match the signed-in profile and restart the backend"
+                          : "Save a new active credential and disable the prior active row for this venue"
+                    }
                   >
-                    Save key
+                    Save credential
                   </button>
                   <button
                     type="button"
@@ -6275,6 +6556,11 @@ const autoFitBanner = async () => {
                       setProfileKeyApiSecret("");
                       setProfileKeyPassphrase("");
                       setProfileKeyTotp("");
+                      setProfileKeyScopeRead(true);
+                      setProfileKeyScopeTrade(false);
+                      setProfileKeyScopeTransfer(false);
+                      setProfileKeyScopeWithdraw(false);
+                      setProfileKeyWithdrawalAck(false);
                       setProfileKeysMsg("");
                     }}
                     disabled={profileKeysBusy}
@@ -6282,51 +6568,120 @@ const autoFitBanner = async () => {
                   >
                     Clear
                   </button>
+                  <button
+                    type="button"
+                    onClick={callProfileApiKeysPanicDisable}
+                    disabled={profileKeysBusy || Number(profileKeysSummary?.active_count || 0) <= 0}
+                    style={{
+                      ...softBtnStyle,
+                      borderColor: "rgba(255,107,107,0.65)",
+                      color: "var(--utt-danger, #ff6b6b)",
+                      fontWeight: 900,
+                      opacity: profileKeysBusy || Number(profileKeysSummary?.active_count || 0) <= 0 ? 0.55 : 1,
+                    }}
+                    title="Disable all active Profile-vault credentials locally. Venue revocation is still required."
+                  >
+                    PANIC DISABLE ALL
+                  </button>
+                </div>
 
-                  <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>
-                    {profileKeysMsg ? profileKeysMsg : profileKeysBusy ? "Working..." : ""}
-                  </div>
+                <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85, minHeight: 18 }}>
+                  {profileKeysMsg ? profileKeysMsg : profileKeysBusy ? "Working..." : ""}
                 </div>
 
                 <div style={{ height: 1, background: "rgba(255,255,255,0.08)", margin: "12px 0" }} />
 
-                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Saved keys (metadata only)</div>
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>
+                  Credential inventory — metadata only ({Number(profileKeysSummary?.active_count || 0)} active /{" "}
+                  {Number(profileKeysSummary?.disabled_count || 0)} disabled)
+                </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                   {Array.isArray(profileKeysItems) && profileKeysItems.length > 0 ? (
-                    profileKeysItems.map((k) => (
-                      <div
-                        key={k.id}
-                        style={{
-                          display: "grid",
-                          gridTemplateColumns: "1fr auto",
-                          gap: 10,
-                          alignItems: "center",
-                          padding: "8px 10px",
-                          borderRadius: 10,
-                          border: "1px solid rgba(255,255,255,0.10)",
-                          background: "rgba(255,255,255,0.03)",
-                        }}
-                      >
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ fontWeight: 700, fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                            {k.venue}{k.label ? ` — ${k.label}` : ""}
-                          </div>
-                          <div style={{ fontSize: 12, opacity: 0.75 }}>
-                            {k.hint ? `key: ${k.hint}` : "key: (hidden)"} {k.updated_at ? ` • updated: ${fmtEpochSec(k.updated_at)}` : ""}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => callProfileApiKeysDelete(k.id)}
-                          disabled={profileKeysBusy}
-                          style={{ ...softBtnStyle, opacity: profileKeysBusy ? 0.6 : 1 }}
+                    profileKeysItems.map((k) => {
+                      const scopes = [
+                        k.scope_read ? "READ" : null,
+                        k.scope_trade ? "TRADE" : null,
+                        k.scope_transfer ? "TRANSFER" : null,
+                        k.scope_withdraw ? "WITHDRAW" : null,
+                      ].filter(Boolean);
+                      return (
+                        <div
+                          key={k.id}
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "1fr auto",
+                            gap: 10,
+                            alignItems: "center",
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: k.enabled
+                              ? "1px solid rgba(101,208,138,0.30)"
+                              : "1px solid rgba(255,255,255,0.10)",
+                            background: k.enabled ? "rgba(101,208,138,0.05)" : "rgba(255,255,255,0.025)",
+                            opacity: k.enabled ? 1 : 0.68,
+                          }}
                         >
-                          Delete
-                        </button>
-                      </div>
-                    ))
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
+                              <div style={{ fontWeight: 700, fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                {k.venue}{k.label ? ` — ${k.label}` : ""}
+                              </div>
+                              <span
+                                style={{
+                                  fontSize: 10,
+                                  fontWeight: 900,
+                                  padding: "2px 6px",
+                                  borderRadius: 999,
+                                  color: k.enabled ? "var(--utt-ok, #65d08a)" : "rgba(255,255,255,0.65)",
+                                  border: "1px solid currentColor",
+                                }}
+                              >
+                                {k.enabled ? "ACTIVE" : "DISABLED"}
+                              </span>
+                            </div>
+                            <div style={{ fontSize: 12, opacity: 0.75, marginTop: 3 }}>
+                              {k.hint ? `key: ${k.hint}` : "key: (hidden)"}
+                              {k.updated_at ? ` • updated: ${fmtEpochSec(k.updated_at)}` : ""}
+                              {k.key_version ? ` • key version: ${k.key_version}` : ""}
+                            </div>
+                            <div
+                              style={{
+                                fontSize: 11,
+                                marginTop: 4,
+                                color: k.scope_withdraw
+                                  ? "var(--utt-danger, #ff6b6b)"
+                                  : k.scope_transfer
+                                    ? "var(--utt-warn, #f7b955)"
+                                    : "rgba(255,255,255,0.72)",
+                              }}
+                            >
+                              Declared scopes: {scopes.length ? scopes.join(" / ") : "NONE"}
+                              {" • "}{k.scope_source || "operator_declared"} / not venue-verified
+                            </div>
+                            {!k.enabled && (
+                              <div style={{ fontSize: 11, opacity: 0.65, marginTop: 3 }}>
+                                {k.disabled_reason ? `disabled: ${k.disabled_reason}` : "disabled"}
+                                {k.disabled_at ? ` • ${fmtEpochSec(k.disabled_at)}` : ""}
+                              </div>
+                            )}
+                          </div>
+                          {k.enabled ? (
+                            <button
+                              type="button"
+                              onClick={() => callProfileApiKeysDelete(k.id)}
+                              disabled={profileKeysBusy}
+                              style={{ ...softBtnStyle, opacity: profileKeysBusy ? 0.6 : 1 }}
+                            >
+                              Disable
+                            </button>
+                          ) : (
+                            <span style={{ fontSize: 11, opacity: 0.6 }}>inactive</span>
+                          )}
+                        </div>
+                      );
+                    })
                   ) : (
-                    <div style={{ fontSize: 12, opacity: 0.6 }}>No saved keys yet.</div>
+                    <div style={{ fontSize: 12, opacity: 0.6 }}>No saved credentials yet.</div>
                   )}
                 </div>
               </div>

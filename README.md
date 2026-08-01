@@ -2,11 +2,11 @@
 
 UTT (Unified Trading Terminal) is a local-first, multi-venue crypto trading terminal built with **FastAPI** on the backend and **React** on the frontend. It is designed to unify centralized exchange (CEX) workflows and selected decentralized exchange (DEX) flows under a single operator-focused interface.
 
-> **Current documented baseline:** this README reflects the codebase through the published Counterparty / UniSat integration series and the R5C.5B controlled Robinhood Chain BUY / SELL lifecycle. Generic custom-pair Robinhood Chain execution remains a later tranche and is not implied by the current live-validated scope.
+> **Current documented baseline:** this README reflects the codebase through the published Counterparty / UniSat integration series, the R5C.5B controlled Robinhood Chain BUY / SELL lifecycle, and the SEC-VAULT.1 credential-vault hardening tranche. Generic custom-pair Robinhood Chain execution remains a later tranche and is not implied by the current live-validated scope.
 
 At a high level, UTT provides one place to:
 
-- connect and manage venue credentials through local profile-managed API-key storage
+- connect and manage venue credentials through an owner-scoped encrypted local API-key vault with metadata-only inventory and read-only migration defaults
 - inspect balances, available amounts, holds, priced totals, cost basis, average cost, and gain/loss columns
 - view CEX orderbooks, DEX pseudo-orderbooks, Counterparty dispenser / protocol-order books, synthetic price-context books, and manual route books
 - submit and track CEX orders, cancel supported venue orders, and monitor venue-native order snapshots
@@ -386,9 +386,15 @@ That includes:
 - keeping live backend secrets outside the repo
 - avoiding committed database and key files
 - using **Profile → API Keys** for venue credentials instead of tracked env files
-- storing user-entered venue keys in the app’s local encrypted credential store rather than plaintext repository files
+- storing user-entered venue keys in an owner-scoped encrypted credential vault rather than plaintext repository files
+- requiring an externally supplied `UTT_KMS_MASTER_KEY` for credential / TOTP encryption and a separate persistent `UTT_AUTH_SECRET` for authentication signing
+- requiring explicit `UTT_VAULT_USERNAME` ownership instead of searching credential rows across arbitrary usernames
+- keeping the runtime database and backup directory outside the repository
+- enforcing one active credential per user / venue while retaining disabled history
+- treating declared Read / Trade / Transfer / Withdrawal scopes as operator metadata, not proof of venue-side permissions
 - keeping UniSat and MetaMask signing material inside the browser wallet rather than backend code
 - separating review, authorization, signing, broadcast, receipt reconciliation, and accounting-preview stages
+- limiting **Panic Disable All** to profile-vault rows; venue-side revocation and separate controls for environment-sourced credentials remain necessary
 
 ---
 
@@ -635,7 +641,26 @@ Profile / account menu
 
 Use this for CEX adapters, Solana-related API helpers where applicable, Hydration / Dwellir keys, Subscan-style history providers, and other venue credentials supported by the local profile store.
 
-Do not put exchange keys, wallet seeds, private keys, or generated key material into tracked repository files.
+Before saving credentials, the Profile security panel should report:
+
+```text
+Vault crypto: READY
+Explicit owner: MATCHED
+DB outside repo: YES
+Backup outside repo: YES
+```
+
+Credential lifecycle and scope behavior:
+
+- migrated credentials default to `Read` with scope source `migration_default_unverified`
+- declared scopes are operator intent and are not venue-verified permissions
+- enabling Withdrawal requires an explicit critical-risk acknowledgement
+- saving a new credential for the same user / venue disables the previously active row atomically
+- disabling the active row does not reactivate older credential history
+- inventory responses show lifecycle metadata and masked key hints, not API keys, secrets, passphrases, ciphertext, or KMS values
+- **Panic Disable All** disables profile-vault rows for the explicit owner; it does not revoke keys at the venue and does not disable credentials sourced from environment variables
+
+Do not put exchange keys, wallet seeds, private keys, generated key material, credential ciphertext, or vault master keys into tracked repository files.
 
 ### 2) Balances and portfolio view
 
@@ -1210,6 +1235,25 @@ UTT_ENV_PATH=C:\path\to\utt-secrets\backend.env
 
 The private `backend.env` file lives outside the repo and contains local-only runtime configuration. Exchange API keys and RPC/API keys should be saved through **Profile → API Keys** whenever the app supports that venue.
 
+#### Credential-vault runtime requirements
+
+SEC-VAULT.1 fails closed unless the private runtime environment supplies separate persistent values for encryption, authentication signing, and explicit vault ownership:
+
+```env
+UTT_KMS_MASTER_KEY=<private-random-master-key>
+UTT_AUTH_SECRET=<separate-private-random-auth-secret>
+UTT_VAULT_USERNAME=<exact-local-profile-owner>
+```
+
+Operational requirements:
+
+- `UTT_KMS_MASTER_KEY` must remain private and stable for credential / TOTP decryption; it must not fall back to an auth password, `UTT_AUTH_SECRET`, or a public literal
+- `UTT_AUTH_SECRET` must be a separate persistent secret used for authentication signing
+- `UTT_VAULT_USERNAME` must match the intended local profile owner exactly
+- the SQLite database path and `BACKUP_DIR` must resolve outside the repository
+- private values belong only in the external runtime environment, never in `backend.env.example`, README examples, logs, screenshots, diffs, or commits
+- back up the private environment and database before changing encryption or ownership settings
+
 For Polkadot / Hydration work, keep the real RPC/API key out of the repository. The recommended pattern is to save the Dwellir/Hydration key through **Profile → API Keys** using the Hydration venue key, while the private env keeps only non-secret runtime toggles and templates.
 
 A safe local Hydration configuration uses placeholder/template values such as:
@@ -1459,8 +1503,35 @@ UTT is intentionally structured so that public source code can live in git while
 - keep private env files outside the repo
 - use tracked stub files only
 - add venue API credentials through **Profile → API Keys**
+- keep the runtime database and backup directory outside the repository
 - scan staged diffs before every push
 - keep wallet and account testing material separate from source control
+
+### Credential-vault lifecycle and scope model
+
+The profile-managed credential vault uses an explicit lifecycle rather than physical deletion:
+
+```text
+new credential for user / venue
+→ previous active row disabled with replacement metadata
+→ new row becomes the only active row
+→ disabled history remains non-resolvable
+```
+
+Important properties:
+
+- at most one active credential row is allowed for each user / venue
+- replacement disables the prior active row atomically
+- disabling a credential does not resurrect an older row
+- normal credential resolution selects active rows only
+- inventory endpoints expose metadata and masked key hints only
+- migrated rows are classified as `migration_default_unverified` and default to Read without Trade, Transfer, or Withdrawal
+- Read / Trade / Transfer / Withdrawal flags are operator-declared scope metadata, not venue-side permission verification
+- Withdrawal requires an explicit critical-risk acknowledgement before it can be declared
+- **Panic Disable All** is owner-scoped and applies only to credentials stored in the Profile vault
+- disabling local vault rows does not revoke the underlying credential at the exchange or provider
+- suspected compromise still requires venue-side revocation / rotation
+- credentials sourced directly from environment variables require separate emergency controls
 
 ---
 
@@ -1781,10 +1852,19 @@ Examples of functionality reflected in the current repository include:
 
 - profile and auth routing
 - API-key management UI flows
-- DB-backed and encrypted secret-bundle patterns in code
+- externally keyed encrypted secret-bundle storage
+- explicit vault-owner binding
+- active / disabled lifecycle metadata and key-version metadata
+- metadata-only active and disabled inventory
+- read, trade, transfer, and withdrawal scope declarations
+- owner-scoped panic-disable controls
 - local runtime settings and operator preferences
 
-Venue API keys are added through the **Profile / API Keys** interface and stored in the application’s local credential store rather than being committed to backend files or repository env files.
+Venue API keys are added through the **Profile / API Keys** interface and stored in the application’s local credential vault rather than being committed to backend files or repository env files.
+
+The Profile panel reports vault readiness, explicit-owner matching, active / disabled counts, dangerous active-scope counts, and whether the database and backup directory resolve outside the repository. Secret fields are write-only; saved API keys, secrets, passphrases, ciphertext, and encryption keys are not returned for display.
+
+The panic-disable control is a local containment mechanism, not a substitute for provider-side incident response. After suspected exposure, disable the local row, revoke or rotate the key at the venue, and review any environment-sourced credentials separately.
 
 ---
 
@@ -1876,6 +1956,29 @@ Check:
 - the correct venue was configured in the profile
 - no real credentials were placed into tracked files
 
+
+### Profile / API Keys reports vault not ready or owner mismatch
+
+Check the private runtime environment and restart the backend after correcting it:
+
+```text
+UTT_KMS_MASTER_KEY is present and unchanged
+UTT_AUTH_SECRET is present and separate from the KMS key
+UTT_VAULT_USERNAME exactly matches the intended local profile owner
+database path resolves outside the repository
+BACKUP_DIR resolves outside the repository
+```
+
+Expected Profile security state:
+
+```text
+Vault crypto: READY
+Explicit owner: MATCHED
+DB outside repo: YES
+Backup outside repo: YES
+```
+
+Do not work around a vault-readiness failure by placing keys in tracked files or by substituting an auth password, a public fallback, or a temporary encryption key. Changing the KMS key without a controlled rotation can make existing ciphertext undecryptable.
 
 ### Counterparty / UniSat data, signing, or broadcast does not work
 
@@ -2264,6 +2367,10 @@ The Order Book and Order Ticket no longer depend on visible Lock controls for no
 The repository includes many execution and accounting surfaces, but several boundaries are intentional:
 
 - UTT does not store live secrets in source control.
+- UTT does not fall back to an auth password, auth-signing secret, or public literal for credential-vault encryption.
+- UTT does not treat operator-declared credential scopes as venue-verified permissions.
+- UTT does not reactivate disabled credential history when a newer credential is disabled.
+- UTT does not treat local panic disable as venue-side credential revocation.
 - UTT does not require withdrawal permission for OKX order testing.
 - UTT does not auto-apply FIFO merely because a venue fill exists.
 - UTT does not invent missing USD basis for transferred-in assets.
@@ -2286,11 +2393,14 @@ This project interacts with trading infrastructure and wallet and account workfl
 
 ### Recommended operator posture
 
+- use separate persistent secrets for vault encryption and authentication signing
+- bind the vault to the explicit intended local profile owner
 - use local-only secrets
 - review staged diffs before every push
 - use separate accounts and wallets for testing
 - avoid storing sensitive values in plaintext inside the repo
 - keep local DB, backup, and key files outside version control
+- revoke or rotate credentials at the venue after suspected compromise; local disable alone is not sufficient
 
 ### Important disclaimer
 

@@ -21,7 +21,9 @@ import {
   getRobinhoodChainFirmQuotePlan,
   getRobinhoodChainIndicativeQuote,
   getRobinhoodChainQuoteStatus,
+  getRobinhoodChainRegistryAssets,
   getRobinhoodChainRegistryMarkets,
+  addRobinhoodChainSelectedPair,
   getRobinhoodChainLatestSwapExecution,
   getRobinhoodChainSwapExecution,
   getRobinhoodChainSwapExecutionStatus,
@@ -71,6 +73,7 @@ const LS_OT_COUNTERPARTY_EXPIRATION_CUSTOM = "utt_counterparty_expiration_custom
 const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
 const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
 const ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT = "utt:robinhood-chain-orderbook-pick";
+const ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT = "utt:robinhood-chain-selected-pair-registered";
 const ROBINHOOD_CHAIN_NETWORK = Object.freeze({
   chainIdHex: "0x1237",
   chainIdDecimal: 4663,
@@ -423,7 +426,7 @@ function robinhoodChainWalletErrorMessage(error, fallback) {
   return String(error?.message || error || fallback || "MetaMask request failed.");
 }
 
-function robinhoodChainQuoteRules(symbol, market = null) {
+function robinhoodChainQuoteRules(symbol, market = null, registryPairReady = false) {
   const normalized = normalizeRobinhoodChainQuoteSymbol(symbol);
   const databaseRegistered = Boolean(market && normalizeRobinhoodChainQuoteSymbol(market?.symbol) === normalized);
   const baseDecimals = Number(market?.base?.decimals);
@@ -463,7 +466,9 @@ function robinhoodChainQuoteRules(symbol, market = null) {
     exact_receive_enabled: exactReceiveEnabled,
     execution_enabled: false,
     errors: !databaseRegistered
-      ? ["This symbol is not present in the Robinhood Chain database market catalog."]
+      ? [registryPairReady
+          ? "REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED. Use Add Selected Pair to create one review-only database objective."
+          : "This symbol is not present in the Robinhood Chain database market catalog."]
       : mechanism !== "swap"
         ? [`This database market uses ${mechanism || "an unsupported"} mechanism; swap quote and firm-plan review are unavailable.`]
         : !exactSpendEnabled && !exactReceiveEnabled
@@ -3613,6 +3618,12 @@ export default function OrderTicketWidget({
   const [robinhoodChainMarkets, setRobinhoodChainMarkets] = useState([]);
   const [robinhoodChainMarketsLoading, setRobinhoodChainMarketsLoading] = useState(false);
   const [robinhoodChainMarketsError, setRobinhoodChainMarketsError] = useState("");
+  const [robinhoodChainRegistryAssets, setRobinhoodChainRegistryAssets] = useState([]);
+  const [robinhoodChainRegistryAssetsLoading, setRobinhoodChainRegistryAssetsLoading] = useState(false);
+  const [robinhoodChainRegistryAssetsError, setRobinhoodChainRegistryAssetsError] = useState("");
+  const [robinhoodChainPairRegistrationBusy, setRobinhoodChainPairRegistrationBusy] = useState(false);
+  const [robinhoodChainPairRegistrationError, setRobinhoodChainPairRegistrationError] = useState("");
+  const [robinhoodChainPairRegistrationNotice, setRobinhoodChainPairRegistrationNotice] = useState("");
   const robinhoodChainMarketsReqRef = useRef(0);
   const [robinhoodChainExecutionAuthority, setRobinhoodChainExecutionAuthority] = useState(null);
   const [robinhoodChainExecutionAuthorityLoading, setRobinhoodChainExecutionAuthorityLoading] = useState(false);
@@ -3850,6 +3861,34 @@ export default function OrderTicketWidget({
       normalizeRobinhoodChainQuoteSymbol(market?.symbol) === robinhoodChainPair.symbol
     )) || null
   ), [robinhoodChainMarkets, robinhoodChainPair.symbol]);
+  const robinhoodChainRegistryAssetBySymbol = useMemo(() => {
+    const out = {};
+    for (const asset of robinhoodChainRegistryAssets || []) {
+      if (!asset || typeof asset !== "object" || asset?.identity_error || asset?.registry_id === null || asset?.registry_id === undefined) continue;
+      const symbol = String(asset?.symbol || "").trim().toUpperCase();
+      if (symbol && !out[symbol]) out[symbol] = asset;
+    }
+    return out;
+  }, [robinhoodChainRegistryAssets]);
+  const robinhoodChainRegistryBaseIdentity = robinhoodChainRegistryAssetBySymbol[robinhoodChainPair.base] || null;
+  const robinhoodChainRegistryQuoteIdentity = robinhoodChainRegistryAssetBySymbol[robinhoodChainPair.quote] || null;
+  const robinhoodChainRegistryPairReady = Boolean(
+    robinhoodChainPair.base &&
+    robinhoodChainPair.quote &&
+    robinhoodChainRegistryBaseIdentity?.registry_id &&
+    robinhoodChainRegistryQuoteIdentity?.registry_id &&
+    Number(robinhoodChainRegistryBaseIdentity.registry_id) !== Number(robinhoodChainRegistryQuoteIdentity.registry_id)
+  );
+  const robinhoodChainPairNotConfigured = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainRegistryPairReady &&
+    !robinhoodChainSelectedMarket
+  );
+  useEffect(() => {
+    setRobinhoodChainPairRegistrationError("");
+    setRobinhoodChainPairRegistrationNotice("");
+  }, [robinhoodChainPair.symbol]);
+
   const robinhoodChainLegacyExecutionMarket = robinhoodChainPair.symbol === "ETH-USDG";
   const robinhoodChainWethReviewMarket = robinhoodChainPair.symbol === "WETH-USDG";
   const robinhoodChainReviewQuoteMarket = Boolean(
@@ -3891,12 +3930,15 @@ export default function OrderTicketWidget({
     for (const [symbol, token] of Object.entries(robinhoodChainQuoteStatus?.tokens || {})) {
       addIdentity(token, symbol);
     }
+    for (const asset of robinhoodChainRegistryAssets || []) {
+      addIdentity(asset);
+    }
     for (const market of robinhoodChainMarkets || []) {
       addIdentity(market?.base);
       addIdentity(market?.quote);
     }
     return identities;
-  }, [robinhoodChainQuoteStatus, robinhoodChainMarkets]);
+  }, [robinhoodChainQuoteStatus, robinhoodChainRegistryAssets, robinhoodChainMarkets]);
   const robinhoodChainUsdgIdentity = robinhoodChainTokenIdentities.USDG || null;
   const robinhoodChainUsdgContract = normalizeRobinhoodChainEvmAddress(
     robinhoodChainUsdgIdentity?.registry_contract_address ||
@@ -4112,6 +4154,12 @@ export default function OrderTicketWidget({
       setRobinhoodChainMarkets([]);
       setRobinhoodChainMarketsLoading(false);
       setRobinhoodChainMarketsError("");
+      setRobinhoodChainRegistryAssets([]);
+      setRobinhoodChainRegistryAssetsLoading(false);
+      setRobinhoodChainRegistryAssetsError("");
+      setRobinhoodChainPairRegistrationBusy(false);
+      setRobinhoodChainPairRegistrationError("");
+      setRobinhoodChainPairRegistrationNotice("");
       return undefined;
     }
 
@@ -4119,30 +4167,168 @@ export default function OrderTicketWidget({
     let cancelled = false;
 
     (async () => {
-      try {
-        setRobinhoodChainMarketsLoading(true);
-        setRobinhoodChainMarketsError("");
-        const payload = await getRobinhoodChainRegistryMarkets({ apiBase, timeout_ms: 30000 });
-        if (payload?.ok !== true) throw new Error(payload?.error || "Robinhood Chain market catalog returned ok=false.");
-        const items = Array.isArray(payload?.items) ? payload.items : [];
-        if (cancelled || robinhoodChainMarketsReqRef.current !== reqId) return;
-        setRobinhoodChainMarkets(items);
+      setRobinhoodChainMarketsLoading(true);
+      setRobinhoodChainRegistryAssetsLoading(true);
+      setRobinhoodChainMarketsError("");
+      setRobinhoodChainRegistryAssetsError("");
 
-      } catch (error) {
-        if (cancelled) return;
+      const [marketsResult, assetsResult] = await Promise.allSettled([
+        getRobinhoodChainRegistryMarkets({ apiBase, timeout_ms: 30000 }),
+        getRobinhoodChainRegistryAssets({ apiBase, timeout_ms: 30000 }),
+      ]);
+      if (cancelled || robinhoodChainMarketsReqRef.current !== reqId) return;
+
+      if (marketsResult.status === "fulfilled" && marketsResult.value?.ok === true) {
+        setRobinhoodChainMarkets(Array.isArray(marketsResult.value?.items) ? marketsResult.value.items : []);
+      } else {
+        const error = marketsResult.status === "rejected"
+          ? marketsResult.reason
+          : new Error(marketsResult.value?.error || "Robinhood Chain market catalog returned ok=false.");
         setRobinhoodChainMarkets([]);
         setRobinhoodChainMarketsError(robinhoodChainQuoteError(error));
-      } finally {
-        if (!cancelled && robinhoodChainMarketsReqRef.current === reqId) {
-          setRobinhoodChainMarketsLoading(false);
-        }
       }
-    })();
+
+      if (assetsResult.status === "fulfilled" && assetsResult.value?.ok === true) {
+        setRobinhoodChainRegistryAssets(Array.isArray(assetsResult.value?.items) ? assetsResult.value.items : []);
+      } else {
+        const error = assetsResult.status === "rejected"
+          ? assetsResult.reason
+          : new Error(assetsResult.value?.error || "Robinhood Chain registry assets returned ok=false.");
+        setRobinhoodChainRegistryAssets([]);
+        setRobinhoodChainRegistryAssetsError(robinhoodChainQuoteError(error));
+      }
+
+      setRobinhoodChainMarketsLoading(false);
+      setRobinhoodChainRegistryAssetsLoading(false);
+    })().catch((error) => {
+      if (cancelled || robinhoodChainMarketsReqRef.current !== reqId) return;
+      setRobinhoodChainMarkets([]);
+      setRobinhoodChainRegistryAssets([]);
+      setRobinhoodChainMarketsError(robinhoodChainQuoteError(error));
+      setRobinhoodChainRegistryAssetsError(robinhoodChainQuoteError(error));
+      setRobinhoodChainMarketsLoading(false);
+      setRobinhoodChainRegistryAssetsLoading(false);
+    });
 
     return () => {
       cancelled = true;
     };
   }, [isRobinhoodChainVenue, apiBase]);
+
+  async function addSelectedRobinhoodChainPair() {
+    if (!robinhoodChainPairNotConfigured || robinhoodChainPairRegistrationBusy) return;
+    const baseRegistryId = Number(robinhoodChainRegistryBaseIdentity?.registry_id);
+    const quoteRegistryId = Number(robinhoodChainRegistryQuoteIdentity?.registry_id);
+    if (!Number.isInteger(baseRegistryId) || !Number.isInteger(quoteRegistryId)) {
+      setRobinhoodChainPairRegistrationError("The selected pair does not resolve to two effective Token Registry identities.");
+      return;
+    }
+
+    const confirmed = typeof window !== "undefined"
+      ? window.confirm(
+          `Add ${robinhoodChainPair.symbol} as one review-only Robinhood Chain selected pair?\n\n` +
+          "This writes one local pair objective only. It does not contact a provider or RPC, request a wallet, sign, broadcast, or enable execution."
+        )
+      : false;
+    if (!confirmed) return;
+
+    setRobinhoodChainPairRegistrationBusy(true);
+    setRobinhoodChainPairRegistrationError("");
+    setRobinhoodChainPairRegistrationNotice("");
+    try {
+      const result = await addRobinhoodChainSelectedPair(
+        {
+          base_token_registry_id: baseRegistryId,
+          quote_token_registry_id: quoteRegistryId,
+        },
+        { apiBase, timeout_ms: 30000 }
+      );
+      if (result?.ok !== true || result?.objective?.review_only !== true || result?.execution_enabled === true) {
+        throw new Error(result?.error || "Selected-pair registration did not return the required review-only state.");
+      }
+      if (
+        result?.provider_contacted === true ||
+        result?.rpc_contacted === true ||
+        result?.wallet_connection_requested === true ||
+        result?.signing_enabled === true ||
+        result?.broadcast_enabled === true ||
+        result?.automatic_execution_promotion === true
+      ) {
+        throw new Error("Selected-pair registration violated the provider-free review-only boundary.");
+      }
+
+      const refreshed = await getRobinhoodChainRegistryMarkets({ apiBase, timeout_ms: 30000 });
+      if (refreshed?.ok !== true) {
+        throw new Error(refreshed?.error || "Selected pair was saved, but the market catalog refresh failed.");
+      }
+      const items = Array.isArray(refreshed?.items) ? refreshed.items : [];
+      const configured = items.find((market) => (
+        normalizeRobinhoodChainQuoteSymbol(market?.symbol) === robinhoodChainPair.symbol
+      ));
+      if (!configured) {
+        throw new Error("Selected pair was saved, but it is not present in the refreshed market catalog.");
+      }
+      setRobinhoodChainMarkets(items);
+      // Registration changes the local objective catalog but must not trigger provider/RPC
+      // discovery. Invalidate any pre-registration authority request and clear its stale
+      // objective-not-found payload so the review-only catalog state is shown immediately.
+      robinhoodChainExecutionAuthorityReqRef.current += 1;
+      setRobinhoodChainExecutionAuthority(null);
+      setRobinhoodChainExecutionAuthorityLoading(false);
+      setRobinhoodChainExecutionAuthorityError("");
+      try {
+        window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT, {
+          detail: {
+            source: "order_ticket",
+            symbol: robinhoodChainPair.symbol,
+            markets: items,
+            idempotent: result?.idempotent === true,
+          },
+        }));
+      } catch {
+        // The initiating widget is already synchronized; the peer can recover on reload.
+      }
+      setRobinhoodChainPairRegistrationNotice(
+        result?.idempotent === true
+          ? `${robinhoodChainPair.symbol} was already configured in review-only mode.`
+          : `${robinhoodChainPair.symbol} added in review-only mode. Use Refresh Selected Market separately to run bounded provider discovery.`
+      );
+    } catch (error) {
+      setRobinhoodChainPairRegistrationError(robinhoodChainQuoteError(error));
+    } finally {
+      setRobinhoodChainPairRegistrationBusy(false);
+    }
+  }
+
+  // RH-CATALOG.SELECT.1B-R2: synchronize registration initiated by the Order Book
+  // without provider/RPC discovery or a selected-market refresh.
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const onSelectedPairRegistered = (event) => {
+      const detail = event?.detail && typeof event.detail === "object" ? event.detail : {};
+      if (String(detail?.source || "") === "order_ticket") return;
+      const eventSymbol = normalizeRobinhoodChainQuoteSymbol(detail?.symbol);
+      const items = Array.isArray(detail?.markets) ? detail.markets : [];
+      const configured = items.find((market) => (
+        normalizeRobinhoodChainQuoteSymbol(market?.symbol) === robinhoodChainPair.symbol
+      ));
+      if (!isRobinhoodChainVenue || !eventSymbol || eventSymbol !== robinhoodChainPair.symbol || !configured) return;
+
+      setRobinhoodChainMarkets(items);
+      robinhoodChainExecutionAuthorityReqRef.current += 1;
+      setRobinhoodChainExecutionAuthority(null);
+      setRobinhoodChainExecutionAuthorityLoading(false);
+      setRobinhoodChainExecutionAuthorityError("");
+      setRobinhoodChainPairRegistrationError("");
+      setRobinhoodChainPairRegistrationNotice(
+        detail?.idempotent === true
+          ? `${eventSymbol} was already configured in review-only mode.`
+          : `${eventSymbol} added in review-only mode. Use Refresh Selected Market separately to run bounded provider discovery.`
+      );
+    };
+    window.addEventListener(ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT, onSelectedPairRegistered);
+    return () => window.removeEventListener(ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT, onSelectedPairRegistered);
+  }, [isRobinhoodChainVenue, robinhoodChainPair.symbol]);
 
   async function readRobinhoodChainWalletState({ requestAccounts = false, reason = "refresh", showBusy = false } = {}) {
     const reqId = ++robinhoodChainWalletReqRef.current;
@@ -5580,7 +5766,7 @@ export default function OrderTicketWidget({
     }
 
     if (isRobinhoodChainVenue || isRobinhoodChainVenueKey(v)) {
-      setRules(robinhoodChainQuoteRules(s, robinhoodChainSelectedMarket));
+      setRules(robinhoodChainQuoteRules(s, robinhoodChainSelectedMarket, robinhoodChainPairNotConfigured));
       setRulesErr(null);
       setRulesLoading(false);
       return;
@@ -5757,7 +5943,7 @@ export default function OrderTicketWidget({
       cancelled = true;
       clearTimeout(t);
     };
-  }, [effectiveVenue, otSymbol, side, tif, postOnly, apiBase, isCounterpartyVenue, isRobinhoodChainVenue, robinhoodChainSelectedMarket]);
+  }, [effectiveVenue, otSymbol, side, tif, postOnly, apiBase, isCounterpartyVenue, isRobinhoodChainVenue, robinhoodChainSelectedMarket, robinhoodChainPairNotConfigured]);
 
   useEffect(() => {
     if (!isCounterpartyVenue) {
@@ -7538,8 +7724,12 @@ export default function OrderTicketWidget({
       lines.push("Robinhood Chain remains on its dedicated execution gate and outside generic LIVE_VENUES.");
 
       if (!robinhoodChainSelectedMarket) {
-        lines.push(robinhoodChainMarketsError || "The selected symbol is not present in the Robinhood Chain database market catalog.");
-        fails.push("robinhood_chain_market_not_registered");
+        lines.push(
+          robinhoodChainPairNotConfigured
+            ? "REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED. Use Add Selected Pair to create one review-only database objective."
+            : robinhoodChainRegistryAssetsError || robinhoodChainMarketsError || "The selected symbol is not present in the Robinhood Chain database market catalog."
+        );
+        fails.push(robinhoodChainPairNotConfigured ? "robinhood_chain_pair_not_configured" : "robinhood_chain_market_not_registered");
       } else if (!robinhoodChainReviewQuoteMarket) {
         const mechanism = String(robinhoodChainSelectedMarket?.mechanism || "unknown").replaceAll("_", " ");
         const marketState = robinhoodChainMarketStatusLabel(robinhoodChainSelectedMarket);
@@ -7935,6 +8125,8 @@ export default function OrderTicketWidget({
     robinhoodChainSelectedCapability,
     robinhoodChainSelectedMarket,
     robinhoodChainMarketsError,
+    robinhoodChainRegistryAssetsError,
+    robinhoodChainPairNotConfigured,
     robinhoodChainLegacyExecutionMarket,
     robinhoodChainPair.symbol,
   ]);
@@ -13061,6 +13253,60 @@ async function submitLimitOrder() {
                       : "SEND GATE BLOCKED"}
               </span>
             </div>
+
+            {(robinhoodChainPairNotConfigured || robinhoodChainPairRegistrationBusy || robinhoodChainPairRegistrationError || robinhoodChainPairRegistrationNotice) && (
+              <div
+                data-rh-catalog-select="selected-pair-registration"
+                data-provider-contacted="false"
+                data-execution-enabled="false"
+                style={{
+                  marginTop: 7,
+                  padding: "7px 8px",
+                  borderRadius: 8,
+                  border: robinhoodChainPairRegistrationError
+                    ? "1px solid rgba(251, 113, 133, 0.52)"
+                    : robinhoodChainPairNotConfigured
+                      ? "1px solid rgba(250, 204, 21, 0.48)"
+                      : "1px solid rgba(74, 222, 128, 0.42)",
+                  background: robinhoodChainPairRegistrationError
+                    ? "rgba(69, 10, 10, 0.22)"
+                    : robinhoodChainPairNotConfigured
+                      ? "rgba(66, 48, 4, 0.22)"
+                      : "rgba(20, 83, 45, 0.18)",
+                  fontSize: 10.5,
+                }}
+              >
+                <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
+                  <b style={{ color: robinhoodChainPairNotConfigured ? "#fde68a" : "#bbf7d0", letterSpacing: 0.35 }}>
+                    {robinhoodChainPairNotConfigured
+                      ? "REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED"
+                      : "SELECTED PAIR REGISTRATION"}
+                  </b>
+                  {robinhoodChainPairNotConfigured && (
+                    <button
+                      type="button"
+                      style={{ ...safeButton, padding: "4px 8px", fontSize: 10.5 }}
+                      disabled={robinhoodChainPairRegistrationBusy || robinhoodChainRegistryAssetsLoading || robinhoodChainMarketsLoading}
+                      onClick={addSelectedRobinhoodChainPair}
+                      title="Create exactly one review-only database pair objective. This action does not contact a provider or RPC, request a wallet, sign, broadcast, or enable execution."
+                    >
+                      {robinhoodChainPairRegistrationBusy ? "Adding…" : "Add Selected Pair"}
+                    </button>
+                  )}
+                </div>
+                {robinhoodChainPairNotConfigured && (
+                  <div style={{ marginTop: 4, color: "#e2e8f0" }}>
+                    {robinhoodChainPair.base} registry #{robinhoodChainRegistryBaseIdentity?.registry_id} + {robinhoodChainPair.quote} registry #{robinhoodChainRegistryQuoteIdentity?.registry_id}. Registration is idempotent and review-only. Refresh Selected Market remains a separate explicit action.
+                  </div>
+                )}
+                {robinhoodChainPairRegistrationNotice && (
+                  <div style={{ marginTop: 4, color: "#bbf7d0" }}>{robinhoodChainPairRegistrationNotice}</div>
+                )}
+                {robinhoodChainPairRegistrationError && (
+                  <div style={{ marginTop: 4, color: "#fecdd3" }}>{robinhoodChainPairRegistrationError}</div>
+                )}
+              </div>
+            )}
 
             <div
               data-rh-ui-norm="compact-status"

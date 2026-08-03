@@ -819,10 +819,23 @@ class RobinhoodChainRegistryDiscoveryService:
     ) -> Dict[str, Any]:
         if confirm_create is not True:
             raise ValueError("confirm_pair_objective_create_required")
+
         base_row = self._registry_row_by_id(db, base_token_registry_id)
         quote_row = self._registry_row_by_id(db, quote_token_registry_id)
         if int(base_row.id) == int(quote_row.id):
             raise ValueError("pair_objective_assets_must_differ")
+
+        effective_registry_ids = {
+            int(row.id)
+            for row in self.registry_rows(db)
+        }
+        requested_registry_ids = {
+            int(base_row.id),
+            int(quote_row.id),
+        }
+        if not requested_registry_ids.issubset(effective_registry_ids):
+            raise ValueError("pair_objective_requires_effective_registry_identity")
+
         normalized_mechanism = str(mechanism or MECHANISM_SWAP).strip().lower()
         if normalized_mechanism not in {MECHANISM_SWAP, MECHANISM_WRAP_UNWRAP}:
             raise ValueError("unsupported_pair_objective_mechanism")
@@ -831,6 +844,7 @@ class RobinhoodChainRegistryDiscoveryService:
             quote_identity = self.token_identity(db, quote_row)
             if bool(base_identity["native"]) == bool(quote_identity["native"]):
                 raise ValueError("wrap_unwrap_requires_one_native_and_one_erc20_asset")
+
         symbol = f"{str(base_row.symbol).strip().upper()}-{str(quote_row.symbol).strip().upper()}"
         row = (
             db.query(RobinhoodChainPairObjective)
@@ -840,27 +854,60 @@ class RobinhoodChainRegistryDiscoveryService:
             )
             .first()
         )
+
+        created = row is None
+        mutated = False
+        requested_notes = _clean_text(notes)
         if row is None:
             row = RobinhoodChainPairObjective(
                 base_token_registry_id=int(base_row.id),
                 quote_token_registry_id=int(quote_row.id),
                 symbol=symbol,
+                mechanism=normalized_mechanism,
+                enabled=True,
+                review_only=True,
+                notes=requested_notes,
+                updated_at=utc_now(),
             )
             db.add(row)
-        row.symbol = symbol
-        row.mechanism = normalized_mechanism
-        row.enabled = True
-        row.review_only = True
-        row.notes = _clean_text(notes)
-        row.updated_at = utc_now()
-        db.commit()
-        db.refresh(row)
+            mutated = True
+        else:
+            desired_notes = row.notes if requested_notes is None else requested_notes
+            desired_values = {
+                "symbol": symbol,
+                "mechanism": normalized_mechanism,
+                "enabled": True,
+                "review_only": True,
+                "notes": desired_notes,
+            }
+            for field_name, desired_value in desired_values.items():
+                if getattr(row, field_name) != desired_value:
+                    setattr(row, field_name, desired_value)
+                    mutated = True
+            if mutated:
+                row.updated_at = utc_now()
+
+        if mutated:
+            db.commit()
+            db.refresh(row)
+
         return {
             "ok": True,
             "objective": self._objective_dict(db, row),
-            "database_mutated": True,
+            "created": bool(created),
+            "updated": bool(mutated and not created),
+            "idempotent": bool(not mutated),
+            "selected_pair_only": True,
+            "database_mutated": bool(mutated),
             "blockchain_read_only": True,
+            "provider_contacted": False,
+            "rpc_contacted": False,
+            "wallet_connection_requested": False,
+            "signing_enabled": False,
+            "broadcast_enabled": False,
+            "automatic_execution_promotion": False,
             "execution_enabled": False,
+            "will_mutate_chain": False,
         }
 
     def delete_objective(

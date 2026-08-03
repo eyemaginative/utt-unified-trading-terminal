@@ -495,6 +495,47 @@ export async function getRobinhoodChainRegistryMarkets({ apiBase, timeout_ms = 3
   return res.data;
 }
 
+export async function getRobinhoodChainRegistryAssets({ apiBase, timeout_ms = 30000 } = {}) {
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  const path = `/api/robinhood_chain/registry-discovery/assets`;
+  if (base === API_BASE) {
+    const res = await http.get(path, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.get(`${base}${path}`, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function addRobinhoodChainSelectedPair(
+  { base_token_registry_id, quote_token_registry_id } = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const baseId = Number(base_token_registry_id);
+  const quoteId = Number(quote_token_registry_id);
+  if (!Number.isInteger(baseId) || baseId <= 0 || !Number.isInteger(quoteId) || quoteId <= 0) {
+    throw new Error("Add Selected Pair requires two effective Token Registry row IDs.");
+  }
+  if (baseId === quoteId) {
+    throw new Error("Add Selected Pair requires two different Token Registry assets.");
+  }
+
+  const body = {
+    base_token_registry_id: baseId,
+    quote_token_registry_id: quoteId,
+    mechanism: "swap",
+    notes: null,
+    confirm_create: true,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  const path = `/api/robinhood_chain/registry-discovery/objectives`;
+  if (base === API_BASE) {
+    const res = await http.post(path, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}${path}`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
 function requireRobinhoodChainReviewRequest(payload = {}) {
   const symbol = String(payload?.symbol || "").trim().toUpperCase().replace(/[\/_]/g, "-");
   const side = String(payload?.side || "").trim().toLowerCase();

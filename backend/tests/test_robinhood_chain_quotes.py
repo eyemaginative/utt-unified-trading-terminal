@@ -831,6 +831,61 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('value={robinhoodChainTicketFieldsUnavailable ? "" : totalQuote}', ticket_source)
         self.assertNotIn('setQty("");\n        setLimitPrice("");\n        setTotalQuote("");', ticket_source)
 
+    def test_selected_pair_registration_clears_stale_authority_without_provider_refresh(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        ticket_source = (repo_root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
+
+        handler_start = ticket_source.index("  async function addSelectedRobinhoodChainPair() {")
+        handler_end = ticket_source.index("  async function readRobinhoodChainWalletState", handler_start)
+        handler = ticket_source[handler_start:handler_end]
+
+        self.assertIn("addRobinhoodChainSelectedPair(", handler)
+        self.assertIn("getRobinhoodChainRegistryMarkets(", handler)
+        self.assertIn("robinhoodChainExecutionAuthorityReqRef.current += 1;", handler)
+        self.assertIn("setRobinhoodChainExecutionAuthority(null);", handler)
+        self.assertIn("setRobinhoodChainExecutionAuthorityLoading(false);", handler)
+        self.assertIn('setRobinhoodChainExecutionAuthorityError("");', handler)
+        self.assertLess(
+            handler.index("setRobinhoodChainMarkets(items);"),
+            handler.index("robinhoodChainExecutionAuthorityReqRef.current += 1;"),
+        )
+        self.assertNotIn("/refresh", handler)
+        self.assertNotIn("provider.request", handler)
+        self.assertNotIn("eth_requestAccounts", handler)
+        self.assertNotIn("eth_sendTransaction", handler)
+        self.assertNotIn("eth_sendRawTransaction", handler)
+
+    def test_selected_pair_registration_cross_widget_event_synchronizes_without_refresh(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        ticket_source = (repo_root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
+        orderbook_source = (repo_root / "frontend" / "src" / "OrderBookWidget.jsx").read_text(encoding="utf-8")
+        event_name = "utt:robinhood-chain-selected-pair-registered"
+
+        self.assertIn(event_name, ticket_source)
+        self.assertIn(event_name, orderbook_source)
+
+        ticket_listener_start = ticket_source.index("  // RH-CATALOG.SELECT.1B-R2: synchronize registration initiated by the Order Book")
+        ticket_listener_end = ticket_source.index("  async function readRobinhoodChainWalletState", ticket_listener_start)
+        ticket_listener = ticket_source[ticket_listener_start:ticket_listener_end]
+        self.assertIn("setRobinhoodChainMarkets(items);", ticket_listener)
+        self.assertIn("robinhoodChainExecutionAuthorityReqRef.current += 1;", ticket_listener)
+        self.assertIn('setRobinhoodChainExecutionAuthorityError("");', ticket_listener)
+        self.assertIn("window.addEventListener(ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT", ticket_listener)
+        self.assertNotIn("/refresh", ticket_listener)
+        self.assertNotIn("provider.request", ticket_listener)
+        self.assertNotIn("eth_requestAccounts", ticket_listener)
+        self.assertNotIn("eth_sendTransaction", ticket_listener)
+
+        book_handler_start = orderbook_source.index("  async function addSelectedRobinhoodChainPairFromBook() {")
+        book_handler_end = orderbook_source.index("  // RH-CATALOG.SELECT.1B-R2: synchronize registration initiated by the Order Ticket", book_handler_start)
+        book_handler = orderbook_source[book_handler_start:book_handler_end]
+        self.assertIn("window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT", book_handler)
+        self.assertIn('source: "order_book"', book_handler)
+        self.assertNotIn("/refresh", book_handler)
+        self.assertNotIn("provider.request", book_handler)
+        self.assertNotIn("eth_requestAccounts", book_handler)
+        self.assertNotIn("eth_sendTransaction", book_handler)
+
     async def test_safe_json_contains_no_provider_calldata(self) -> None:
         service, _ = self.make_service()
         quote = await _quote_request(service,

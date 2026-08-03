@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, List
 
 from sqlalchemy import create_engine, text
@@ -451,6 +452,94 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(objective["quote"]["registry_id"], quote.id)
         self.assertTrue(objective["review_only"])
         self.assertFalse(result["execution_enabled"])
+
+    def test_create_objective_is_idempotent_and_provider_free(self) -> None:
+        base = self._token("AAA", "0x" + "79" * 20, 18)
+        quote = self._token("BBB", "0x" + "9b" * 20, 6)
+
+        first = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="operator objective",
+            confirm_create=True,
+        )
+        second = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="operator objective",
+            confirm_create=True,
+        )
+
+        self.assertTrue(first["created"])
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(first["database_mutated"])
+        self.assertFalse(second["created"])
+        self.assertFalse(second["updated"])
+        self.assertTrue(second["idempotent"])
+        self.assertFalse(second["database_mutated"])
+        self.assertEqual(first["objective"]["id"], second["objective"]["id"])
+        self.assertEqual(
+            self.db.query(RobinhoodChainPairObjective).count(),
+            1,
+        )
+        for result in (first, second):
+            self.assertTrue(result["selected_pair_only"])
+            self.assertTrue(result["objective"]["review_only"])
+            self.assertFalse(result["execution_enabled"])
+            self.assertFalse(result["provider_contacted"])
+            self.assertFalse(result["rpc_contacted"])
+            self.assertFalse(result["wallet_connection_requested"])
+            self.assertFalse(result["signing_enabled"])
+            self.assertFalse(result["broadcast_enabled"])
+            self.assertFalse(result["automatic_execution_promotion"])
+            self.assertFalse(result["will_mutate_chain"])
+        self.assertEqual(self.fake_rpc.calls, [])
+        self.assertEqual(self.fake_discovery.calls, [])
+        self.assertEqual(self.fake_planning.calls, [])
+
+    def test_create_objective_requires_effective_registry_identities(self) -> None:
+        global_base = self._token("AAA", "0x" + "7a" * 20, 18)
+        venue_base = self._token(
+            "AAA",
+            "0x" + "7b" * 20,
+            18,
+            venue="robinhood_chain",
+        )
+        quote = self._token("BBB", "0x" + "9c" * 20, 6)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "pair_objective_requires_effective_registry_identity",
+        ):
+            self.service.create_objective(
+                self.db,
+                base_token_registry_id=global_base.id,
+                quote_token_registry_id=quote.id,
+                mechanism=MECHANISM_SWAP,
+                notes=None,
+                confirm_create=True,
+            )
+
+        result = self.service.create_objective(
+            self.db,
+            base_token_registry_id=venue_base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes=None,
+            confirm_create=True,
+        )
+        self.assertEqual(
+            result["objective"]["base"]["registry_id"],
+            venue_base.id,
+        )
+        self.assertEqual(
+            result["objective"]["quote"]["registry_id"],
+            quote.id,
+        )
 
     async def test_pair_discovery_requires_verified_registry_identities(self) -> None:
         base = self._token("AAA", "0x" + "ab" * 20, 18)
@@ -1332,6 +1421,50 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["market"]["orderbook_reason"], "not_yet_probed")
         self.assertFalse(result["market"]["orderbook_enabled"])
         self.assertFalse(result["automatic_execution_promotion"])
+
+    def test_selected_pair_registration_frontend_is_explicit_and_provider_free(self) -> None:
+        test_path = Path(__file__).resolve()
+        root_candidates = [
+            test_path.parents[2],
+            test_path.parents[1],
+        ]
+        root = next(
+            (
+                candidate
+                for candidate in root_candidates
+                if (candidate / "frontend" / "src" / "OrderTicketWidget.jsx").exists()
+            ),
+            root_candidates[0],
+        )
+        api_source = (root / "frontend" / "src" / "lib" / "api.js").read_text(encoding="utf-8")
+        ticket_source = (root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
+        orderbook_source = (root / "frontend" / "src" / "OrderBookWidget.jsx").read_text(encoding="utf-8")
+
+        helper_start = api_source.index("export async function addRobinhoodChainSelectedPair")
+        helper_end = api_source.index("function requireRobinhoodChainReviewRequest", helper_start)
+        helper_source = api_source[helper_start:helper_end]
+
+        self.assertIn("getRobinhoodChainRegistryAssets", api_source)
+        self.assertIn("/registry-discovery/assets", api_source)
+        self.assertIn("/registry-discovery/objectives", helper_source)
+        self.assertIn('mechanism: "swap"', helper_source)
+        self.assertIn("confirm_create: true", helper_source)
+        self.assertNotIn("/refresh", helper_source)
+        self.assertNotIn("provider.request", helper_source)
+        self.assertNotIn("eth_requestAccounts", helper_source)
+
+        for source in (ticket_source, orderbook_source):
+            self.assertIn("REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED", source)
+            self.assertIn("Add Selected Pair", source)
+            self.assertIn('data-provider-contacted="false"', source)
+            self.assertIn('data-execution-enabled="false"', source)
+            self.assertIn("review-only", source)
+            self.assertIn("separate explicit action", source)
+
+        self.assertIn("onClick={addSelectedRobinhoodChainPair}", ticket_source)
+        self.assertIn("onClick={addSelectedRobinhoodChainPairFromBook}", orderbook_source)
+        self.assertIn("robinhoodChainPairNotConfigured", ticket_source)
+        self.assertIn("robinhoodChainPairNotConfigured", orderbook_source)
 
     def test_discovery_sources_contain_no_known_token_contract_or_pair_objectives(self) -> None:
         import inspect

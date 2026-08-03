@@ -37,6 +37,7 @@ def _vault_environment(*, owner: str | None = "admin", kms: str | None = _TEST_K
         "UTT_AUTH_SECRET",
         "UTT_AUTH_PASSWORD",
         "UTT_AUTH_DB",
+        "UNISWAP_API_KEY",
     )
     original = {key: os.environ.get(key) for key in keys}
     try:
@@ -343,6 +344,56 @@ class CredentialVaultSecurityTests(unittest.TestCase):
                         ident={"user": "admin"},
                     )
                 self.assertEqual(owner_ctx.exception.status_code, 403)
+
+    def test_uniswap_api_credential_requires_operator_declared_read_only_scope(self):
+        with tempfile.TemporaryDirectory() as tmp, _vault_environment():
+            db_path = Path(tmp) / "vault.db"
+            with _temporary_auth_engine(db_path):
+                auth.ensure_api_key_vault_schema()
+                safe = auth._db_api_keys_upsert(
+                    "admin",
+                    "uniswap_api",
+                    "read-only",
+                    "uniswap-key",
+                    None,
+                    None,
+                    scope_read=True,
+                    scope_trade=False,
+                    scope_transfer=False,
+                    scope_withdraw=False,
+                )
+
+                settings = Settings(_env_file=None, SQLITE_PATH=str(db_path))
+                credential = settings.robinhood_chain_uniswap_api_credential()
+                self.assertIsNotNone(credential)
+                self.assertEqual(credential["api_key"], "uniswap-key")
+                self.assertTrue(credential["api_key_configured"])
+                self.assertTrue(credential["declared_read_only"])
+                self.assertFalse(credential["dangerous_scope_present"])
+                self.assertEqual(credential["scope_source"], "operator_declared")
+
+                auth._db_api_keys_disable("admin", safe["id"])
+                os.environ["UNISWAP_API_KEY"] = "environment-key-must-not-be-used"
+                self.assertIsNone(settings.robinhood_chain_uniswap_api_credential())
+
+                auth._db_api_keys_upsert(
+                    "admin",
+                    "uniswap_api",
+                    "unsafe",
+                    "unsafe-key",
+                    None,
+                    None,
+                    scope_read=True,
+                    scope_trade=True,
+                    scope_transfer=False,
+                    scope_withdraw=False,
+                )
+                unsafe = settings.robinhood_chain_uniswap_api_credential()
+                self.assertIsNotNone(unsafe)
+                self.assertTrue(unsafe["api_key_configured"])
+                self.assertIsNone(unsafe["api_key"])
+                self.assertFalse(unsafe["declared_read_only"])
+                self.assertTrue(unsafe["dangerous_scope_present"])
 
     def test_vault_mirrored_cryptocom_fields_clear_after_disable_but_env_fields_remain(self):
         with tempfile.TemporaryDirectory() as tmp, _vault_environment():

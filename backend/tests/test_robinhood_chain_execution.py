@@ -134,6 +134,14 @@ class FakeRpcClient:
             "actual_chain_id": "0x1237",
         }
 
+    async def get_native_balance(self, address, *, block_tag="latest", force_refresh=False):
+        self.calls.append(("get_native_balance", address, block_tag, force_refresh))
+        return {
+            "ok": True,
+            "balance_wei": str(10 * 10**18),
+            "block_tag": block_tag,
+        }
+
     async def rpc_read(self, method, params, *, cache_namespace=None, force_refresh=False):
         self.calls.append((method, list(params), cache_namespace, force_refresh))
         if method == "eth_getTransactionByHash":
@@ -244,7 +252,8 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.db.commit()
         self.planning = FakePlanningService()
-        self.service = RobinhoodChainExecutionService(planning_service=self.planning)
+        self.rpc = FakeRpcClient()
+        self.service = RobinhoodChainExecutionService(planning_service=self.planning, rpc_client=self.rpc)
 
     def tearDown(self) -> None:
         self.db.close()
@@ -268,7 +277,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(settings, "armed", True),
             patch.object(settings, "dry_run", False),
         ):
-            claim = self.service.claim_send(
+            claim = await self.service.claim_send(
                 self.db,
                 execution_id=prepared["execution"]["id"],
                 wallet_address=TAKER,
@@ -331,7 +340,6 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             ("0", "invalid_robinhood_chain_execution_quantity"),
             ("-0.001", "invalid_robinhood_chain_execution_quantity"),
-            ("0.002000000000000001", "quantity_exceeds_cap"),
             ("0.0000000000000000001", "precision_exceeded"),
         )
         for quantity, expected in cases:
@@ -339,6 +347,11 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ValueError, expected):
                     await self.prepare(quantity)
         self.assertEqual(self.db.query(RobinhoodChainExecution).count(), 0)
+
+    async def test_quantity_above_historical_default_is_allowed(self):
+        prepared = await self.prepare("0.01")
+        self.assertEqual(prepared["execution"]["input_amount"], "0.01")
+        self.assertEqual(prepared["execution"]["input_amount_atomic"], "10000000000000000")
 
     async def test_quantity_normalizer_preserves_18_decimal_atomic_identity(self):
         amount, text, atomic = normalize_robinhood_chain_execution_quantity("0.000000000000000001")
@@ -380,7 +393,39 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(settings, "dry_run", False),
         ):
             with self.assertRaisesRegex(ValueError, "locked_transaction_value_mismatch"):
-                self.service.claim_send(
+                await self.service.claim_send(
+                    self.db,
+                    execution_id=prepared["execution"]["id"],
+                    wallet_address=TAKER,
+                    plan_hash=prepared["execution"]["plan_hash"],
+                    claim_id=CLAIM_ID,
+                    confirm_send_claim=True,
+                )
+
+    async def test_claim_send_requires_live_balance_for_input_plus_maximum_fee(self):
+        prepared = await self.prepare("0.01")
+        self.rpc.get_native_balance = lambda *args, **kwargs: None
+
+        async def insufficient(*args, **kwargs):
+            row = prepared["execution"]
+            maximum_fee = int(row["gas_limit"]) * int(row["gas_price_wei"])
+            return {
+                "ok": True,
+                "balance_wei": str(int(row["input_amount_atomic"]) + maximum_fee - 1),
+            }
+
+        self.rpc.get_native_balance = insufficient
+        with (
+            patch.object(settings.__class__, "robinhood_chain_effective_enabled", return_value=True),
+            patch.object(settings, "robinhood_chain_live_execution_enabled", True),
+            patch.object(settings, "armed", True),
+            patch.object(settings, "dry_run", False),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "robinhood_chain_execution_insufficient_live_balance_for_input_and_max_fee",
+            ):
+                await self.service.claim_send(
                     self.db,
                     execution_id=prepared["execution"]["id"],
                     wallet_address=TAKER,
@@ -399,6 +444,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             "normalize_robinhood_chain_execution_quantity(normalized_authority_amount)",
             source,
         )
+        self.assertIn("return await get_robinhood_chain_execution_service().claim_send(", source)
         self.assertNotIn(
             "normalize_robinhood_chain_execution_quantity(request.quantity)",
             source,
@@ -495,7 +541,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(settings, "dry_run", False),
         ):
             with self.assertRaisesRegex(ValueError, "live_send_gate_blocked"):
-                self.service.claim_send(
+                await self.service.claim_send(
                     self.db,
                     execution_id=prepared["execution"]["id"],
                     wallet_address=TAKER,
@@ -516,7 +562,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(settings, "dry_run", False),
         ):
             with self.assertRaisesRegex(ValueError, "plan_expired"):
-                self.service.claim_send(
+                await self.service.claim_send(
                     self.db,
                     execution_id=prepared["execution"]["id"],
                     wallet_address=TAKER,
@@ -535,7 +581,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(settings, "armed", True),
             patch.object(settings, "dry_run", False),
         ):
-            same = self.service.claim_send(
+            same = await self.service.claim_send(
                 self.db,
                 execution_id=prepared["execution"]["id"],
                 wallet_address=TAKER,
@@ -545,7 +591,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(same["idempotent"])
             with self.assertRaisesRegex(ValueError, "send_already_claimed"):
-                self.service.claim_send(
+                await self.service.claim_send(
                     self.db,
                     execution_id=prepared["execution"]["id"],
                     wallet_address=TAKER,
@@ -598,7 +644,7 @@ class RobinhoodChainExecutionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(settings, "armed", True),
                 patch.object(settings, "dry_run", False),
             ):
-                self.service.claim_send(
+                await self.service.claim_send(
                     self.db,
                     execution_id=prepared["execution"]["id"],
                     wallet_address=TAKER,

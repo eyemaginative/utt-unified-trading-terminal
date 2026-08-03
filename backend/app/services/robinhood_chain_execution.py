@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import RobinhoodChainExecution
-from .evm_rpc import decode_hex_quantity, validate_evm_address
+from .evm_rpc import decode_hex_quantity, get_robinhood_chain_client, validate_evm_address
 from .robinhood_chain_transaction_planning import (
     EXPECTED_CHAIN_ID,
     RobinhoodChainTransactionPlanningService,
@@ -30,13 +30,10 @@ from .robinhood_chain_registry_discovery import (
 
 ROBINHOOD_CHAIN_EXECUTION_SYMBOL = "ETH-USDG"
 ROBINHOOD_CHAIN_EXECUTION_SIDE = "sell"
-# Backward-compatible names retained for callers that display the historical
-# accepted amount. R5C.3B.1 treats this value as the maximum reviewed input,
-# not as a mandatory fixed amount.
+# Historical accepted amount retained only as the default ticket value.
+# RH-EXEC.AMT.1 validates the operator's current exact input and live balance.
 ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH = Decimal("0.002")
 ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI = 2_000_000_000_000_000
-ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH = ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH
-ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI = ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI
 ROBINHOOD_CHAIN_EXECUTION_STATUSES = frozenset(
     {
         "prepared",
@@ -108,7 +105,7 @@ def _decimal_text(value: Any, *, field: str) -> str:
 
 
 def normalize_robinhood_chain_execution_quantity(value: Any) -> tuple[Decimal, str, int]:
-    """Normalize one positive native-ETH input bounded by the reviewed cap."""
+    """Normalize one positive native-ETH input using Token Registry precision."""
     raw = str(value if value is not None else "").strip()
     try:
         amount = Decimal(raw)
@@ -120,16 +117,13 @@ def normalize_robinhood_chain_execution_quantity(value: Any) -> tuple[Decimal, s
     normalized = amount.normalize()
     if normalized.as_tuple().exponent < -18:
         raise ValueError("robinhood_chain_execution_quantity_precision_exceeded")
-    if amount > ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH:
-        raise ValueError("robinhood_chain_execution_quantity_exceeds_cap")
-
     atomic_decimal = amount * _WEI_PER_ETH
     integral_atomic = atomic_decimal.to_integral_value()
     if atomic_decimal != integral_atomic:
         raise ValueError("robinhood_chain_execution_quantity_precision_exceeded")
     atomic = int(integral_atomic)
-    if atomic <= 0 or atomic > ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI:
-        raise ValueError("robinhood_chain_execution_quantity_exceeds_cap")
+    if atomic <= 0:
+        raise ValueError("invalid_robinhood_chain_execution_quantity")
 
     text = format(amount, "f")
     if "." in text:
@@ -480,11 +474,12 @@ def _execution_gate() -> Dict[str, Any]:
         "chain_id": EXPECTED_CHAIN_ID,
         "symbol": ROBINHOOD_CHAIN_EXECUTION_SYMBOL,
         "side": ROBINHOOD_CHAIN_EXECUTION_SIDE,
-        "exact_input_policy": "custom_up_to_reviewed_maximum",
-        "exact_input_eth": format(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH, "f"),
-        "exact_input_wei": str(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI),
-        "maximum_input_eth": format(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH, "f"),
-        "maximum_input_wei": str(ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_WEI),
+        "exact_input_policy": "user_selected_current_amount",
+        "default_input_eth": format(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH, "f"),
+        "default_input_wei": str(ROBINHOOD_CHAIN_EXECUTION_INPUT_WEI),
+        "maximum_input_eth": None,
+        "maximum_input_wei": None,
+        "live_balance_and_max_fee_check": True,
         "custom_input_enabled": True,
         "dedicated_execution_enabled": dedicated,
         "armed": armed,
@@ -761,7 +756,7 @@ class RobinhoodChainExecutionService:
             raise ValueError("robinhood_chain_execution_not_found")
         return {"ok": True, "execution": serialize_execution(row), "send_gate": self.status()}
 
-    def claim_send(
+    async def claim_send(
         self,
         db: Session,
         *,
@@ -795,6 +790,26 @@ class RobinhoodChainExecutionService:
             raise ValueError("robinhood_chain_execution_plan_expired")
         if row.tx_hash:
             raise ValueError("robinhood_chain_execution_already_submitted")
+
+        rpc = self.rpc_client or get_robinhood_chain_client()
+        chain = await rpc.verify_expected_chain(force_refresh=True)
+        if chain.get("ok") is not True or chain.get("chain_id_matches") is not True:
+            raise ValueError("robinhood_chain_execution_claim_chain_mismatch")
+        balance = await rpc.get_native_balance(
+            row.wallet_address,
+            block_tag="latest",
+            force_refresh=True,
+        )
+        if balance.get("ok") is not True:
+            raise ValueError("robinhood_chain_execution_live_balance_read_failed")
+        try:
+            balance_wei = int(str(balance.get("balance_wei") or "0"))
+            input_wei = int(str(row.input_amount_atomic or "0"))
+            maximum_fee_wei = int(str(row.gas_limit or "0")) * int(str(row.gas_price_wei or "0"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("robinhood_chain_execution_live_balance_invalid") from exc
+        if balance_wei < input_wei + maximum_fee_wei:
+            raise ValueError("robinhood_chain_execution_insufficient_live_balance_for_input_and_max_fee")
 
         if row.status == "send_claimed":
             if str(row.send_claim_id or "").lower() != normalized_claim_id:

@@ -47,6 +47,20 @@ MECHANISM_WRAP_UNWRAP = "wrap_unwrap"
 PROVIDER_ZEROX = "0x"
 PROVIDER_NATIVE_WRAP = "native_wrap"
 PREPARATION_STATUS = "preparation_verified"
+INDICATIVE_AVAILABLE_STATUSES = {"available", "live_verified"}
+INDICATIVE_UNAVAILABLE_PRIORITY = (
+    "identity_invalid",
+    "legal_restriction",
+    "provider_authentication_failed",
+    "provider_not_configured",
+    "backoff_active",
+    "provider_transient_error",
+    "unsupported",
+    "no_liquidity",
+    "provider_error",
+    "not_yet_probed",
+    "not_tested",
+)
 LIVE_AUTHORIZED_PENDING_CONFIRMATION = "live_authorized_pending_confirmation"
 R5C5A_AUTHORIZATION_TTL_MINUTES = 60
 R5C5B_AUTHORIZATION_TTL_MINUTES = 60
@@ -102,6 +116,7 @@ def _json_safe_error(value: Any) -> Dict[str, Any]:
             "http_status",
             "retry_after",
             "backoff_until",
+            "provider_error",
         ):
             if value.get(key) is not None:
                 safe[key] = copy.deepcopy(value.get(key))
@@ -109,6 +124,99 @@ def _json_safe_error(value: Any) -> Dict[str, Any]:
             return safe
     text_value = _clean_text(value, 1000)
     return {"message": text_value} if text_value else {}
+
+
+def _provider_error_text(value: Any, *, max_length: int = 4000) -> str:
+    parts: List[str] = []
+
+    def collect(item: Any) -> None:
+        if len(" ".join(parts)) >= max_length:
+            return
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                parts.append(str(key))
+                collect(nested)
+            return
+        if isinstance(item, (list, tuple, set)):
+            for nested in item:
+                collect(nested)
+            return
+        text_value = str(item or "").strip()
+        if text_value:
+            parts.append(text_value)
+
+    collect(value)
+    return " ".join(parts)[:max_length].lower()
+
+
+def _probe_provider_contacted(result: Dict[str, Any]) -> bool:
+    if result.get("provider_contacted") is not None:
+        return bool(result.get("provider_contacted"))
+    error = str(result.get("error") or "").strip().lower()
+    return error in {
+        "execution_discovery_provider_transient_error",
+        "provider_authentication_failed",
+        "execution_discovery_provider_error",
+    }
+
+
+def _classify_probe_result(result: Dict[str, Any]) -> str:
+    if result.get("ok") is True:
+        return "available" if result.get("liquidity_available") is True else "no_liquidity"
+
+    error = str(result.get("error") or "").strip().lower()
+    exact = {
+        "execution_discovery_not_configured": "provider_not_configured",
+        "execution_discovery_backoff_active": "backoff_active",
+        "execution_discovery_provider_transient_error": "provider_transient_error",
+        "provider_transient_error": "provider_transient_error",
+        "provider_authentication_failed": "provider_authentication_failed",
+        "unsupported_discovery_pair": "unsupported",
+        "invalid_registry_token_identity": "identity_invalid",
+        "execution_discovery_provider_identity_mismatch": "identity_invalid",
+        "chain_id_mismatch_or_unavailable": "identity_invalid",
+        "contract_code_unavailable": "identity_invalid",
+        "pair_discovery_requires_verified_registry_identity": "identity_invalid",
+        "not_yet_probed": "not_yet_probed",
+    }
+    if error in exact:
+        return exact[error]
+
+    detail = _provider_error_text(result)
+    legal_restriction_terms = (
+        "buy_token_not_authorized_for_trade",
+        "sell_token_not_authorized_for_trade",
+        "token_not_authorized_for_trade",
+        "not authorized for trade due to legal restrictions",
+        "not authorized for trade",
+        "legal restriction",
+        "legal restrictions",
+    )
+    unsupported_terms = (
+        "unsupported",
+        "not supported",
+        "token_not_tradable",
+        "token not tradable",
+        "invalid token pair",
+        "pair not supported",
+    )
+    no_liquidity_terms = (
+        "insufficient_asset_liquidity",
+        "insufficient asset liquidity",
+        "no liquidity",
+        "liquidity unavailable",
+        "no route",
+        "no routes",
+        "no quote",
+        "cannot find a route",
+    )
+    if any(term in detail for term in legal_restriction_terms):
+        return "legal_restriction"
+    if any(term in detail for term in unsupported_terms):
+        return "unsupported"
+    if any(term in detail for term in no_liquidity_terms):
+        return "no_liquidity"
+    return "provider_error"
 
 
 def _decode_abi_string(value: Any) -> Optional[str]:
@@ -578,14 +686,15 @@ class RobinhoodChainRegistryDiscoveryService:
             for item in capabilities
             if isinstance(item, dict)
         }
-        if "live_verified" in statuses:
+        if statuses and statuses.issubset({"live_verified"}):
             return "live_verified"
-        if "available" in statuses:
+        if statuses and statuses.issubset(INDICATIVE_AVAILABLE_STATUSES):
             return "available"
         if "mechanism_configured" in statuses:
             return "mechanism_configured"
-        if "provider_error" in statuses:
-            return "provider_error"
+        for status in INDICATIVE_UNAVAILABLE_PRIORITY:
+            if status in statuses:
+                return status
         return "not_tested"
 
     def market_catalog(self, db: Session) -> List[Dict[str, Any]]:
@@ -607,7 +716,7 @@ class RobinhoodChainRegistryDiscoveryService:
                     str(objective.get("base", {}).get("symbol") or "").strip().upper(),
                 ),
             }
-            available_statuses = {"available", "live_verified"}
+            available_statuses = INDICATIVE_AVAILABLE_STATUSES
             available_directions = {
                 (
                     str(item.get("from_asset") or "").strip().upper(),
@@ -620,6 +729,19 @@ class RobinhoodChainRegistryDiscoveryService:
                 item for item in capabilities
                 if str(item.get("indicative_status") or "").strip().lower() == "provider_error"
             ]
+            legal_restrictions = [
+                item for item in capabilities
+                if str(item.get("indicative_status") or "").strip().lower() == "legal_restriction"
+            ]
+            unavailable_capabilities = [
+                item for item in capabilities
+                if str(item.get("indicative_status") or "").strip().lower() not in available_statuses
+            ]
+            direction_statuses = {
+                f"{str(item.get('from_asset') or '').strip().upper()}->{str(item.get('to_asset') or '').strip().upper()}":
+                    str(item.get("indicative_status") or "not_yet_probed").strip().lower()
+                for item in capabilities
+            }
             live_verified = [
                 item for item in capabilities
                 if str(item.get("execution_status") or "").strip().lower() == "live_verified"
@@ -642,10 +764,13 @@ class RobinhoodChainRegistryDiscoveryService:
                 orderbook_reason = None
             elif mechanism == MECHANISM_WRAP_UNWRAP:
                 orderbook_reason = "wrap_unwrap_uses_dedicated_mechanism_view"
-            elif provider_errors:
-                orderbook_reason = "provider_error"
             else:
-                orderbook_reason = "both_exact_input_directions_not_available"
+                unavailable_state = self._market_indicative_state(unavailable_capabilities)
+                orderbook_reason = (
+                    unavailable_state
+                    if unavailable_state not in {"available", "live_verified", "mechanism_configured"}
+                    else "both_exact_input_directions_not_available"
+                )
 
             providers = sorted({
                 str(item.get("provider") or "").strip()
@@ -673,6 +798,11 @@ class RobinhoodChainRegistryDiscoveryService:
                 "available_direction_count": len(available_directions),
                 "live_verified_direction_count": len(live_verified),
                 "provider_error_direction_count": len(provider_errors),
+                "legal_restriction_direction_count": len(legal_restrictions),
+                "unavailable_direction_count": len(unavailable_capabilities),
+                "direction_statuses": direction_statuses,
+                "refresh_supported": bool(mechanism == MECHANISM_SWAP and objective.get("enabled") is True),
+                "explicit_refresh_required": bool(mechanism == MECHANISM_SWAP and not orderbook_enabled),
                 "last_verified_at": verified_times[-1] if verified_times else None,
             })
         return markets
@@ -795,6 +925,23 @@ class RobinhoodChainRegistryDiscoveryService:
         from_symbol = str(from_row.symbol or "").strip().upper()
         to_symbol = str(to_row.symbol or "").strip().upper()
         display_mode = "exact_spend" if row.amount_mode == AMOUNT_MODE_EXACT_INPUT else row.amount_mode
+        persisted_indicative_status = str(row.indicative_status or "not_tested").strip().lower()
+        provider_error = copy.deepcopy(row.provider_error) if isinstance(row.provider_error, dict) else {}
+        evidence = copy.deepcopy(row.evidence) if isinstance(row.evidence, dict) else {}
+        effective_indicative_status = persisted_indicative_status
+        classification_source = "persisted_status"
+        if persisted_indicative_status == "provider_error" and provider_error:
+            reclassified = _classify_probe_result({
+                "ok": False,
+                "error": provider_error.get("error") or "execution_discovery_provider_error",
+                "http_status": provider_error.get("http_status"),
+                "provider_error": provider_error.get("provider_error") or provider_error,
+            })
+            if reclassified != "provider_error":
+                effective_indicative_status = reclassified
+                classification_source = "persisted_provider_error_envelope"
+                provider_error["classification"] = reclassified
+                evidence["classification"] = reclassified
         reason = None
         if row.execution_status == PREPARATION_STATUS:
             reason = "Bounded preparation is verified; live execution remains unverified."
@@ -812,16 +959,18 @@ class RobinhoodChainRegistryDiscoveryService:
             "amount_mode": row.amount_mode,
             "display_mode": display_mode,
             "provider": row.provider,
-            "indicative_status": row.indicative_status,
+            "indicative_status": effective_indicative_status,
+            "persisted_indicative_status": persisted_indicative_status,
+            "classification_source": classification_source,
             "firm_plan_status": row.firm_plan_status,
             "execution_status": row.execution_status,
             "enabled": bool(row.enabled),
             "route_sources": copy.deepcopy(row.route_sources) if isinstance(row.route_sources, dict) else {},
             "probe_amount": row.probe_amount,
             "price_impact_bps": row.price_impact_bps,
-            "provider_error": copy.deepcopy(row.provider_error) if isinstance(row.provider_error, dict) else {},
+            "provider_error": provider_error,
             "backoff_until": iso_or_none(row.backoff_until),
-            "evidence": copy.deepcopy(row.evidence) if isinstance(row.evidence, dict) else {},
+            "evidence": evidence,
             "last_verified_at": iso_or_none(row.last_verified_at),
             "reason": reason,
             "review_only": True,
@@ -906,14 +1055,27 @@ class RobinhoodChainRegistryDiscoveryService:
             price_impact_float = float(price_impact) if price_impact is not None else None
         except Exception:
             price_impact_float = None
-        row.indicative_status = "available" if result.get("ok") else "provider_error"
-        row.firm_plan_status = "not_tested"
-        row.execution_status = "disabled"
-        row.enabled = False
+        classification = _classify_probe_result(result)
+        row.indicative_status = classification
+        authority_already_verified = bool(
+            row.enabled
+            or str(row.execution_status or "").strip().lower()
+            in {PREPARATION_STATUS, "live_verified", LIVE_AUTHORIZED_PENDING_CONFIRMATION}
+        )
+        if not authority_already_verified:
+            row.firm_plan_status = "not_tested"
+            row.execution_status = "disabled"
+            row.enabled = False
         row.route_sources = {"sources": sources, "fill_count": len(fills)}
         row.probe_amount = probe_amount
         row.price_impact_bps = price_impact_float
-        row.provider_error = {} if result.get("ok") else _json_safe_error(result)
+        if classification in INDICATIVE_AVAILABLE_STATUSES:
+            row.provider_error = {}
+        else:
+            row.provider_error = {
+                **_json_safe_error(result),
+                "classification": classification,
+            }
         backoff_raw = _clean_text(result.get("backoff_until"), 128)
         row.backoff_until = None
         if backoff_raw:
@@ -922,13 +1084,16 @@ class RobinhoodChainRegistryDiscoveryService:
             except Exception:
                 row.backoff_until = None
         row.evidence = {
-            "liquidity_available": bool(result.get("liquidity_available")),
+            "classification": classification,
+            "liquidity_available": result.get("liquidity_available") is True,
             "sell_amount": result.get("sell_amount"),
             "buy_amount": result.get("buy_amount"),
             "price_buy_per_sell": result.get("price_buy_per_sell"),
             "provider_warnings": list(result.get("provider_warnings") or [])[:20],
-            "provider_contacted": result.get("provider_contacted", True),
+            "provider_contacted": _probe_provider_contacted(result),
             "read_only": True,
+            "transaction_constructed": False,
+            "automatic_execution_promotion": False,
         }
         row.last_verified_at = now
         row.updated_at = now
@@ -1031,6 +1196,180 @@ class RobinhoodChainRegistryDiscoveryService:
             "signing_enabled": False,
             "broadcast_enabled": False,
             "automatic_execution_promotion": False,
+            "will_mutate_chain": False,
+        }
+
+    async def refresh_selected_market(
+        self,
+        db: Session,
+        *,
+        symbol: str,
+        taker_address: str,
+        force_refresh: bool,
+        confirm_refresh: bool,
+    ) -> Dict[str, Any]:
+        """Refresh only the persisted exact-input directions for one selected market.
+
+        This explicit operator action may perform bounded read-only provider/RPC
+        calls and update local review-only capability evidence. It never promotes
+        firm-plan or execution authority and never constructs transaction data.
+        """
+        if confirm_refresh is not True:
+            raise ValueError("confirm_selected_market_refresh_required")
+
+        normalized_symbol = _normalize_market_symbol(symbol)
+        objective = (
+            db.query(RobinhoodChainPairObjective)
+            .filter(
+                RobinhoodChainPairObjective.symbol == normalized_symbol,
+                RobinhoodChainPairObjective.enabled.is_(True),
+            )
+            .first()
+        )
+        if objective is None:
+            raise ValueError("robinhood_chain_pair_objective_not_found")
+        if str(objective.mechanism or "").strip().lower() != MECHANISM_SWAP:
+            raise ValueError("selected_market_refresh_requires_swap_objective")
+
+        base_row, quote_row = self._objective_tokens(db, objective)
+        base_identity = self.token_identity(db, base_row)
+        quote_identity = self.token_identity(db, quote_row)
+        taker = validate_evm_address(taker_address)
+        directions = (
+            (base_row, quote_row, base_identity, quote_identity),
+            (quote_row, base_row, quote_identity, base_identity),
+        )
+        results: List[Dict[str, Any]] = []
+        provider_contacted = False
+
+        identity_error: Optional[str] = None
+        try:
+            self._verified_identity_required(db, int(base_row.id))
+            self._verified_identity_required(db, int(quote_row.id))
+        except ValueError as exc:
+            identity_error = str(exc)
+
+        for from_row, to_row, from_identity, to_identity in directions:
+            capability = self._capability_row(
+                db,
+                objective_id=objective.id,
+                from_token_registry_id=int(from_row.id),
+                to_token_registry_id=int(to_row.id),
+                amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                provider=PROVIDER_ZEROX,
+            )
+            probe_amount = str(capability.probe_amount or "").strip()
+            classification_result: Optional[Dict[str, Any]] = None
+
+            if identity_error:
+                classification_result = {
+                    "ok": False,
+                    "error": identity_error,
+                    "provider_contacted": False,
+                    "liquidity_available": False,
+                    "read_only": True,
+                    "will_mutate": False,
+                }
+            else:
+                try:
+                    probe_amount = _parse_probe_amount(probe_amount, int(from_row.decimals))
+                except ValueError:
+                    classification_result = {
+                        "ok": False,
+                        "error": "not_yet_probed",
+                        "provider_contacted": False,
+                        "liquidity_available": False,
+                        "read_only": True,
+                        "will_mutate": False,
+                    }
+
+            if classification_result is None:
+                classification_result = await self.discovery_service.probe(
+                    sell_token=from_identity,
+                    buy_token=to_identity,
+                    sell_amount=probe_amount,
+                    buy_amount=None,
+                    taker_address=taker,
+                    force_refresh=force_refresh,
+                    route_capability=None,
+                    require_live_verified=False,
+                    max_probe_amount=probe_amount,
+                )
+
+            provider_contacted = provider_contacted or _probe_provider_contacted(classification_result)
+            row = self._persist_probe_result(
+                db,
+                objective=objective,
+                from_row=from_row,
+                to_row=to_row,
+                provider=PROVIDER_ZEROX,
+                probe_amount=probe_amount or str(capability.probe_amount or ""),
+                result=classification_result,
+            )
+            db.flush()
+            results.append(self._capability_dict(db, row))
+
+        db.commit()
+        market = next(
+            (item for item in self.market_catalog(db) if item.get("symbol") == normalized_symbol),
+            None,
+        )
+        if market is None:
+            raise ValueError("robinhood_chain_pair_objective_not_found")
+
+        provider_contacted_direction_count = sum(
+            1
+            for item in results
+            if isinstance(item, dict)
+            and isinstance(item.get("evidence"), dict)
+            and item["evidence"].get("provider_contacted") is True
+        )
+        provider_http_statuses = sorted({
+            int(item["provider_error"]["http_status"])
+            for item in results
+            if isinstance(item, dict)
+            and isinstance(item.get("provider_error"), dict)
+            and item["provider_error"].get("http_status") is not None
+        })
+        provider_error_names = sorted({
+            str(item["provider_error"]["provider_error"].get("name") or "").strip()
+            for item in results
+            if isinstance(item, dict)
+            and isinstance(item.get("provider_error"), dict)
+            and isinstance(item["provider_error"].get("provider_error"), dict)
+            and str(item["provider_error"]["provider_error"].get("name") or "").strip()
+        })
+        provider_error_messages = sorted({
+            str(item["provider_error"]["provider_error"].get("message") or "").strip()
+            for item in results
+            if isinstance(item, dict)
+            and isinstance(item.get("provider_error"), dict)
+            and isinstance(item["provider_error"].get("provider_error"), dict)
+            and str(item["provider_error"]["provider_error"].get("message") or "").strip()
+        })
+
+        return {
+            "ok": True,
+            "tranche": "R5C.5D.2A",
+            "symbol": normalized_symbol,
+            "market": market,
+            "results": results,
+            "provider_contacted": provider_contacted,
+            "provider_contacted_direction_count": provider_contacted_direction_count,
+            "provider_http_statuses": provider_http_statuses,
+            "provider_error_names": provider_error_names,
+            "provider_error_messages": provider_error_messages,
+            "selected_pair_only": True,
+            "probe_direction_count": len(results),
+            "database_mutated": True,
+            "blockchain_read_only": True,
+            "provider_read_only": True,
+            "execution_enabled": False,
+            "signing_enabled": False,
+            "broadcast_enabled": False,
+            "automatic_execution_promotion": False,
+            "transaction_constructed": False,
+            "transaction_calldata": None,
             "will_mutate_chain": False,
         }
 

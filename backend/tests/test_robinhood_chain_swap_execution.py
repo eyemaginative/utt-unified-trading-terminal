@@ -125,6 +125,32 @@ def weth_preparation_authority_capability():
     }
 
 
+def eth_buy_preparation_authority_capability():
+    """Mirror the router-resolved ETH-USDG direction authority used in production."""
+    capability = weth_preparation_authority_capability()
+    capability["symbol"] = "ETH-USDG"
+    capability["to_asset"] = "ETH"
+    capability["probe_amount"] = "2"
+
+    authority = capability["execution_authority"]
+    authority["symbol"] = "ETH-USDG"
+    authority["output"] = ETH
+    authority["objective"] = {"id": "eth-usdg-objective"}
+    authority["execution_ceiling"] = {"amount": "2", "asset": "USDG"}
+
+    authority_capability = authority["capability"]
+    authority_capability["id"] = "eth-usdg-preparation-capability"
+    authority_capability["probe_amount"] = "2"
+
+    evidence = authority_capability["evidence"]
+    evidence["symbol"] = "ETH-USDG"
+    evidence["to_asset"] = "ETH"
+    evidence["verified_input_amount"] = "2"
+    evidence["firm_plan_input_ceiling"] = "2"
+    capability["evidence"] = evidence
+    return capability
+
+
 def weth_live_authorized_capability():
     capability = weth_preparation_authority_capability()
     authority = capability["execution_authority"]
@@ -531,6 +557,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             slippage_bps=100,
             eth_token=ETH,
             usdg_token=USDG,
+            route_capability=eth_buy_preparation_authority_capability(),
             confirm_prepare=True,
         )
 
@@ -860,7 +887,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["execution"]["id"], second["execution"]["id"])
         self.assertEqual(len(self.planning.calls), 1)
 
-    async def test_r5c5a_reauthorization_starts_new_lifecycle_before_old_plan_expires(self):
+    async def test_historical_authorization_id_change_does_not_replace_fresh_current_amount_lifecycle(self):
         first_capability = weth_live_authorized_capability()
         first = await self.service.prepare(
             self.db, taker_address=TAKER, exact_input_amount="1", slippage_bps=100,
@@ -882,22 +909,12 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             route_capability=renewed_capability, confirm_prepare=True,
         )
 
-        self.assertFalse(second["idempotent"])
-        self.assertNotEqual(first_id, second["execution"]["id"])
-        self.assertEqual(len(self.planning.calls), 2)
-        self.assertEqual(
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(first_id, second["execution"]["id"])
+        self.assertEqual(len(self.planning.calls), 1)
+        self.assertNotEqual(
             self.db.get(RobinhoodChainSwapExecution, first_id).status,
             "expired",
-        )
-        second_row = self.db.get(
-            RobinhoodChainSwapExecution,
-            second["execution"]["id"],
-        )
-        self.assertEqual(
-            second_row.route["execution_authority"]["live_authorization"][
-                "authorization_id"
-            ],
-            "ff" * 16,
         )
 
     async def test_prepare_starts_new_lifecycle_after_matching_confirmed_execution(self):
@@ -972,10 +989,11 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["execution"]["status"], "allowance_sufficient")
         self.assertEqual(result["execution"]["approval_status"], "not_required")
 
-    async def test_input_cap_fails_before_provider(self):
-        with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_input_exceeds_cap"):
-            await self.prepare(amount="5.000001")
-        self.assertEqual(self.planning.calls, [])
+    async def test_current_amount_above_historical_five_usdg_limit_is_allowed(self):
+        result = await self.prepare(amount="5.000001")
+        self.assertEqual(result["execution"]["exact_input_amount"], "5.000001")
+        self.assertEqual(result["execution"]["approval"]["amount_atomic"], "5000001")
+        self.assertEqual(len(self.planning.calls), 1)
 
     async def test_approval_send_requires_dedicated_gate_and_claim(self):
         prepared = await self.prepare()
@@ -1163,7 +1181,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.prepare_weth("1")
         self.assertTrue(result["ok"])
         row = result["execution"]
-        self.assertEqual(row["tranche"], "R5C.4A")
+        self.assertEqual(row["tranche"], "RH-EXEC.AMT.1")
         self.assertEqual(row["symbol"], "WETH-USDG")
         self.assertEqual(row["from_asset"], "USDG")
         self.assertEqual(row["to_asset"], "WETH")
@@ -1206,7 +1224,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         expected = encode_erc20_approve(SPENDER, 1_000_000)
         self.assertEqual(result["approval_transaction_plan"]["calldata"], expected)
 
-    async def test_r5c5a_preparation_only_authority_cannot_claim_successful_buy_broadcast(self):
+    async def test_preparation_verified_direction_can_claim_finite_approval_without_amount_preauthorization(self):
         prepared = await self.service.prepare(
             self.db,
             taker_address=TAKER,
@@ -1221,18 +1239,21 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         execution_id = prepared["execution"]["id"]
         with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
-            with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_successful_broadcast_not_authorized"):
-                self.service.claim_approval_send(
-                    self.db, execution_id=execution_id, wallet_address=TAKER,
-                    plan_hash=prepared["execution"]["approval"]["plan_hash"],
-                    claim_id=APPROVAL_CLAIM, confirm_send_claim=True,
-                )
+            claimed = self.service.claim_approval_send(
+                self.db,
+                execution_id=execution_id,
+                wallet_address=TAKER,
+                plan_hash=prepared["execution"]["approval"]["plan_hash"],
+                claim_id=APPROVAL_CLAIM,
+                confirm_send_claim=True,
+            )
+        self.assertTrue(claimed["ok"])
         row = self.db.get(RobinhoodChainSwapExecution, execution_id)
-        self.assertEqual(row.status, "approval_prepared")
+        self.assertEqual(row.status, "approval_send_claimed")
         self.assertIsNone(row.approval_tx_hash)
         self.assertIsNone(row.swap_tx_hash)
 
-    async def test_r5c5a_live_authority_wallet_mismatch_fails_before_claim(self):
+    async def test_historical_live_authorization_wallet_does_not_replace_saved_wallet_validation(self):
         capability = weth_live_authorized_capability()
         capability["execution_authority"]["live_authorization"]["wallet_address"] = "0x" + "99" * 20
         capability["execution_authority"]["capability"]["evidence"]["live_authorization"]["wallet_address"] = "0x" + "99" * 20
@@ -1242,12 +1263,12 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             route_capability=capability, confirm_prepare=True,
         )
         with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
-            with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_live_authority_wallet_mismatch"):
-                self.service.claim_approval_send(
-                    self.db, execution_id=prepared["execution"]["id"], wallet_address=TAKER,
-                    plan_hash=prepared["execution"]["approval"]["plan_hash"],
-                    claim_id=APPROVAL_CLAIM, confirm_send_claim=True,
-                )
+            claimed = self.service.claim_approval_send(
+                self.db, execution_id=prepared["execution"]["id"], wallet_address=TAKER,
+                plan_hash=prepared["execution"]["approval"]["plan_hash"],
+                claim_id=APPROVAL_CLAIM, confirm_send_claim=True,
+            )
+        self.assertTrue(claimed["ok"])
 
     async def test_weth_approval_claim_and_wallet_rejection_do_not_open_swap(self):
         prepared = await self.prepare_weth("1")
@@ -1294,7 +1315,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(refreshed["execution"]["swap_stage_enabled"])
         self.assertFalse(refreshed["execution"]["automatic_second_transaction"])
 
-    async def test_r5c5a_post_approval_reauthorization_rebinds_stage2_without_second_approval(self):
+    async def test_historical_authorization_id_change_does_not_require_second_approval(self):
         prepared = await self.prepare_weth("1")
         execution_id = prepared["execution"]["id"]
         original_authorization_id = (
@@ -1528,7 +1549,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             confirm_prepare=True,
         )
         row = result["execution"]
-        self.assertEqual(row["tranche"], "R5C.4A")
+        self.assertEqual(row["tranche"], "RH-EXEC.AMT.1")
         self.assertEqual(row["symbol"], "WETH-USDG")
         self.assertEqual(row["exact_input_amount"], "1")
         self.assertFalse(row["to_native"])
@@ -1540,22 +1561,21 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stored["successful_broadcast_authorized"])
         self.assertFalse(row["automatic_second_transaction"])
 
-    async def test_r5c4a_preparation_authority_enforces_one_usdg_ceiling_before_provider(self):
-        capability = weth_preparation_authority_capability()
-        with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_input_exceeds_verified_authority_ceiling"):
-            await self.service.prepare(
-                self.db,
-                taker_address=TAKER,
-                exact_input_amount="1.000001",
-                slippage_bps=100,
-                eth_token=None,
-                usdg_token=USDG,
-                to_asset="WETH",
-                to_token=WETH,
-                route_capability=capability,
-                confirm_prepare=True,
-            )
-        self.assertEqual(self.planning.calls, [])
+    async def test_preparation_authority_allows_current_amount_above_historical_evidence(self):
+        result = await self.service.prepare(
+            self.db,
+            taker_address=TAKER,
+            exact_input_amount="1.000001",
+            slippage_bps=100,
+            eth_token=None,
+            usdg_token=USDG,
+            to_asset="WETH",
+            to_token=WETH,
+            route_capability=weth_preparation_authority_capability(),
+            confirm_prepare=True,
+        )
+        self.assertEqual(result["execution"]["exact_input_amount"], "1.000001")
+        self.assertEqual(len(self.planning.calls), 1)
 
     async def test_r5c4a_malformed_preparation_evidence_fails_before_provider(self):
         capability = weth_preparation_authority_capability()
@@ -1575,13 +1595,13 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(self.planning.calls, [])
 
-    async def test_r5c4b_sell_preparation_builds_finite_weth_approval_and_locks_swap(self):
+    async def test_weth_sell_preparation_builds_finite_approval_and_enables_separate_swap_stage(self):
         result = await self.prepare_weth_sell()
         self.assertTrue(result["ok"])
         self.assertFalse(result["idempotent"])
         self.assertTrue(result["approval_required"])
         row = result["execution"]
-        self.assertEqual(row["tranche"], "R5C.4B")
+        self.assertEqual(row["tranche"], "RH-EXEC.AMT.1")
         self.assertEqual(row["symbol"], "WETH-USDG")
         self.assertEqual(row["side"], "sell")
         self.assertEqual(row["from_asset"], "WETH")
@@ -1590,10 +1610,10 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["exact_input_amount_atomic"], "100000000000000")
         self.assertFalse(row["from_native"])
         self.assertFalse(row["to_native"])
-        self.assertTrue(row["approval_only"])
-        self.assertFalse(row["swap_stage_enabled"])
+        self.assertFalse(row["approval_only"])
+        self.assertTrue(row["swap_stage_enabled"])
         self.assertFalse(row["swap_execution_enabled"])
-        self.assertEqual(row["swap_stage_locked_reason"], "R5C.4B successful broadcast not authorized")
+        self.assertIsNone(row["swap_stage_locked_reason"])
         self.assertEqual(row["allowance"]["token_address"].lower(), WETH["contract_address"].lower())
         self.assertEqual(row["approval"]["transaction_to"].lower(), WETH["contract_address"].lower())
         self.assertEqual(row["approval"]["amount"], "0.0001")
@@ -1626,37 +1646,37 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["base_token"]["symbol"], "WETH")
         self.assertEqual(call["quote_token"]["symbol"], "USDG")
 
-    async def test_r5c4b_sell_amount_is_exactly_locked_before_provider(self):
-        with self.assertRaisesRegex(ValueError, "r5c4b_exact_input_amount_locked"):
-            await self.prepare_weth_sell("0.000100000000000001")
-        self.assertEqual(self.planning.calls, [])
+    async def test_weth_sell_current_amount_is_not_locked_to_historical_probe(self):
+        result = await self.prepare_weth_sell("0.000100000000000001")
+        self.assertEqual(result["execution"]["exact_input_amount"], "0.000100000000000001")
+        self.assertEqual(len(self.planning.calls), 1)
 
-    async def test_r5c4b_preparation_only_sell_cannot_claim_any_wallet_send(self):
+    async def test_weth_sell_preparation_direction_can_claim_finite_approval(self):
         prepared = await self.prepare_weth_sell()
         execution_id = prepared["execution"]["id"]
         with self.live_gate()[0], self.live_gate()[1], self.live_gate()[2], self.live_gate()[3]:
-            with self.assertRaisesRegex(
-                ValueError,
-                "robinhood_chain_swap_successful_broadcast_not_authorized",
-            ):
-                self.service.claim_approval_send(
-                    self.db,
-                    execution_id=execution_id,
-                    wallet_address=TAKER,
-                    plan_hash=prepared["execution"]["approval"]["plan_hash"],
-                    claim_id=APPROVAL_CLAIM,
-                    confirm_send_claim=True,
-                )
+            claimed = self.service.claim_approval_send(
+                self.db,
+                execution_id=execution_id,
+                wallet_address=TAKER,
+                plan_hash=prepared["execution"]["approval"]["plan_hash"],
+                claim_id=APPROVAL_CLAIM,
+                confirm_send_claim=True,
+            )
+        self.assertTrue(claimed["ok"])
         row = self.db.get(RobinhoodChainSwapExecution, execution_id)
-        self.assertEqual(row.status, "approval_prepared")
+        self.assertEqual(row.status, "approval_send_claimed")
         self.assertIsNone(row.approval_tx_hash)
         self.assertIsNone(row.swap_tx_hash)
-        self.assertFalse(((row.route or {}).get("execution_lifecycle") or {}).get("approval", {}).get("send_claim_id"))
+        self.assertEqual(
+            ((row.route or {}).get("execution_lifecycle") or {}).get("approval", {}).get("send_claim_id"),
+            APPROVAL_CLAIM,
+        )
 
-    async def test_r5c5b_live_sell_enables_finite_approval_and_separate_swap_stage(self):
+    async def test_historical_live_sell_evidence_preserves_finite_approval_and_separate_swap_stage(self):
         result = await self.prepare_weth_sell(live_authorized=True)
         row = result["execution"]
-        self.assertEqual(row["tranche"], "R5C.5B")
+        self.assertEqual(row["tranche"], "RH-EXEC.AMT.1")
         self.assertEqual(row["side"], "sell")
         self.assertEqual(row["from_asset"], "WETH")
         self.assertEqual(row["to_asset"], "USDG")
@@ -1877,7 +1897,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.refresh_swap(self.db, execution_id=execution_id)
         reconciled = result["execution"]
         self.assertEqual(reconciled["status"], "confirmed")
-        self.assertEqual(reconciled["tranche"], "R5C.5B")
+        self.assertEqual(reconciled["tranche"], "RH-EXEC.AMT.1")
         self.assertEqual(reconciled["actual_input_asset"], "WETH")
         self.assertEqual(reconciled["actual_input_amount_atomic"], str(input_atomic))
         self.assertEqual(reconciled["actual_input_amount"], "0.0001")
@@ -1996,7 +2016,7 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/execution-authority/verify-preparation", source)
         self.assertIn("/execution-authority/authorize-controlled-buy", source)
         self.assertIn("/execution-authority/authorize-controlled-sell", source)
-        self.assertIn("require_successful_broadcast=_controlled_weth_usdg_execution(execution)", source)
+        self.assertIn("require_successful_broadcast=False", source)
         self.assertIn("symbol=request.symbol", source)
         self.assertIn('if str(authority.get("execution_adapter") or "") != "erc20_exact_input"', source)
         self.assertIn('input_token = dict(authority.get("input") or {})', source)

@@ -772,6 +772,65 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(book["asks"]), ROBINHOOD_CHAIN_MAX_BOOK_LEVELS)
         self.assertEqual(len(discovery.calls), 10)
 
+    async def test_specific_unavailable_capability_blocks_book_without_provider(self) -> None:
+        service, discovery = self.make_service()
+        unavailable = {
+            "symbol": "WGAS-CRED",
+            "mechanism": "swap",
+            "from_asset": "WGAS",
+            "to_asset": "CRED",
+            "amount_mode": "exact_input",
+            "indicative_status": "no_liquidity",
+            "execution_status": "disabled",
+            "enabled": False,
+            "probe_amount": "0.004",
+            "provider_error": {"classification": "no_liquidity"},
+        }
+        book = await _pair_book_request(
+            service,
+            symbol="WGAS-CRED",
+            depth=3,
+            taker_address=TAKER,
+            base_token=WGAS,
+            quote_token=CRED,
+            base_to_quote_capability=unavailable,
+            quote_to_base_capability=CRED_TO_WGAS,
+            force_refresh=True,
+        )
+        self.assertFalse(book["ok"])
+        self.assertEqual(book["error"], "robinhood_chain_bid_direction_unavailable")
+        self.assertEqual(book["route_capability"]["indicative_status"], "no_liquidity")
+        self.assertFalse(book["provider_contacted"])
+        self.assertIsNone(book["transaction_calldata"])
+        self.assertEqual(discovery.calls, [])
+
+    def test_r5c5d_frontend_refresh_and_manual_field_guards_are_present(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        orderbook_source = (repo_root / "frontend" / "src" / "OrderBookWidget.jsx").read_text(encoding="utf-8")
+        ticket_source = (repo_root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
+
+        self.assertIn("/registry-discovery/markets/${encodeURIComponent(sym)}/refresh", orderbook_source)
+        self.assertIn("confirm_refresh: true", orderbook_source)
+        self.assertIn("robinhoodChainMarket?.orderbook_enabled !== true && !opts.force", orderbook_source)
+        self.assertIn("selected_pair_capability_refresh", orderbook_source)
+        self.assertIn("SELECTED PAIR CHECKED", orderbook_source)
+        self.assertIn("robinhoodChainRefreshSummaryRef", orderbook_source)
+        self.assertIn("providerContactedDirectionCount", orderbook_source)
+        self.assertIn("providerHttpStatuses", orderbook_source)
+        self.assertIn("PERSISTED PROVIDER EVIDENCE", orderbook_source)
+        self.assertIn("persisted_provider_evidence", orderbook_source)
+        self.assertIn('legal_restriction: "LEGAL RESTRICTION"', orderbook_source)
+
+        self.assertIn('placeholder={robinhoodChainTicketFieldsUnavailable ? "Manual amount" : totalLabel}', ticket_source)
+        self.assertIn('value={qty}', ticket_source)
+        self.assertIn('value={totalQuote}', ticket_source)
+        self.assertIn('checked={autoCalc}', ticket_source)
+        self.assertIn('Auto-calc waiting for quote', ticket_source)
+        self.assertIn('state === "legal_restriction"', ticket_source)
+        self.assertIn('Provider Legal Restriction', ticket_source)
+        self.assertNotIn('value={robinhoodChainTicketFieldsUnavailable ? "" : totalQuote}', ticket_source)
+        self.assertNotIn('setQty("");\n        setLimitPrice("");\n        setTotalQuote("");', ticket_source)
+
     async def test_safe_json_contains_no_provider_calldata(self) -> None:
         service, _ = self.make_service()
         quote = await _quote_request(service,

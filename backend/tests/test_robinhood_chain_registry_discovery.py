@@ -20,6 +20,7 @@ from app.services.robinhood_chain_registry_discovery import (
     MECHANISM_WRAP_UNWRAP,
     PREPARATION_STATUS,
     RobinhoodChainRegistryDiscoveryService,
+    _classify_probe_result,
     _parse_probe_amount,
 )
 
@@ -549,7 +550,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             confirm_discovery=True,
         )
         statuses = [item["indicative_status"] for item in result["results"]]
-        self.assertEqual(statuses, ["available", "provider_error"])
+        self.assertEqual(statuses, ["available", "provider_transient_error"])
         self.assertEqual(len(self.service.route_capabilities(self.db)), 2)
         self.assertFalse(any(item["enabled"] for item in result["results"]))
 
@@ -1087,6 +1088,251 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 confirm_create=True,
             )
 
+    def test_probe_status_taxonomy_preserves_specific_unavailable_states(self) -> None:
+        cases = (
+            ({"ok": True, "liquidity_available": True}, "available"),
+            ({"ok": True, "liquidity_available": False}, "no_liquidity"),
+            ({"ok": False, "error": "unsupported_discovery_pair"}, "unsupported"),
+            ({"ok": False, "error": "execution_discovery_provider_transient_error"}, "provider_transient_error"),
+            ({"ok": False, "error": "provider_authentication_failed"}, "provider_authentication_failed"),
+            ({"ok": False, "error": "execution_discovery_not_configured"}, "provider_not_configured"),
+            ({"ok": False, "error": "execution_discovery_backoff_active"}, "backoff_active"),
+            ({"ok": False, "error": "invalid_registry_token_identity"}, "identity_invalid"),
+            ({"ok": False, "error": "not_yet_probed"}, "not_yet_probed"),
+            (
+                {
+                    "ok": False,
+                    "error": "execution_discovery_provider_error",
+                    "provider_error": {"code": "INSUFFICIENT_ASSET_LIQUIDITY"},
+                },
+                "no_liquidity",
+            ),
+            (
+                {
+                    "ok": False,
+                    "error": "execution_discovery_provider_error",
+                    "provider_error": {"code": "TOKEN_NOT_TRADABLE"},
+                },
+                "unsupported",
+            ),
+            (
+                {
+                    "ok": False,
+                    "error": "execution_discovery_provider_error",
+                    "provider_error": {
+                        "name": "BUY_TOKEN_NOT_AUTHORIZED_FOR_TRADE",
+                        "message": "The buy token is not authorized for trade due to legal restrictions",
+                    },
+                },
+                "legal_restriction",
+            ),
+            (
+                {
+                    "ok": False,
+                    "error": "execution_discovery_provider_error",
+                    "provider_error": {
+                        "name": "SELL_TOKEN_NOT_AUTHORIZED_FOR_TRADE",
+                        "message": "The sell token is not authorized for trade due to legal restrictions",
+                    },
+                },
+                "legal_restriction",
+            ),
+            ({"ok": False, "error": "execution_discovery_provider_error"}, "provider_error"),
+        )
+        for result, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(_classify_probe_result(result), expected)
+
+    async def test_selected_market_refresh_uses_only_persisted_probe_amounts_and_stays_review_only(self) -> None:
+        self.fake_discovery.results = [
+            {
+                "ok": True,
+                "liquidity_available": False,
+                "sell_amount": "0.01",
+                "buy_amount": "0",
+                "provider_contacted": True,
+                "route": {"fills": []},
+            },
+            {
+                "ok": False,
+                "error": "execution_discovery_provider_error",
+                "http_status": 422,
+                "provider_error": {
+                    "name": "SELL_TOKEN_NOT_AUTHORIZED_FOR_TRADE",
+                    "message": "The sell token is not authorized for trade due to legal restrictions",
+                },
+                "provider_contacted": True,
+            },
+        ]
+        base = self._token("ALPHA", "0x" + "c1" * 20, 18)
+        quote = self._token("BETA", "0x" + "c2" * 20, 6, price_source="stable")
+        self._mark_verified(base)
+        self._mark_verified(quote)
+        objective = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="selected refresh",
+            confirm_create=True,
+        )["objective"]
+        for from_row, to_row, amount in (
+            (base, quote, "0.01"),
+            (quote, base, "1"),
+        ):
+            self.db.add(
+                RobinhoodChainPairCapability(
+                    objective_id=objective["id"],
+                    from_token_registry_id=from_row.id,
+                    to_token_registry_id=to_row.id,
+                    amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                    provider="0x",
+                    indicative_status="provider_error",
+                    firm_plan_status="not_tested",
+                    execution_status="disabled",
+                    enabled=False,
+                    probe_amount=amount,
+                    route_sources={},
+                    provider_error={"error": "stale"},
+                    evidence={"provider_contacted": False},
+                )
+            )
+        self.db.commit()
+
+        result = await self.service.refresh_selected_market(
+            self.db,
+            symbol="ALPHA-BETA",
+            taker_address="0x" + "c3" * 20,
+            force_refresh=True,
+            confirm_refresh=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["selected_pair_only"])
+        self.assertEqual(result["probe_direction_count"], 2)
+        self.assertTrue(result["provider_contacted"])
+        self.assertEqual(len(self.fake_discovery.calls), 2)
+        self.assertEqual([call["sell_amount"] for call in self.fake_discovery.calls], ["0.01", "1"])
+        self.assertEqual([call["max_probe_amount"] for call in self.fake_discovery.calls], ["0.01", "1"])
+        self.assertTrue(all(call["require_live_verified"] is False for call in self.fake_discovery.calls))
+        self.assertEqual(
+            [item["indicative_status"] for item in result["results"]],
+            ["no_liquidity", "legal_restriction"],
+        )
+        self.assertEqual(result["market"]["orderbook_reason"], "legal_restriction")
+        self.assertEqual(result["provider_contacted_direction_count"], 2)
+        self.assertEqual(result["provider_http_statuses"], [422])
+        self.assertEqual(
+            result["provider_error_names"],
+            ["SELL_TOKEN_NOT_AUTHORIZED_FOR_TRADE"],
+        )
+        self.assertEqual(
+            result["provider_error_messages"],
+            ["The sell token is not authorized for trade due to legal restrictions"],
+        )
+        self.assertFalse(result["market"]["orderbook_enabled"])
+        self.assertFalse(result["execution_enabled"])
+        self.assertFalse(result["automatic_execution_promotion"])
+        self.assertIsNone(result["transaction_calldata"])
+        for row in self.db.query(RobinhoodChainPairCapability).all():
+            self.assertFalse(row.enabled)
+            self.assertEqual(row.firm_plan_status, "not_tested")
+            self.assertEqual(row.execution_status, "disabled")
+
+    async def test_selected_market_refresh_never_demotes_existing_verified_authority(self) -> None:
+        self.fake_discovery.results = [
+            {"ok": True, "liquidity_available": False, "provider_contacted": True},
+            {"ok": True, "liquidity_available": True, "provider_contacted": True},
+        ]
+        base = self._token("ALPHA", "0x" + "e1" * 20, 18)
+        quote = self._token("BETA", "0x" + "e2" * 20, 6)
+        self._mark_verified(base)
+        self._mark_verified(quote)
+        objective = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="preserve authority",
+            confirm_create=True,
+        )["objective"]
+        live_row = RobinhoodChainPairCapability(
+            objective_id=objective["id"],
+            from_token_registry_id=base.id,
+            to_token_registry_id=quote.id,
+            amount_mode=AMOUNT_MODE_EXACT_INPUT,
+            provider="0x",
+            indicative_status="live_verified",
+            firm_plan_status="live_verified",
+            execution_status="live_verified",
+            enabled=True,
+            probe_amount="0.01",
+            route_sources={},
+            provider_error={},
+            evidence={"provider_contacted": True},
+        )
+        review_row = RobinhoodChainPairCapability(
+            objective_id=objective["id"],
+            from_token_registry_id=quote.id,
+            to_token_registry_id=base.id,
+            amount_mode=AMOUNT_MODE_EXACT_INPUT,
+            provider="0x",
+            indicative_status="provider_error",
+            firm_plan_status="not_tested",
+            execution_status="disabled",
+            enabled=False,
+            probe_amount="1",
+            route_sources={},
+            provider_error={},
+            evidence={"provider_contacted": False},
+        )
+        self.db.add_all([live_row, review_row])
+        self.db.commit()
+
+        await self.service.refresh_selected_market(
+            self.db,
+            symbol="ALPHA-BETA",
+            taker_address="0x" + "e3" * 20,
+            force_refresh=True,
+            confirm_refresh=True,
+        )
+        self.db.refresh(live_row)
+        self.assertTrue(live_row.enabled)
+        self.assertEqual(live_row.firm_plan_status, "live_verified")
+        self.assertEqual(live_row.execution_status, "live_verified")
+
+    async def test_selected_market_refresh_without_persisted_probe_amount_never_contacts_provider(self) -> None:
+        base = self._token("ALPHA", "0x" + "d1" * 20, 18)
+        quote = self._token("BETA", "0x" + "d2" * 20, 6)
+        self._mark_verified(base)
+        self._mark_verified(quote)
+        self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="missing persisted probes",
+            confirm_create=True,
+        )
+
+        result = await self.service.refresh_selected_market(
+            self.db,
+            symbol="ALPHA-BETA",
+            taker_address="0x" + "d3" * 20,
+            force_refresh=True,
+            confirm_refresh=True,
+        )
+
+        self.assertEqual(self.fake_discovery.calls, [])
+        self.assertFalse(result["provider_contacted"])
+        self.assertEqual(
+            [item["indicative_status"] for item in result["results"]],
+            ["not_yet_probed", "not_yet_probed"],
+        )
+        self.assertEqual(result["market"]["orderbook_reason"], "not_yet_probed")
+        self.assertFalse(result["market"]["orderbook_enabled"])
+        self.assertFalse(result["automatic_execution_promotion"])
+
     def test_discovery_sources_contain_no_known_token_contract_or_pair_objectives(self) -> None:
         import inspect
         import app.services.robinhood_chain_execution_discovery as provider_module
@@ -1156,12 +1402,17 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(market["automatic_execution_promotion"])
         self.assertEqual(market["identity_source"], "token_registry")
         self.assertEqual(market["capability_source"], "database")
+        self.assertTrue(market["refresh_supported"])
+        self.assertFalse(market["explicit_refresh_required"])
+        self.assertEqual(market["unavailable_direction_count"], 0)
 
     def test_market_catalog_classifies_wrap_and_provider_error_without_enabling_books(self) -> None:
         native = self._token("GASX", None, 9)
         wrapped = self._token("WGASX", "0x" + "b1" * 20, 9)
         blocked_base = self._token("GAMMA", "0x" + "b2" * 20, 18)
         blocked_quote = self._token("DELTA", "0x" + "b3" * 20, 6)
+        legal_base = self._token("LEGALX", "0x" + "b4" * 20, 18)
+        legal_quote = self._token("LEGALY", "0x" + "b5" * 20, 6)
 
         wrap_result = self.service.create_objective(
             self.db,
@@ -1179,6 +1430,14 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             notes=None,
             confirm_create=True,
         )
+        legal_result = self.service.create_objective(
+            self.db,
+            base_token_registry_id=legal_base.id,
+            quote_token_registry_id=legal_quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes=None,
+            confirm_create=True,
+        )
         for objective_id, pairs, provider, status in (
             (
                 wrap_result["objective"]["id"],
@@ -1192,6 +1451,12 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 "0x",
                 "provider_error",
             ),
+            (
+                legal_result["objective"]["id"],
+                ((legal_base, legal_quote), (legal_quote, legal_base)),
+                "0x",
+                "legal_envelope",
+            ),
         ):
             for from_row, to_row in pairs:
                 self.db.add(
@@ -1201,14 +1466,26 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                         to_token_registry_id=to_row.id,
                         amount_mode=AMOUNT_MODE_EXACT_INPUT,
                         provider=provider,
-                        indicative_status=status,
+                        indicative_status="provider_error" if status == "legal_envelope" else status,
                         firm_plan_status="not_tested",
                         execution_status="disabled",
                         enabled=False,
                         probe_amount="0.01",
                         route_sources={"sources": [provider]},
-                        provider_error={"message": "provider failure"} if status == "provider_error" else {},
-                        evidence={"provider_contacted": status == "provider_error"},
+                        provider_error=(
+                            {
+                                "error": "execution_discovery_provider_error",
+                                "http_status": 422,
+                                "provider_error": {
+                                    "name": "BUY_TOKEN_NOT_AUTHORIZED_FOR_TRADE",
+                                    "message": "The buy token is not authorized for trade due to legal restrictions",
+                                },
+                                "classification": "provider_error",
+                            }
+                            if status == "legal_envelope"
+                            else ({"message": "provider failure"} if status == "provider_error" else {})
+                        ),
+                        evidence={"provider_contacted": status in {"provider_error", "legal_envelope"}},
                     )
                 )
         self.db.commit()
@@ -1225,6 +1502,24 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked["provider_error_direction_count"], 2)
         self.assertFalse(blocked["orderbook_enabled"])
         self.assertEqual(blocked["orderbook_reason"], "provider_error")
+        self.assertTrue(blocked["refresh_supported"])
+        self.assertTrue(blocked["explicit_refresh_required"])
+        self.assertEqual(blocked["unavailable_direction_count"], 2)
+
+        legal = by_symbol["LEGALX-LEGALY"]
+        self.assertEqual(legal["indicative_state"], "legal_restriction")
+        self.assertEqual(legal["legal_restriction_direction_count"], 2)
+        self.assertEqual(legal["provider_error_direction_count"], 0)
+        self.assertEqual(legal["orderbook_reason"], "legal_restriction")
+        self.assertFalse(legal["orderbook_enabled"])
+        self.assertTrue(
+            all(
+                item["persisted_indicative_status"] == "provider_error"
+                and item["indicative_status"] == "legal_restriction"
+                and item["classification_source"] == "persisted_provider_error_envelope"
+                for item in legal["capabilities"]
+            )
+        )
 
     def test_router_exposes_review_only_registry_discovery_routes(self) -> None:
         from pathlib import Path
@@ -1240,6 +1535,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "/registry-discovery/assets",
             "/registry-discovery/objectives",
             "/registry-discovery/markets",
+            "/registry-discovery/markets/{symbol}/refresh",
             "/registry-discovery/sync-execution-evidence",
             "/execution-authority/authorize-controlled-buy",
         ):

@@ -263,6 +263,27 @@ class Settings(BaseSettings):
         ge=1,
         le=4,
     )
+
+    # R5C5D-2D-UNI.1: backend-only, read-only Uniswap Trading API canary.
+    # The API key is resolved only from Profile -> API Keys (venue=uniswap_api).
+    # No environment API-key fallback is accepted.  This tranche calls /quote
+    # only; /swap and /order remain unreachable.
+    robinhood_chain_uniswap_api_base: Optional[str] = Field(
+        default="https://trade-api.gateway.uniswap.org/v1",
+        alias="ROBINHOOD_CHAIN_UNISWAP_API_BASE",
+    )
+    robinhood_chain_uniswap_quote_timeout_s: float = Field(
+        default=15.0,
+        alias="ROBINHOOD_CHAIN_UNISWAP_QUOTE_TIMEOUT_S",
+        ge=2.0,
+        le=30.0,
+    )
+    robinhood_chain_uniswap_quote_max_concurrent: int = Field(
+        default=1,
+        alias="ROBINHOOD_CHAIN_UNISWAP_QUOTE_MAX_CONCURRENT",
+        ge=1,
+        le=4,
+    )
     robinhood_chain_discovery_max_sell_usd: float = Field(
         default=5.0,
         alias="ROBINHOOD_CHAIN_DISCOVERY_MAX_SELL_USD",
@@ -438,6 +459,63 @@ class Settings(BaseSettings):
         except Exception:
             # Missing migration, missing table/column, locked DB, and decryption
             # errors all fail closed. Startup migration is owned by app.main.
+            return None
+
+    def _vault_latest_credential_record(
+        self,
+        venue: str,
+        username: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Return one active vault row with scope metadata and decrypted bundle.
+
+        The encrypted payload and API key never leave this Settings instance.
+        Missing owner/KMS/schema, unsupported key versions, and decryption errors
+        all fail closed.
+        """
+        owner = self._vault_owner_username(username)
+        normalized_venue = (venue or "").strip().lower()
+        if not owner or not normalized_venue or self._vault_fernet() is None:
+            return None
+
+        try:
+            conn = sqlite3.connect(self._vault_db_path())
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT secret_enc, key_version, scope_read, scope_trade,
+                           scope_transfer, scope_withdraw, scope_source
+                    FROM utt_api_keys
+                    WHERE username = ?
+                      AND venue = ?
+                      AND enabled = 1
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (owner, normalized_venue),
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    return None
+                key_version = int(row[1] or 0)
+                if key_version != 1:
+                    return None
+                bundle = self._vault_decrypt(str(row[0]))
+                if not isinstance(bundle, dict) or not bundle:
+                    return None
+                return {
+                    "venue": normalized_venue,
+                    "key_version": key_version,
+                    "scope_read": bool(int(row[2] or 0)),
+                    "scope_trade": bool(int(row[3] or 0)),
+                    "scope_transfer": bool(int(row[4] or 0)),
+                    "scope_withdraw": bool(int(row[5] or 0)),
+                    "scope_source": str(row[6] or "").strip() or None,
+                    "bundle": bundle,
+                }
+            finally:
+                conn.close()
+        except Exception:
             return None
 
 
@@ -725,6 +803,57 @@ class Settings(BaseSettings):
             return None
         api_key = str(credential.get("api_key") or "").strip()
         return api_key or None
+
+    def robinhood_chain_uniswap_api_credential(self) -> Optional[dict]:
+        """Return strict read-only metadata for the canonical Uniswap API row.
+
+        The API key is included only when the active venue='uniswap_api' row is
+        operator-declared read-only. Any trade, transfer, or withdrawal scope
+        suppresses the key and therefore blocks provider contact. No environment
+        API-key fallback or venue alias is accepted.
+        """
+        record = self._vault_latest_credential_record("uniswap_api")
+        if not record:
+            return None
+
+        bundle = record.get("bundle") if isinstance(record.get("bundle"), dict) else {}
+        api_key = str(bundle.get("api_key") or "").strip()
+        api_key_configured = bool(api_key)
+        scope_read = bool(record.get("scope_read"))
+        scope_trade = bool(record.get("scope_trade"))
+        scope_transfer = bool(record.get("scope_transfer"))
+        scope_withdraw = bool(record.get("scope_withdraw"))
+        scope_source = str(record.get("scope_source") or "").strip() or None
+        dangerous_scope_present = bool(scope_trade or scope_transfer or scope_withdraw)
+        declared_read_only = bool(
+            api_key_configured
+            and scope_read
+            and not dangerous_scope_present
+            and scope_source == "operator_declared"
+        )
+        return {
+            "api_key": api_key if declared_read_only else None,
+            "api_key_configured": api_key_configured,
+            "source": "profile_vault",
+            "venue": "uniswap_api",
+            "key_version": int(record.get("key_version") or 0),
+            "scope_read": scope_read,
+            "scope_trade": scope_trade,
+            "scope_transfer": scope_transfer,
+            "scope_withdraw": scope_withdraw,
+            "scope_source": scope_source,
+            "declared_read_only": declared_read_only,
+            "dangerous_scope_present": dangerous_scope_present,
+        }
+
+    def robinhood_chain_effective_uniswap_api_base(self) -> str:
+        base = str(
+            getattr(self, "robinhood_chain_uniswap_api_base", None)
+            or "https://trade-api.gateway.uniswap.org/v1"
+        ).strip().rstrip("/")
+        if base.endswith("/quote"):
+            base = base[: -len("/quote")].rstrip("/")
+        return base
 
     def polkadot_hydration_rpc_api_key(self):
         """Optional callable for Hydration RPC: returns a Dwellir API key from DB vault.

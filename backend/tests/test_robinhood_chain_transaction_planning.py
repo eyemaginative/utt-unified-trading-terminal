@@ -640,7 +640,7 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"], "firm_quote_token_identity_mismatch")
         self.assertEqual(rpc.rpc_calls, [])
 
-    async def test_exact_input_can_exceed_probe_with_verified_firm_plan_ceiling(self) -> None:
+    async def test_exact_input_can_exceed_historical_probe_evidence(self) -> None:
         service, _ = self.make_service()
         result = await _plan_request(
             service,
@@ -659,8 +659,9 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["probe_amount"], "0.002")
         self.assertEqual(result["firm_plan_input_ceiling"], "0.01")
         self.assertEqual(result["firm_plan_ceiling_source"], "database_direction_capability")
+        self.assertFalse(result["firm_plan_ceiling_enforced"])
 
-    async def test_amount_caps_fail_closed(self) -> None:
+    async def test_exact_input_above_historical_firm_plan_evidence_is_allowed(self) -> None:
         service, _ = self.make_service()
         result = await _plan_request(service,
             symbol="GASX-CRED",
@@ -672,8 +673,9 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
             quote_token=CRED,
             slippage_bps=100,
         )
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error"], "firm_quote_input_exceeds_firm_plan_ceiling")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["firm_plan_ceiling_enforced"])
+        self.assertEqual(result["current_amount_policy"], "user_selected_exact_input")
 
     async def test_slippage_bounds_fail_closed(self) -> None:
         service, _ = self.make_service()

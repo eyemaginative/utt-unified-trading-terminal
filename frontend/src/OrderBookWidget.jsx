@@ -380,8 +380,81 @@ function robinhoodChainMarketStatusLabel(market) {
   if (market?.execution_enabled === true) return "LIVE VERIFIED";
   if (market?.orderbook_enabled === true) return "SYNTH BOOK AVAILABLE";
   if (mechanism === "wrap_unwrap" && market?.mechanism_configured === true) return "WRAP / UNWRAP CONFIGURED";
-  if (state === "provider_error") return "PROVIDER ERROR";
-  return state.replaceAll("_", " ").toUpperCase();
+  const labels = {
+    no_liquidity: "NO LIQUIDITY",
+    legal_restriction: "LEGAL RESTRICTION",
+    unsupported: "UNSUPPORTED",
+    provider_error: "PROVIDER ERROR",
+    provider_transient_error: "PROVIDER TEMPORARILY UNAVAILABLE",
+    provider_authentication_failed: "PROVIDER AUTH FAILED",
+    provider_not_configured: "PROVIDER NOT CONFIGURED",
+    backoff_active: "PROVIDER BACKOFF",
+    identity_invalid: "IDENTITY INVALID",
+    not_yet_probed: "NOT YET PROBED",
+    not_tested: "NOT TESTED",
+  };
+  return labels[state] || state.replaceAll("_", " ").toUpperCase();
+}
+
+function robinhoodChainMarketStatusDetail(market) {
+  if (market?.orderbook_enabled === true) {
+    return "Both exact-input directions have usable review-only evidence for a synthetic quote-only book.";
+  }
+  if (market?.execution_enabled === true) {
+    return "Execution evidence is live verified for an existing controlled lifecycle.";
+  }
+  const state = String(market?.orderbook_reason || market?.indicative_state || "not_tested").trim().toLowerCase();
+  const details = {
+    no_liquidity: "The selected pair was checked, but both exact-input directions do not currently have usable indicative liquidity.",
+    legal_restriction: "The provider reported that one or both selected tokens are not authorized for trade due to legal restrictions. UTT keeps quotes and execution locked.",
+    unsupported: "The provider classified this selected pair or token direction as unsupported.",
+    provider_error: "The selected-pair provider check failed without a more specific supported classification.",
+    provider_transient_error: "The provider or network returned a temporary error. Wait for the backoff window before another explicit refresh.",
+    provider_authentication_failed: "The configured provider credential was rejected. No synthetic book was requested.",
+    provider_not_configured: "The configured provider is not ready for selected-pair discovery.",
+    backoff_active: "Provider backoff is active. Automatic refresh will not bypass it.",
+    identity_invalid: "The selected Token Registry identity or on-chain verification is invalid for provider discovery.",
+    not_yet_probed: "No bounded persisted probe amount is available for one or both selected-pair directions.",
+    both_exact_input_directions_not_available: "Both exact-input directions must be available before a synthetic bid/ask book can be built.",
+  };
+  return details[state] || "This selected market does not currently have both usable exact-input directions.";
+}
+
+function robinhoodChainSelectedPairRefreshSummary(payload, symbol) {
+  const results = Array.isArray(payload?.results) ? payload.results : [];
+  const providerContactedDirectionCount = results.filter((item) => item?.evidence?.provider_contacted === true).length;
+  const providerHttpStatuses = [...new Set(results
+    .map((item) => Number(item?.provider_error?.http_status))
+    .filter((value) => Number.isFinite(value) && value > 0))].sort((a, b) => a - b);
+  const providerErrorNames = [...new Set(results
+    .map((item) => String(item?.provider_error?.provider_error?.name || "").trim())
+    .filter(Boolean))];
+  const providerErrorMessages = [...new Set(results
+    .map((item) => String(item?.provider_error?.provider_error?.message || "").trim())
+    .filter(Boolean))];
+  const classifications = [...new Set(results
+    .map((item) => String(item?.indicative_status || item?.provider_error?.classification || "").trim().toLowerCase())
+    .filter(Boolean))];
+  return {
+    symbol: robinhoodChainPairParts(symbol || payload?.symbol).symbol,
+    refreshAttempted: true,
+    providerContacted: payload?.provider_contacted === true || providerContactedDirectionCount > 0,
+    providerContactedDirectionCount: Number(payload?.provider_contacted_direction_count ?? providerContactedDirectionCount) || 0,
+    probeDirectionCount: Number(payload?.probe_direction_count ?? results.length) || 0,
+    providerHttpStatuses: Array.isArray(payload?.provider_http_statuses) && payload.provider_http_statuses.length
+      ? payload.provider_http_statuses
+      : providerHttpStatuses,
+    providerErrorNames: Array.isArray(payload?.provider_error_names) && payload.provider_error_names.length
+      ? payload.provider_error_names
+      : providerErrorNames,
+    providerErrorMessages: Array.isArray(payload?.provider_error_messages) && payload.provider_error_messages.length
+      ? payload.provider_error_messages
+      : providerErrorMessages,
+    classifications,
+    selectedPairOnly: payload?.selected_pair_only === true,
+    persistedProviderEvidence: payload?.persisted_provider_evidence === true,
+    refreshedAt: Date.now(),
+  };
 }
 
 function counterpartyPairParts(symbol) {
@@ -717,6 +790,7 @@ export default function OrderBookWidget({
   const [robinhoodChainMarketsLoading, setRobinhoodChainMarketsLoading] = useState(false);
   const [robinhoodChainMarketsError, setRobinhoodChainMarketsError] = useState("");
   const robinhoodChainMarketsReqRef = useRef(0);
+  const robinhoodChainRefreshSummaryRef = useRef(null);
   const [counterpartyLiquidityFilter, setCounterpartyLiquidityFilter] = useState(() => readCounterpartyLiquidityFilter());
   const [counterpartyExecutionMode, setCounterpartyExecutionMode] = useState(() => readCounterpartyExecutionMode());
   const quoteUsdReqRef = useRef(0);
@@ -747,6 +821,10 @@ export default function OrderBookWidget({
     if (n === null) return 30;
     return Math.max(1, Math.min(300, Math.floor(n)));
   });
+  useEffect(() => {
+    robinhoodChainRefreshSummaryRef.current = null;
+  }, [effectiveVenue, obSymbol]);
+
   const [obSolanaRouterMode, setObSolanaRouterMode] = useState(() => {
     try {
       const v = String(localStorage.getItem(LS_OB_SOL_ROUTER) || "auto").toLowerCase().trim();
@@ -1569,6 +1647,61 @@ function clampBox(next) {
     return retryAtMs;
   }
 
+  function showRobinhoodChainUnavailableMarket(market, refresh = {}) {
+    const parts = robinhoodChainPairParts(market?.symbol);
+    const savedRefresh = robinhoodChainRefreshSummaryRef.current?.symbol === parts.symbol
+      ? robinhoodChainRefreshSummaryRef.current
+      : null;
+    const persistedCapabilities = Array.isArray(market?.capabilities) ? market.capabilities : [];
+    const persistedProviderContacted = persistedCapabilities.some((item) => item?.evidence?.provider_contacted === true);
+    const persistedRefresh = persistedProviderContacted
+      ? robinhoodChainSelectedPairRefreshSummary({
+          results: persistedCapabilities,
+          provider_contacted: true,
+          provider_contacted_direction_count: persistedCapabilities.filter((item) => item?.evidence?.provider_contacted === true).length,
+          probe_direction_count: persistedCapabilities.length,
+          selected_pair_only: true,
+          persisted_provider_evidence: true,
+        }, parts.symbol)
+      : null;
+    const effectiveRefresh = refresh?.refreshAttempted === true
+      ? { ...(savedRefresh || persistedRefresh || {}), ...refresh, symbol: parts.symbol }
+      : (savedRefresh || persistedRefresh || refresh || {});
+    setObAsks([]);
+    setObBids([]);
+    setObError(null);
+    setObActiveRouter(String(market?.mechanism || "").trim().toLowerCase() === "wrap_unwrap" ? "native_wrap" : null);
+    setOrderBookMeta({
+      venue: "robinhood_chain",
+      symbol: parts.symbol,
+      baseAsset: String(market?.base?.symbol || parts.base).trim().toUpperCase(),
+      quoteAsset: String(market?.quote?.symbol || parts.quote).trim().toUpperCase(),
+      mechanism: market?.mechanism || null,
+      marketStatus: market?.indicative_state || "not_tested",
+      marketStatusLabel: robinhoodChainMarketStatusLabel(market),
+      marketStatusDetail: robinhoodChainMarketStatusDetail(market),
+      orderbookEnabled: false,
+      orderbookReason: market?.orderbook_reason || null,
+      provider: Array.isArray(market?.providers) ? market.providers.join(", ") : null,
+      providerContacted: effectiveRefresh?.providerContacted === true,
+      providerContactedDirectionCount: Number(effectiveRefresh?.providerContactedDirectionCount || 0),
+      probeDirectionCount: Number(effectiveRefresh?.probeDirectionCount || 0),
+      providerHttpStatuses: Array.isArray(effectiveRefresh?.providerHttpStatuses) ? effectiveRefresh.providerHttpStatuses : [],
+      providerErrorNames: Array.isArray(effectiveRefresh?.providerErrorNames) ? effectiveRefresh.providerErrorNames : [],
+      providerErrorMessages: Array.isArray(effectiveRefresh?.providerErrorMessages) ? effectiveRefresh.providerErrorMessages : [],
+      refreshAttempted: effectiveRefresh?.refreshAttempted === true,
+      selectedPairOnly: effectiveRefresh?.selectedPairOnly === true,
+      persistedProviderEvidence: effectiveRefresh?.persistedProviderEvidence === true,
+      synthetic: false,
+      quoteOnly: true,
+      restingOrder: false,
+      warningCount: Number(market?.unavailable_direction_count || market?.provider_error_direction_count || 0),
+      fetchedAt: market?.last_verified_at || null,
+      stale: false,
+      snapshotSource: effectiveRefresh?.refreshAttempted ? "selected_pair_capability_refresh" : "database_market_catalog",
+    });
+  }
+
   async function fetchOrderBook(opts = {}) {
     const v = String(opts.venueOverride ?? effectiveVenue ?? "").toLowerCase().trim();
     const sym = String(opts.symbolOverride ?? obSymbol ?? "").trim();
@@ -1576,40 +1709,30 @@ function clampBox(next) {
 
     if (!v || !sym) return;
 
+    let robinhoodChainMarket = null;
     if (isRobinhoodChainVenueKey(v)) {
       if (robinhoodChainMarketsLoading) return;
-      const market = robinhoodChainMarketForSymbol(sym);
-      if (!market) {
+      robinhoodChainMarket = robinhoodChainMarketForSymbol(sym);
+      if (!robinhoodChainMarket) {
         setObAsks([]);
         setObBids([]);
         setOrderBookMeta(null);
         setObError(robinhoodChainMarketsError || "This market is not present in the Robinhood Chain database catalog.");
         return;
       }
-      if (market?.orderbook_enabled !== true) {
-        const parts = robinhoodChainPairParts(market?.symbol);
-        setObAsks([]);
-        setObBids([]);
-        setObError(null);
-        setObActiveRouter(String(market?.mechanism || "").trim().toLowerCase() === "wrap_unwrap" ? "native_wrap" : null);
-        setOrderBookMeta({
-          venue: v,
-          symbol: parts.symbol,
-          baseAsset: String(market?.base?.symbol || parts.base).trim().toUpperCase(),
-          quoteAsset: String(market?.quote?.symbol || parts.quote).trim().toUpperCase(),
-          mechanism: market?.mechanism || null,
-          marketStatus: market?.indicative_state || "not_tested",
-          orderbookEnabled: false,
-          orderbookReason: market?.orderbook_reason || null,
-          provider: Array.isArray(market?.providers) ? market.providers.join(", ") : null,
-          synthetic: false,
-          quoteOnly: true,
-          restingOrder: false,
-          warningCount: Number(market?.provider_error_direction_count || 0),
-          fetchedAt: market?.last_verified_at || null,
-          stale: false,
-          snapshotSource: "database_market_catalog",
-        });
+      if (robinhoodChainMarket?.orderbook_enabled === true) {
+        robinhoodChainRefreshSummaryRef.current = null;
+      }
+      if (robinhoodChainMarket?.orderbook_enabled !== true && !opts.force) {
+        showRobinhoodChainUnavailableMarket(robinhoodChainMarket);
+        return;
+      }
+      if (
+        robinhoodChainMarket?.orderbook_enabled !== true &&
+        opts.force &&
+        robinhoodChainMarket?.refresh_supported !== true
+      ) {
+        showRobinhoodChainUnavailableMarket(robinhoodChainMarket, { refreshAttempted: false });
         return;
       }
     }
@@ -1645,6 +1768,61 @@ function clampBox(next) {
       abortRef.current = ac;
       let requestTimedOut = false;
       let requestTimeoutId = null;
+
+      if (
+        isRobinhoodChainVenueKey(v) &&
+        opts.force &&
+        robinhoodChainMarket?.orderbook_enabled !== true
+      ) {
+        const refreshResponse = await fetch(
+          `${apiBase}/api/robinhood_chain/registry-discovery/markets/${encodeURIComponent(sym)}/refresh`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ confirm_refresh: true, force_refresh: true }),
+            signal: ac.signal,
+            cache: "no-store",
+          }
+        );
+        const refreshText = await refreshResponse.text();
+        let refreshPayload = null;
+        try {
+          refreshPayload = refreshText ? JSON.parse(refreshText) : null;
+        } catch {
+          refreshPayload = null;
+        }
+        if (!refreshResponse.ok || refreshPayload?.ok !== true) {
+          const detail = refreshPayload?.detail;
+          const message = typeof detail === "string"
+            ? detail
+            : detail?.error || refreshPayload?.error || refreshText || `Selected-pair refresh HTTP ${refreshResponse.status}`;
+          throw new Error(String(message));
+        }
+        const refreshedMarket = refreshPayload?.market && typeof refreshPayload.market === "object"
+          ? refreshPayload.market
+          : null;
+        if (!refreshedMarket) {
+          throw new Error("Selected-pair refresh returned no market state.");
+        }
+        const refreshedSymbol = robinhoodChainPairParts(refreshedMarket?.symbol).symbol;
+        const refreshSummary = robinhoodChainSelectedPairRefreshSummary(refreshPayload, refreshedSymbol);
+        robinhoodChainRefreshSummaryRef.current = refreshSummary;
+        setRobinhoodChainMarkets((current) => {
+          const items = Array.isArray(current) ? current : [];
+          let replaced = false;
+          const next = items.map((item) => {
+            if (robinhoodChainPairParts(item?.symbol).symbol !== refreshedSymbol) return item;
+            replaced = true;
+            return refreshedMarket;
+          });
+          return replaced ? next : [...next, refreshedMarket];
+        });
+        robinhoodChainMarket = refreshedMarket;
+        if (refreshedMarket?.orderbook_enabled !== true) {
+          showRobinhoodChainUnavailableMarket(refreshedMarket, refreshSummary);
+          return;
+        }
+      }
 
       // IMPORTANT:
       // - _ts busts browser/proxy caches
@@ -2656,7 +2834,11 @@ function clampBox(next) {
           <button
             style={{ ...btnCompact(), ...((obLoading || counterpartyCooldownActive) ? styles.buttonDisabled : {}) }}
             disabled={obLoading || counterpartyCooldownActive}
-            title={counterpartyCooldownActive ? `Counterparty cooldown active. Refresh available in ${counterpartyCooldownLabel}.` : "Refresh OrderBook"}
+            title={counterpartyCooldownActive
+              ? `Counterparty cooldown active. Refresh available in ${counterpartyCooldownLabel}.`
+              : isRobinhoodChainVenue
+                ? "Explicitly refresh only the selected Robinhood Chain pair. A blocked pair may perform two bounded read-only exact-input provider probes; no wallet request, signing, transaction construction, or execution promotion occurs."
+                : "Refresh OrderBook"}
             onClick={() => refreshSelectedMarket(true)}
           >
             {obLoading ? "Loading…" : counterpartyCooldownActive ? `Retry ${counterpartyCooldownLabel}` : "Refresh"}
@@ -2669,7 +2851,7 @@ function clampBox(next) {
             title={isCounterpartyVenue
               ? `Counterparty liquidity filter: ${counterpartyLiquidityFilterLabel(counterpartyLiquidityFilter)}. DISP = immediate dispenser liquidity. LIMIT = open protocol order. Ticket mode: ${counterpartyExecutionMode === "limit_order" ? "Limit Order" : "Dispenser Purchase"}.`
               : isRobinhoodChainVenue
-                ? `${selectedRobinhoodChainMarket?.symbol || robinhoodChainPairParts(obSymbol).symbol || "Robinhood Chain market"} · ${String(selectedRobinhoodChainMarket?.mechanism || "catalog").replaceAll("_", " ").toUpperCase()} · ${robinhoodChainMarketStatusLabel(selectedRobinhoodChainMarket)} · execution ${selectedRobinhoodChainMarket?.execution_enabled ? "LIVE VERIFIED" : "NO"} · identity TokenRegistry · capabilities database`
+                ? `${selectedRobinhoodChainMarket?.symbol || robinhoodChainPairParts(obSymbol).symbol || "Robinhood Chain market"} · ${String(selectedRobinhoodChainMarket?.mechanism || "catalog").replaceAll("_", " ").toUpperCase()} · ${robinhoodChainMarketStatusLabel(selectedRobinhoodChainMarket)} · ${robinhoodChainMarketStatusDetail(selectedRobinhoodChainMarket)} · execution ${selectedRobinhoodChainMarket?.execution_enabled ? "LIVE VERIFIED" : "NO"} · identity TokenRegistry · capabilities database`
                 : undefined}
           >
             Depth <b>{obDepth}</b> • Auto <b>{obAutoRefresh ? `${obAutoSeconds}s` : "off"}</b>
@@ -2704,7 +2886,14 @@ function clampBox(next) {
                   </>
                 ) : (
                   <>
-                    {" "}• <b>NO PROVIDER FETCH</b>
+                    {" "}• <b>{orderBookMeta?.refreshAttempted
+                      ? orderBookMeta?.providerContacted
+                        ? `${orderBookMeta?.persistedProviderEvidence ? "PERSISTED PROVIDER EVIDENCE" : "SELECTED PAIR CHECKED"} ${Number(orderBookMeta?.providerContactedDirectionCount || 0)}/${Number(orderBookMeta?.probeDirectionCount || 0)}`
+                        : "NO PROVIDER CONTACT"
+                      : "NO PROVIDER FETCH"}</b>
+                    {Array.isArray(orderBookMeta?.providerHttpStatuses) && orderBookMeta.providerHttpStatuses.length
+                      ? <> • HTTP <b>{orderBookMeta.providerHttpStatuses.join(", ")}</b></>
+                      : null}
                   </>
                 )}
               </>

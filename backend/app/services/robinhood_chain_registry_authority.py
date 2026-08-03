@@ -494,8 +494,6 @@ def _execution_blocking_reasons(
             reasons.append("firm_plan_not_live_verified")
         if str(capability.execution_status or "").strip().lower() != EXECUTION_STATUS_LIVE_VERIFIED:
             reasons.append("execution_not_live_verified")
-    if not str(capability.probe_amount or "").strip():
-        reasons.append("execution_ceiling_missing")
     return reasons
 
 
@@ -510,10 +508,10 @@ def resolve_robinhood_chain_execution_authority(
 ) -> Dict[str, Any]:
     """Resolve one execution direction from database capability and Token Registry identity.
 
-    This resolver never contacts a provider and never mutates capability state. The
-    persisted probe amount is treated only as the currently verified execution
-    ceiling; indicative and firm-plan ceilings remain independently enforced by
-    their existing quote/planning services.
+    This resolver never contacts a provider and never mutates capability state.
+    Persisted probe and prior acceptance amounts remain historical capability
+    evidence only; each explicit transaction uses the operator's current exact
+    input, a fresh plan, live balance checks, and current allowance checks.
     """
     normalized_symbol = normalize_execution_symbol(symbol)
     normalized_side = normalize_execution_side(side)
@@ -671,6 +669,8 @@ def resolve_robinhood_chain_execution_authority(
         "execution_ceiling": {
             "amount": ceiling or None,
             "asset": input_identity["symbol"],
+            "enforced": False,
+            "role": "historical_capability_evidence",
             "source": (
                 "database_confirmed_execution_evidence"
                 if live_execution_verified
@@ -720,6 +720,7 @@ def assert_robinhood_chain_execution_amount(
     authority: Dict[str, Any],
     amount: Any,
 ) -> str:
+    """Validate the operator's current exact input without enforcing probe evidence."""
     raw_amount = str(amount or "").strip()
     try:
         requested = Decimal(raw_amount)
@@ -737,30 +738,34 @@ def assert_robinhood_chain_execution_amount(
             amount=amount,
             provider_contacted=False,
         )
-    ceiling_raw = str(((authority or {}).get("execution_ceiling") or {}).get("amount") or "").strip()
+
     try:
-        ceiling = Decimal(ceiling_raw)
-    except (InvalidOperation, ValueError) as exc:
+        decimals = int(((authority or {}).get("input") or {}).get("decimals"))
+    except (TypeError, ValueError) as exc:
         raise RobinhoodChainRegistryAuthorityError(
-            "robinhood_chain_execution_ceiling_missing",
-            "No verified execution ceiling is persisted for this direction.",
+            "robinhood_chain_execution_input_decimals_missing",
+            "Execution input decimals are unavailable from Token Registry authority.",
             authority=authority,
             provider_contacted=False,
         ) from exc
-    if not ceiling.is_finite() or ceiling <= 0:
+    if decimals < 0 or decimals > 18:
         raise RobinhoodChainRegistryAuthorityError(
-            "robinhood_chain_execution_ceiling_missing",
-            "No verified execution ceiling is persisted for this direction.",
+            "robinhood_chain_execution_input_decimals_missing",
+            "Execution input decimals are outside the supported Token Registry range.",
             authority=authority,
             provider_contacted=False,
         )
-    if requested > ceiling:
+    if max(0, -requested.as_tuple().exponent) > decimals:
         raise RobinhoodChainRegistryAuthorityError(
-            "robinhood_chain_execution_amount_exceeds_ceiling",
-            "Execution input exceeds the persisted verified authority ceiling.",
+            "robinhood_chain_execution_amount_precision_exceeded",
+            "Execution input exceeds the Token Registry decimal precision.",
             requested_amount=raw_amount,
-            maximum_input_amount=ceiling_raw,
+            input_decimals=decimals,
             input_asset=((authority or {}).get("input") or {}).get("symbol"),
             provider_contacted=False,
         )
-    return format(requested, "f")
+
+    normalized = format(requested, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"

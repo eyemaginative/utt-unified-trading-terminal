@@ -312,7 +312,7 @@ class RobinhoodChainTransactionPlanningService:
             "route_capabilities": [],
             "pair_capability_source": "database_router",
             "token_contracts_hardcoded": False,
-            "review_limit_source": "database_direction_capability_probe_evidence",
+            "review_limit_source": "historical_capability_evidence_only",
             "default_slippage_bps": ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
             "minimum_slippage_bps": ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
             "maximum_slippage_bps": ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
@@ -456,10 +456,6 @@ class RobinhoodChainTransactionPlanningService:
             firm_plan_ceiling, firm_plan_ceiling_source = self._firm_plan_exact_input_ceiling(
                 route_capability
             )
-            if firm_plan_ceiling is None:
-                raise ValueError("firm_quote_input_ceiling_unavailable")
-            if Decimal(requested_display) > firm_plan_ceiling:
-                raise ValueError("firm_quote_input_exceeds_firm_plan_ceiling")
             trade = {
                 "symbol": normalized_symbol,
                 "side": normalized_side,
@@ -470,9 +466,11 @@ class RobinhoodChainTransactionPlanningService:
                 "sell_amount": requested_display,
                 "maximum_sell_amount_atomic": requested_atomic,
                 "maximum_sell_amount": requested_display,
-                "review_input_ceiling": _decimal_text(firm_plan_ceiling),
-                "firm_plan_input_ceiling": _decimal_text(firm_plan_ceiling),
+                "review_input_ceiling": None,
+                "firm_plan_input_ceiling": _decimal_text(firm_plan_ceiling) if firm_plan_ceiling is not None else None,
                 "firm_plan_ceiling_source": firm_plan_ceiling_source,
+                "firm_plan_ceiling_enforced": False,
+                "current_amount_policy": "user_selected_exact_input",
                 "probe_amount": _decimal_text(probe_limit) if probe_limit is not None else None,
                 "probe_amount_role": "evidence_and_orderbook_seed",
             }
@@ -896,6 +894,8 @@ class RobinhoodChainTransactionPlanningService:
             "firm_plan_ceiling_source": trade.get("firm_plan_ceiling_source"),
             "probe_amount": trade.get("probe_amount"),
             "probe_amount_role": trade.get("probe_amount_role"),
+            "firm_plan_ceiling_enforced": trade.get("firm_plan_ceiling_enforced", trade["amount_mode"] == "exact_output"),
+            "current_amount_policy": trade.get("current_amount_policy"),
             "effective_price": _decimal_text(effective_price),
             "slippage_bps": slippage,
             "observed_minimum_received_protection_bps": _decimal_text(observed_protection_bps),

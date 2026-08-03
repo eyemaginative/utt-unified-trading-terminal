@@ -36,6 +36,10 @@ from ..services.robinhood_chain_quotes import (
     ROBINHOOD_CHAIN_QUOTE_PROVIDER,
     get_robinhood_chain_quote_service,
 )
+from ..services.robinhood_chain_uniswap_quote import (
+    UNISWAP_PROVIDER,
+    get_robinhood_chain_uniswap_quote_service,
+)
 from ..services.robinhood_chain_transaction_planning import (
     ROBINHOOD_CHAIN_DEFAULT_SLIPPAGE_BPS,
     ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
@@ -44,7 +48,6 @@ from ..services.robinhood_chain_transaction_planning import (
 )
 from ..services.robinhood_chain_execution import (
     ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH,
-    ROBINHOOD_CHAIN_EXECUTION_MAX_INPUT_ETH,
     ROBINHOOD_CHAIN_EXECUTION_SIDE,
     ROBINHOOD_CHAIN_EXECUTION_SYMBOL,
     ROBINHOOD_CHAIN_SUBMISSION_FAILURE_REASONS,
@@ -68,7 +71,6 @@ from ..services.robinhood_chain_swap_execution import (
     ROBINHOOD_CHAIN_SWAP_DEFAULT_USDG,
     ROBINHOOD_CHAIN_SWAP_DISPLAY_MODE,
     ROBINHOOD_CHAIN_SWAP_FROM_ASSET,
-    ROBINHOOD_CHAIN_SWAP_MAX_USDG,
     ROBINHOOD_CHAIN_SWAP_TO_ASSET,
     get_robinhood_chain_swap_execution_service,
 )
@@ -401,10 +403,8 @@ def _r5c5b_controlled_sell_execution(execution: Dict[str, Any]) -> bool:
 
 
 def _controlled_weth_usdg_execution(execution: Dict[str, Any]) -> bool:
-    return bool(
-        _r5c5a_controlled_buy_execution(execution)
-        or _r5c5b_controlled_sell_execution(execution)
-    )
+    """Amount-specific live authorization is retired by RH-EXEC.AMT.1."""
+    return False
 
 
 def _resolve_robinhood_chain_review_identities(
@@ -525,6 +525,20 @@ class RobinhoodChainPairDiscoveryRequest(BaseModel):
     )
 
 
+class RobinhoodChainSelectedMarketRefreshRequest(BaseModel):
+    taker_address: Optional[str] = Field(
+        default=None,
+        min_length=42,
+        max_length=42,
+        description="Optional public address override. When omitted, UTT uses the saved Robinhood Chain wallet.",
+    )
+    force_refresh: bool = True
+    confirm_refresh: bool = Field(
+        default=False,
+        description="Must be true to refresh only the selected market's bounded review-only capability evidence.",
+    )
+
+
 class RobinhoodChainExecutionEvidenceSyncRequest(BaseModel):
     confirm_sync: bool = Field(
         default=False,
@@ -562,6 +576,41 @@ class RobinhoodChainIndicativeQuoteRequest(BaseModel):
         description="Optional public address override. When omitted, UTT uses the saved ALL / robinhood_chain wallet.",
     )
     force_refresh: bool = False
+
+
+class RobinhoodChainUniswapQuoteRequest(BaseModel):
+    symbol: str = Field(
+        min_length=1,
+        max_length=32,
+        description="Explicit Token Registry-backed Robinhood Chain market symbol.",
+    )
+    side: str = Field(min_length=3, max_length=4, description="buy or sell")
+    amount_mode: str = Field(
+        default="exact_input",
+        min_length=10,
+        max_length=12,
+        description="The canary accepts exact_input only.",
+    )
+    requested_amount: str = Field(
+        min_length=1,
+        max_length=80,
+        description="Exact input amount in display units of the direction's input token.",
+    )
+    slippage_bps: int = Field(
+        default=50,
+        ge=ROBINHOOD_CHAIN_MIN_SLIPPAGE_BPS,
+        le=ROBINHOOD_CHAIN_MAX_SLIPPAGE_BPS,
+    )
+    taker_address: Optional[str] = Field(
+        default=None,
+        min_length=42,
+        max_length=42,
+        description="Optional public address override; no wallet connection is requested.",
+    )
+    confirm_quote: bool = Field(
+        default=False,
+        description="Must be true to make one explicit read-only Uniswap /quote request.",
+    )
 
 
 class RobinhoodChainFirmQuotePlanRequest(BaseModel):
@@ -983,8 +1032,6 @@ def _quote_failure_status(result: Dict[str, Any]) -> int:
         "unsupported_discovery_pair",
         "invalid_firm_quote_amount",
         "firm_quote_amount_exceeds_capability_probe",
-        "firm_quote_input_ceiling_unavailable",
-        "firm_quote_input_exceeds_firm_plan_ceiling",
         "firm_quote_maximum_input_exceeds_capability_ceiling",
         "robinhood_chain_quote_amount_exceeds_indicative_ceiling",
         "robinhood_chain_quote_exact_output_exceeds_probe_evidence",
@@ -1652,6 +1699,38 @@ async def robinhood_chain_registry_discovery_markets(
     }
 
 
+@router.post("/registry-discovery/markets/{symbol}/refresh")
+async def robinhood_chain_registry_discovery_refresh_market(
+    symbol: str,
+    request: RobinhoodChainSelectedMarketRefreshRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Explicitly refresh one selected market's bounded review-only directions."""
+    taker = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
+    try:
+        return await get_robinhood_chain_registry_discovery_service().refresh_selected_market(
+            db,
+            symbol=symbol,
+            taker_address=taker,
+            force_refresh=bool(request.force_refresh),
+            confirm_refresh=bool(request.confirm_refresh),
+        )
+    except ValueError as exc:
+        db.rollback()
+        error = str(exc)
+        status_code = 404 if "not_found" in error else 409
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error": error,
+                "symbol": str(symbol or "").strip().upper(),
+                "provider_contacted": False,
+                "execution_enabled": False,
+                "automatic_execution_promotion": False,
+            },
+        ) from exc
+
+
 @router.post("/registry-discovery/objectives")
 async def robinhood_chain_registry_discovery_create_objective(
     request: RobinhoodChainPairObjectiveCreateRequest,
@@ -1811,6 +1890,150 @@ async def robinhood_chain_execution_discovery_probe(
         status_code = 503
     elif error in {"contract_code_unavailable", "provider_authentication_failed"}:
         status_code = 502
+    else:
+        status_code = 502
+    raise HTTPException(status_code=status_code, detail=result)
+
+
+@router.get("/uniswap/status")
+async def robinhood_chain_uniswap_status(
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return secret-free readiness for the backend-only Uniswap /quote canary."""
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(
+            status_code=503,
+            detail="Robinhood Chain configuration is not effective for chain ID 4663",
+        )
+
+    wallet_row = (
+        db.query(WalletAddress)
+        .filter(
+            WalletAddress.network == _TOKEN_REGISTRY_CHAIN,
+            WalletAddress.wallet_id == _TOKEN_REGISTRY_VENUE,
+            WalletAddress.asset.in_(["ALL", "*"]),
+        )
+        .order_by(WalletAddress.created_at.desc())
+        .first()
+    )
+    payload = get_robinhood_chain_uniswap_quote_service().status()
+    payload["wallet_configured"] = wallet_row is not None
+    payload["provider"] = UNISWAP_PROVIDER
+    payload["execution_enabled"] = False
+    payload["will_mutate"] = False
+    db.rollback()
+    return payload
+
+
+@router.post("/uniswap/quote")
+async def robinhood_chain_uniswap_quote(
+    request: RobinhoodChainUniswapQuoteRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Make one explicit AMM-only Uniswap quote without persistence or execution."""
+    if not bool(settings.robinhood_chain_enabled):
+        raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(
+            status_code=503,
+            detail="Robinhood Chain configuration is not effective for chain ID 4663",
+        )
+    if not bool(request.confirm_quote):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "uniswap_quote_confirmation_required",
+                "provider_contacted": False,
+                "read_only": True,
+                "will_mutate": False,
+            },
+        )
+
+    registry_service = get_robinhood_chain_registry_discovery_service()
+    try:
+        market = registry_service.objective_by_symbol(db, request.symbol)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": str(exc),
+                "symbol": str(request.symbol or "").strip().upper(),
+                "identity_source": "token_registry",
+                "provider_contacted": False,
+                "read_only": True,
+                "will_mutate": False,
+            },
+        ) from exc
+
+    if str(market.get("mechanism") or "").strip().lower() != "swap":
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "uniswap_quote_mechanism_not_supported",
+                "symbol": market.get("symbol"),
+                "mechanism": market.get("mechanism"),
+                "provider_contacted": False,
+                "read_only": True,
+                "will_mutate": False,
+            },
+        )
+
+    normalized_side = str(request.side or "").strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_quote_side", "provider_contacted": False},
+        )
+    if str(request.amount_mode or "").strip().lower() != "exact_input":
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "uniswap_quote_exact_input_only",
+                "provider_contacted": False,
+            },
+        )
+
+    base = market.get("base") if isinstance(market.get("base"), dict) else {}
+    quote = market.get("quote") if isinstance(market.get("quote"), dict) else {}
+    input_token = quote if normalized_side == "buy" else base
+    output_token = base if normalized_side == "buy" else quote
+    taker = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
+    result = await get_robinhood_chain_uniswap_quote_service().quote(
+        symbol=market.get("symbol") or request.symbol,
+        side=normalized_side,
+        amount_mode=request.amount_mode,
+        requested_amount=request.requested_amount,
+        slippage_bps=int(request.slippage_bps),
+        swapper_address=taker,
+        input_token=input_token,
+        output_token=output_token,
+        confirm_quote=True,
+    )
+    db.rollback()
+    if result.get("ok"):
+        return result
+
+    error = str(result.get("error") or "uniswap_quote_failed")
+    if error in {
+        "uniswap_quote_confirmation_required",
+        "invalid_quote_side",
+        "uniswap_quote_exact_input_only",
+        "invalid_requested_amount",
+        "requested_amount_exceeds_token_precision",
+        "invalid_token_decimals",
+        "invalid_uniswap_registry_identity",
+        "uniswap_quote_same_asset",
+        "invalid_slippage_bps",
+    }:
+        status_code = 400
+    elif error in {"uniswap_quote_not_configured", "uniswap_quote_api_base_invalid"}:
+        status_code = 503
     else:
         status_code = 502
     raise HTTPException(status_code=status_code, detail=result)
@@ -2206,7 +2429,7 @@ async def robinhood_chain_execution_prepare(
             status_code=409,
             detail={
                 "error": str(exc),
-                "execution_ceiling": authority.get("execution_ceiling"),
+                "historical_amount_evidence": authority.get("execution_ceiling"),
                 "provider_contacted": False,
             },
         ) from exc
@@ -2257,7 +2480,7 @@ async def robinhood_chain_execution_claim_send(
 ) -> Dict[str, Any]:
     """Atomically reserve one prepared plan for one explicit MetaMask request."""
     try:
-        return get_robinhood_chain_execution_service().claim_send(
+        return await get_robinhood_chain_execution_service().claim_send(
             db,
             execution_id=execution_id,
             wallet_address=request.wallet_address,
@@ -2497,7 +2720,7 @@ async def robinhood_chain_swap_execution_claim_approval_send(
             raise ValueError("robinhood_chain_swap_execution_not_found")
         authority = _assert_persisted_swap_execution_authority(
             db, execution,
-            require_successful_broadcast=_controlled_weth_usdg_execution(execution),
+            require_successful_broadcast=False,
         )
         return service.claim_approval_send(
             db, execution_id=execution_id, wallet_address=request.wallet_address,
@@ -2570,7 +2793,7 @@ async def robinhood_chain_swap_execution_prepare_fresh_swap(
             raise ValueError("robinhood_chain_swap_execution_not_found")
         authority = _assert_persisted_swap_execution_authority(
             db, execution,
-            require_successful_broadcast=_controlled_weth_usdg_execution(execution),
+            require_successful_broadcast=False,
         )
         if str(authority.get("execution_adapter") or "") != "erc20_exact_input":
             raise ValueError("robinhood_chain_erc20_execution_adapter_required")
@@ -2610,7 +2833,7 @@ async def robinhood_chain_swap_execution_claim_swap_send(
             raise ValueError("robinhood_chain_swap_execution_not_found")
         authority = _assert_persisted_swap_execution_authority(
             db, execution,
-            require_successful_broadcast=_controlled_weth_usdg_execution(execution),
+            require_successful_broadcast=False,
         )
         return await service.claim_swap_send(
             db, execution_id=execution_id, wallet_address=request.wallet_address,

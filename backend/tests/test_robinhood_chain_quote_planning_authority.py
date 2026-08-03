@@ -180,7 +180,12 @@ class RobinhoodChainQuotePlanningAuthorityTests(unittest.TestCase):
         frontend_path = BACKEND_ROOT.parent / "frontend" / "src" / "OrderTicketWidget.jsx"
         source = frontend_path.read_text(encoding="utf-8")
 
-        self.assertIn("probe amount is evidence and the synthetic Order Book seed", source)
+        self.assertIn(
+            "The persisted probe amount is historical capability evidence and the "
+            "synthetic Order Book seed. The current manually entered exact-input "
+            "amount is used for each fresh unsigned plan.",
+            source,
+        )
         self.assertIn("robinhoodChainConfiguredReviewValueCeilingUsd", source)
         self.assertIn("robinhoodChainExplicitIndicativeInputCeiling", source)
         self.assertNotIn("robinhood_chain_quote_capability_probe", source)
@@ -250,7 +255,11 @@ class RobinhoodChainQuotePlanningAuthorityTests(unittest.TestCase):
         )
         self.assertTrue(trade["sell_token"]["native"])
         self.assertEqual(trade["sell_amount_atomic"], "100000")
-        self.assertEqual(trade["review_input_ceiling"], "0.002")
+        self.assertIsNone(trade["review_input_ceiling"])
+        self.assertEqual(trade["probe_amount"], "0.002")
+        self.assertEqual(trade["probe_amount_role"], "evidence_and_orderbook_seed")
+        self.assertEqual(trade["current_amount_policy"], "user_selected_exact_input")
+        self.assertFalse(trade["firm_plan_ceiling_enforced"])
 
     def test_erc20_to_native_exact_input_uses_direction_authority(self) -> None:
         service = self.make_planning_service()

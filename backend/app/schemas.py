@@ -3,9 +3,15 @@ from typing import Optional, List, Literal
 from datetime import datetime
 
 Venue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx"]
-# Venue-order history can include read-only/non-trading sources that must not
-# automatically become valid OrderCreate, balance-refresh, or cancel venues.
-VenueOrderVenue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx", "counterparty"]
+# Order creation can be enabled for a venue without also enabling broad mutating
+# schemas such as CancelAllRequest. Cexius is promoted here for limit orders only.
+OrderCreateVenue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx", "cexius"]
+# Read-only market and balance responses may include venues that are not valid
+# broad cancel-all targets.
+ReadVenue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx", "cexius"]
+# Venue-order history can include read-only/non-trading sources without
+# automatically promoting them into the mutating Venue type above.
+VenueOrderVenue = Literal["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx", "counterparty", "cexius"]
 Side = Literal["buy", "sell"]
 OrderType = Literal["market", "limit"]
 
@@ -14,7 +20,7 @@ OrderType = Literal["market", "limit"]
 # Orders (LOCAL DB)
 # ─────────────────────────────────────────────────────────────
 class OrderCreate(BaseModel):
-    venue: Venue
+    venue: OrderCreateVenue
     symbol: str = Field(..., description="Canonical symbol, e.g., USDT-USD")
     side: Side
     type: OrderType
@@ -46,6 +52,11 @@ class OrderOut(BaseModel):
     created_at: datetime
     submitted_at: Optional[datetime]
     updated_at: datetime
+
+    # CEXIUS.2B: explicit non-persistent simulation metadata for DRY_RUN/disarmed
+    # order review. Existing live/local Order rows use the defaults below.
+    simulated: bool = False
+    venue_request_sent: bool = True
 
 
 class OrdersPage(BaseModel):
@@ -87,7 +98,7 @@ class FillsPage(BaseModel):
 # Balances (snapshots)
 # ─────────────────────────────────────────────────────────────
 class BalanceRow(BaseModel):
-    venue: Venue
+    venue: ReadVenue
     asset: str
     total: float
     available: float
@@ -161,19 +172,19 @@ class BasisLotsResponse(BaseModel):
 
 
 class BalanceRefreshRequest(BaseModel):
-    venue: Venue
+    venue: ReadVenue
 
 
 # ─────────────────────────────────────────────────────────────
 # Symbols / Market Data
 # ─────────────────────────────────────────────────────────────
 class SymbolListResponse(BaseModel):
-    venue: Venue
+    venue: ReadVenue
     symbols: List[str]
 
 
 class SymbolResolveResponse(BaseModel):
-    venue: Venue
+    venue: ReadVenue
     symbol_canon: str
     symbol_venue: str
 
@@ -184,7 +195,7 @@ class OrderBookLevel(BaseModel):
 
 
 class OrderBookResponse(BaseModel):
-    venue: Venue
+    venue: ReadVenue
     symbol_canon: str
     bids: List[OrderBookLevel]
     asks: List[OrderBookLevel]
@@ -195,7 +206,7 @@ class OrderBookResponse(BaseModel):
 # NEW: Order Rules (Phase 1)
 # ─────────────────────────────────────────────────────────────
 class OrderRulesResponse(BaseModel):
-    venue: Venue
+    venue: ReadVenue
     symbol_canon: str
     symbol_venue: str
 
@@ -290,6 +301,7 @@ class AllOrderRow(BaseModel):
     total_after_fee: Optional[float] = None
 
     created_at: Optional[datetime] = None
+    submitted_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     captured_at: Optional[datetime] = None
 
@@ -297,6 +309,16 @@ class AllOrderRow(BaseModel):
     client_order_id: Optional[str] = None
 
     reject_reason: Optional[str] = None
+
+    # ORDERS.DETAILS.1: read-only transaction identity/link passthrough.
+    # These fields are optional and are emitted only when an existing unified
+    # order source already has authoritative transaction metadata.
+    transaction_id: Optional[str] = None
+    txid: Optional[str] = None
+    approval_transaction_id: Optional[str] = None
+    approval_txid: Optional[str] = None
+    transaction_url: Optional[str] = None
+    explorer_url: Optional[str] = None
 
     # NEW: workflow fields
     closed_at: Optional[datetime] = None

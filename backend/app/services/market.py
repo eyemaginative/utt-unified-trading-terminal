@@ -468,8 +468,13 @@ def orderbook_snapshot(
             if cached3 is not None:
                 return cached3
 
-        # Resolve to venue symbol
-        _, symbol_venue = resolve_symbol(v, sym)
+        # Cexius public order books use the canonical dash market directly.
+        # Avoid the generic symbol-resolution path here because that path may
+        # perform a separate /markets request before the actual order-book fetch.
+        if v == "cexius":
+            symbol_venue = sym
+        else:
+            _, symbol_venue = resolve_symbol(v, sym)
         adapter = get_adapter(v)
 
         # Concurrency bounds: acquire global + per-venue
@@ -841,6 +846,36 @@ def _kraken_assetpairs_public() -> List[Dict[str, Any]]:
 
 def _fetch_venue_markets_uncached(venue: str) -> List[Dict[str, Any]]:
     v = (venue or "").strip().lower()
+
+    if v == "cexius":
+        # Cexius public markets are normalized by its adapter so the same
+        # registry authority drives symbol discovery, rules, and order books.
+        try:
+            adapter = get_adapter(v)
+            fn = getattr(adapter, "list_markets", None)
+            rows = fn() if callable(fn) else []
+            out: List[Dict[str, Any]] = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                base = _canon(row.get("base") or "")
+                quote = _canon(row.get("quote") or "")
+                symbol_canon = _canon(row.get("symbol_canon") or "")
+                symbol_venue = str(row.get("symbol_venue") or symbol_canon).strip()
+                if not base or not quote or not symbol_canon:
+                    continue
+                out.append(
+                    {
+                        "venue": "cexius",
+                        "symbol_canon": symbol_canon,
+                        "base": base,
+                        "quote": quote,
+                        "symbol_venue": symbol_venue,
+                    }
+                )
+            return out
+        except Exception:
+            return []
 
     if v in ("cryptocom", "crypto_com", "crypto.com", "crypto-com"):
         # Crypto.com Exchange public instruments list

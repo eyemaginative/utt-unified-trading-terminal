@@ -4108,6 +4108,8 @@ const autoFitBanner = async () => {
     return id === "arb" || title === "arb";
   };
 
+  const arbToolWindow = (toolWindows || []).find((w) => isArbTool(w)) || null;
+
   const isTopGainersTool = (w) => {
     const id = String(w?.id ?? "").trim().toLowerCase();
     const title = String(w?.title ?? "").trim().toLowerCase();
@@ -7584,6 +7586,8 @@ const autoFitBanner = async () => {
             popoverAlign="left"
             chipVariant="tooltab"
             chipTitle="Arbitrage"
+            managedWindowOpen={!!arbToolWindow?.open}
+            onOpenManagedWindow={() => toggleToolWindow?.(arbToolWindow?.id || "arb")}
           />
         </div>
 

@@ -87,6 +87,15 @@ def _cryptocom_enabled() -> bool:
     return bool(k2 and s2)
 
 
+def _cexius_enabled() -> bool:
+    """Cexius is enabled only when a read-scoped vault token is available."""
+    try:
+        fn = getattr(settings, "cexius_effective_enabled", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
 def _okx_enabled() -> bool:
     """OKX is enabled when a complete env or Profile API-key bundle exists."""
     try:
@@ -147,6 +156,10 @@ def _make_registry() -> Dict[str, VenueSpec]:
     def cryptocom_factory():
         from ..adapters.cryptocom_exchange import CryptoComExchangeAdapter
         return CryptoComExchangeAdapter()
+
+    def cexius_factory():
+        from ..adapters.cexius import CexiusAdapter
+        return CexiusAdapter()
 
     def okx_factory():
         from ..adapters.okx import OKXAdapter
@@ -236,6 +249,18 @@ def _make_registry() -> Dict[str, VenueSpec]:
             supports_balances=True,
             supports_orderbook=True,  # public/get-book
             supports_markets=True,    # instruments discovery via public/get-instruments
+        ),
+
+        # Cexius Exchange (REST; CEXIUS.2B limit submit + selected cancel)
+        "cexius": VenueSpec(
+            key="cexius",
+            display_name="Cexius",
+            enabled=_cexius_enabled,
+            adapter_factory=cexius_factory,
+            supports_trading=True,    # Limit BUY/SELL only; market and cancel-all remain blocked.
+            supports_balances=True,
+            supports_orderbook=True,
+            supports_markets=True,
         ),
 
         # NEW: OKX Exchange (REST, read-only foundation first)

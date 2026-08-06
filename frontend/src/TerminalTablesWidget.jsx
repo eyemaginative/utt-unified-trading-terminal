@@ -22,6 +22,12 @@ const LS_GEOM_XW_KEY = "utt_tables_widget_geom_v3_xw";
 
 const LS_LOCK_KEY = "utt_tables_widget_lock_v1";
 
+// ORDERS.DETAILS.1-R2: persistent viewport-level Details window geometry.
+const LS_ORDER_DETAILS_WINDOW_GEOM_KEY = "utt_order_details_window_geom_v1";
+const DETAILS_MODAL_EDGE_PX = 8;
+const DETAILS_MODAL_MIN_WIDTH_PX = 420;
+const DETAILS_MODAL_MIN_HEIGHT_PX = 260;
+
 // Docking (tables below chart)
 const LS_DOCK_KEY = "utt_tables_widget_dock_v1";
 const LS_DOCK_OFFSET_KEY = "utt_tables_widget_dock_offset_v1";
@@ -73,7 +79,7 @@ const LS_SOLANA_DETECTED_TOKENS_KEY = "utt_solana_detected_tokens_v1";
 
 // Discovery-enabled venues (UI allow-list)
 // We only show venues that are BOTH supported by the app AND in this allow-list.
-const DEFAULT_DISCOVERY_ALLOW_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "cryptocom", "okx"];
+const DEFAULT_DISCOVERY_ALLOW_VENUES = ["gemini", "coinbase", "kraken", "robinhood", "dex_trade", "cryptocom", "cexius", "okx"];
 const COLS = {
   created: "created",
   closed: "closed",
@@ -4552,14 +4558,264 @@ async function refreshSolanaOnchainBalances() {
   }));
 
   const [counterpartyDetailsRow, setCounterpartyDetailsRow] = useState(null);
+  const [orderDetailsRow, setOrderDetailsRow] = useState(null);
+  const [detailsModalKind, setDetailsModalKind] = useState("generic");
+  const [detailsModalPosition, setDetailsModalPosition] = useState(null);
+  const [detailsModalSize, setDetailsModalSize] = useState(null);
+  const detailsModalCardRef = useRef(null);
+  const detailsModalDragRef = useRef(null);
+  const detailsModalResizeRef = useRef(null);
+
+  function detailsModalStorageKey(kind) {
+    return `${LS_ORDER_DETAILS_WINDOW_GEOM_KEY}:${kind === "counterparty" ? "counterparty" : "generic"}`;
+  }
+
+  function getDefaultDetailsModalGeometry(kind = detailsModalKind) {
+    const viewportWidth = Math.max(1, typeof window !== "undefined" ? Number(window.innerWidth) || 1 : 1280);
+    const viewportHeight = Math.max(1, typeof window !== "undefined" ? Number(window.innerHeight) || 1 : 800);
+    const maxWidth = Math.max(DETAILS_MODAL_MIN_WIDTH_PX, viewportWidth - DETAILS_MODAL_EDGE_PX * 2);
+    const maxHeight = Math.max(DETAILS_MODAL_MIN_HEIGHT_PX, viewportHeight - DETAILS_MODAL_EDGE_PX * 2);
+    const preferredWidth = kind === "counterparty" ? 720 : 860;
+    const preferredHeight = kind === "counterparty" ? 560 : 760;
+    const width = Math.min(preferredWidth, maxWidth);
+    const height = Math.min(preferredHeight, maxHeight);
+
+    return {
+      x: Math.max(DETAILS_MODAL_EDGE_PX, Math.round((viewportWidth - width) / 2)),
+      y: Math.max(DETAILS_MODAL_EDGE_PX, Math.round((viewportHeight - height) / 2)),
+      width,
+      height,
+    };
+  }
+
+  function clampDetailsModalGeometry(geometry, kind = detailsModalKind) {
+    const fallback = getDefaultDetailsModalGeometry(kind);
+    const viewportWidth = Math.max(1, typeof window !== "undefined" ? Number(window.innerWidth) || 1 : 1280);
+    const viewportHeight = Math.max(1, typeof window !== "undefined" ? Number(window.innerHeight) || 1 : 800);
+    const maxWidth = Math.max(DETAILS_MODAL_MIN_WIDTH_PX, viewportWidth - DETAILS_MODAL_EDGE_PX * 2);
+    const maxHeight = Math.max(DETAILS_MODAL_MIN_HEIGHT_PX, viewportHeight - DETAILS_MODAL_EDGE_PX * 2);
+    const rawWidth = Number(geometry?.width);
+    const rawHeight = Number(geometry?.height);
+    const rawX = Number(geometry?.x);
+    const rawY = Number(geometry?.y);
+    const width = clamp(Number.isFinite(rawWidth) ? rawWidth : fallback.width, DETAILS_MODAL_MIN_WIDTH_PX, maxWidth);
+    const height = clamp(Number.isFinite(rawHeight) ? rawHeight : fallback.height, DETAILS_MODAL_MIN_HEIGHT_PX, maxHeight);
+    const maxX = Math.max(DETAILS_MODAL_EDGE_PX, viewportWidth - width - DETAILS_MODAL_EDGE_PX);
+    const maxY = Math.max(DETAILS_MODAL_EDGE_PX, viewportHeight - height - DETAILS_MODAL_EDGE_PX);
+
+    return {
+      x: clamp(Number.isFinite(rawX) ? rawX : fallback.x, DETAILS_MODAL_EDGE_PX, maxX),
+      y: clamp(Number.isFinite(rawY) ? rawY : fallback.y, DETAILS_MODAL_EDGE_PX, maxY),
+      width,
+      height,
+    };
+  }
+
+  function loadDetailsModalGeometry(kind) {
+    try {
+      const raw = localStorage.getItem(detailsModalStorageKey(kind));
+      if (raw) return clampDetailsModalGeometry(JSON.parse(raw), kind);
+    } catch {
+      // Invalid or unavailable local storage falls back to defaults.
+    }
+    return getDefaultDetailsModalGeometry(kind);
+  }
+
+  function persistDetailsModalGeometry(kind, geometry) {
+    const next = clampDetailsModalGeometry(geometry, kind);
+    try {
+      localStorage.setItem(detailsModalStorageKey(kind), JSON.stringify(next));
+    } catch {
+      // Persistence is best-effort; the in-memory geometry still applies.
+    }
+    return next;
+  }
+
+  function applyDetailsModalGeometry(geometry, kind = detailsModalKind, persist = false) {
+    const next = persist
+      ? persistDetailsModalGeometry(kind, geometry)
+      : clampDetailsModalGeometry(geometry, kind);
+    setDetailsModalPosition({ x: next.x, y: next.y });
+    setDetailsModalSize({ width: next.width, height: next.height });
+    return next;
+  }
+
+  function resetDetailsModalGeometry(kind = detailsModalKind) {
+    detailsModalDragRef.current = null;
+    detailsModalResizeRef.current = null;
+    try {
+      localStorage.removeItem(detailsModalStorageKey(kind));
+    } catch {
+      // Local storage cleanup is best-effort.
+    }
+    applyDetailsModalGeometry(getDefaultDetailsModalGeometry(kind), kind, false);
+  }
+
+  function persistCurrentDetailsModalGeometry(kind = detailsModalKind) {
+    const card = detailsModalCardRef.current;
+    if (!card) return;
+    const rect = card.getBoundingClientRect();
+    applyDetailsModalGeometry(
+      { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+      kind,
+      true
+    );
+  }
+
+  function openOrderDetails(o) {
+    if (!o) return;
+    const kind = "generic";
+    setDetailsModalKind(kind);
+    applyDetailsModalGeometry(loadDetailsModalGeometry(kind), kind, false);
+    setOrderDetailsRow(o);
+  }
+
+  function closeOrderDetails() {
+    setOrderDetailsRow(null);
+    detailsModalDragRef.current = null;
+    detailsModalResizeRef.current = null;
+  }
 
   function openCounterpartyDetails(o) {
     if (!o) return;
+    const kind = "counterparty";
+    setDetailsModalKind(kind);
+    applyDetailsModalGeometry(loadDetailsModalGeometry(kind), kind, false);
     setCounterpartyDetailsRow(o);
   }
 
   function closeCounterpartyDetails() {
     setCounterpartyDetailsRow(null);
+    detailsModalDragRef.current = null;
+    detailsModalResizeRef.current = null;
+  }
+
+  function beginDetailsModalDrag(e) {
+    if (e?.button !== undefined && e.button !== 0) return;
+    if (e?.target?.closest?.("button, a, input, textarea, select")) return;
+
+    const card = detailsModalCardRef.current;
+    if (!card) return;
+
+    const rect = card.getBoundingClientRect();
+    detailsModalDragRef.current = {
+      pointerId: e.pointerId,
+      offsetX: e.clientX - rect.left,
+      offsetY: e.clientY - rect.top,
+      width: rect.width,
+      height: rect.height,
+      kind: detailsModalKind,
+    };
+
+    setDetailsModalPosition({ x: rect.left, y: rect.top });
+    setDetailsModalSize({ width: rect.width, height: rect.height });
+
+    try {
+      e.currentTarget?.setPointerCapture?.(e.pointerId);
+    } catch {
+      // Pointer capture is best-effort.
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function moveDetailsModalDrag(e) {
+    const drag = detailsModalDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+
+    const viewportWidth = Math.max(1, Number(window?.innerWidth) || 1);
+    const viewportHeight = Math.max(1, Number(window?.innerHeight) || 1);
+    const maxX = Math.max(DETAILS_MODAL_EDGE_PX, viewportWidth - drag.width - DETAILS_MODAL_EDGE_PX);
+    const maxY = Math.max(DETAILS_MODAL_EDGE_PX, viewportHeight - drag.height - DETAILS_MODAL_EDGE_PX);
+
+    setDetailsModalPosition({
+      x: clamp(e.clientX - drag.offsetX, DETAILS_MODAL_EDGE_PX, maxX),
+      y: clamp(e.clientY - drag.offsetY, DETAILS_MODAL_EDGE_PX, maxY),
+    });
+
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function endDetailsModalDrag(e) {
+    const drag = detailsModalDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+
+    detailsModalDragRef.current = null;
+    try {
+      e.currentTarget?.releasePointerCapture?.(e.pointerId);
+    } catch {
+      // Pointer release is best-effort.
+    }
+
+    persistCurrentDetailsModalGeometry(drag.kind);
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function beginDetailsModalResize(e) {
+    if (e?.button !== undefined && e.button !== 0) return;
+    const card = detailsModalCardRef.current;
+    if (!card) return;
+
+    const rect = card.getBoundingClientRect();
+    detailsModalResizeRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      startWidth: rect.width,
+      startHeight: rect.height,
+      x: rect.left,
+      y: rect.top,
+      kind: detailsModalKind,
+    };
+
+    setDetailsModalPosition({ x: rect.left, y: rect.top });
+    setDetailsModalSize({ width: rect.width, height: rect.height });
+
+    try {
+      e.currentTarget?.setPointerCapture?.(e.pointerId);
+    } catch {
+      // Pointer capture is best-effort.
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function moveDetailsModalResize(e) {
+    const resize = detailsModalResizeRef.current;
+    if (!resize || resize.pointerId !== e.pointerId) return;
+
+    const viewportWidth = Math.max(1, Number(window?.innerWidth) || 1);
+    const viewportHeight = Math.max(1, Number(window?.innerHeight) || 1);
+    const maxWidth = Math.max(DETAILS_MODAL_MIN_WIDTH_PX, viewportWidth - resize.x - DETAILS_MODAL_EDGE_PX);
+    const maxHeight = Math.max(DETAILS_MODAL_MIN_HEIGHT_PX, viewportHeight - resize.y - DETAILS_MODAL_EDGE_PX);
+
+    setDetailsModalSize({
+      width: clamp(resize.startWidth + (e.clientX - resize.startX), DETAILS_MODAL_MIN_WIDTH_PX, maxWidth),
+      height: clamp(resize.startHeight + (e.clientY - resize.startY), DETAILS_MODAL_MIN_HEIGHT_PX, maxHeight),
+    });
+
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function endDetailsModalResize(e) {
+    const resize = detailsModalResizeRef.current;
+    if (!resize || resize.pointerId !== e.pointerId) return;
+
+    detailsModalResizeRef.current = null;
+    try {
+      e.currentTarget?.releasePointerCapture?.(e.pointerId);
+    } catch {
+      // Pointer release is best-effort.
+    }
+
+    persistCurrentDetailsModalGeometry(resize.kind);
+    e.preventDefault();
+    e.stopPropagation();
   }
 
   function closeCancelModal() {
@@ -4624,6 +4880,40 @@ async function refreshSolanaOnchainBalances() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [cancelModal.open]);
+
+  // Details windows are read-only and close on Escape without changing row state.
+  useEffect(() => {
+    if (!orderDetailsRow && !counterpartyDetailsRow) return;
+
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      if (orderDetailsRow) closeOrderDetails();
+      if (counterpartyDetailsRow) closeCounterpartyDetails();
+    };
+
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [orderDetailsRow, counterpartyDetailsRow]);
+
+  // Keep persisted Details geometry visible when the browser viewport changes.
+  useEffect(() => {
+    if (!orderDetailsRow && !counterpartyDetailsRow) return;
+
+    const onResize = () => {
+      const card = detailsModalCardRef.current;
+      if (!card) return;
+      const rect = card.getBoundingClientRect();
+      applyDetailsModalGeometry(
+        { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+        detailsModalKind,
+        true
+      );
+    };
+
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [orderDetailsRow, counterpartyDetailsRow, detailsModalKind]);
 
   // ─────────────────────────────────────────────────────────────
   // Cancel helpers (make Local cancel behave exactly like Unified)
@@ -4774,6 +5064,8 @@ async function refreshSolanaOnchainBalances() {
   async function cancelUnifiedOrder(o) {
     if (!o) return;
 
+    const venueLower = String(o?.venue || aoVenue || "").trim().toLowerCase();
+
     const k = rowCancelKey(o);
     if (cancelingKeys[k]) return;
 
@@ -4797,7 +5089,20 @@ async function refreshSolanaOnchainBalances() {
           return;
         }
 
-        // Refresh orders + balances (recompute holds)
+        if (resp && typeof resp === "object" && resp.simulated === true) {
+          try {
+            window.alert(
+              "Simulation only — no venue cancellation request was sent. " +
+                "The order remains open until confirmed otherwise by the venue."
+            );
+          } catch {
+            // ignore
+          }
+          await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
+          return;
+        }
+
+        // Confirmed live cancel: refresh orders + balances (recompute released holds).
         await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
         await postCancelRefresh(ven);
         return;
@@ -4866,7 +5171,21 @@ async function refreshSolanaOnchainBalances() {
           return;
         }
 
-        // Keep Local + Unified views consistent after a cancel.
+        if (resp && typeof resp === "object" && resp.simulated === true) {
+          try {
+            window.alert(
+              "Simulation only — no venue cancellation request was sent. " +
+                "The order remains open until confirmed otherwise by the venue."
+            );
+          } catch {
+            // ignore
+          }
+          await doLoadOrders?.();
+          await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
+          return;
+        }
+
+        // Keep Local + Unified views consistent after a confirmed live cancel.
         await doLoadOrders?.();
         await doSyncAndLoadAllOrders?.({ venue: ven, force: true });
         await postCancelRefresh(ven);
@@ -5180,29 +5499,16 @@ const bucket = orderBucket(o);
       const terminal = isTerminalBucket?.(bucket) || isTerminalStatus?.(st);
       const venueLower = String(o?.venue || "").trim().toLowerCase();
       const typeLower = String(o?.type || "").trim().toLowerCase();
+      const src = String(o.source || "").toUpperCase().trim();
+
       const isCounterpartyDispense =
         venueLower === "counterparty" &&
         (typeLower === "dispenser_purchase" || typeLower === "dispense_buy");
 
-      // Confirmed dispenser purchases are terminal chain activity. They expose
-      // Details instead of even a disabled Cancel action.
-      if (isCounterpartyDispense) {
-        return (
-          <td style={td}>
-            <button
-              data-no-drag="1"
-              style={btn?.(false) ?? smallBtn(false)}
-              disabled={!!hideTableDataGlobal}
-              onClick={() => openCounterpartyDetails(o)}
-              title="View confirmed Counterparty dispense transaction details"
-            >
-              Details
-            </button>
-          </td>
-        );
-      }
-
-      const src = String(o.source || "").toUpperCase().trim();
+      const isSwapLike =
+        typeLower === "swap" ||
+        src === "SWAP" ||
+        src === "RHCHAIN";
       const cancelRef = String(o.cancel_ref || o.cancelRef || "").trim();
 
       const hasUnifiedHandler = typeof doCancelUnifiedOrder === "function" && !!cancelRef;
@@ -5223,35 +5529,65 @@ const bucket = orderBucket(o);
       const k = rowCancelKey(o);
       const isCanceling = !!cancelingKeys[k];
 
-      const disabled = !!hideTableDataGlobal || !canCancel || isCanceling;
+      const cancelDisabled = !!hideTableDataGlobal || isCanceling;
+      const detailsDisabled = !!hideTableDataGlobal;
 
-      const title = hideTableDataGlobal
+      const cancelTitle = hideTableDataGlobal
         ? "Hidden"
-        : terminal
-          ? "Order is terminal"
-          : isCanceling
-            ? "Canceling…"
-            : canCancelPreferred
-              ? hasUnifiedHandler
-                ? "Cancel (uses cancel_ref)"
-                : "Cancel (local order id)"
-              : canCancelLegacy
-                ? "Cancel (legacy handler: pass row to doCancelUnifiedOrder)"
-                : !cancelRef && src !== "LOCAL"
-                  ? "Missing cancel_ref for venue order (backend must include cancel_ref)"
-                  : "Order is not cancelable";
+        : isCanceling
+          ? "Canceling…"
+          : canCancelPreferred
+            ? hasUnifiedHandler
+              ? "Cancel (uses cancel_ref)"
+              : "Cancel (local order id)"
+            : canCancelLegacy
+              ? "Cancel (legacy handler: pass row to doCancelUnifiedOrder)"
+              : "Order is not cancelable";
+
+      const detailsTitle = isCounterpartyDispense
+        ? "View confirmed Counterparty dispense transaction details"
+        : "View read-only order, lifecycle, fill, fee, and accounting details";
+
+      const openDetails = () => {
+        if (isCounterpartyDispense) openCounterpartyDetails(o);
+        else openOrderDetails(o);
+      };
+
+      // ORDERS.DETAILS.1-R1:
+      // - cancelable open rows: Cancel only
+      // - terminal rows and noncancelable swaps: Details only
+      // - other open/noncancelable rows: no action
+      const showDetails = !canCancel && (terminal || isCounterpartyDispense || isSwapLike);
 
       return (
         <td style={td}>
-          <button
-            data-no-drag="1"
-            style={btn?.(disabled) ?? smallBtn(disabled)}
-            disabled={disabled}
-            onClick={() => openCancelModalUnified(o)}
-            title={title}
-          >
-            {isCanceling ? "Canceling…" : "Cancel"}
-          </button>
+          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+            {showDetails ? (
+              <button
+                data-no-drag="1"
+                style={btn?.(detailsDisabled) ?? smallBtn(detailsDisabled)}
+                disabled={detailsDisabled}
+                onClick={openDetails}
+                title={detailsTitle}
+              >
+                Details
+              </button>
+            ) : null}
+
+            {canCancel ? (
+              <button
+                data-no-drag="1"
+                style={btn?.(cancelDisabled) ?? smallBtn(cancelDisabled)}
+                disabled={cancelDisabled}
+                onClick={() => openCancelModalUnified(o)}
+                title={cancelTitle}
+              >
+                {isCanceling ? "Canceling…" : "Cancel"}
+              </button>
+            ) : null}
+
+            {!showDetails && !canCancel ? <span style={sx.muted}>—</span> : null}
+          </div>
         </td>
       );
     }
@@ -5927,9 +6263,11 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
       const sl = normalizeStatusLower(s);
       return sl === "canceled" || sl === "cancelled" || sl.includes("canceled") || sl.includes("cancelled");
     };
+    const isRejected = (s) => normalizeStatusLower(s) === "rejected";
 
     return aoRaw.filter((o) => {
       const st = normalizeStatus(pickOrderStatus(o));
+      if (isRejected(st)) return false;
       if (typeof isCanceledStatus === "function") return !isCanceledStatus(st);
       return !fallbackIsCanceled(st);
     });
@@ -7802,9 +8140,9 @@ function renderFillToasts() {
             </button>
           </div>
 
-          <label data-no-drag="1" style={sx.pill} title="Hide canceled orders in unified view">
+          <label data-no-drag="1" style={sx.pill} title="Hide canceled and rejected orders in unified view">
             <input data-no-drag="1" type="checkbox" checked={!!hideCancelledUnified} onChange={(e) => setHideCancelledUnified?.(e.target.checked)} />
-            <span>Hide canceled</span>
+            <span>Hide canceled / rejected</span>
           </label>
 
 
@@ -8431,7 +8769,9 @@ function renderFillToasts() {
 
     const disableSubmit = !!manualCancelBusy || !String(manualCancelOrderId || "").trim();
 
-    return (
+    if (typeof document === "undefined" || !document.body) return null;
+
+    return createPortal(
       <div
         data-no-drag="1"
         style={overlay}
@@ -8521,6 +8861,385 @@ function renderFillToasts() {
     );
   }
 
+  // ORDERS.DETAILS.1: generic read-only order details modal.
+  // It renders only fields already present on the unified row and performs no API call.
+  function renderOrderDetailsModal() {
+    const o = orderDetailsRow;
+    if (!o) return null;
+
+    const hasValue = (value) =>
+      value !== null &&
+      value !== undefined &&
+      !(typeof value === "string" && value.trim() === "");
+
+    const firstValue = (...values) => values.find((value) => hasValue(value));
+
+    const safeText = (value, fallback = "—") => {
+      if (!hasValue(value)) return fallback;
+      try {
+        return String(value);
+      } catch {
+        return fallback;
+      }
+    };
+
+    const displayText = (value, fallback = "—") =>
+      hideTableDataGlobal ? "••••" : safeText(value, fallback);
+
+    const formatDate = (value) =>
+      hasValue(value) ? fmtTime?.(value) || safeText(value) : "—";
+
+    const formatQtyValue = (value) =>
+      hasValue(value) ? fmtEcoHi(value) : "—";
+
+    const formatMoneyValue = (value) =>
+      hasValue(value) ? fmtMoney?.(value) || safeText(value) : "—";
+
+    const requestedQty = firstValue(o?.qty, o?.requested_qty, o?.quantity);
+    const filledQty = firstValue(o?.filled_qty, o?.filledQuantity, o?.qty_filled);
+    let remainingQty = firstValue(o?.remaining_qty, o?.remainingQuantity);
+    if (!hasValue(remainingQty) && hasValue(requestedQty) && hasValue(filledQty)) {
+      const requested = Number(requestedQty);
+      const filled = Number(filledQty);
+      if (Number.isFinite(requested) && Number.isFinite(filled)) {
+        remainingQty = Math.max(0, requested - filled);
+      }
+    }
+
+    const gross = calcGrossTotal?.(o);
+    const fee = calcFee?.(o);
+    const net = calcNetTotal?.(o);
+    const feeAsset = String(o?.fee_asset || o?.feeAsset || "").trim().toUpperCase();
+
+    const status = normalizeStatus(pickOrderStatus(o)) || "—";
+    const bucket = orderBucket(o) || "—";
+    const statusKind = classifyStatusKind(normalizeStatusLower(status), bucket);
+    const isCanceled = statusKind === "canceled";
+
+    const backendTax = pickOrderTaxUsdMaybe(o);
+    const gainUsd = pickOrderGainUsdMaybe(o);
+    const symbolForTax = pickOrderSymbolStr(o);
+    const shouldFallbackTax =
+      !isCanceled &&
+      !!aoTaxWithholdEnabled &&
+      backendTax === null &&
+      isUsdQuotedSymbol(symbolForTax) &&
+      isFilledSellOrder(o) &&
+      net !== null &&
+      net !== undefined;
+
+    const taxableBase =
+      shouldFallbackTax
+        ? gainUsd !== null
+          ? Math.max(0, Number(gainUsd))
+          : aoTaxAssumeNetWhenGainUnknown
+            ? Math.max(0, Number(net))
+            : null
+        : null;
+
+    const taxRate = Number(aoTaxCombinedPct) / 100;
+    const fallbackTax =
+      taxableBase !== null && Number.isFinite(taxRate) && taxRate > 0
+        ? Math.max(0, Number(taxableBase) * taxRate)
+        : null;
+
+    const isInventoryError =
+      String(o?.realized_status || "").trim().toLowerCase() === "unapplied" &&
+      String(o?.realized_error || "").trim().toLowerCase() === "insufficient_inventory";
+
+    const taxValue = isCanceled
+      ? null
+      : backendTax !== null
+        ? backendTax
+        : fallbackTax;
+
+    const taxText = isCanceled
+      ? "—"
+      : taxValue === null
+        ? isInventoryError
+          ? "I/E"
+          : "—"
+        : fmtMoney?.(taxValue);
+
+    const taxForNet = taxValue === null ? 0 : Number(taxValue);
+    const netAfterTax =
+      net === null || net === undefined || !Number.isFinite(Number(net))
+        ? null
+        : Number(net) - (Number.isFinite(taxForNet) ? taxForNet : 0);
+
+    const txid = firstValue(o?.transaction_id, o?.txid);
+    const approvalTxid = firstValue(o?.approval_transaction_id, o?.approval_txid);
+    const transactionUrl = firstValue(o?.transaction_url, o?.explorer_url);
+    const cancelOrRejectReason = firstValue(
+      o?.cancel_reason,
+      o?.cancellation_reason,
+      o?.reject_reason,
+      o?.error_message,
+      o?.error
+    );
+
+    const fillRows = Array.isArray(o?.fills) ? o.fills : [];
+    const fillSummary =
+      fillRows.length > 0
+        ? `${fillRows.length} fill${fillRows.length === 1 ? "" : "s"}`
+        : "—";
+
+    const overlay = {
+      position: "fixed",
+      inset: 0,
+      background: "rgba(0,0,0,0.55)",
+      zIndex: 2147483000,
+    };
+
+    const card = {
+      position: "fixed",
+      left: detailsModalPosition?.x ?? DETAILS_MODAL_EDGE_PX,
+      top: detailsModalPosition?.y ?? DETAILS_MODAL_EDGE_PX,
+      width: detailsModalSize?.width ?? getDefaultDetailsModalGeometry("generic").width,
+      height: detailsModalSize?.height ?? getDefaultDetailsModalGeometry("generic").height,
+      minWidth: DETAILS_MODAL_MIN_WIDTH_PX,
+      minHeight: DETAILS_MODAL_MIN_HEIGHT_PX,
+      maxWidth: `calc(100vw - ${DETAILS_MODAL_EDGE_PX * 2}px)`,
+      maxHeight: `calc(100vh - ${DETAILS_MODAL_EDGE_PX * 2}px)`,
+      overflow: "auto",
+      boxSizing: "border-box",
+      border: `1px solid ${pal.border}`,
+      background: pal.widgetBg,
+      borderRadius: 12,
+      boxShadow: `0 18px 40px ${pal.shadow}`,
+      padding: 16,
+      color: pal.text,
+    };
+
+    const dragHeader = {
+      position: "sticky",
+      top: -16,
+      zIndex: 2,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "flex-start",
+      gap: 12,
+      margin: "-16px -16px 10px",
+      padding: "16px 16px 12px",
+      borderBottom: `1px solid ${pal.border}`,
+      background: pal.widgetBg,
+      cursor: "move",
+      userSelect: "none",
+      touchAction: "none",
+    };
+
+    const sectionTitle = {
+      marginTop: 14,
+      marginBottom: 4,
+      paddingBottom: 5,
+      borderBottom: `1px solid ${pal.border}`,
+      color: pal.text,
+      fontSize: 12,
+      fontWeight: 900,
+      letterSpacing: 0.4,
+      textTransform: "uppercase",
+    };
+
+    const detailRow = {
+      display: "grid",
+      gridTemplateColumns: "190px minmax(0, 1fr)",
+      gap: 10,
+      alignItems: "start",
+      fontSize: 12,
+      padding: "4px 0",
+    };
+
+    const valueStyle = {
+      color: pal.text,
+      overflowWrap: "anywhere",
+      whiteSpace: "pre-wrap",
+    };
+
+    const row = (label, value, { code = false, title } = {}) => (
+      <div style={detailRow}>
+        <span style={sx.muted}>{label}</span>
+        {code ? (
+          <code style={{ ...valueStyle, fontSize: 11 }} title={title}>
+            {displayText(value)}
+          </code>
+        ) : (
+          <b style={valueStyle} title={title}>
+            {displayText(value)}
+          </b>
+        )}
+      </div>
+    );
+
+    const copyButton = (value, label) =>
+      !hideTableDataGlobal && hasValue(value) ? (
+        <button
+          data-no-drag="1"
+          style={btn?.(false) ?? smallBtn(false)}
+          onClick={() => copyTextSafe(value)}
+          title={`Copy ${label}`}
+        >
+          Copy
+        </button>
+      ) : null;
+
+    if (typeof document === "undefined" || !document.body) return null;
+
+    return createPortal(
+      <div
+        data-no-drag="1"
+        style={overlay}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          closeOrderDetails();
+        }}
+      >
+        <div
+          ref={detailsModalCardRef}
+          data-no-drag="1"
+          style={card}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <div
+            data-details-drag-handle="1"
+            style={dragHeader}
+            onPointerDown={beginDetailsModalDrag}
+            onPointerMove={moveDetailsModalDrag}
+            onPointerUp={endDetailsModalDrag}
+            onPointerCancel={endDetailsModalDrag}
+            title="Drag to move this window"
+          >
+            <div>
+              <div style={{ fontSize: 17, fontWeight: 900 }}>Order Details</div>
+              <div style={{ ...sx.muted, fontSize: 12, marginTop: 3 }}>
+                Read-only order, lifecycle, fee, and accounting data. Drag this header to move; use the lower-right handle to resize.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flex: "0 0 auto" }}>
+              <button
+                data-no-drag="1"
+                style={btn?.(false) ?? smallBtn(false)}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => resetDetailsModalGeometry("generic")}
+                title="Restore the default size and centered position"
+              >
+                Reset window
+              </button>
+              <button
+                data-no-drag="1"
+                style={btn?.(false) ?? smallBtn(false)}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={closeOrderDetails}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+
+          <div style={sectionTitle}>Identity</div>
+          {row("UTT order ID", o?.id, { code: true })}
+          {row("Venue order ID", o?.venue_order_id, { code: true })}
+          {row("Client order ID", o?.client_order_id, { code: true })}
+          {row("View key", o?.view_key, { code: true })}
+          {row("Cancel reference", o?.cancel_ref, { code: true })}
+          {row("Venue", o?.venue)}
+          {row("Source", o?.source)}
+
+          <div style={sectionTitle}>Order</div>
+          {row("Symbol", firstValue(o?.symbol, o?.symbol_canon, o?.symbol_venue))}
+          {row("Venue symbol", o?.symbol_venue)}
+          {row("Side / Type", `${safeText(o?.side)} / ${safeText(o?.type)}`)}
+          {row("Requested quantity", formatQtyValue(requestedQty))}
+          {row("Filled quantity", formatQtyValue(filledQty))}
+          {row("Remaining quantity", formatQtyValue(remainingQty))}
+          {row("Limit price", hasValue(o?.limit_price) ? fmtPrice?.(o.limit_price) : "—")}
+          {row("Average fill price", hasValue(o?.avg_fill_price) ? fmtPrice?.(o.avg_fill_price) : "—")}
+          {row("Time in force", firstValue(o?.tif, o?.time_in_force))}
+          {row("Post-only", hasValue(o?.post_only) ? (o.post_only ? "Yes" : "No") : "—")}
+
+          <div style={sectionTitle}>Financial</div>
+          {row("Gross", formatMoneyValue(gross))}
+          {row("Fee", fee === null || fee === undefined ? "—" : `${fmtFee?.(fee)}${feeAsset ? ` ${feeAsset}` : ""}`)}
+          {row("Net", formatMoneyValue(net))}
+          {row("Tax", taxText, {
+            title: isInventoryError && taxValue === null ? "Insufficient inventory" : undefined,
+          })}
+          {row("Net after tax", netAfterTax === null ? "—" : formatMoneyValue(netAfterTax))}
+
+          <div style={sectionTitle}>Lifecycle</div>
+          {row("Status", status)}
+          {row("Bucket", bucket)}
+          {row("Created", formatDate(o?.created_at))}
+          {row("Submitted", formatDate(o?.submitted_at))}
+          {row("Updated", formatDate(o?.updated_at))}
+          {row("Captured", formatDate(o?.captured_at))}
+          {row("Closed", formatDate(o?.closed_at))}
+          {row("Closed time inferred", hasValue(o?.closed_at_inferred) ? (o.closed_at_inferred ? "Yes" : "No") : "—")}
+          {row("Reject / cancel reason", cancelOrRejectReason)}
+
+          <div style={sectionTitle}>Accounting</div>
+          {row("Realized status", o?.realized_status)}
+          {row("Realized proceeds (USD)", formatMoneyValue(o?.realized_proceeds_usd))}
+          {row("Basis used (USD)", formatMoneyValue(o?.realized_basis_used_usd))}
+          {row("Realized fee (USD)", formatMoneyValue(o?.realized_fee_usd))}
+          {row("Realized P&L (USD)", formatMoneyValue(o?.realized_pnl_usd))}
+          {row("Realized error", o?.realized_error)}
+          {row("Tax / inventory state", taxText)}
+
+          <div style={sectionTitle}>Related data</div>
+          <div style={detailRow}>
+            <span style={sx.muted}>Transaction ID</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", flexWrap: "wrap" }}>
+              <code style={{ ...valueStyle, fontSize: 11 }}>{displayText(txid)}</code>
+              {copyButton(txid, "transaction ID")}
+              {!hideTableDataGlobal && hasValue(transactionUrl) ? (
+                <a
+                  href={String(transactionUrl)}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  style={{ color: pal.link, fontWeight: 800 }}
+                >
+                  Open transaction
+                </a>
+              ) : null}
+            </div>
+          </div>
+          <div style={detailRow}>
+            <span style={sx.muted}>Approval transaction ID</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", flexWrap: "wrap" }}>
+              <code style={{ ...valueStyle, fontSize: 11 }}>{displayText(approvalTxid)}</code>
+              {copyButton(approvalTxid, "approval transaction ID")}
+            </div>
+          </div>
+          {row("Individual fills", fillSummary)}
+          <div
+            data-no-drag="1"
+            data-details-resize-handle="1"
+            onPointerDown={beginDetailsModalResize}
+            onPointerMove={moveDetailsModalResize}
+            onPointerUp={endDetailsModalResize}
+            onPointerCancel={endDetailsModalResize}
+            title="Drag to resize this window"
+            style={{
+              position: "absolute",
+              right: 3,
+              bottom: 3,
+              width: 22,
+              height: 22,
+              zIndex: 4,
+              cursor: "nwse-resize",
+              touchAction: "none",
+              borderRight: `3px solid ${pal.muted}`,
+              borderBottom: `3px solid ${pal.muted}`,
+              borderBottomRightRadius: 7,
+              opacity: 0.75,
+            }}
+          />
+        </div>
+      </div>,
+      document.body
+    );
+  }
+
   // Cancel confirmation modal (rendered over widget)
   function renderCounterpartyOrderDetailsModal() {
     const o = counterpartyDetailsRow;
@@ -8537,26 +9256,45 @@ function renderFillToasts() {
     const closed = o?.closed_at ? fmtTime?.(o.closed_at) : o?.updated_at ? fmtTime?.(o.updated_at) : "—";
 
     const overlay = {
-      position: "absolute",
-      left: 0,
-      top: 0,
-      width: "100%",
-      height: "100%",
+      position: "fixed",
+      inset: 0,
       background: "rgba(0,0,0,0.55)",
-      zIndex: 108,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: 12,
+      zIndex: 2147483000,
     };
     const card = {
-      width: "min(720px, 100%)",
+      position: "fixed",
+      left: detailsModalPosition?.x ?? DETAILS_MODAL_EDGE_PX,
+      top: detailsModalPosition?.y ?? DETAILS_MODAL_EDGE_PX,
+      width: detailsModalSize?.width ?? getDefaultDetailsModalGeometry("counterparty").width,
+      height: detailsModalSize?.height ?? getDefaultDetailsModalGeometry("counterparty").height,
+      minWidth: DETAILS_MODAL_MIN_WIDTH_PX,
+      minHeight: DETAILS_MODAL_MIN_HEIGHT_PX,
+      maxWidth: `calc(100vw - ${DETAILS_MODAL_EDGE_PX * 2}px)`,
+      maxHeight: `calc(100vh - ${DETAILS_MODAL_EDGE_PX * 2}px)`,
+      overflow: "auto",
+      boxSizing: "border-box",
       border: `1px solid ${pal.border}`,
       background: pal.widgetBg,
       borderRadius: 12,
       boxShadow: `0 18px 40px ${pal.shadow}`,
       padding: 16,
       color: pal.text,
+    };
+    const dragHeader = {
+      position: "sticky",
+      top: -16,
+      zIndex: 2,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      gap: 12,
+      margin: "-16px -16px 10px",
+      padding: "16px 16px 12px",
+      borderBottom: `1px solid ${pal.border}`,
+      background: pal.widgetBg,
+      cursor: "move",
+      userSelect: "none",
+      touchAction: "none",
     };
     const detailRow = {
       display: "grid",
@@ -8586,17 +9324,46 @@ function renderFillToasts() {
           closeCounterpartyDetails();
         }}
       >
-        <div data-no-drag="1" style={card} onPointerDown={(e) => e.stopPropagation()}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <div
+          ref={detailsModalCardRef}
+          data-no-drag="1"
+          style={card}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <div
+            data-details-drag-handle="1"
+            style={dragHeader}
+            onPointerDown={beginDetailsModalDrag}
+            onPointerMove={moveDetailsModalDrag}
+            onPointerUp={endDetailsModalDrag}
+            onPointerCancel={endDetailsModalDrag}
+            title="Drag to move this window"
+          >
             <div>
               <div style={{ fontSize: 17, fontWeight: 900 }}>Counterparty Dispense Purchase</div>
               <div style={{ ...sx.muted, fontSize: 12, marginTop: 3 }}>
-                Confirmed chain-derived activity. No cancel, signing, broadcast, ledger, FIFO, or basis action is available here.
+                Confirmed chain-derived activity. Drag this header to move; use the lower-right handle to resize.
               </div>
             </div>
-            <button data-no-drag="1" style={btn?.(false) ?? smallBtn(false)} onClick={closeCounterpartyDetails}>
-              Close
-            </button>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flex: "0 0 auto" }}>
+              <button
+                data-no-drag="1"
+                style={btn?.(false) ?? smallBtn(false)}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => resetDetailsModalGeometry("counterparty")}
+                title="Restore the default size and centered position"
+              >
+                Reset window
+              </button>
+              <button
+                data-no-drag="1"
+                style={btn?.(false) ?? smallBtn(false)}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={closeCounterpartyDetails}
+              >
+                Close
+              </button>
+            </div>
           </div>
 
           <div style={detailRow}><span style={sx.muted}>Venue</span><b style={valueStyle}>{hideTableDataGlobal ? "••••" : "counterparty"}</b></div>
@@ -8621,8 +9388,32 @@ function renderFillToasts() {
               ) : null}
             </div>
           </div>
+          <div
+            data-no-drag="1"
+            data-details-resize-handle="1"
+            onPointerDown={beginDetailsModalResize}
+            onPointerMove={moveDetailsModalResize}
+            onPointerUp={endDetailsModalResize}
+            onPointerCancel={endDetailsModalResize}
+            title="Drag to resize this window"
+            style={{
+              position: "absolute",
+              right: 3,
+              bottom: 3,
+              width: 22,
+              height: 22,
+              zIndex: 4,
+              cursor: "nwse-resize",
+              touchAction: "none",
+              borderRight: `3px solid ${pal.muted}`,
+              borderBottom: `3px solid ${pal.muted}`,
+              borderBottomRightRadius: 7,
+              opacity: 0.75,
+            }}
+          />
         </div>
-      </div>
+      </div>,
+      document.body
     );
   }
 
@@ -9067,6 +9858,7 @@ function renderFillToasts() {
 
       {/* Modal overlays */}
       {renderManualCancelModal()}
+      {renderOrderDetailsModal()}
       {renderCounterpartyOrderDetailsModal()}
       {renderCancelConfirmModal()}
 

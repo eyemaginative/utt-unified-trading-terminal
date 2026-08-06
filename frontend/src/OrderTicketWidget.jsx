@@ -3800,6 +3800,9 @@ export default function OrderTicketWidget({
     if (venueId === "okx" || (tradeGate?.okx_enable_trading !== null && tradeGate?.okx_enable_trading !== undefined)) {
       lines.push(`OKX_ENABLE_TRADING: ${yn(tradeGate?.okx_enable_trading)}`);
     }
+    if (venueId === "cexius" || (tradeGate?.cexius_trade_scope_enabled !== null && tradeGate?.cexius_trade_scope_enabled !== undefined)) {
+      lines.push(`Cexius read+trade credential scope: ${yn(tradeGate?.cexius_trade_scope_enabled)}`);
+    }
 
     lines.push(`effective live submit: ${yn(tradeGate?.effective_live_submit_enabled)}`);
 
@@ -3814,6 +3817,9 @@ export default function OrderTicketWidget({
 
     if (venueId === "okx" || (tradeGate?.okx_enable_trading !== null && tradeGate?.okx_enable_trading !== undefined)) {
       inlineParts.push(`OKX_ENABLE_TRADING ${yn(tradeGate?.okx_enable_trading)}`);
+    }
+    if (venueId === "cexius" || (tradeGate?.cexius_trade_scope_enabled !== null && tradeGate?.cexius_trade_scope_enabled !== undefined)) {
+      inlineParts.push(`trade scope ${yn(tradeGate?.cexius_trade_scope_enabled)}`);
     }
 
     inlineParts.push(`effective live submit ${yn(tradeGate?.effective_live_submit_enabled)}`);
@@ -3855,6 +3861,10 @@ export default function OrderTicketWidget({
   }, [effectiveVenue]);
   const isCounterpartyVenue = useMemo(() => isCounterpartyVenueKey(effectiveVenue), [effectiveVenue]);
   const isRobinhoodChainVenue = useMemo(() => isRobinhoodChainVenueKey(effectiveVenue), [effectiveVenue]);
+  const isCexiusVenue = useMemo(
+    () => String(effectiveVenue || "").trim().toLowerCase() === "cexius",
+    [effectiveVenue]
+  );
   const robinhoodChainPair = robinhoodChainPairParts(otSymbol);
   const robinhoodChainSelectedMarket = useMemo(() => (
     (robinhoodChainMarkets || []).find((market) => (
@@ -5739,6 +5749,13 @@ export default function OrderTicketWidget({
     return Number.isFinite(n) ? n : null;
   };
 
+  const precisionDigitsOrNull = (value) => {
+    if (value === null || value === undefined || String(value).trim() === "") return null;
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return Math.min(Math.max(Math.trunc(n), 0), 18);
+  };
+
   // ─────────────────────────────────────────────────────────────
   // Order Rules
   // ─────────────────────────────────────────────────────────────
@@ -5781,7 +5798,9 @@ export default function OrderTicketWidget({
         setRulesErr(null);
 
         const data = await getOrderRules(
-          { venue: v, symbol: s, side, type: "limit", tif, post_only: postOnly },
+          isCexiusVenue
+            ? { venue: v, symbol: s, side, type: "limit" }
+            : { venue: v, symbol: s, side, type: "limit", tif, post_only: postOnly },
           { apiBase }
         );
 
@@ -5943,7 +5962,7 @@ export default function OrderTicketWidget({
       cancelled = true;
       clearTimeout(t);
     };
-  }, [effectiveVenue, otSymbol, side, tif, postOnly, apiBase, isCounterpartyVenue, isRobinhoodChainVenue, robinhoodChainSelectedMarket, robinhoodChainPairNotConfigured]);
+  }, [effectiveVenue, otSymbol, side, tif, postOnly, apiBase, isCounterpartyVenue, isRobinhoodChainVenue, isCexiusVenue, robinhoodChainSelectedMarket, robinhoodChainPairNotConfigured]);
 
   useEffect(() => {
     if (!isCounterpartyVenue) {
@@ -6315,9 +6334,8 @@ export default function OrderTicketWidget({
       if (qNum === null) return cleaned;
 
       const dec =
-        Number.isFinite(Number(pxDec)) && Number(pxDec) >= 0
-          ? Math.min(Math.max(Math.trunc(Number(pxDec)), 0), 18)
-          : decimalsFromIncrement(piStr);
+        precisionDigitsOrNull(pxDec) ??
+        decimalsFromIncrement(piStr);
 
       if (dec === null || dec === undefined || !Number.isFinite(dec)) {
         return String(qNum);
@@ -6328,9 +6346,9 @@ export default function OrderTicketWidget({
     }
 
     // Fallback: clamp by decimals if we have them.
-    if (Number.isFinite(Number(pxDec)) && Number(pxDec) >= 0) {
-      const dec = Math.min(Math.max(Math.trunc(Number(pxDec)), 0), 18);
-      return Number(n).toFixed(dec);
+    const fallbackDecimals = precisionDigitsOrNull(pxDec);
+    if (fallbackDecimals !== null) {
+      return Number(n).toFixed(fallbackDecimals);
     }
 
     return cleaned;
@@ -7473,9 +7491,7 @@ export default function OrderTicketWidget({
       // Keep the last manual Total intact until a usable Limit exists.
       if (pxNum === null || qtyFromTotal === null) return;
 
-      const maxFrac = Number.isFinite(Number(rules?.qty_decimals))
-        ? Math.min(Math.max(Math.trunc(Number(rules.qty_decimals)), 0), 18)
-        : 18;
+      const maxFrac = precisionDigitsOrNull(rules?.qty_decimals) ?? 8;
       const nextQty = fmtPlain(qtyFromTotal, { maxFrac });
       if (!nextQty) return;
 
@@ -8013,8 +8029,8 @@ export default function OrderTicketWidget({
 
     if (qtyNum !== null) {
       const dCount = countDecimalsFromString(qty);
-      if (dCount !== null && Number.isFinite(Number(qtyDec)) && Number(qtyDec) >= 0) {
-        const allowed = Math.min(Math.max(Math.trunc(Number(qtyDec)), 0), 18);
+      const allowed = precisionDigitsOrNull(qtyDec);
+      if (dCount !== null && allowed !== null) {
         if (dCount > allowed) {
           lines.push(hideTableData ? "Qty precision too high." : `Qty precision: ${dCount} decimals → allowed ${allowed}.`);
           fails.push("qty_precision");
@@ -8024,8 +8040,8 @@ export default function OrderTicketWidget({
 
     if (pxNum !== null) {
       const dCount = countDecimalsFromString(limitStrExpanded);
-      if (dCount !== null && Number.isFinite(Number(pxDec)) && Number(pxDec) >= 0) {
-        const allowed = Math.min(Math.max(Math.trunc(Number(pxDec)), 0), 18);
+      const allowed = precisionDigitsOrNull(pxDec);
+      if (dCount !== null && allowed !== null) {
         if (dCount > allowed) {
           lines.push(hideTableData ? "Price precision too high." : `Price precision: ${dCount} decimals → allowed ${allowed}.`);
           fails.push("px_precision");
@@ -8168,11 +8184,18 @@ export default function OrderTicketWidget({
     return qtyNum !== null && pxNum !== null;
   }, [effectiveVenue, otSymbol, side, isDexSwapVenue, isSolanaLimitMode, isCounterpartyVenue, isRobinhoodChainVenue, qtyNum, pxNum, totalQuoteNum, robinhoodChainReviewQuoteMarket, robinhoodChainQuoteReviewEnabled, robinhoodChainEffectiveAmountMode]);
 
+  const liveTradeGateBlocked = useMemo(() => {
+    if (!tradeGate) return false;
+    const liveAttempt = tradeGate?.dry_run === false && tradeGate?.armed === true;
+    return liveAttempt && tradeGate?.effective_live_submit_enabled !== true;
+  }, [tradeGate]);
+
   const canSubmit = useMemo(() => {
     if (!canSubmitBase) return false;
     if (preTrade?.block) return false;
+    if (liveTradeGateBlocked) return false;
     return true;
-  }, [canSubmitBase, preTrade]);
+  }, [canSubmitBase, preTrade, liveTradeGateBlocked]);
 
 
   const canCounterpartyComposePreview = useMemo(() => {
@@ -9923,6 +9946,9 @@ async function submitLimitOrder() {
   // If something changed after the confirm modal opened, surface why.
   if (!canSubmit) {
     const reason =
+      (liveTradeGateBlocked
+        ? `Live submit gate is blocked: ${(tradeGate?.missing_requirements || []).join(", ") || "requirements unresolved"}.`
+        : "") ||
       preTrade?.message ||
       (preTrade?.status ? String(preTrade.status) : "") ||
       "Order is not currently submittable — check Qty/Price and venue rules.";
@@ -9953,9 +9979,13 @@ async function submitLimitOrder() {
       type: "limit",
       qty: Number(qtyNum),
       limit_price: Number(pxNum),
-      tif,
-      post_only: !!postOnly,
-      client_order_id: clientOid ? String(clientOid).trim() : undefined,
+      ...(v === "cexius"
+        ? {}
+        : {
+            tif,
+            post_only: !!postOnly,
+            client_order_id: clientOid ? String(clientOid).trim() : undefined,
+          }),
     };
 
     const headers = { "Content-Type": "application/json" };
@@ -9977,6 +10007,34 @@ async function submitLimitOrder() {
     }
 
     const j = await r.json();
+    const simulated = j?.simulated === true || String(j?.status || "").trim().toLowerCase() === "simulated";
+    if (simulated) {
+      const simulationPayload = {
+        ...(j || {}),
+        post_submit_refresh: {
+          status: "not_run",
+          venue: v,
+          reason: "simulation_only",
+        },
+      };
+      setSubmitOk(simulationPayload);
+      openSubmitResultModal(
+        "info",
+        simulationPayload,
+        "Simulation Only — No Venue Order Sent"
+      );
+      onToast?.({
+        kind: "info",
+        msg: "Simulation only — no Cexius venue order request was sent and no local open order was created.",
+      });
+      return;
+    }
+
+    const returnedStatus = String(j?.status || "").trim().toLowerCase();
+    if (["rejected", "failed", "error"].includes(returnedStatus)) {
+      throw new Error(j?.reject_reason || `Order returned status ${returnedStatus}`);
+    }
+
     orderAccepted = true;
     const pendingPayload = {
       ...(j || {}),
@@ -12954,9 +13012,11 @@ async function submitLimitOrder() {
         ? [{ k: "Expiry", v: hideTableData ? "••••" : solanaExpiryLabel }]
         : isCounterpartyVenue
           ? []
-          : [{ k: "TIF", v: String(tif || "gtc").toUpperCase() }]),
-      ...(!isSolanaLimitMode && !isCounterpartyVenue ? [{ k: "Post-only", v: postOnly ? "YES" : "NO" }] : []),
-      ...(!isSolanaLimitMode && !isCounterpartyVenue && clientOid ? [{ k: "Client OID", v: hideTableData ? "••••" : String(clientOid) }] : []),
+          : isCexiusVenue
+            ? [{ k: "Venue options", v: "API default — TIF, post-only, and Client OID omitted" }]
+            : [{ k: "TIF", v: String(tif || "gtc").toUpperCase() }]),
+      ...(!isSolanaLimitMode && !isCounterpartyVenue && !isCexiusVenue ? [{ k: "Post-only", v: postOnly ? "YES" : "NO" }] : []),
+      ...(!isSolanaLimitMode && !isCounterpartyVenue && !isCexiusVenue && clientOid ? [{ k: "Client OID", v: hideTableData ? "••••" : String(clientOid) }] : []),
     ];
   }, [
     venueLabel,
@@ -12978,6 +13038,7 @@ async function submitLimitOrder() {
     isSolanaJupiterVenue,
     isPolkadotDexVenue,
     isCounterpartyVenue,
+    isCexiusVenue,
     isCounterpartyLimitOrderMode,
     counterpartyExpirationLabel,
     preferredHydrationRouteMode,
@@ -14566,10 +14627,7 @@ async function submitLimitOrder() {
                 // If user pasted/entered too many decimals, normalize immediately (prevents “stuck disabled button”).
                 const d = countDecimalsFromString(expandExponential(cleaned));
                 const pxDec = rules?.price_decimals;
-                const allowed =
-                  Number.isFinite(Number(pxDec)) && Number(pxDec) >= 0
-                    ? Math.min(Math.max(Math.trunc(Number(pxDec)), 0), 18)
-                    : null;
+                const allowed = precisionDigitsOrNull(pxDec);
 
                 if (d !== null && allowed !== null && d > allowed) {
                   const normalized = normalizeLimitPriceStr(cleaned, rules, side);
@@ -15216,7 +15274,14 @@ async function submitLimitOrder() {
                 </div>
               )}
             </>
-          ) : (isCounterpartyVenue || isRobinhoodChainVenue) ? null : (
+          ) : (isCounterpartyVenue || isRobinhoodChainVenue) ? null : isCexiusVenue ? (
+            <div
+              style={{ ...safePill, color: "#fde68a" }}
+              title="Cexius does not document time-in-force, post-only, or client-order-id fields for POST /trading/order."
+            >
+              Cexius venue options: API default · TIF / post-only / Client OID not sent
+            </div>
+          ) : (
             <>
               <div style={safePill}>
                 <span>TIF</span>

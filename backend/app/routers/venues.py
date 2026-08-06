@@ -23,6 +23,25 @@ def _live_venues_set() -> set[str]:
         return {x.strip().lower() for x in str(raw).split(",") if x.strip()}
 
 
+def _cexius_trade_scope_enabled() -> bool:
+    """Return only a non-secret boolean for the Cexius vault trade scope."""
+    fn = getattr(settings, "_vault_latest_credential_record", None)
+    if not callable(fn):
+        return False
+    try:
+        record = fn("cexius")
+    except Exception:
+        return False
+    if not isinstance(record, dict):
+        return False
+    bundle = record.get("bundle")
+    token_present = bool(
+        isinstance(bundle, dict)
+        and str(bundle.get("api_secret") or bundle.get("api_key") or "").strip()
+    )
+    return bool(record.get("scope_read") and record.get("scope_trade") and token_present)
+
+
 def _trade_gate_for_venue(spec, *, enabled: bool) -> dict:
     """Return non-secret live-trading gate status for UI display.
 
@@ -39,6 +58,8 @@ def _trade_gate_for_venue(spec, *, enabled: bool) -> dict:
 
     is_okx = venue == "okx"
     okx_enable_trading = _env_bool("OKX_ENABLE_TRADING") if is_okx else None
+    is_cexius = venue == "cexius"
+    cexius_trade_scope_enabled = _cexius_trade_scope_enabled() if is_cexius else None
 
     effective_live_submit_enabled = bool(
         supports_trading
@@ -47,6 +68,7 @@ def _trade_gate_for_venue(spec, *, enabled: bool) -> dict:
         and armed
         and live_venues_includes_venue
         and ((not is_okx) or bool(okx_enable_trading))
+        and ((not is_cexius) or bool(cexius_trade_scope_enabled))
     )
 
     missing = []
@@ -62,6 +84,8 @@ def _trade_gate_for_venue(spec, *, enabled: bool) -> dict:
         missing.append(f"LIVE_VENUES includes {venue}")
     if is_okx and not okx_enable_trading:
         missing.append("OKX_ENABLE_TRADING=1")
+    if is_cexius and not cexius_trade_scope_enabled:
+        missing.append("Cexius credential read=true and trade=true")
 
     return {
         "version": "trade_gate_v1",
@@ -72,6 +96,7 @@ def _trade_gate_for_venue(spec, *, enabled: bool) -> dict:
         "armed": armed,
         "live_venues_includes_venue": live_venues_includes_venue,
         "okx_enable_trading": okx_enable_trading,
+        "cexius_trade_scope_enabled": cexius_trade_scope_enabled,
         "effective_live_submit_enabled": effective_live_submit_enabled,
         "missing_requirements": missing,
     }

@@ -714,10 +714,11 @@ function isCanceledStatus(status) {
   return s === "canceled" || s === "cancelled";
 }
 
-// unified hide predicate (for Local + Unified tables)
+// Unified/local hide predicate. The existing preference now hides both canceled
+// spellings and venue-rejected rows; explicit status filters still remain available.
 function isHiddenByHideCancelled(status) {
   const s = String(status || "").toLowerCase();
-  return s === "canceled" || s === "cancelled";
+  return s === "canceled" || s === "cancelled" || s === "rejected";
 }
 
 function fmtEco(n) {
@@ -4065,6 +4066,7 @@ export default function App() {
     if (value === "kraken") return "Kraken";
     if (value === "robinhood") return "Robinhood";
     if (value === "dex_trade") return "Dex-Trade";
+    if (value === "cexius") return "Cexius";
     if (value === "okx") return "OKX";
     if (value === "polkadot_hydration") return "Polkadot-Hydration";
     if (value === "polkadot_dex") return "Polkadot DEX";
@@ -4106,6 +4108,11 @@ export default function App() {
         dry_run: !!j?.dry_run,
         armed: !!j?.armed,
       });
+
+      // The Order Ticket receives its non-secret trade gate from /api/venues.
+      // Refresh that registry snapshot automatically after ARM state changes so
+      // the ticket banner cannot remain stale until a manual global Refresh.
+      setVenuesReloadNonce((x) => x + 1);
     } catch (e) {
       const msg = e?.response?.data?.detail || e?.message || "Unknown error setting armed state";
       setError(String(msg));
@@ -5163,7 +5170,10 @@ export default function App() {
       // Treat "", null, "all", and ALL_VENUES_VALUE as "all venues"
       const wantsAllVenues = !v || v === "all" || v === String(ALL_VENUES_VALUE || "").toLowerCase();
 
-      const refreshCandidates = tradingVenuesList.length > 0 ? tradingVenuesList : supportedVenues;
+      const refreshCandidates = normalizeVenueList([
+        ...(tradingVenuesList.length > 0 ? tradingVenuesList : supportedVenues),
+        ...(supportedVenues.includes("cexius") ? ["cexius"] : []),
+      ]);
 
       // If a specific venue was requested and is valid, refresh only that one. Otherwise refresh all candidates.
       const venuesToRefresh = wantsAllVenues ? refreshCandidates : refreshCandidates.includes(v) ? [v] : refreshCandidates;
@@ -6403,6 +6413,8 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
                 symbolCanon={activeMarketSymbol}
                 venues={arbVenues}
                 fmtPrice={fmtPrice}
+                hideTableData={hideTableDataGlobal}
+                hideVenueNames={hideVenueNames}
                 fetchArbSnapshot={({ apiBase, symbol, venues }) => getArbSnapshot({ apiBase, symbol, venues })}
               />
             );

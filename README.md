@@ -2,7 +2,7 @@
 
 UTT (Unified Trading Terminal) is a local-first, multi-venue crypto trading terminal built with **FastAPI** on the backend and **React** on the frontend. It is designed to unify centralized exchange (CEX) workflows and selected decentralized exchange (DEX) flows under a single operator-focused interface.
 
-> **Current documented baseline:** this README reflects the codebase through the published Counterparty / UniSat integration series, the R5C.5B controlled Robinhood Chain BUY / SELL lifecycle, and the SEC-VAULT.1 credential-vault hardening tranche. Generic custom-pair Robinhood Chain execution remains a later tranche and is not implied by the current live-validated scope.
+> **Current documented baseline:** this README reflects the cumulative codebase through the published Counterparty / UniSat and controlled Robinhood Chain series, SEC-VAULT.1 credential-vault hardening, review-only Robinhood Chain selected-pair registration and provider-scoped indicative quotes, the accepted Cexius REST trading lifecycle, generic read-only Order Details windows, and the managed Arbitrage snapshot window. Generic Robinhood Chain custom-pair live execution, Cexius market orders, Cexius Cancel All, and automated arbitrage execution are not implied by the current scope.
 
 At a high level, UTT provides one place to:
 
@@ -10,9 +10,9 @@ At a high level, UTT provides one place to:
 - inspect balances, available amounts, holds, priced totals, cost basis, average cost, and gain/loss columns
 - view CEX orderbooks, DEX pseudo-orderbooks, Counterparty dispenser / protocol-order books, synthetic price-context books, and manual route books
 - submit and track CEX orders, cancel supported venue orders, and monitor venue-native order snapshots
-- trade through supported live-gated CEX adapters such as Coinbase, Crypto.com, Dex-Trade, Gemini, Kraken, Robinhood, and OKX where configured
+- trade through supported live-gated CEX adapters such as Coinbase, Crypto.com, Cexius, Dex-Trade, Gemini, Kraken, Robinhood, and OKX where configured
 - use Counterparty / UniSat workflows for Bitcoin-metaprotocol assets, collectibles, orderbook context, unsigned compose review, explicit PSBT signing, and separately gated broadcast
-- use Robinhood Chain for registry-backed EVM balances, quote discovery, synthetic books, bounded unsigned planning, controlled browser-wallet execution, receipt reconciliation, and All Orders reflection
+- use Robinhood Chain for registry-backed EVM balances, 0x and provider-scoped read-only indicative quote discovery, review-only selected-pair registration, synthetic books, bounded unsigned planning, controlled browser-wallet execution, receipt reconciliation, and All Orders reflection
 - submit and track Solana swaps / limit-style flows and confirmed Hydration manual-route swaps
 - monitor scanners, discovery tools, Ordinals / Counterparty collectibles, wallet activity, market-cap data, volume data, and self-custody balances
 - filter Market Cap and Volume windows by All / Owned / Unowned and by venue/source such as Coinbase, Crypto.com, Dex-Trade, Gemini, Hydration, Kraken, OKX, Robinhood, self-custody, Solana, and Solana-Jupiter
@@ -20,6 +20,7 @@ At a high level, UTT provides one place to:
 - preview per-fill basis impact for supported venue fills without mutating FIFO lots
 - plan cross-chain UTTT movements with bridge-transfer records, canonical supply context, per-chain supply context, and read-only basis previews
 - manage Token Registry rows, Hydration Route Registry rows, wallet addresses, venue API keys, and local operator preferences
+- inspect a managed read-only Arbitrage window with best bid/ask, spread, per-venue top-of-book rows, manual refresh, and bounded auto-refresh
 - integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
 
 ---
@@ -52,6 +53,7 @@ UTT is best understood as a local operator workstation rather than a single exch
 - Server-side pre-trade normalization to venue increments before live order placement.
 - Dry-run / armed / live-venue gate enforcement so live trading cannot occur only because the UI is visible.
 - OKX gated live submit and cancel support using the OKX trade endpoint and cancel endpoint, while leaving withdrawals unsupported.
+- Cexius public and authenticated REST integration with complete paginated order snapshots, normalized balances and rules, selected-order cancellation, and limit BUY / SELL submission behind the shared live gates.
 - Counterparty read-only market / balance discovery, unsigned compose previews, explicit UniSat `signPsbt`, and separately gated `pushPsbt` broadcast with no backend signing or automatic broadcast.
 - Robinhood Chain registry-backed quote discovery, unsigned transaction planning, bounded exact-input execution authority, finite ERC-20 approval, separate browser-wallet requests, and receipt reconciliation.
 - Solana DEX swap and limit-style flow integration where the selected wallet and route support the requested pair.
@@ -59,7 +61,8 @@ UTT is best understood as a local operator workstation rather than a single exch
 
 ### Market data and routing context
 
-- CEX orderbooks where venue adapters expose them.
+- CEX orderbooks where venue adapters expose them, including a direct-symbol Cexius fast path that avoids a redundant market-catalog lookup.
+- Managed Arbitrage snapshots that compare configured venue top-of-book data without creating an execution path.
 - DEX pseudo-orderbooks for route-based execution contexts.
 - Counterparty ASSET-BTC dispenser and protocol-order context with exact audit prices, mode separation, USD reference values, and rate-limit-safe fallback behavior.
 - Robinhood Chain pair catalog and provider-backed synthetic books for registry-authorized directional quote context.
@@ -73,6 +76,7 @@ UTT is best understood as a local operator workstation rather than a single exch
 ### Portfolio, balances, and accounting context
 
 - Per-venue balances with total, available, and hold values.
+- Cexius balance normalization that treats spendable balance separately from locked, reserved, and trading-locked amounts without double counting.
 - USD pricing enrichment for balances when requested.
 - AppHeader portfolio totals across CEX, Counterparty / Bitcoin, Robinhood Chain, Solana DEX, Hydration DEX, and cached self-custody balances where configured.
 - Counterparty asset and BTC balances resolved from the configured Wallet Addresses account, with direct or ASSET-BTC-derived USD valuation when sufficiently authoritative.
@@ -90,6 +94,8 @@ UTT is best understood as a local operator workstation rather than a single exch
 - All Orders view that merges local orders, venue order snapshots, and supported DEX swap records.
 - Open and terminal bucket separation.
 - Cancelability detection for open venue rows.
+- Generic read-only Order Details windows for terminal and noncancelable transaction-bearing rows, with draggable/resizable top-layer presentation, persistent geometry, and Reset controls.
+- Cexius open, filled, canceled, and rejected lifecycle reflection with selected-order cancellation, truthful simulated cancellation behavior, and no Cancel All path.
 - Fee, gross, net, tax-estimate, and net-after-tax display fields where backend data exists.
 - Viewed/confirmed tracking for operator review workflows.
 - Sound and toast-on-fill UI behavior.
@@ -180,6 +186,29 @@ The OKX adapter is now integrated as a live-gated CEX venue. OKX support include
 OKX live routing remains explicitly guarded. A visible OKX Order Ticket is not enough to place an order. Live OKX submit/cancel requires the backend to be armed, dry-run to be disabled, `LIVE_VENUES` to include `okx`, and `OKX_ENABLE_TRADING=1`. OKX withdrawal support is intentionally not implemented.
 
 
+#### Cexius integration
+
+The Cexius adapter is integrated as a vault-backed REST venue with public market data, authenticated account reads, and tightly bounded live order mutations.
+
+Current Cexius capabilities include:
+
+- public market catalog, market rules, ticker, trades, candles, fees, and orderbook reads
+- a direct-symbol orderbook fast path so orderbook refresh does not wait on a full market-catalog lookup
+- profile-vault Bearer-token authentication with explicit Read and Trade scope metadata and no credential environment fallback
+- normalized balances with distinct `Total`, `Available`, and `Hold` semantics
+- bounded pagination for complete open-order retrieval, duplicate suppression, repeated-page protection, and coherent open / filled / canceled persistence
+- unified All Orders visibility, including truthful `I/E` display when a filled disposal has insufficient venue-scoped inventory and `—` for canceled-order tax
+- API-authoritative quantity precision, price precision, minimum quantity, and minimum notional handling, including the observed Cexius `trading_amount_precision`, `trading_price_precision`, `trading_min_amount`, and minimum-order-value fields
+- selected single-order cancellation through the shared confirmation and `cancel_by_ref` path
+- non-mutating cancellation simulation while disarmed or in dry-run mode; simulated actions do not rewrite local rows as canceled
+- limit BUY and SELL submission only, with manually editable Quantity, Limit, and Total, optional Auto-calc, explicit final confirmation, and exactly one upstream request
+- immediate order and balance refresh after an authoritative live submit or cancel
+- generic read-only Details windows for terminal Cexius rows
+
+Cexius live routing remains explicitly guarded. A visible Order Ticket is not enough to submit or cancel an order. Live mutation requires `DRY_RUN=false`, `ARMED=true`, `LIVE_VENUES` to include `cexius`, a matching enabled venue capability, and a Profile-vault credential declared for both Read and Trade. The implementation intentionally does not enable market orders, Cancel All, withdrawals, deposit-address generation, or automatic retry.
+
+A zero-fill open order is not execution evidence and is excluded from ledger/FIFO processing. Existing filled rows may correctly show `I/E` when Cexius-scoped inventory is unavailable; basis and tax values are not fabricated. Organic-fill revalidation remains an operational follow-up rather than a claim that every historical fill has complete local basis.
+
 ### Counterparty / UniSat workflow
 
 UTT includes a Bitcoin-metaprotocol integration for Counterparty assets and UniSat browser-wallet workflows. This is separate from the CEX adapters and from the EVM-based Robinhood Chain path.
@@ -227,10 +256,13 @@ Current Robinhood Chain capabilities include:
 - bounded Blockscout-backed transaction-history display
 - read-only transaction and accounting previews
 - 0x-backed indicative quote discovery using a profile-managed API key stored under venue `zerox`
+- provider-scoped read-only Uniswap indicative quote support where configured, with quote access kept separate from disabled provider swap / order endpoints
 - registry-driven pair objectives, directional capabilities, token identity, provider identity, and execution authority
+- review-only selected-pair registration and refresh so a discovered pair can be added to the local catalog without automatically receiving live execution authority
 - lazy directional discovery rather than broad N-squared pair probing
 - pair catalogs and synthetic provider-backed orderbook context
 - unsigned exact-input planning with saved-wallet, chain, provider, pair, direction, and amount binding
+- directly editable Quantity and Total fields with optional Auto-calc; persisted unlimited or blanket preauthorization is not required
 - finite ERC-20 approval planning; unlimited approval remains disabled
 - explicit separation between approval and swap wallet requests
 - short-lived provider plans and claim IDs that fail closed when stale, mismatched, or already consumed
@@ -338,6 +370,25 @@ Current architecture in this repository includes support for:
 
 The frontend does not call CoinGecko directly. Market-cap and volume windows read normalized data from the backend market-metrics service, while the backend owns source selection, caching, rate-limit handling, and symbol-to-source resolution.
 
+### Managed Arbitrage snapshot workflow
+
+UTT includes a canonical WindowManager-based Arbitrage window for comparing venue top-of-book data. The AppHeader **Arbitrage** tool tab opens or focuses the one managed window instead of creating a second generic window or a separate chip popover.
+
+Current behavior includes:
+
+- selected canonical market and configured venue list
+- best ask venue and price
+- best bid venue and price
+- absolute spread and percentage spread
+- per-venue bid / ask rows when returned by the snapshot endpoint
+- manual Refresh
+- persisted auto-refresh interval and background-refresh policy
+- same-tab in-flight request coalescing and a short snapshot cache to prevent duplicate bursts
+- global table-data and venue-name privacy masking
+- close, reopen, and repeated-click focus through the existing window manager
+
+The Arbitrage window reuses the existing read-only snapshot callback. It does not submit orders, cancel orders, invoke Cancel All, move funds, request withdrawals, or create transfer records. It is a monitoring surface, not an automated arbitrage engine.
+
 ### Spread / Bridge planning workflow
 
 UTT includes a Spread / Bridge dashboard for planning cross-chain UTTT movement without enabling bridge execution by default.
@@ -370,6 +421,8 @@ Representative components include:
 - `OrderBookWidget.jsx`
 - `OrderTicketWidget.jsx`
 - `TerminalTablesWidget.jsx`
+- `ArbChip.jsx` for reusable snapshot rendering and header tool-tab state
+- `features/arb/ArbWindow.jsx` for the canonical managed Arbitrage window
 - `features/bridge/SpreadBridgeDashboardChip.jsx` for Spread / Bridge planning
 - `features/nfts/NftCollectiblesWindow.jsx` for UniSat Ordinals and Counterparty collectibles
 - `features/wallets/RobinhoodChainHistoryPanel.jsx` and `RobinhoodChainAccountingPreview.jsx`
@@ -423,6 +476,7 @@ A simplified view of the current repository structure:
 │       ├── app/
 │       ├── components/
 │       ├── features/
+│       │   ├── arb/
 │       │   ├── bridge/
 │       │   ├── nfts/
 │       │   ├── registry/
@@ -484,7 +538,8 @@ Current areas of focus include:
 - Solana wallet-manager integration for DEX flows
 - UniSat wallet handoff, Counterparty ticket modes, and collectibles/media windows
 - MetaMask-linked Robinhood Chain balances, quote context, controlled execution review, lifecycle restoration, and result-evidence UI
-- registry, scanner, Market Cap, Volume, and Spread / Bridge planning windows
+- registry, scanner, Market Cap, Volume, managed Arbitrage, and Spread / Bridge planning windows
+- generic read-only Order Details windows with draggable/resizable top-layer geometry, persistence, and Reset controls
 - compact Hydration price-status UI that avoids triggering backend refresh or SDK quote paths
 - compact AppHeader tool tabs and consistent safety/status coloring
 - AppHeader portfolio totals that include CEX, Counterparty, Robinhood Chain, cached wallet-address, and other self-custody balances
@@ -505,11 +560,12 @@ The backend acts as the local orchestration layer for UTT. It is not just a thin
 It is responsible for:
 
 - venue adapter access
+- Cexius market/rule normalization, complete paginated order ingestion, balance semantics, selected cancellation, and limit-order submission under the shared live gates
 - wallet and market routing
 - Counterparty API normalization, compose-preview safety, PSBT handoff metadata, and read-only accounting previews
 - bounded EVM RPC, Blockscout history, 0x quote discovery, registry authority, and Robinhood Chain lifecycle reconciliation
 - order creation and cancellation support
-- unified order views
+- unified order views and read-only transaction-detail passthrough for generic Details windows
 - token and symbol resolution
 - backend-cached market metrics, external market-data resolution, and rate-limit-safe source caching
 - wallet-address history ingestion, caching, and materialization workflows
@@ -529,6 +585,18 @@ The exact state of each venue may evolve over time, but the repository currently
 
 - Coinbase
 - Crypto.com Exchange
+- Cexius
+  - public market catalog, rules, ticker, trades, candles, fees, and direct-symbol orderbooks
+  - Profile-vault Bearer-token authentication with Read / Trade scope checks and no env credential fallback
+  - normalized Total / Available / Hold balances
+  - complete paginated open, filled, and canceled order ingestion with idempotent refresh
+  - selected single-order cancellation and truthful non-mutating simulation
+  - limit BUY / SELL submission with API-authoritative precision and minimums
+  - manually editable Quantity / Limit / Total, optional Auto-calc, explicit confirmation, and one-request/no-retry behavior
+  - generic read-only terminal-order Details windows
+  - insufficient-inventory `I/E` presentation without fabricated basis or tax
+  - market orders, Cancel All, withdrawals, and deposit-address generation intentionally disabled
+
 - Dex-Trade
 - Gemini
 - Kraken
@@ -592,6 +660,7 @@ Supporting routes and tooling also include:
 - wallet address handling
 - all-orders aggregation
 - scanner and discovery windows
+- managed read-only Arbitrage window with snapshot coalescing, manual/auto refresh, privacy masking, and canonical WindowManager focus behavior
 - donation window and public support-address display/copy helpers
 - airdrop-related routing and tooling
 
@@ -782,7 +851,82 @@ synthetic price-only fallback for visual context
 SDK route only when explicitly enabled
 ```
 
-### 5) Token Registry
+### 5) Cexius venue workflow
+
+Add the Cexius credential through the Profile vault rather than a tracked environment variable.
+
+Recommended setup:
+
+```text
+Profile → API Keys
+→ venue: cexius
+→ API key field: Cexius API ID when supplied
+→ API secret field: Cexius Bearer token
+→ declare Read
+→ declare Trade only when intentionally testing submit/cancel
+→ save
+```
+
+Typical read-only sequence:
+
+```text
+select Cexius
+→ Sync+Load markets, balances, and venue orders
+→ inspect Total / Available / Hold
+→ select a market such as DOGE-USDT
+→ refresh the Order Book
+→ inspect API-derived rules and minimums
+```
+
+Typical live limit-order sequence:
+
+```text
+DRY_RUN=false
+→ ARMED=true
+→ LIVE_VENUES includes cexius
+→ credential has Read + Trade declarations
+→ enter Quantity, Limit, and Total
+→ keep Auto-calc on or turn it off for direct manual entry
+→ review pre-trade checks
+→ open the explicit confirmation
+→ submit exactly once
+→ Sync+Load and refresh balances
+```
+
+Selected cancellation uses the existing All Orders confirmation flow. Cancel only the exact intended open row. A disarmed or dry-run cancellation is a transient simulation and must not rewrite the authoritative local lifecycle.
+
+Cexius safety boundaries:
+
+```text
+limit BUY / SELL only
+selected single-order cancellation only
+no market orders
+no Cancel All
+no withdrawal or deposit-address mutation
+no automatic retry
+no fabricated fill, basis, or tax
+```
+
+### 6) Managed Arbitrage window
+
+Open the AppHeader **Arbitrage** tool tab to open or focus the canonical managed window.
+
+Typical flow:
+
+```text
+select the canonical market and configured venues
+→ open Arbitrage
+→ inspect best ask, best bid, spread, and per-venue rows
+→ click Refresh for one read-only snapshot
+→ optionally enable bounded auto-refresh
+→ close and reopen through WindowManager
+```
+
+Repeated tool-tab clicks focus the existing window; they do not create a second window or a separate header popover. Global privacy controls mask market data and venue names in the managed window.
+
+The Arbitrage window is read-only. It does not submit or cancel orders and does not move funds.
+
+### 7) Token Registry
 
 Use the Token Registry to manage local asset metadata that the terminal needs for display, routing, pricing, and diagnostics.
 
@@ -809,7 +953,7 @@ Native asset     → use native when the backend expects the chain-native asset 
 
 For Hydration route work, intermediate route assets such as `aDOT` can be added with no price source if they are not intended as user-facing priced assets.
 
-### 6) Hydration Route Registry
+### 8) Hydration Route Registry
 
 Use the Hydration Route Registry to control manual routes through the UI instead of hardcoding route assets in backend files.
 
@@ -852,7 +996,7 @@ Example HDX-DOT route JSON:
 ]
 ```
 
-### 7) Hydration swaps
+### 9) Hydration swaps
 
 Hydration swaps use wallet signing through the Polkadot / Substrate wallet flow. The backend builds unsigned transaction payloads, the frontend requests signing, and successful swaps are recorded into local swap-order state.
 
@@ -880,7 +1024,7 @@ Order Ticket
 
 The terminal should never treat a synthetic price-only orderbook as tradable by itself.
 
-### 8) Solana DEX flows
+### 10) Solana DEX flows
 
 Use Solana DEX flows when a supported wallet is connected and the selected route supports the requested asset pair.
 
@@ -899,7 +1043,7 @@ select Solana DEX venue
 Solana support includes Jupiter-related routing paths, Raydium routing, token registry lookup, mint resolution, and wallet-aware Order Ticket behavior.
 
 
-### 9) Counterparty / UniSat flows
+### 11) Counterparty / UniSat flows
 
 Use the `counterparty` venue for Bitcoin-metaprotocol asset discovery, balances, collectibles, orderbook context, compose review, and explicit UniSat wallet handoff.
 
@@ -961,7 +1105,7 @@ confirmed Counterparty txid
 
 These accounting paths are previews. They do not automatically create deposits, withdrawals, basis lots, FIFO consumption, or tax records.
 
-### 10) Robinhood Chain flows
+### 12) Robinhood Chain flows
 
 Use the `robinhood_chain` venue for chain diagnostics, registered-token balances, quote context, synthetic books, bounded review, and controlled browser-wallet execution.
 
@@ -1017,7 +1161,7 @@ Important Robinhood Chain rules:
 - current live-validated execution scope is WETH-USDG; arbitrary registry pairs are not automatically authorized
 - All Orders must preserve BUY / SELL direction and pair economics
 
-### 11) Wallet addresses and self-custody visibility
+### 13) Wallet addresses and self-custody visibility
 
 Use wallet-address tooling to register self-custody addresses and include cached wallet balances or history in local views.
 
@@ -1033,7 +1177,7 @@ Open wallet/address tooling
 
 Self-custody balances can contribute to AppHeader portfolio totals when cached and available.
 
-### 12) Hydration wallet-history ingestion and ledger materialization
+### 14) Hydration wallet-history ingestion and ledger materialization
 
 Hydration wallet-history ingestion is a dry-run-first workflow.
 
@@ -1051,7 +1195,7 @@ coverage dry run
 
 This avoids inventing USD basis and avoids treating internal transfers, bridge-like movements, or LP / Omnipool rows as normal taxable disposals by default.
 
-### 13) Deposits, withdrawals, FIFO lots, and basis
+### 15) Deposits, withdrawals, FIFO lots, and basis
 
 The local ledger tooling is designed for conservative local accounting workflows.
 
@@ -1068,7 +1212,7 @@ FIFO lot impact    = explicit preview/apply workflow for eligible withdrawals
 
 Do not apply broad FIFO rebuilds until preview output looks correct.
 
-### 14) Spread / Bridge dashboard
+### 16) Spread / Bridge dashboard
 
 The Spread / Bridge dashboard is a planning dashboard, not an execution bridge.
 
@@ -1090,7 +1234,7 @@ open Spread / Bridge
 
 Actual bridge execution and actual basis mutation remain intentionally disabled until a guarded apply path is explicitly implemented and tested.
 
-### 15) Market Cap and Volume windows
+### 17) Market Cap and Volume windows
 
 Use the AppHeader Market Cap and Volume tool tabs to inspect normalized backend-cached market metrics.
 
@@ -1143,7 +1287,7 @@ venue_filter_keys
 
 A market-data row can still display as `global` for the market-data venue while also being filterable under OKX or another local source because the price/volume source and the local ownership source are intentionally separate concepts.
 
-### 16) Scanner and discovery tooling
+### 18) Scanner and discovery tooling
 
 Scanner and discovery windows are operator tools for surfacing assets, venue data, or other candidate rows depending on which backend routes are enabled.
 
@@ -1157,7 +1301,7 @@ open scanner/discovery window
 → use registry or terminal actions to wire supported assets into trading views
 ```
 
-### 17) Donate window
+### 19) Donate window
 
 The Donate window is an AppHeader utility for public support addresses.
 
@@ -1171,7 +1315,7 @@ DEX-wallet-aware Send buttons can hand off supported assets toward the wallet/or
 
 Only public donation addresses belong in the UI. Never put private keys or seed phrases into the donation configuration.
 
-### 18) Local backup and session hygiene
+### 20) Local backup and session hygiene
 
 Use profile/logout backup behavior and local backup tooling to preserve local DB state before major changes.
 
@@ -1250,7 +1394,7 @@ Operational requirements:
 - `UTT_KMS_MASTER_KEY` must remain private and stable for credential / TOTP decryption; it must not fall back to an auth password, `UTT_AUTH_SECRET`, or a public literal
 - `UTT_AUTH_SECRET` must be a separate persistent secret used for authentication signing
 - `UTT_VAULT_USERNAME` must match the intended local profile owner exactly
-- the SQLite database path and `BACKUP_DIR` must resolve outside the repository
+- the SQLite database path and backup directory must resolve outside the repository
 - private values belong only in the external runtime environment, never in `backend.env.example`, README examples, logs, screenshots, diffs, or commits
 - back up the private environment and database before changing encryption or ownership settings
 
@@ -1354,6 +1498,23 @@ Store the 0x API key through **Profile → API Keys** using venue `zerox`. Do no
 
 Enabling `ROBINHOOD_CHAIN_LIVE_EXECUTION_ENABLED=1` is not sufficient by itself. Live execution also requires the global trading gates, an accepted registry capability, a matching saved wallet, a fresh provider plan, an explicit database authority, and explicit browser-wallet confirmation for each transaction stage.
 
+#### Cexius configuration
+
+Cexius credentials are vault-only. Do not add a Cexius API token to `backend.env.example` or a tracked `.env` file.
+
+Use **Profile → API Keys** with venue `cexius`:
+
+```text
+API key field     = Cexius API ID when supplied
+API secret field  = Cexius Bearer token
+Read              = required for balances and order/history reads
+Trade             = required for selected cancellation and limit submission
+Transfer          = not required
+Withdrawal        = not required
+```
+
+The adapter has no Cexius credential environment fallback. Public REST reads can use the built-in public API base; authenticated operations resolve the explicit owner’s active Profile-vault row.
+
 ### 3) Create and activate a backend virtual environment
 
 ```powershell
@@ -1452,6 +1613,16 @@ Then restart the backend from that same terminal. If any required gate is missin
 
 Do not grant withdrawal permission to OKX API keys for UTT live order testing. The OKX workflow only requires the permissions needed for balances, market data, and trade placement/canceling.
 
+For Cexius live limit submit or selected cancellation, use the same global controls and include `cexius` in `LIVE_VENUES`:
+
+```powershell
+$env:DRY_RUN="false"
+$env:ARMED="true"
+$env:LIVE_VENUES="coinbase,cryptocom,cexius,dex_trade,gemini,kraken,robinhood,okx"
+```
+
+Cexius does not require a separate tracked venue-specific enable variable. The backend still requires the enabled venue capability plus an active explicit-owner Profile-vault credential declared for Read and Trade. Market orders and Cancel All remain rejected.
+
 Counterparty and Robinhood Chain use additional venue-specific gates:
 
 ```text
@@ -1507,6 +1678,9 @@ UTT is intentionally structured so that public source code can live in git while
 - scan staged diffs before every push
 - keep wallet and account testing material separate from source control
 
+---
+
+
 ### Credential-vault lifecycle and scope model
 
 The profile-managed credential vault uses an explicit lifecycle rather than physical deletion:
@@ -1533,8 +1707,54 @@ Important properties:
 - suspected compromise still requires venue-side revocation / rotation
 - credentials sourced directly from environment variables require separate emergency controls
 
----
+## Cexius notes
 
+Cexius is a centralized REST venue integration. Public market data and authenticated account state are normalized into the same terminal structures used by the other CEX adapters, while mutation authority remains intentionally narrower.
+
+### Credential and scope model
+
+Cexius private REST uses a Bearer token from the active explicit-owner Profile-vault row. The supported local field convention is:
+
+```text
+api_key     = Cexius API ID when supplied
+api_secret  = Cexius Bearer token
+```
+
+Read-scoped operations require Read. Live selected cancellation and live limit submission require both Read and Trade. There is no Cexius API-key or token environment fallback.
+
+### Balance and order model
+
+When the API does not provide an explicit free/spendable field, UTT derives spendable funds from the venue balance and all positive lock categories. The result is exposed as:
+
+```text
+Total      = complete owned quantity represented by available plus hold
+Available  = spendable quantity
+Hold       = locked + reserved + trading-locked quantity not currently spendable
+```
+
+Open-order ingestion is bounded and paginated, respects reported totals, removes duplicate order IDs, and stops repeated-page loops. Open, filled, canceled, and rejected rows are normalized into venue snapshots and the unified All Orders view.
+
+### Rule and execution model
+
+Cexius rule normalization uses venue-provided market precision and minimum fields. Decimal precision is converted into increments when the API publishes decimal counts instead of explicit steps. The venue minimum order value remains authoritative.
+
+The live path supports exact limit BUY and SELL only:
+
+```text
+market
+side
+order type = limit
+amount
+price
+```
+
+UTT intentionally omits unsupported time-in-force, post-only, and client-order-ID fields for the accepted Cexius request shape. The operator reviews one confirmation and one request is sent; there is no automatic retry.
+
+### Cancellation and accounting boundaries
+
+Only the selected open order can be canceled. Cancel All remains absent. Dry-run or disarmed cancellation reports a simulation without changing authoritative local lifecycle state.
+
+A resting zero-fill order affects Available and Hold but does not create an execution, fee, ledger row, FIFO consumption, basis mutation, or realized tax. When a historical filled disposal cannot be matched to Cexius-scoped inventory, UTT reports `I/E` rather than inventing basis or tax.
 
 ## Counterparty / UniSat notes
 
@@ -1896,6 +2116,8 @@ UTT uses a unified terminal style where the order book, order ticket, tables, sc
 Current work includes:
 
 - venue-aware order book display
+- Cexius direct-symbol orderbook retrieval that avoids redundant market-catalog resolution
+- managed Arbitrage top-of-book snapshot presentation using existing read-only venue data
 - pseudo-orderbook behavior for DEX routes
 - Counterparty dispenser / protocol-order books with exact BTC and USD context
 - Robinhood Chain synthetic provider-backed books for registry-authorized directional quote context
@@ -1909,6 +2131,7 @@ Current work includes:
 Current work includes:
 
 - venue-aware order entry
+- Cexius limit BUY / SELL with exact manual Quantity / Limit / Total, optional Auto-calc, explicit confirmation, and no automatic retry
 - Counterparty dispenser / protocol-order mode selection, compose preview, fee tier, UniSat PSBT signing, and separately gated broadcast
 - Robinhood Chain editable Quantity / Total controls, optional Auto-calc, bounded authority, finite approval, separate swap request, and lifecycle restoration
 - Solana wallet-manager integration
@@ -1918,8 +2141,17 @@ Current work includes:
 - blocked generic Hydration swap-tx path when router quotes are disabled
 - operator status and preflight behavior
 - simplified widget controls with redundant Lock buttons and the Order Ticket top-left resize handle removed
+- generic terminal-order Details windows that are read-only, draggable, resizable, top-layered, geometry-persistent, and resettable
 
 ---
+
+## Arbitrage window notes
+
+The Arbitrage tool tab and window share one canonical WindowManager record. The header chip reports Open / Closed from that record, opens the managed window when closed, and focuses the same window when already open.
+
+The embedded window reuses `ArbChip` snapshot logic, including request coalescing, short cache reuse, persisted refresh settings, and privacy formatting. The header does not mount a second live popover, so opening the managed window does not create duplicate scheduled snapshot traffic.
+
+The snapshot path is read-only. The Arbitrage feature contains no order-submit, selected-cancel, Cancel All, withdrawal, deposit-address, or transfer mutation path.
 
 ## Data and runtime state
 
@@ -1966,7 +2198,7 @@ UTT_KMS_MASTER_KEY is present and unchanged
 UTT_AUTH_SECRET is present and separate from the KMS key
 UTT_VAULT_USERNAME exactly matches the intended local profile owner
 database path resolves outside the repository
-BACKUP_DIR resolves outside the repository
+backup directory resolves outside the repository
 ```
 
 Expected Profile security state:
@@ -2268,6 +2500,43 @@ Check:
 
 The FIFO rebuild path is explicit-only. Do not use `allow_partial=true`, `force_rebuild=true`, or broad all-asset application unless you are intentionally performing a controlled ledger repair.
 
+### Cexius markets, balances, orders, submit, or cancel do not work
+
+Check:
+
+- the active Profile-vault row uses venue `cexius`
+- the Bearer token is in the API secret field and the optional API ID is in the API key field
+- Read is declared for balances and order/history reads
+- Trade is also declared for live selected cancellation or limit submission
+- `UTT_VAULT_USERNAME` matches the signed-in owner
+- the browser was hard-refreshed after capability changes
+- `DRY_RUN=false`, `ARMED=true`, and `LIVE_VENUES` includes `cexius` only when intentionally testing live mutation
+- the selected market reports quantity precision, price precision, minimum quantity, and minimum notional
+- the order type is limit; market orders are intentionally rejected
+
+For read-only diagnostics, verify:
+
+```text
+GET /api/venues?include_disabled=true
+POST /api/balances/refresh
+GET /api/balances/latest?venue=cexius&with_prices=true
+POST /api/venue_orders/refresh
+GET /api/venue_orders/latest?venue=cexius&page_size=100
+GET /api/all_orders?scope=VENUES&venue=cexius&page_size=100
+```
+
+Expected safety behavior:
+
+```text
+Cancel All remains unavailable
+withdrawals remain unavailable
+disarmed/dry-run submit or cancel is simulated without authoritative lifecycle mutation
+one confirmed live action sends one request and is not retried automatically
+zero-fill rows do not enter execution accounting
+```
+
+If a filled disposal shows `I/E`, inspect Cexius-scoped inventory and transfer-in basis before treating it as a calculation defect. `I/E` means insufficient inventory; UTT does not borrow lots from another venue or invent basis.
+
 ### OKX Order Ticket, live submit, or cancel does not work
 
 Check:
@@ -2352,6 +2621,19 @@ venue_filter_keys includes okx
 
 The Market Cap and Volume windows each maintain browser-side snapshots. If one window updates before the other, click Refresh in that window or clear only that window's browser cache key.
 
+### Arbitrage tool tab opens the wrong surface or refreshes twice
+
+Check:
+
+- the AppHeader tool tab opens the canonical `arb` WindowManager entry
+- only one managed Arbitrage window exists
+- no separate header popover appears
+- repeated tool-tab clicks focus the existing window
+- the embedded window receives the current symbol, venue list, snapshot callback, and privacy props
+- browser local state is not retaining an obsolete generic Arbitrage tool window
+
+With DevTools Network filtered to the Arbitrage snapshot request, one manual Refresh should issue one read-only request. Auto-refresh should not produce a duplicate burst from both the header and managed window. Close and reopen the window or clear only obsolete Arbitrage UI state when an older layout remains cached.
+
 ### UI layout looks wrong
 
 The terminal UI uses pane and window logic with multiple specialized widgets. Layout issues are usually related to dependencies, recent layout changes, or stale frontend state after major UI updates.
@@ -2371,7 +2653,10 @@ The repository includes many execution and accounting surfaces, but several boun
 - UTT does not treat operator-declared credential scopes as venue-verified permissions.
 - UTT does not reactivate disabled credential history when a newer credential is disabled.
 - UTT does not treat local panic disable as venue-side credential revocation.
-- UTT does not require withdrawal permission for OKX order testing.
+- UTT does not require withdrawal permission for OKX or Cexius order testing.
+- UTT does not enable Cexius market orders, Cancel All, withdrawals, deposit-address generation, or automatic order retry.
+- UTT does not treat a Cexius zero-fill resting order as an executed ledger event.
+- UTT does not execute arbitrage from the managed Arbitrage snapshot window.
 - UTT does not auto-apply FIFO merely because a venue fill exists.
 - UTT does not invent missing USD basis for transferred-in assets.
 - UTTT bridge execution is not enabled by the planning dashboard.
@@ -2443,31 +2728,26 @@ See the top-level [LICENSE](LICENSE) file for the full license text.
 
 ## Status
 
-UTT is an actively evolving trading terminal codebase with ongoing work across:
+UTT is an actively evolving trading terminal codebase with current accepted work across:
 
-- UI and layout refinement, compact AppHeader tooling, and consistent safety-state presentation
+- SEC-VAULT.1 owner-scoped encrypted credential storage, explicit vault ownership, active/disabled lifecycle metadata, metadata-only inventory, scope declarations, and panic-disable containment
 - Counterparty / UniSat mainnet integration, balances, collectibles, market context, dispenser / order modes, unsigned compose review, explicit PSBT signing, separately gated broadcast, All Orders reflection, and BTC accounting previews
-- Robinhood Chain chain-ID-4663 integration, MetaMask linkage, Token Registry identity, balances, history, 0x quote discovery, synthetic books, bounded WETH-USDG BUY / SELL execution, non-archive RPC reconciliation, and direction-correct All Orders economics
+- Robinhood Chain chain-ID-4663 integration, MetaMask linkage, Token Registry identity, balances, history, 0x execution quoting, provider-scoped read-only Uniswap indicative quotes, review-only selected-pair registration, bounded WETH-USDG BUY / SELL execution, non-archive RPC reconciliation, and direction-correct All Orders economics
+- Cexius public/authenticated REST integration, normalized balances and rules, complete order histories, fast orderbooks, selected cancellation, limit BUY / SELL submission, truthful dry-run simulation, and insufficient-inventory presentation
+- generic read-only Order Details windows with transaction metadata, draggable/resizable top-layer presentation, persistent geometry, and Reset controls
+- managed Arbitrage snapshot window with canonical WindowManager routing, no duplicate popover, best bid/ask and spread display, manual/auto refresh, request coalescing, and privacy handoff
 - OKX balances, orderbooks, rules, fills diagnostics, fill basis preview, live-gated submit, live-gated cancel, and Market Cap / Volume source filtering
 - CEX order-economics normalization, fee/net display, and All Orders cancelability
 - balance cost basis, average cost, basis badges, lot drilldowns, 1D gain, and total gain display
 - Market Cap / Volume owned/unowned and venue/source filters backed by cached market-metrics context
 - Solana wallet and router integration
-- Polkadot / Hydration UTTT-HDX routing
-- Hydration price-cache status, external USD pricing, and UTTT/USD derivation
-- Hydration sidecar quote-cache / singleflight / backoff safety
-- manual UTTT-HDX orderbook and buy/sell transaction preparation
-- confirmed DOT-HDX and HDX-DOT manual Router buy/sell transaction preparation through route-registry rows
-- compact Hydration UI status indicators for Order Book and Order Ticket
-- Hydration wallet-history ingestion and ledger materialization
+- Polkadot / Hydration UTTT-HDX routing, manual Router paths, price-cache status, external USD pricing, sidecar protection, wallet-history ingestion, and ledger materialization
 - Spread / Bridge transfer-record planning, canonical supply context, and read-only basis/apply previews
-- missing-basis lots, transfer-link previews, and explicit-only FIFO lot impact
-- LP / Omnipool special handling for pool-token activity
-- registry, scanner, Market Cap, and Volume tool windows
-- auth, profile, and API-key handling
-- venue adapter coverage
+- missing-basis lots, transfer-link previews, explicit-only FIFO lot impact, and LP / Omnipool special handling
+- registry, scanner, Market Cap, Volume, Arbitrage, and Spread / Bridge tool windows
 - wallet-address and self-custody portfolio visibility
 - unified order and ledger workflows
-- upcoming Robinhood Chain custom-pair registry discovery, synthetic Order Book generalization, and bounded custom-token execution work
+
+Current deliberate boundaries remain: Cexius market orders, Cancel All, withdrawals, deposit-address generation, and automatic retry are disabled; the Arbitrage window is monitoring-only; generic Robinhood Chain custom-pair live execution remains later work; and organic Cexius fill-accounting revalidation remains an operational follow-up rather than a publication blocker.
 
 Expect active iteration rather than a frozen, final product. Current live-validated Robinhood Chain execution should be read as the accepted WETH-USDG bounded workflow, not as universal support for every registry pair.

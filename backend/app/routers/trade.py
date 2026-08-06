@@ -19,6 +19,7 @@ from ..schemas import OrderCreate, OrderOut
 from ..services.orders import create_order, cancel_by_ref
 from ..routers.auth import require_auth
 from ..models import RuntimeSetting
+from ..utils import new_client_order_id, now_utc
 
 
 router = APIRouter(prefix="/api/trade", tags=["trade"])
@@ -94,6 +95,50 @@ def _enabled_live_venues() -> set[str]:
     return {p.strip().lower() for p in s.split(",") if p.strip()}
 
 
+def _validate_cexius_order_contract(req: OrderCreate) -> None:
+    if (req.venue or "").strip().lower() != "cexius":
+        return
+    if str(req.type or "").strip().lower() != "limit":
+        raise HTTPException(status_code=400, detail="CEXIUS.2B permits limit orders only.")
+    if req.limit_price is None or float(req.limit_price) <= 0:
+        raise HTTPException(status_code=400, detail="Cexius limit_price is required.")
+    if str(getattr(req, "tif", None) or "").strip():
+        raise HTTPException(status_code=400, detail="Cexius time-in-force is unsupported and must be omitted.")
+    if bool(getattr(req, "post_only", False)):
+        raise HTTPException(status_code=400, detail="Cexius post-only is unsupported.")
+    if str(getattr(req, "client_order_id", None) or "").strip():
+        raise HTTPException(status_code=400, detail="Cexius client order ID is unsupported and must be omitted.")
+
+
+def _cexius_simulated_order(req: OrderCreate) -> dict:
+    now = now_utc()
+    client_order_id = new_client_order_id()
+    symbol = str(req.symbol or "").strip().upper().replace("/", "-").replace("_", "-")
+    while "--" in symbol:
+        symbol = symbol.replace("--", "-")
+    return {
+        "id": f"SIMULATED:{client_order_id}",
+        "client_order_id": client_order_id,
+        "venue": "cexius",
+        "symbol_canon": symbol,
+        "symbol_venue": symbol,
+        "side": req.side,
+        "type": "limit",
+        "qty": float(req.qty),
+        "limit_price": float(req.limit_price) if req.limit_price is not None else None,
+        "status": "simulated",
+        "filled_qty": 0.0,
+        "avg_fill_price": None,
+        "venue_order_id": None,
+        "reject_reason": "simulation only: no Cexius venue order request was sent",
+        "created_at": now,
+        "submitted_at": now,
+        "updated_at": now,
+        "simulated": True,
+        "venue_request_sent": False,
+    }
+
+
 @router.post("/order", response_model=OrderOut)
 def post_trade_order(req: OrderCreate, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     """
@@ -104,6 +149,12 @@ def post_trade_order(req: OrderCreate, db: Session = Depends(get_db), _auth: dic
       - LIVE routing (DRY_RUN=false AND ARMED=true) is additionally gated by LIVE_VENUES.
     """
     venue = (req.venue or "").strip().lower()
+    _validate_cexius_order_contract(req)
+
+    # CEXIUS.2B simulation is intentionally non-persistent: no adapter call,
+    # no local Order row, no fabricated open order, and no implied balance hold.
+    if venue == "cexius" and _effective_dry_run():
+        return _cexius_simulated_order(req)
 
     # Enforce "one exchange at a time" only for LIVE mode
     if not _effective_dry_run():
@@ -120,6 +171,13 @@ def post_trade_order(req: OrderCreate, db: Session = Depends(get_db), _auth: dic
             )
 
     o = create_order(db, req)
+
+    status = str(o.status or "").strip().lower()
+    if venue == "cexius" and status in {"rejected", "failed", "error"}:
+        raise HTTPException(
+            status_code=400,
+            detail=str(o.reject_reason or "Cexius order submission was rejected."),
+        )
 
     return {
         "id": o.id,
@@ -139,6 +197,8 @@ def post_trade_order(req: OrderCreate, db: Session = Depends(get_db), _auth: dic
         "created_at": o.created_at,
         "submitted_at": o.submitted_at,
         "updated_at": o.updated_at,
+        "simulated": False,
+        "venue_request_sent": True,
     }
 
 

@@ -56,6 +56,10 @@ export default function ArbChip({
 
   chipVariant = "pill",
   chipTitle = "Arb",
+
+  // Optional WindowManager integration for tooltab usage.
+  managedWindowOpen = false,
+  onOpenManagedWindow,
 }) {
   const [open, setOpen] = useState(false);
   const [snap, setSnap] = useState(null);
@@ -287,6 +291,12 @@ export default function ArbChip({
     }
   };
 
+  const chipVariantKey = String(chipVariant || "pill").toLowerCase();
+  const chipAsToolTab = chipVariantKey === "tooltab";
+  const chipAsWindow = chipVariantKey === "window";
+  const usesManagedToolWindow = chipAsToolTab && typeof onOpenManagedWindow === "function";
+  const expanded = chipAsWindow || (usesManagedToolWindow ? !!managedWindowOpen : open);
+
   const effectiveIntervalMs = useMemo(() => {
     const fg = Math.max(1500, Number(uiRefreshMs) || 8000);
     const bg = Math.max(1500, Number(bgSlowMs) || 30000);
@@ -294,13 +304,13 @@ export default function ArbChip({
     if (!autoRefresh) return null;
 
     if (bgMode === "open_only") {
-      return open ? fg : null;
+      return expanded ? fg : null;
     }
     if (bgMode === "slow") {
-      return open ? fg : bg;
+      return expanded ? fg : bg;
     }
     return fg;
-  }, [autoRefresh, uiRefreshMs, bgSlowMs, bgMode, open]);
+  }, [autoRefresh, uiRefreshMs, bgSlowMs, bgMode, expanded]);
 
   const leaseTtlMs = useMemo(() => {
     const base = Math.max(15000, Number(effectiveIntervalMs || 0) * 3 || 15000);
@@ -554,8 +564,6 @@ export default function ArbChip({
     return a === "left" ? { left: 0 } : { right: 0 };
   }, [popoverAlign]);
 
-  const chipAsToolTab = String(chipVariant || "pill").toLowerCase() === "tooltab";
-
   const toolTabBaseStyle = useMemo(
     () => ({
       display: "inline-flex",
@@ -600,17 +608,26 @@ export default function ArbChip({
   }, [hideTableData, toolTabSymLabel, loading, err, snap, pctLabel]);
 
   return (
-    <div style={{ position: "relative", display: "inline-block" }}>
-      {chipAsToolTab ? (
+    <div
+      style={
+        chipAsWindow
+          ? { position: "relative", display: "block", width: "100%", height: "100%", minHeight: 0 }
+          : { position: "relative", display: "inline-block" }
+      }
+    >
+      {!chipAsWindow && (chipAsToolTab ? (
         <button
           type="button"
-          onClick={() => setOpen((p) => !p)}
-          style={open ? toolTabOpenStyle : toolTabBaseStyle}
+          onClick={() => {
+            if (usesManagedToolWindow) onOpenManagedWindow();
+            else setOpen((p) => !p);
+          }}
+          style={expanded ? toolTabOpenStyle : toolTabBaseStyle}
           title={err ? `Arb error: ${err}` : `Best bid/ask across venues for ${sym} (auto: ${intervalLabel})`}
         >
           <div style={{ display: "flex", alignItems: "baseline", gap: 8, lineHeight: 1.1 }}>
             <span style={{ fontWeight: 800, fontSize: 13 }}>{chipTitle}</span>
-            <span style={{ fontSize: 11, opacity: 0.75 }}>{open ? "Open" : "Closed"}</span>
+            <span style={{ fontSize: 11, opacity: 0.75 }}>{expanded ? "Open" : "Closed"}</span>
           </div>
           <div style={{ fontSize: 11, opacity: 0.75, fontVariantNumeric: "tabular-nums" }}>{toolTabSubLabel}</div>
         </button>
@@ -623,21 +640,25 @@ export default function ArbChip({
           <b style={{ letterSpacing: 0.2 }}>{chipTitle}</b>
           <span style={{ fontVariantNumeric: "tabular-nums" }}>{loading ? "…" : pctLabel}</span>
         </div>
-      )}
+      ))}
 
-      {open && (
+      {(chipAsWindow || (!usesManagedToolWindow && open)) && (
         <div
           style={{
-            position: "absolute",
-            marginTop: 8,
-            width: "min(560px, 92vw)",
-            borderRadius: 14,
-            border: "1px solid #2a2a2a",
+            position: chipAsWindow ? "relative" : "absolute",
+            marginTop: chipAsWindow ? 0 : 8,
+            width: chipAsWindow ? "100%" : "min(560px, 92vw)",
+            height: chipAsWindow ? "100%" : undefined,
+            minHeight: 0,
+            overflow: chipAsWindow ? "auto" : undefined,
+            boxSizing: "border-box",
+            borderRadius: chipAsWindow ? 0 : 14,
+            border: chipAsWindow ? "none" : "1px solid #2a2a2a",
             background: "#0f0f0f",
-            boxShadow: "0 12px 40px rgba(0,0,0,0.55)",
+            boxShadow: chipAsWindow ? "none" : "0 12px 40px rgba(0,0,0,0.55)",
             padding: 12,
-            zIndex: 9999,
-            ...popoverPos,
+            zIndex: chipAsWindow ? "auto" : 9999,
+            ...(chipAsWindow ? {} : popoverPos),
           }}
         >
           <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
@@ -648,9 +669,11 @@ export default function ArbChip({
               <button style={{ ...button, padding: "6px 10px" }} onClick={() => loadOnce({ reason: "manual" })} type="button">
                 Refresh
               </button>
-              <button style={{ ...button, padding: "6px 10px", opacity: 0.9 }} onClick={() => setOpen(false)} type="button">
-                Close
-              </button>
+              {!chipAsWindow && (
+                <button style={{ ...button, padding: "6px 10px", opacity: 0.9 }} onClick={() => setOpen(false)} type="button">
+                  Close
+                </button>
+              )}
             </div>
           </div>
 

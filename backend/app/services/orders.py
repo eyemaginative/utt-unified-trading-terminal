@@ -598,7 +598,7 @@ def cancel_order(db: Session, order_id: str) -> Order:
     Cancel a LOCAL Order row and (when possible) cancel at the venue.
 
     Correctness rules:
-      - If dry-run (or not armed): do not call venue; mark local row canceled (simulated).
+      - If dry-run (or not armed): do not call venue and do not mutate local lifecycle state.
       - In LIVE mode: do NOT mark local row canceled unless the venue confirms.
       - If venue_order_id missing in LIVE mode: keep status as-is, record reject_reason.
       - If cancel succeeds: also mark *all* matching rows for (venue, venue_order_id) as canceled,
@@ -616,16 +616,9 @@ def cancel_order(db: Session, order_id: str) -> Order:
     is_dry = _effective_dry_run()
     now = now_utc()
 
-    # In dry-run, simulate cancel deterministically.
+    # Dry-run/disarmed cancellation is a no-op against both the venue and local lifecycle.
+    # The caller may report simulation metadata, but the authoritative order state stays intact.
     if is_dry:
-        order.status = "canceled"
-        order.reject_reason = None
-        order.updated_at = now
-        if getattr(order, "closed_at", None) is None:
-            order.closed_at = now
-        db.add(order)
-        db.commit()
-        db.refresh(order)
         return order
 
     # LIVE mode: if we cannot identify the venue order id, we must not claim canceled.
@@ -737,7 +730,7 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
     Correctness rules:
       - In LIVE mode, do NOT mark the snapshot row canceled unless the adapter cancel returns ok=True.
       - Never allow adapter exceptions to bubble to the router; return ok=False + error text instead.
-      - In DRY mode, simulate cancel by updating snapshot status only (best-effort).
+      - In DRY/disarmed mode, report simulation without calling an adapter or mutating local lifecycle state.
     """
     kind, venue, key = _parse_cancel_ref(cancel_ref)
     is_dry = _effective_dry_run()
@@ -746,7 +739,12 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
         o = cancel_order(db, key)
         return {
             "kind": "LOCAL",
-            "ok": (str(o.status or "").lower() == "canceled"),
+            "ok": True if is_dry else (str(o.status or "").lower() == "canceled"),
+            "simulated": bool(is_dry),
+            "venue_request_sent": False if is_dry else True,
+            "snapshot_updated": False if is_dry else (str(o.status or "").lower() == "canceled"),
+            "snapshot_rows_updated": 0,
+            "orders_rows_updated": 0 if is_dry else (1 if str(o.status or "").lower() == "canceled" else 0),
             "id": o.id,
             "status": o.status,
             "venue": o.venue,
@@ -795,7 +793,7 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
     snapshot_rows_updated = 0
     orders_rows_updated = 0
     post_refresh = None
-    if simulated or ok:
+    if ok and not simulated:
         now = now_utc()
 
         # IMPORTANT: venue_orders is a *snapshot* table (multiple rows per venue_order_id).
@@ -855,6 +853,7 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
             "kind": "VENUE",
             "ok": bool(ok),
             "simulated": bool(simulated),
+            "venue_request_sent": bool(not simulated),
             "venue": row.venue,
             "venue_order_id": row.venue_order_id,
             "status": row.status,
@@ -871,10 +870,13 @@ def cancel_by_ref(db: Session, cancel_ref: str) -> dict:
         "kind": "VENUE",
         "ok": bool(ok),
         "simulated": bool(simulated),
+        "venue_request_sent": bool(not simulated),
         "venue": venue,
         "venue_order_id": venue_order_id,
-        "status": ("canceled" if (simulated or ok) else "unknown"),
+        "status": ("canceled" if (ok and not simulated) else "unknown"),
         "snapshot_updated": False,
+        "snapshot_rows_updated": 0,
+        "orders_rows_updated": 0,
         "post_cancel_refresh": post_refresh,
         "note": "no VenueOrderRow found to update",
         "error": error,

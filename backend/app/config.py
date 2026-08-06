@@ -148,6 +148,15 @@ class Settings(BaseSettings):
     cryptocom_enabled: bool = Field(default=False, alias="CRYPTOCOM_ENABLED")
 
     # ─────────────────────────────────────────────────────────────
+    # Cexius integration — vault-backed Bearer token, read-only foundation
+    #
+    # The private token is intentionally not mirrored into a Settings field and
+    # has no environment fallback. It is resolved only from the encrypted UTT
+    # credential vault under venue='cexius'.
+    # ─────────────────────────────────────────────────────────────
+    cexius_base_url: str = Field(default="https://cexius.com/api/v2", alias="CEXIUS_BASE_URL")
+
+    # ─────────────────────────────────────────────────────────────
     # OKX integration — optional & guarded
     #
     # Credentials can come from env vars or Profile → API Keys with venue='okx'.
@@ -670,6 +679,39 @@ class Settings(BaseSettings):
         if has_env:
             return True
         return False
+
+
+    def cexius_private_token(self) -> Optional[str]:
+        """Return the read-scoped Cexius Bearer token from the encrypted vault.
+
+        Cexius API Keys exposes an API ID/key plus an API secret. Private REST
+        requests use the API secret as the Bearer token. The api_key fallback is
+        retained for older single-token vault records. No environment fallback
+        is accepted, and scope_read remains mandatory for read-only operations.
+        """
+        record = self._vault_latest_credential_record("cexius")
+        if not isinstance(record, dict) or not bool(record.get("scope_read")):
+            return None
+        bundle = record.get("bundle")
+        if not isinstance(bundle, dict):
+            return None
+        api_secret = str(bundle.get("api_secret") or "").strip()
+        api_key = str(bundle.get("api_key") or "").strip()
+        return api_secret or api_key or None
+
+    def cexius_effective_base_url(self) -> str:
+        base = str(getattr(self, "cexius_base_url", "") or "https://cexius.com/api/v2").strip().rstrip("/")
+        return base or "https://cexius.com/api/v2"
+
+    def cexius_effective_enabled(self) -> bool:
+        """Enable Cexius when a read-scoped vault token and valid HTTPS base URL exist."""
+        token = None
+        try:
+            token = self.cexius_private_token()
+        except Exception:
+            token = None
+        base = self.cexius_effective_base_url()
+        return bool(token) and base.startswith("https://")
 
 
     def okx_private_creds(self):

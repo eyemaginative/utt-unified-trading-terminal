@@ -47,7 +47,7 @@ def post_refresh(
 
     if is_all:
         # Keep this list up to date as you add venues.
-        venues = ["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx", "counterparty"]
+        venues = ["gemini", "kraken", "coinbase", "robinhood", "dex_trade", "cryptocom", "okx", "cexius", "counterparty"]
 
         results_list: List[Dict[str, Any]] = []
         results_by_venue: Dict[str, Dict[str, Any]] = {}
@@ -150,7 +150,9 @@ def get_latest(
 
     out = []
     for v in items:
-        cancel_ref = f"{(v.venue or '').strip().lower()}:{(v.venue_order_id or '').strip()}"
+        venue_norm = (v.venue or "").strip().lower()
+        venue_order_id = (v.venue_order_id or "").strip()
+        cancel_ref = f"{venue_norm}:{venue_order_id}" if venue_norm and venue_order_id else None
 
         out.append(
             {

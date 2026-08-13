@@ -20,6 +20,9 @@ from app.services.robinhood_chain_transaction_planning import (  # noqa: E402
     ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST,
     RobinhoodChainTransactionPlanningService,
 )
+from app.services.robinhood_chain_uniswap_quote import (  # noqa: E402
+    RobinhoodChainUniswapQuoteService,
+)
 
 
 
@@ -290,7 +293,7 @@ async def _plan_request(
 
 
 class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
-    def test_router_firm_plan_keywords_match_service_signature(self) -> None:
+    def test_router_firm_plan_keywords_match_provider_service_signatures(self) -> None:
         router_path = BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py"
         tree = ast.parse(router_path.read_text(encoding="utf-8"), filename=str(router_path))
         endpoint = next(
@@ -299,27 +302,78 @@ class RobinhoodChainTransactionPlanningTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(node, ast.AsyncFunctionDef)
             and node.name == "robinhood_chain_firm_quote_plan"
         )
-        call = next(
+
+        calls = [
             node
             for node in ast.walk(endpoint)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "firm_quote_plan"
+        ]
+        self.assertEqual(len(calls), 2)
+
+        def receiver_getter_name(call: ast.Call) -> str:
+            receiver = call.func.value
+            self.assertIsInstance(receiver, ast.Call)
+            self.assertIsInstance(receiver.func, ast.Name)
+            return receiver.func.id
+
+        by_receiver = {receiver_getter_name(call): call for call in calls}
+        self.assertEqual(
+            set(by_receiver),
+            {
+                "get_robinhood_chain_transaction_planning_service",
+                "get_robinhood_chain_uniswap_quote_service",
+            },
         )
-        endpoint_keywords = {keyword.arg for keyword in call.keywords if keyword.arg}
-        service_keywords = set(
+
+        zerox_keywords = {
+            keyword.arg
+            for keyword in by_receiver[
+                "get_robinhood_chain_transaction_planning_service"
+            ].keywords
+            if keyword.arg
+        }
+        zerox_service_keywords = set(
             inspect.signature(RobinhoodChainTransactionPlanningService.firm_quote_plan).parameters
         ) - {"self"}
+        self.assertTrue(zerox_keywords <= zerox_service_keywords)
+        self.assertNotIn("exact_output_quantity", zerox_keywords)
+        self.assertNotIn("maximum_total_quote", zerox_keywords)
+        for required in {
+            "amount_mode",
+            "requested_amount",
+            "maximum_input_amount",
+            "base_token",
+            "quote_token",
+            "route_capability",
+        }:
+            self.assertIn(required, zerox_keywords)
 
-        self.assertTrue(endpoint_keywords <= service_keywords)
-        self.assertNotIn("exact_output_quantity", endpoint_keywords)
-        self.assertNotIn("maximum_total_quote", endpoint_keywords)
-        self.assertIn("amount_mode", endpoint_keywords)
-        self.assertIn("requested_amount", endpoint_keywords)
-        self.assertIn("maximum_input_amount", endpoint_keywords)
-        self.assertIn("base_token", endpoint_keywords)
-        self.assertIn("quote_token", endpoint_keywords)
-        self.assertIn("route_capability", endpoint_keywords)
+        uniswap_keywords = {
+            keyword.arg
+            for keyword in by_receiver[
+                "get_robinhood_chain_uniswap_quote_service"
+            ].keywords
+            if keyword.arg
+        }
+        uniswap_service_keywords = set(
+            inspect.signature(RobinhoodChainUniswapQuoteService.firm_quote_plan).parameters
+        ) - {"self"}
+        self.assertTrue(uniswap_keywords <= uniswap_service_keywords)
+        for required in {
+            "symbol",
+            "side",
+            "amount_mode",
+            "requested_amount",
+            "slippage_bps",
+            "swapper_address",
+            "input_token",
+            "output_token",
+        }:
+            self.assertIn(required, uniswap_keywords)
+        self.assertNotIn("maximum_input_amount", uniswap_keywords)
+        self.assertNotIn("route_capability", uniswap_keywords)
 
     def make_service(self, *, allowance_atomic: int = 0, body_mutator=None):
         rpc = FakeRpcClient(allowance_atomic=allowance_atomic)

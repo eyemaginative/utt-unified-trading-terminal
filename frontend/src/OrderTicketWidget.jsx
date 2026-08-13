@@ -32,6 +32,9 @@ import {
   prepareRobinhoodChainSwapFreshPlan,
   prepareRobinhoodChainBuySwap,
   prepareRobinhoodChainExecution,
+  prepareRobinhoodChainWalletRejection,
+  prepareRobinhoodChainWalletApproval,
+  prepareRobinhoodChainWalletSwap,
   recordRobinhoodChainBuyApprovalSubmission,
   recordRobinhoodChainBuyApprovalSubmissionFailure,
   recordRobinhoodChainBuySwapSubmission,
@@ -47,6 +50,8 @@ import {
   refreshRobinhoodChainSwapApproval,
   refreshRobinhoodChainSwap,
   refreshRobinhoodChainExecution,
+  refreshRobinhoodChainWalletApprovalReceipt,
+  refreshRobinhoodChainWalletSwapReceipt,
   runCrossTabHeavyTask,
 } from "./lib/api";
 import { expandExponential } from "./lib/format";
@@ -426,6 +431,15 @@ function robinhoodChainWalletErrorMessage(error, fallback) {
   return String(error?.message || error || fallback || "MetaMask request failed.");
 }
 
+function robinhoodChainRegistryIdentityVerified(identity) {
+  return Boolean(
+    identity &&
+    !identity?.identity_error &&
+    String(identity?.verification?.canonical_status || "").trim().toLowerCase() === "verified" &&
+    identity?.verification?.registry_match === true
+  );
+}
+
 function robinhoodChainQuoteRules(symbol, market = null, registryPairReady = false) {
   const normalized = normalizeRobinhoodChainQuoteSymbol(symbol);
   const databaseRegistered = Boolean(market && normalizeRobinhoodChainQuoteSymbol(market?.symbol) === normalized);
@@ -486,12 +500,24 @@ function robinhoodChainCapabilityFor(status, fromAsset, toAsset, displayMode) {
   const from = String(fromAsset || "").trim().toUpperCase();
   const to = String(toAsset || "").trim().toUpperCase();
   const mode = String(displayMode || "").trim().toLowerCase();
-  const rows = Array.isArray(status?.route_capabilities) ? status.route_capabilities : [];
-  return rows.find((row) => (
+  const rows = (Array.isArray(status?.route_capabilities) ? status.route_capabilities : []).filter((row) => (
     String(row?.from_asset || "").trim().toUpperCase() === from &&
     String(row?.to_asset || "").trim().toUpperCase() === to &&
     String(row?.display_mode || "").trim().toLowerCase() === mode
-  )) || null;
+  ));
+  const available = (row) => ["available", "live_verified"].includes(
+    String(row?.indicative_status || "").trim().toLowerCase()
+  );
+  const liveExecution = (row) => (
+    row?.enabled === true &&
+    String(row?.execution_status || "").trim().toLowerCase() === "live_verified"
+  );
+  return rows.find(liveExecution)
+    || rows.find((row) => String(row?.provider || "").trim().toLowerCase() === "uniswap_api" && available(row))
+    || rows.find((row) => String(row?.provider || "").trim().toLowerCase() === "0x" && available(row))
+    || rows.find(available)
+    || rows[0]
+    || null;
 }
 
 function robinhoodChainCapabilityAmount(capability, keys = []) {
@@ -3642,6 +3668,25 @@ export default function OrderTicketWidget({
   const [robinhoodChainSlippageBps, setRobinhoodChainSlippageBps] = useState(100);
   const [robinhoodChainFirmPlanClock, setRobinhoodChainFirmPlanClock] = useState(0);
   const robinhoodChainFirmPlanReqRef = useRef(0);
+  const [robinhoodChainWalletRejectionPrepared, setRobinhoodChainWalletRejectionPrepared] = useState(null);
+  const [robinhoodChainWalletRejectionBusy, setRobinhoodChainWalletRejectionBusy] = useState(false);
+  const [robinhoodChainWalletRejectionError, setRobinhoodChainWalletRejectionError] = useState("");
+  const [robinhoodChainWalletRejectionReviewed, setRobinhoodChainWalletRejectionReviewed] = useState(false);
+  const [robinhoodChainWalletRejectionAttempted, setRobinhoodChainWalletRejectionAttempted] = useState(false);
+  const [robinhoodChainWalletRejectionResult, setRobinhoodChainWalletRejectionResult] = useState(null);
+  const robinhoodChainWalletRejectionSendRef = useRef(false);
+  const [robinhoodChainWalletApprovalPrepared, setRobinhoodChainWalletApprovalPrepared] = useState(null);
+  const [robinhoodChainWalletApprovalBusy, setRobinhoodChainWalletApprovalBusy] = useState(false);
+  const [robinhoodChainWalletApprovalError, setRobinhoodChainWalletApprovalError] = useState("");
+  const [robinhoodChainWalletApprovalAttempted, setRobinhoodChainWalletApprovalAttempted] = useState(false);
+  const [robinhoodChainWalletApprovalResult, setRobinhoodChainWalletApprovalResult] = useState(null);
+  const robinhoodChainWalletApprovalSendRef = useRef(false);
+  const [robinhoodChainWalletSwapPrepared, setRobinhoodChainWalletSwapPrepared] = useState(null);
+  const [robinhoodChainWalletSwapBusy, setRobinhoodChainWalletSwapBusy] = useState(false);
+  const [robinhoodChainWalletSwapError, setRobinhoodChainWalletSwapError] = useState("");
+  const [robinhoodChainWalletSwapAttempted, setRobinhoodChainWalletSwapAttempted] = useState(false);
+  const [robinhoodChainWalletSwapResult, setRobinhoodChainWalletSwapResult] = useState(null);
+  const robinhoodChainWalletSwapSendRef = useRef(false);
   const [robinhoodChainAutoPreparationPhase, setRobinhoodChainAutoPreparationPhase] = useState("idle");
   const [robinhoodChainAutoPreparationDetail, setRobinhoodChainAutoPreparationDetail] = useState("");
   const robinhoodChainAutoQuoteTimerRef = useRef(null);
@@ -3731,6 +3776,19 @@ export default function OrderTicketWidget({
     setRobinhoodChainFirmPlan(null);
     setRobinhoodChainFirmPlanErrorText("");
     setRobinhoodChainFirmPlanLoading(false);
+    setRobinhoodChainWalletRejectionPrepared(null);
+    setRobinhoodChainWalletRejectionError("");
+    setRobinhoodChainWalletRejectionReviewed(false);
+    setRobinhoodChainWalletRejectionAttempted(false);
+    setRobinhoodChainWalletRejectionResult(null);
+    setRobinhoodChainWalletApprovalPrepared(null);
+    setRobinhoodChainWalletApprovalError("");
+    setRobinhoodChainWalletApprovalAttempted(false);
+    setRobinhoodChainWalletApprovalResult(null);
+    setRobinhoodChainWalletSwapPrepared(null);
+    setRobinhoodChainWalletSwapError("");
+    setRobinhoodChainWalletSwapAttempted(false);
+    setRobinhoodChainWalletSwapResult(null);
 
     setRobinhoodChainPreparedExecution(null);
     setRobinhoodChainExecutionConfirmed(false);
@@ -3882,12 +3940,24 @@ export default function OrderTicketWidget({
   }, [robinhoodChainRegistryAssets]);
   const robinhoodChainRegistryBaseIdentity = robinhoodChainRegistryAssetBySymbol[robinhoodChainPair.base] || null;
   const robinhoodChainRegistryQuoteIdentity = robinhoodChainRegistryAssetBySymbol[robinhoodChainPair.quote] || null;
-  const robinhoodChainRegistryPairReady = Boolean(
+  const robinhoodChainRegistryPairResolved = Boolean(
     robinhoodChainPair.base &&
     robinhoodChainPair.quote &&
     robinhoodChainRegistryBaseIdentity?.registry_id &&
     robinhoodChainRegistryQuoteIdentity?.registry_id &&
     Number(robinhoodChainRegistryBaseIdentity.registry_id) !== Number(robinhoodChainRegistryQuoteIdentity.registry_id)
+  );
+  const robinhoodChainRegistryBaseVerified = robinhoodChainRegistryIdentityVerified(robinhoodChainRegistryBaseIdentity);
+  const robinhoodChainRegistryQuoteVerified = robinhoodChainRegistryIdentityVerified(robinhoodChainRegistryQuoteIdentity);
+  const robinhoodChainRegistryPairReady = Boolean(
+    robinhoodChainRegistryPairResolved &&
+    robinhoodChainRegistryBaseVerified &&
+    robinhoodChainRegistryQuoteVerified
+  );
+  const robinhoodChainPairVerificationBlocked = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainRegistryPairResolved &&
+    !robinhoodChainRegistryPairReady
   );
   const robinhoodChainPairNotConfigured = Boolean(
     isRobinhoodChainVenue &&
@@ -3983,6 +4053,9 @@ export default function OrderTicketWidget({
     ),
     [robinhoodChainCapabilityStatus, robinhoodChainFromAsset, robinhoodChainToAsset, robinhoodChainEffectiveAmountMode]
   );
+  const robinhoodChainSelectedProvider = String(
+    robinhoodChainSelectedCapability?.provider || "0x"
+  ).trim().toLowerCase();
   const robinhoodChainCapabilityEnabled = robinhoodChainSelectedCapability?.enabled === true;
   const robinhoodChainIndicativeAvailable = ["available", "live_verified"].includes(
     String(robinhoodChainSelectedCapability?.indicative_status || "").trim().toLowerCase()
@@ -3998,6 +4071,10 @@ export default function OrderTicketWidget({
   const robinhoodChainFirmPlanStatusLabel = robinhoodChainFirmPlanStatus.replaceAll("_", " ").toUpperCase();
   const robinhoodChainFirmPlanAvailable = ["available", "live_verified"].includes(
     robinhoodChainFirmPlanStatus
+  ) || (
+    robinhoodChainSelectedProvider === "uniswap_api" &&
+    robinhoodChainIndicativeAvailable &&
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND
   );
   const robinhoodChainFirmPlanReviewEnabled = Boolean(
     robinhoodChainQuoteReviewEnabled && robinhoodChainFirmPlanAvailable
@@ -4253,8 +4330,14 @@ export default function OrderTicketWidget({
         },
         { apiBase, timeout_ms: 30000 }
       );
-      if (result?.ok !== true || result?.objective?.review_only !== true || result?.execution_enabled === true) {
-        throw new Error(result?.error || "Selected-pair registration did not return the required review-only state.");
+      if (
+        result?.ok !== true ||
+        result?.objective?.review_only !== true ||
+        result?.execution_enabled === true ||
+        result?.registry_verification_required !== true ||
+        result?.registry_verified !== true
+      ) {
+        throw new Error(result?.error || "Selected-pair registration did not return the required verified, review-only state.");
       }
       if (
         result?.provider_contacted === true ||
@@ -8197,6 +8280,15 @@ export default function OrderTicketWidget({
     return true;
   }, [canSubmitBase, preTrade, liveTradeGateBlocked]);
 
+  // Robinhood Chain quote and unsigned-plan preparation are explicitly read-only.
+  // Keep them available while the separate live execution gate remains locked.
+  const canPrepareRobinhoodChainReview = useMemo(() => {
+    if (!isRobinhoodChainVenue) return false;
+    if (!canSubmitBase) return false;
+    if (preTrade?.block) return false;
+    return true;
+  }, [isRobinhoodChainVenue, canSubmitBase, preTrade]);
+
 
   const canCounterpartyComposePreview = useMemo(() => {
   if (!isCounterpartyVenue) return false;
@@ -8210,7 +8302,7 @@ export default function OrderTicketWidget({
   return qtyNum !== null && pxNum !== null;
   }, [isCounterpartyVenue, otSymbol, side, qtyNum, pxNum, counterpartyExecutionMode, counterpartyExpirationBlocks, counterpartyDispenserLot, counterpartyDispenserPriceWithinLimit]);
 
-  const primaryActionDisabled = submitting || postSubmitSyncing || robinhoodChainQuoteLoading || (isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
+  const primaryActionDisabled = submitting || postSubmitSyncing || robinhoodChainQuoteLoading || (isRobinhoodChainVenue ? !canPrepareRobinhoodChainReview : isCounterpartyVenue ? !canCounterpartyComposePreview : !canSubmit);
 
   const robinhoodChainQuoteStale = useMemo(() => {
     if (!isRobinhoodChainVenue || !robinhoodChainQuote?.ok) return false;
@@ -8236,6 +8328,30 @@ export default function OrderTicketWidget({
     const timer = window.setTimeout(() => setRobinhoodChainFirmPlanClock((value) => value + 1), delay);
     return () => window.clearTimeout(timer);
   }, [robinhoodChainFirmPlan?.plan_expires_at]);
+
+  useEffect(() => {
+    const expiresAt = Date.parse(String(robinhoodChainWalletRejectionPrepared?.expires_at || ""));
+    if (!Number.isFinite(expiresAt)) return undefined;
+    const delay = Math.max(0, expiresAt - Date.now()) + 25;
+    const timer = window.setTimeout(() => setRobinhoodChainFirmPlanClock((value) => value + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [robinhoodChainWalletRejectionPrepared?.expires_at]);
+
+  useEffect(() => {
+    const expiresAt = Date.parse(String(robinhoodChainWalletApprovalPrepared?.expires_at || ""));
+    if (!Number.isFinite(expiresAt)) return undefined;
+    const delay = Math.max(0, expiresAt - Date.now()) + 25;
+    const timer = window.setTimeout(() => setRobinhoodChainFirmPlanClock((value) => value + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [robinhoodChainWalletApprovalPrepared?.expires_at]);
+
+  useEffect(() => {
+    const expiresAt = Date.parse(String(robinhoodChainWalletSwapPrepared?.expires_at || ""));
+    if (!Number.isFinite(expiresAt)) return undefined;
+    const delay = Math.max(0, expiresAt - Date.now()) + 25;
+    const timer = window.setTimeout(() => setRobinhoodChainFirmPlanClock((value) => value + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [robinhoodChainWalletSwapPrepared?.expires_at]);
 
   const robinhoodChainFirmPlanStale = useMemo(() => {
     if (!isRobinhoodChainVenue || !robinhoodChainFirmPlan?.ok) return false;
@@ -8275,13 +8391,79 @@ export default function OrderTicketWidget({
 
   const canBuildRobinhoodChainFirmPlan = Boolean(
     isRobinhoodChainVenue &&
-    canSubmit &&
+    canPrepareRobinhoodChainReview &&
     robinhoodChainReviewWalletReady &&
     robinhoodChainQuote?.ok &&
     !robinhoodChainQuoteStale &&
     !robinhoodChainQuoteLoading &&
     !robinhoodChainFirmPlanLoading &&
     robinhoodChainFirmPlanReviewEnabled
+  );
+
+  const robinhoodChainWalletRejectionRequestedAmount = normalizeRobinhoodChainAmountText(
+    side === "buy" ? totalQuote : qty
+  );
+  const robinhoodChainWalletRejectionExpiresAt = Date.parse(
+    String(robinhoodChainWalletRejectionPrepared?.expires_at || "")
+  );
+  const robinhoodChainWalletRejectionExpired = Boolean(
+    Number.isFinite(robinhoodChainWalletRejectionExpiresAt) && Date.now() >= robinhoodChainWalletRejectionExpiresAt
+  );
+  const canPrepareRobinhoodChainWalletRejection = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
+    robinhoodChainReviewWalletReady &&
+    robinhoodChainFirmPlan?.ok &&
+    !robinhoodChainFirmPlanStale &&
+    String(robinhoodChainFirmPlan?.provider || "").trim().toLowerCase() === "uniswap_api" &&
+    robinhoodChainWalletRejectionRequestedAmount &&
+    !robinhoodChainWalletRejectionBusy
+  );
+  const robinhoodChainWalletApprovalExpiresAt = Date.parse(
+    String(robinhoodChainWalletApprovalPrepared?.expires_at || "")
+  );
+  const robinhoodChainWalletApprovalExpired = Boolean(
+    Number.isFinite(robinhoodChainWalletApprovalExpiresAt) && Date.now() >= robinhoodChainWalletApprovalExpiresAt
+  );
+  const canPrepareRobinhoodChainWalletApproval = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
+    robinhoodChainReviewWalletReady &&
+    robinhoodChainFirmPlan?.ok &&
+    !robinhoodChainFirmPlanStale &&
+    String(robinhoodChainFirmPlan?.provider || "").trim().toLowerCase() === "uniswap_api" &&
+    robinhoodChainFirmPlan?.approval_required === true &&
+    robinhoodChainFirmPlan?.allowance?.approval_exact === true &&
+    robinhoodChainFirmPlan?.allowance?.unlimited_approval === false &&
+    robinhoodChainWalletRejectionRequestedAmount &&
+    !robinhoodChainWalletApprovalBusy
+  );
+  const robinhoodChainWalletSwapExpiresAt = Date.parse(
+    String(robinhoodChainWalletSwapPrepared?.expires_at || "")
+  );
+  const robinhoodChainWalletSwapExpired = Boolean(
+    Number.isFinite(robinhoodChainWalletSwapExpiresAt) && Date.now() >= robinhoodChainWalletSwapExpiresAt
+  );
+  const robinhoodChainApprovalConfirmedForCurrentContext = Boolean(
+    robinhoodChainWalletApprovalResult?.status === "approval_confirmed" &&
+    robinhoodChainWalletApprovalResult?.confirmed === true &&
+    normalizeRobinhoodChainQuoteSymbol(robinhoodChainWalletApprovalResult?.symbol) === normalizeRobinhoodChainQuoteSymbol(otSymbol) &&
+    String(robinhoodChainWalletApprovalResult?.side || "").trim().toLowerCase() === String(side || "").trim().toLowerCase() &&
+    normalizeRobinhoodChainAmountText(robinhoodChainWalletApprovalResult?.requested_amount) === robinhoodChainWalletRejectionRequestedAmount
+  );
+  const canPrepareRobinhoodChainWalletSwap = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
+    robinhoodChainReviewWalletReady &&
+    robinhoodChainFirmPlan?.ok &&
+    !robinhoodChainFirmPlanStale &&
+    String(robinhoodChainFirmPlan?.provider || "").trim().toLowerCase() === "uniswap_api" &&
+    robinhoodChainWalletRejectionRequestedAmount &&
+    (
+      robinhoodChainFirmPlan?.approval_required === false ||
+      robinhoodChainApprovalConfirmedForCurrentContext
+    ) &&
+    !robinhoodChainWalletSwapBusy
   );
 
   const robinhoodChainAutoRequestedAmount = normalizeRobinhoodChainAmountText(
@@ -8311,7 +8493,7 @@ export default function OrderTicketWidget({
     robinhoodChainFirmPlanReviewEnabled &&
     robinhoodChainFirmPlanAmountWithinCeiling &&
     robinhoodChainAutoRequestedAmountValid &&
-    canSubmit &&
+    canPrepareRobinhoodChainReview &&
     !robinhoodChainExecutionAuthorityLoading
   );
   const robinhoodChainAutoQuoteKey = [
@@ -8450,7 +8632,7 @@ export default function OrderTicketWidget({
     if (!robinhoodChainAutoRequestedAmountValid) {
       return { label: "AUTO PREP WAITING", color: "#fde68a", detail: "Enter a valid exact-spend amount." };
     }
-    if (!canSubmit) {
+    if (!canPrepareRobinhoodChainReview) {
       return { label: "AUTO PREP HELD", color: "#fda4af", detail: "Current balance, market, or ticket validation blocks preparation." };
     }
     if (robinhoodChainQuoteLoading || robinhoodChainAutoPreparationPhase === "quoting") {
@@ -8487,7 +8669,7 @@ export default function OrderTicketWidget({
     robinhoodChainAutoRequestedAmountValid,
     robinhoodChainFirmPlanAmountWithinCeiling,
     robinhoodChainFirmPlanCeilingLabel,
-    canSubmit,
+    canPrepareRobinhoodChainReview,
     robinhoodChainQuoteLoading,
     robinhoodChainFirmPlanLoading,
     robinhoodChainAutoPreparationPhase,
@@ -8705,14 +8887,83 @@ export default function OrderTicketWidget({
     !robinhoodChainSwapBusy
   );
 
+  const robinhoodChainFirmPlanAllowance = robinhoodChainFirmPlan?.allowance && typeof robinhoodChainFirmPlan.allowance === "object"
+    ? robinhoodChainFirmPlan.allowance
+    : {};
+  const robinhoodChainFirmPlanApprovalPlan = robinhoodChainFirmPlanAllowance?.approval_transaction_plan && typeof robinhoodChainFirmPlanAllowance.approval_transaction_plan === "object"
+    ? robinhoodChainFirmPlanAllowance.approval_transaction_plan
+    : null;
+  const robinhoodChainFirmPlanRequiredApprovalAtomic = String(
+    robinhoodChainFirmPlanAllowance?.required_amount_atomic ??
+    robinhoodChainFirmPlanAllowance?.required_atomic ??
+    robinhoodChainFirmPlan?.input_amount_atomic ??
+    ""
+  ).trim();
+  const robinhoodChainFirmPlanApprovedAtomic = String(
+    robinhoodChainFirmPlanApprovalPlan?.approved_amount_atomic ??
+    (robinhoodChainFirmPlanAllowance?.approval_exact === true ? robinhoodChainFirmPlanRequiredApprovalAtomic : "")
+  ).trim();
+  const robinhoodChainFirmPlanProviderApprovedAtomic = String(
+    robinhoodChainFirmPlanApprovalPlan?.provider_approved_amount_atomic ?? ""
+  ).trim();
+  const robinhoodChainFirmPlanUnlimitedApproval = Boolean(
+    robinhoodChainFirmPlanAllowance?.unlimited_approval === true ||
+    robinhoodChainFirmPlanApprovalPlan?.unlimited_approval === true
+  );
+  const robinhoodChainFirmPlanExactApprovalVerified = Boolean(
+    robinhoodChainFirmPlan?.approval_required === true &&
+    !robinhoodChainFirmPlanUnlimitedApproval &&
+    robinhoodChainFirmPlanRequiredApprovalAtomic &&
+    robinhoodChainFirmPlanApprovedAtomic === robinhoodChainFirmPlanRequiredApprovalAtomic &&
+    (
+      robinhoodChainFirmPlanAllowance?.approval_exact === true ||
+      robinhoodChainFirmPlanApprovalPlan?.approval_exact === true
+    )
+  );
+  const robinhoodChainFirmPlanData = String(
+    robinhoodChainFirmPlan?.unsigned_transaction_plan?.data ||
+    robinhoodChainFirmPlan?.unsigned_transaction_plan?.calldata ||
+    ""
+  ).trim();
+  const robinhoodChainFirmPlanDataBytes = (() => {
+    const legacy = Number(robinhoodChainFirmPlan?.unsigned_transaction_plan?.calldata_bytes);
+    if (Number.isFinite(legacy) && legacy >= 0) return Math.trunc(legacy);
+    if (/^0x[0-9a-fA-F]*$/.test(robinhoodChainFirmPlanData) && robinhoodChainFirmPlanData.length >= 2) {
+      return Math.max(0, Math.floor((robinhoodChainFirmPlanData.length - 2) / 2));
+    }
+    return null;
+  })();
+  const robinhoodChainFirmPlanValueWei = String(
+    robinhoodChainFirmPlan?.unsigned_transaction_plan?.value_wei ??
+    robinhoodChainFirmPlan?.unsigned_transaction_plan?.value_atomic ??
+    ""
+  ).trim();
+  const robinhoodChainFirmPlanSpender = String(
+    robinhoodChainFirmPlanApprovalPlan?.spender || robinhoodChainFirmPlanAllowance?.spender || ""
+  ).trim();
+  const robinhoodChainFirmPlanSimulationLabel = robinhoodChainFirmPlan?.swap_simulation_deferred_until_approval === true
+    ? "DEFERRED UNTIL APPROVAL"
+    : robinhoodChainFirmPlan?.swap_simulation_requested === true
+      ? "COMPLETE"
+      : "NOT REQUESTED";
+  const robinhoodChainFirmPlanRefreshLabel = robinhoodChainFirmPlan?.requires_refresh_after_approval === true
+    ? "REQUIRED AFTER APPROVAL"
+    : "NOT REQUIRED";
+
   const robinhoodChainFirmPlanApprovalState = (() => {
-    if (robinhoodChainExecutionAdapter === "native_exact_input") return "native_input";
-    if (robinhoodChainExecutionAdapter !== "erc20_exact_input") return "not_applicable";
-    if (!robinhoodChainCurrentSwapInputWithinAvailableBalance) return "blocked";
     if (!robinhoodChainFirmPlan?.ok || robinhoodChainFirmPlanStale) return "blocked";
-    if (robinhoodChainFirmPlan?.allowance?.applicable === false) return "native_input";
-    if (robinhoodChainFirmPlan?.approval_required === true) return "finite_required";
+    if (
+      robinhoodChainFirmPlanAllowance?.applicable === false ||
+      robinhoodChainFirmPlan?.unsigned_transaction_plan?.native_input === true
+    ) return "native_input";
     if (robinhoodChainFirmPlan?.approval_required === false) return "allowance_sufficient";
+    if (robinhoodChainFirmPlan?.approval_required === true) {
+      if (robinhoodChainFirmPlanExactApprovalVerified) return "finite_required";
+      // Preserve the already-authorized legacy execution presentation while the
+      // generic Uniswap path must prove an exact finite approval in the plan itself.
+      if (robinhoodChainExecutionAdapter === "erc20_exact_input") return "finite_required";
+      return "blocked";
+    }
     return "blocked";
   })();
   const robinhoodChainFirmPlanApprovalLabel =
@@ -8732,15 +8983,22 @@ export default function OrderTicketWidget({
     }
     if (robinhoodChainFirmPlanApprovalState === "finite_required") {
       const amount = String(robinhoodChainFirmPlan?.input_amount || robinhoodChainCurrentSwapInputAmount || "").trim();
-      return `Exact finite approval ${amount || "—"} ${robinhoodChainFromAsset || "input"}. Unlimited approval remains prohibited.`;
+      const atomic = robinhoodChainFirmPlanRequiredApprovalAtomic;
+      const providerAtomic = robinhoodChainFirmPlanProviderApprovedAtomic;
+      const rewritten = robinhoodChainFirmPlanApprovalPlan?.provider_approval_rewritten === true;
+      const providerDetail = providerAtomic
+        ? ` Provider proposed ${providerAtomic} atomic; UTT ${rewritten ? "rewrote it to the exact input" : "accepted the already-exact amount"}.`
+        : "";
+      return `Exact finite approval ${amount || "—"} ${robinhoodChainFirmPlan?.input_asset || robinhoodChainFromAsset || "input"}${atomic ? ` (${atomic} atomic)` : ""}.${providerDetail} Unlimited approval remains prohibited.`;
     }
     if (!robinhoodChainCurrentSwapInputAmount) return "Enter a valid exact-spend amount before presenting any approval action.";
-    if (!robinhoodChainExecutionAuthorized) return "Execution authority is not verified for this direction.";
-    if (robinhoodChainEffectiveAmountMode !== ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND) return "Exact-receive approval presentation remains blocked.";
-    if (!robinhoodChainCurrentSwapAmountAuthorized) return "Enter a positive exact-spend amount within the Token Registry precision.";
-    if (!robinhoodChainCurrentSwapInputWithinAvailableBalance) return `Insufficient ${robinhoodChainFromAsset || "input asset"} available for this exact spend. No approval action is presented.`;
     if (!robinhoodChainFirmPlan?.ok) return "Waiting for a current unsigned plan before presenting any approval action.";
     if (robinhoodChainFirmPlanStale) return "The unsigned plan is stale. A fresh current-context plan is required.";
+    if (robinhoodChainFirmPlan?.approval_required === true && !robinhoodChainFirmPlanExactApprovalVerified && robinhoodChainExecutionAdapter !== "erc20_exact_input") {
+      return "The current generic plan did not prove an exact finite approval. Wallet handoff remains blocked.";
+    }
+    if (!robinhoodChainCurrentSwapAmountAuthorized) return "Enter a positive exact-spend amount within the Token Registry precision.";
+    if (!robinhoodChainCurrentSwapInputWithinAvailableBalance) return `Insufficient ${robinhoodChainFromAsset || "input asset"} available for this exact spend. No approval action is presented.`;
     if (!robinhoodChainWalletState.providerAvailable || !robinhoodChainWalletConnected || !robinhoodChainWalletOnExpectedChain) return "Wallet action required: connect MetaMask on Robinhood Chain 4663.";
     if (!robinhoodChainExecutionReviewWalletReady) return "Saved-wallet identity is not ready for explicit backend verification.";
     return "The current plan is not eligible for an explicit lifecycle review.";
@@ -10174,7 +10432,7 @@ async function submitLimitOrder() {
     try {
       const data = await getRobinhoodChainIndicativeQuote(
         {
-          provider: "0x",
+          provider: robinhoodChainSelectedProvider,
           symbol,
           side,
           amount_mode: exactReceive ? "exact_output" : "exact_input",
@@ -10287,7 +10545,7 @@ async function submitLimitOrder() {
     try {
       const data = await getRobinhoodChainFirmQuotePlan(
         {
-          provider: "0x",
+          provider: robinhoodChainSelectedProvider,
           symbol: normalizeRobinhoodChainQuoteSymbol(otSymbol),
           side,
           amount_mode: robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_RECEIVE
@@ -10347,6 +10605,627 @@ async function submitLimitOrder() {
       ) {
         setRobinhoodChainFirmPlanLoading(false);
       }
+    }
+  }
+
+  async function prepareRobinhoodChainFirstWalletRejection() {
+    if (!canPrepareRobinhoodChainWalletRejection || robinhoodChainWalletRejectionBusy) return;
+    const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
+    setRobinhoodChainWalletRejectionBusy(true);
+    setRobinhoodChainWalletRejectionError("");
+    setRobinhoodChainWalletRejectionPrepared(null);
+    setRobinhoodChainWalletRejectionReviewed(false);
+    setRobinhoodChainWalletRejectionAttempted(false);
+    setRobinhoodChainWalletRejectionResult(null);
+    try {
+      const data = await prepareRobinhoodChainWalletRejection(
+        {
+          symbol: normalizeRobinhoodChainQuoteSymbol(otSymbol),
+          side,
+          requested_amount: robinhoodChainWalletRejectionRequestedAmount,
+          slippage_bps: Number(robinhoodChainSlippageBps),
+          taker_address: robinhoodChainConnectedAddress,
+        },
+        { apiBase, timeout_ms: 60000 }
+      );
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
+      if (
+        !data?.ok ||
+        data?.reject_only !== true ||
+        data?.successful_broadcast_authorized !== false ||
+        data?.automatic_retry !== false ||
+        data?.automatic_second_transaction !== false ||
+        data?.wallet_request?.ok !== true ||
+        !data?.wallet_request?.transaction
+      ) {
+        throw new Error("Reject-only wallet preflight returned an unsafe or incomplete response.");
+      }
+      setRobinhoodChainWalletRejectionPrepared(data);
+      setRobinhoodChainWalletNotice(
+        `R5C.5D.2F.1 reject-only ${String(data?.wallet_request?.action || "wallet")} request prepared. No MetaMask request has occurred yet.`
+      );
+      onToast?.({
+        kind: "warn",
+        msg: "Reject-only wallet preflight passed. The next explicit button opens one real MetaMask request; reject it in MetaMask.",
+      });
+    } catch (error) {
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainWalletRejectionError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      setRobinhoodChainWalletRejectionBusy(false);
+    }
+  }
+
+  async function sendRobinhoodChainFirstWalletRejectionRequest() {
+    if (
+      robinhoodChainWalletRejectionSendRef.current ||
+      robinhoodChainWalletRejectionBusy ||
+      !robinhoodChainWalletRejectionReviewed ||
+      robinhoodChainWalletRejectionAttempted
+    ) return;
+    const prepared = robinhoodChainWalletRejectionPrepared;
+    const request = prepared?.wallet_request;
+    const tx = request?.transaction;
+    if (
+      !prepared?.ok ||
+      prepared?.reject_only !== true ||
+      prepared?.successful_broadcast_authorized !== false ||
+      request?.reject_only !== true ||
+      request?.successful_broadcast_authorized !== false ||
+      !tx
+    ) {
+      setRobinhoodChainWalletRejectionError("Reject-only wallet preparation is missing or unsafe.");
+      return;
+    }
+    const expiresAt = Date.parse(String(prepared?.expires_at || ""));
+    if (!Number.isFinite(expiresAt) || Date.now() >= expiresAt) {
+      setRobinhoodChainWalletRejectionError("Reject-only wallet preflight expired. Prepare a fresh rejection test.");
+      return;
+    }
+    const currentSymbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
+    const currentAmount = normalizeRobinhoodChainAmountText(side === "buy" ? totalQuote : qty);
+    if (
+      normalizeRobinhoodChainQuoteSymbol(prepared?.symbol) !== currentSymbol ||
+      String(prepared?.side || "").trim().toLowerCase() !== String(side || "").trim().toLowerCase() ||
+      normalizeRobinhoodChainAmountText(prepared?.requested_amount) !== currentAmount
+    ) {
+      setRobinhoodChainWalletRejectionError("Ticket context changed after reject-only preflight. Prepare a fresh rejection test.");
+      return;
+    }
+    const provider = robinhoodChainMetaMaskProviderRef.current || getRobinhoodChainMetaMaskProvider();
+    if (!provider) {
+      setRobinhoodChainWalletRejectionError("MetaMask was not detected.");
+      return;
+    }
+
+    robinhoodChainWalletRejectionSendRef.current = true;
+    setRobinhoodChainWalletRejectionBusy(true);
+    setRobinhoodChainWalletRejectionError("");
+    try {
+      const accounts = await provider.request({ method: "eth_accounts" });
+      const activeAddress = normalizeRobinhoodChainEvmAddress(Array.isArray(accounts) ? accounts[0] : "");
+      const chainId = normalizeRobinhoodChainEvmChainId(await provider.request({ method: "eth_chainId" }));
+      const preparedWallet = normalizeRobinhoodChainEvmAddress(prepared?.wallet_request?.wallet_address);
+      if (
+        !activeAddress ||
+        activeAddress !== robinhoodChainConnectedAddress ||
+        activeAddress !== robinhoodChainSavedAddress ||
+        activeAddress !== preparedWallet
+      ) {
+        throw new Error("MetaMask account no longer matches the saved and preflighted Robinhood Chain wallet.");
+      }
+      if (chainId !== ROBINHOOD_CHAIN_NETWORK.chainIdHex) {
+        throw new Error("MetaMask is not on Robinhood Chain mainnet (chain 4663).");
+      }
+
+      const txRequest = {
+        from: activeAddress,
+        to: normalizeRobinhoodChainEvmAddress(tx?.to),
+        data: String(tx?.data || ""),
+        value: robinhoodChainHexQuantity(BigInt(String(tx?.value_wei || "0"))),
+        gas: robinhoodChainHexQuantity(BigInt(String(tx?.gas_limit || "0"))),
+      };
+      if (tx?.max_fee_per_gas) {
+        txRequest.maxFeePerGas = robinhoodChainHexQuantity(BigInt(String(tx.max_fee_per_gas)));
+        if (tx?.max_priority_fee_per_gas) {
+          txRequest.maxPriorityFeePerGas = robinhoodChainHexQuantity(BigInt(String(tx.max_priority_fee_per_gas)));
+        }
+      } else if (tx?.gas_price) {
+        txRequest.gasPrice = robinhoodChainHexQuantity(BigInt(String(tx.gas_price)));
+      } else {
+        throw new Error("Reject-only wallet transaction has no bounded gas fee field.");
+      }
+
+      const action = String(request?.action || "transaction").toUpperCase();
+      const input = `${request?.input_amount || prepared?.requested_amount || "—"} ${request?.input_asset || "INPUT"}`;
+      const maximumFeeWei = String(request?.balance_checks?.maximum_fee_wei || "—");
+      const review = [
+        "R5C.5D.2F.1 · FIRST METAMASK REQUEST — REJECTION TEST",
+        "",
+        `Action: ${action}`,
+        `Market: ${prepared?.symbol || otSymbol}`,
+        `Side: ${String(prepared?.side || side).toUpperCase()}`,
+        `Exact input: ${input}`,
+        `From: ${activeAddress}`,
+        `To: ${txRequest.to}`,
+        `Transaction value: ${tx?.value_wei || "0"} wei`,
+        `Maximum reviewed fee: ${maximumFeeWei} wei`,
+        request?.approval
+          ? `Approval: EXACT ${request.approval.approved_amount_atomic} atomic ${request.approval.token_symbol || request.input_asset}; unlimited = NO`
+          : "Approval: not applicable / not required for this first request",
+        "",
+        "SUCCESSFUL BROADCAST IS NOT AUTHORIZED IN THIS TRANCHE.",
+        "After MetaMask opens, click REJECT / CANCEL in MetaMask.",
+        "UTT will not retry automatically and will not open a second wallet request.",
+      ].join("\n");
+      if (!window.confirm(review)) {
+        setRobinhoodChainWalletRejectionError("Rejection test canceled before MetaMask was requested.");
+        return;
+      }
+
+      setRobinhoodChainWalletRejectionAttempted(true);
+      try {
+        const rawResult = await provider.request({ method: "eth_sendTransaction", params: [txRequest] });
+        const returnedTxHash = normalizeRobinhoodChainTransactionHash(rawResult);
+        const result = {
+          ok: false,
+          tranche: "R5C.5D.2F.1",
+          status: "unexpected_wallet_acceptance",
+          transaction_hash: returnedTxHash || String(rawResult || "") || null,
+          successful_broadcast_authorized: false,
+          automatic_retry: false,
+          automatic_second_transaction: false,
+        };
+        setRobinhoodChainWalletRejectionResult(result);
+        const msg = returnedTxHash
+          ? `CRITICAL: MetaMask returned transaction ${returnedTxHash}. Do not retry or continue; inspect the chain before any further action.`
+          : "CRITICAL: MetaMask did not reject the request. Do not retry or continue.";
+        setRobinhoodChainWalletRejectionError(msg);
+        openSubmitResultModal("error", result, "Unexpected Robinhood Chain Wallet Acceptance");
+        onToast?.({ kind: "warn", msg });
+      } catch (error) {
+        const rejected = Number(error?.code) === 4001 || /reject|denied|declin|cancel/i.test(String(error?.message || ""));
+        if (!rejected) throw error;
+        const result = {
+          ok: true,
+          tranche: "R5C.5D.2F.1",
+          status: "wallet_rejected",
+          symbol: prepared?.symbol || normalizeRobinhoodChainQuoteSymbol(otSymbol),
+          side: prepared?.side || side,
+          action: request?.action || null,
+          transaction_hash: null,
+          successful_broadcast_authorized: false,
+          automatic_retry: false,
+          automatic_second_transaction: false,
+          order_mutation: false,
+          ledger_mutation: false,
+          fifo_mutation: false,
+          basis_mutation: false,
+          tax_mutation: false,
+        };
+        setRobinhoodChainWalletRejectionResult(result);
+        setRobinhoodChainWalletNotice("FIRST WALLET REQUEST REJECTED — acceptance target met. No transaction hash exists and no automatic retry will occur.");
+        openSubmitResultModal("ok", result, "Robinhood Chain First Wallet Rejection Accepted");
+        onToast?.({ kind: "ok", msg: "First MetaMask request rejected as required. No automatic retry or second request occurred." });
+      }
+    } catch (error) {
+      const msg = robinhoodChainWalletErrorMessage(error, "Reject-only MetaMask request failed before a confirmed rejection.");
+      setRobinhoodChainWalletRejectionError(msg);
+      setRobinhoodChainWalletRejectionResult({
+        ok: false,
+        tranche: "R5C.5D.2F.1",
+        status: "wallet_rejection_test_failed",
+        transaction_hash: null,
+        error: msg,
+        successful_broadcast_authorized: false,
+        automatic_retry: false,
+        automatic_second_transaction: false,
+      });
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      robinhoodChainWalletRejectionSendRef.current = false;
+      setRobinhoodChainWalletRejectionBusy(false);
+    }
+  }
+
+  async function prepareRobinhoodChainSuccessfulApproval() {
+    if (!canPrepareRobinhoodChainWalletApproval || robinhoodChainWalletApprovalBusy) return;
+    const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
+    setRobinhoodChainWalletApprovalBusy(true);
+    setRobinhoodChainWalletApprovalError("");
+    setRobinhoodChainWalletApprovalPrepared(null);
+    setRobinhoodChainWalletApprovalAttempted(false);
+    setRobinhoodChainWalletApprovalResult(null);
+    try {
+      const data = await prepareRobinhoodChainWalletApproval(
+        {
+          symbol: normalizeRobinhoodChainQuoteSymbol(otSymbol),
+          side,
+          requested_amount: robinhoodChainWalletRejectionRequestedAmount,
+          slippage_bps: Number(robinhoodChainSlippageBps),
+          taker_address: robinhoodChainConnectedAddress,
+        },
+        { apiBase, timeout_ms: 60000 }
+      );
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
+      if (
+        !data?.ok ||
+        data?.approval_only !== true ||
+        data?.successful_broadcast_authorized !== true ||
+        data?.swap_request_authorized !== false ||
+        data?.automatic_retry !== false ||
+        data?.automatic_second_transaction !== false ||
+        data?.wallet_request?.action !== "approval" ||
+        data?.wallet_request?.approval?.unlimited_approval !== false ||
+        !data?.approval_capability ||
+        !data?.wallet_request?.transaction
+      ) {
+        throw new Error("Successful finite-approval preflight returned an unsafe or incomplete response.");
+      }
+      setRobinhoodChainWalletApprovalPrepared(data);
+      setRobinhoodChainWalletNotice("R5C.5D.2F.2 exact finite approval prepared. No MetaMask request has occurred yet and no swap request is authorized.");
+      onToast?.({ kind: "warn", msg: "Successful finite-approval preflight passed. Review it before opening the one approval-only MetaMask request." });
+    } catch (error) {
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainWalletApprovalError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      setRobinhoodChainWalletApprovalBusy(false);
+    }
+  }
+
+  async function refreshRobinhoodChainSuccessfulApprovalReceipt() {
+    const prepared = robinhoodChainWalletApprovalPrepared;
+    const txHash = normalizeRobinhoodChainTransactionHash(robinhoodChainWalletApprovalResult?.transaction_hash);
+    if (!prepared?.approval_capability || !txHash || robinhoodChainWalletApprovalBusy) return;
+    setRobinhoodChainWalletApprovalBusy(true);
+    setRobinhoodChainWalletApprovalError("");
+    try {
+      const data = await refreshRobinhoodChainWalletApprovalReceipt(
+        { capability: prepared.approval_capability, tx_hash: txHash },
+        { apiBase, timeout_ms: 60000 }
+      );
+      setRobinhoodChainWalletApprovalResult((current) => ({ ...(current || {}), ...(data || {}), transaction_hash: txHash }));
+      if (data?.confirmed === true && data?.status === "approval_confirmed") {
+        setRobinhoodChainWalletNotice("FINITE APPROVAL CONFIRMED — no swap request was opened. A fresh post-approval quote and plan are mandatory before any later swap tranche.");
+        openSubmitResultModal("ok", data, "Robinhood Chain Finite Approval Confirmed");
+        onToast?.({ kind: "ok", msg: "Exact finite approval confirmed. No automatic swap request occurred." });
+      } else if (data?.reverted === true) {
+        setRobinhoodChainWalletApprovalError("Approval transaction reverted. No swap request is authorized.");
+        openSubmitResultModal("error", data, "Robinhood Chain Approval Reverted");
+      } else {
+        onToast?.({ kind: "info", msg: "Approval transaction is still pending. Refresh the receipt again after confirmation." });
+      }
+    } catch (error) {
+      const msg = robinhoodChainWalletErrorMessage(error, "Approval receipt verification failed.");
+      setRobinhoodChainWalletApprovalError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      setRobinhoodChainWalletApprovalBusy(false);
+    }
+  }
+
+  async function sendRobinhoodChainSuccessfulApprovalRequest() {
+    if (
+      robinhoodChainWalletApprovalSendRef.current ||
+      robinhoodChainWalletApprovalBusy ||
+      robinhoodChainWalletApprovalAttempted
+    ) return;
+    const prepared = robinhoodChainWalletApprovalPrepared;
+    const request = prepared?.wallet_request;
+    const tx = request?.transaction;
+    if (
+      !prepared?.ok ||
+      prepared?.approval_only !== true ||
+      prepared?.successful_broadcast_authorized !== true ||
+      prepared?.swap_request_authorized !== false ||
+      prepared?.automatic_second_transaction !== false ||
+      request?.action !== "approval" ||
+      request?.approval?.unlimited_approval !== false ||
+      !prepared?.approval_capability ||
+      !tx
+    ) {
+      setRobinhoodChainWalletApprovalError("Successful finite-approval preparation is missing or unsafe.");
+      return;
+    }
+    const expiresAt = Date.parse(String(prepared?.expires_at || ""));
+    if (!Number.isFinite(expiresAt) || Date.now() >= expiresAt) {
+      setRobinhoodChainWalletApprovalError("Successful approval preflight expired. Prepare a fresh approval.");
+      return;
+    }
+    const currentSymbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
+    const currentAmount = normalizeRobinhoodChainAmountText(side === "buy" ? totalQuote : qty);
+    if (
+      normalizeRobinhoodChainQuoteSymbol(prepared?.symbol) !== currentSymbol ||
+      String(prepared?.side || "").trim().toLowerCase() !== String(side || "").trim().toLowerCase() ||
+      normalizeRobinhoodChainAmountText(prepared?.requested_amount) !== currentAmount
+    ) {
+      setRobinhoodChainWalletApprovalError("Ticket context changed after approval preflight. Prepare a fresh approval.");
+      return;
+    }
+    const provider = robinhoodChainMetaMaskProviderRef.current || getRobinhoodChainMetaMaskProvider();
+    if (!provider) {
+      setRobinhoodChainWalletApprovalError("MetaMask was not detected.");
+      return;
+    }
+    robinhoodChainWalletApprovalSendRef.current = true;
+    setRobinhoodChainWalletApprovalBusy(true);
+    setRobinhoodChainWalletApprovalError("");
+    try {
+      const accounts = await provider.request({ method: "eth_accounts" });
+      const activeAddress = normalizeRobinhoodChainEvmAddress(Array.isArray(accounts) ? accounts[0] : "");
+      const chainId = normalizeRobinhoodChainEvmChainId(await provider.request({ method: "eth_chainId" }));
+      const preparedWallet = normalizeRobinhoodChainEvmAddress(request?.wallet_address);
+      if (!activeAddress || activeAddress !== robinhoodChainConnectedAddress || activeAddress !== robinhoodChainSavedAddress || activeAddress !== preparedWallet) {
+        throw new Error("MetaMask account no longer matches the saved and preflighted Robinhood Chain wallet.");
+      }
+      if (chainId !== ROBINHOOD_CHAIN_NETWORK.chainIdHex) {
+        throw new Error("MetaMask is not on Robinhood Chain mainnet (chain 4663).");
+      }
+      const txRequest = {
+        from: activeAddress,
+        to: normalizeRobinhoodChainEvmAddress(tx?.to),
+        data: String(tx?.data || ""),
+        value: robinhoodChainHexQuantity(BigInt(String(tx?.value_wei || "0"))),
+        gas: robinhoodChainHexQuantity(BigInt(String(tx?.gas_limit || "0"))),
+      };
+      if (tx?.max_fee_per_gas) {
+        txRequest.maxFeePerGas = robinhoodChainHexQuantity(BigInt(String(tx.max_fee_per_gas)));
+        if (tx?.max_priority_fee_per_gas) txRequest.maxPriorityFeePerGas = robinhoodChainHexQuantity(BigInt(String(tx.max_priority_fee_per_gas)));
+      } else if (tx?.gas_price) {
+        txRequest.gasPrice = robinhoodChainHexQuantity(BigInt(String(tx.gas_price)));
+      } else {
+        throw new Error("Approval transaction has no bounded gas fee field.");
+      }
+      setRobinhoodChainWalletApprovalAttempted(true);
+      try {
+        const rawResult = await provider.request({ method: "eth_sendTransaction", params: [txRequest] });
+        const returnedTxHash = normalizeRobinhoodChainTransactionHash(rawResult);
+        if (!returnedTxHash) throw new Error("MetaMask returned no valid transaction hash for the approval.");
+        const result = {
+          ok: true, tranche: "R5C.5D.2F.2", status: "approval_submitted",
+          symbol: prepared?.symbol || currentSymbol, side: prepared?.side || side, action: "approval",
+          transaction_hash: returnedTxHash, successful_broadcast_authorized: true, approval_only: true,
+          swap_request_authorized: false, automatic_retry: false, automatic_second_transaction: false,
+        };
+        setRobinhoodChainWalletApprovalResult(result);
+        setRobinhoodChainWalletNotice(`FINITE APPROVAL SUBMITTED: ${returnedTxHash}. No swap request was opened.`);
+        openSubmitResultModal("ok", result, "Robinhood Chain Finite Approval Submitted");
+        onToast?.({ kind: "ok", msg: "Finite approval submitted. Refresh its receipt after confirmation; no swap request will open automatically." });
+      } catch (error) {
+        const rejected = Number(error?.code) === 4001 || /reject|denied|declin|cancel/i.test(String(error?.message || ""));
+        if (!rejected) throw error;
+        const result = {
+          ok: true, tranche: "R5C.5D.2F.2", status: "wallet_rejected", transaction_hash: null,
+          successful_broadcast_authorized: true, approval_only: true, swap_request_authorized: false,
+          automatic_retry: false, automatic_second_transaction: false,
+        };
+        setRobinhoodChainWalletApprovalResult(result);
+        setRobinhoodChainWalletApprovalError("Approval request was rejected in MetaMask. No transaction exists and no swap request was opened.");
+        openSubmitResultModal("ok", result, "Robinhood Chain Finite Approval Rejected");
+      }
+    } catch (error) {
+      const msg = robinhoodChainWalletErrorMessage(error, "Successful finite approval request failed.");
+      setRobinhoodChainWalletApprovalError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      robinhoodChainWalletApprovalSendRef.current = false;
+      setRobinhoodChainWalletApprovalBusy(false);
+    }
+  }
+
+  async function prepareRobinhoodChainSuccessfulSwap() {
+    if (!canPrepareRobinhoodChainWalletSwap || robinhoodChainWalletSwapBusy) return;
+    const reviewContextVersion = robinhoodChainReviewContextVersionRef.current;
+    setRobinhoodChainWalletSwapBusy(true);
+    setRobinhoodChainWalletSwapError("");
+    setRobinhoodChainWalletSwapPrepared(null);
+    setRobinhoodChainWalletSwapAttempted(false);
+    setRobinhoodChainWalletSwapResult(null);
+    try {
+      const data = await prepareRobinhoodChainWalletSwap(
+        {
+          symbol: normalizeRobinhoodChainQuoteSymbol(otSymbol),
+          side,
+          requested_amount: robinhoodChainWalletRejectionRequestedAmount,
+          slippage_bps: Number(robinhoodChainSlippageBps),
+          taker_address: robinhoodChainConnectedAddress,
+          approval_tx_hash: normalizeRobinhoodChainTransactionHash(
+            robinhoodChainWalletApprovalResult?.transaction_hash || robinhoodChainWalletApprovalResult?.tx_hash
+          ) || undefined,
+        },
+        { apiBase, timeout_ms: 60000 }
+      );
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
+      if (
+        !data?.ok ||
+        data?.swap_only !== true ||
+        data?.successful_broadcast_authorized !== true ||
+        data?.approval_request_authorized !== false ||
+        data?.swap_request_authorized !== true ||
+        data?.provider_simulation_complete !== true ||
+        data?.automatic_retry !== false ||
+        data?.automatic_second_transaction !== false ||
+        data?.wallet_request?.action !== "swap" ||
+        data?.wallet_request?.approval_required !== false ||
+        data?.wallet_request?.provider_simulation_requested !== true ||
+        data?.wallet_request?.requires_refresh_after_approval !== false ||
+        !data?.swap_capability ||
+        !data?.wallet_request?.transaction
+      ) {
+        throw new Error("Fresh swap-only preflight returned an unsafe or incomplete response.");
+      }
+      setRobinhoodChainWalletSwapPrepared(data);
+      setRobinhoodChainWalletNotice("R5C.5D.2F.3 fresh post-approval swap prepared and simulated. No MetaMask request has occurred yet.");
+      onToast?.({ kind: "warn", msg: "Fresh swap-only preflight passed. Review the transaction; MetaMask will be the final approve/reject decision." });
+    } catch (error) {
+      if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
+      const msg = robinhoodChainQuoteError(error);
+      setRobinhoodChainWalletSwapError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      setRobinhoodChainWalletSwapBusy(false);
+    }
+  }
+
+  async function refreshRobinhoodChainSuccessfulSwapReceipt() {
+    const prepared = robinhoodChainWalletSwapPrepared;
+    const txHash = normalizeRobinhoodChainTransactionHash(robinhoodChainWalletSwapResult?.transaction_hash);
+    if (!prepared?.swap_capability || !txHash || robinhoodChainWalletSwapBusy) return;
+    setRobinhoodChainWalletSwapBusy(true);
+    setRobinhoodChainWalletSwapError("");
+    try {
+      const data = await refreshRobinhoodChainWalletSwapReceipt(
+        { capability: prepared.swap_capability, tx_hash: txHash },
+        { apiBase, timeout_ms: 60000 }
+      );
+      setRobinhoodChainWalletSwapResult((current) => ({ ...(current || {}), ...(data || {}), transaction_hash: txHash }));
+      if (data?.confirmed === true && data?.status === "swap_confirmed") {
+        if (data?.order_mutation === true) requestAllOrdersRefresh();
+        setRobinhoodChainWalletNotice(
+          data?.order_mutation === true
+            ? "SWAP CONFIRMED + RECONCILED — All Orders persistence completed; no automatic second transaction occurred."
+            : "SWAP CONFIRMED — accounting reconciliation is held; no automatic second transaction occurred."
+        );
+        openSubmitResultModal("ok", data, "Robinhood Chain Swap Confirmed");
+        onToast?.({
+          kind: data?.order_mutation === true ? "ok" : "warn",
+          msg: data?.order_mutation === true
+            ? "Swap receipt confirmed and persisted for All Orders. No automatic second transaction occurred."
+            : "Swap confirmed, but accounting reconciliation did not persist. Review the reconciliation error before continuing.",
+        });
+      } else if (data?.reverted === true) {
+        setRobinhoodChainWalletSwapError("Swap transaction reverted. No automatic retry or second wallet request is authorized.");
+        openSubmitResultModal("error", data, "Robinhood Chain Swap Reverted");
+      } else {
+        onToast?.({ kind: "info", msg: "Swap transaction is still pending. Refresh the receipt again after confirmation." });
+      }
+    } catch (error) {
+      const msg = robinhoodChainWalletErrorMessage(error, "Swap receipt verification failed.");
+      setRobinhoodChainWalletSwapError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      setRobinhoodChainWalletSwapBusy(false);
+    }
+  }
+
+  async function sendRobinhoodChainSuccessfulSwapRequest() {
+    if (
+      robinhoodChainWalletSwapSendRef.current ||
+      robinhoodChainWalletSwapBusy ||
+      robinhoodChainWalletSwapAttempted
+    ) return;
+    const prepared = robinhoodChainWalletSwapPrepared;
+    const request = prepared?.wallet_request;
+    const tx = request?.transaction;
+    if (
+      !prepared?.ok ||
+      prepared?.swap_only !== true ||
+      prepared?.successful_broadcast_authorized !== true ||
+      prepared?.approval_request_authorized !== false ||
+      prepared?.swap_request_authorized !== true ||
+      prepared?.provider_simulation_complete !== true ||
+      prepared?.automatic_second_transaction !== false ||
+      request?.action !== "swap" ||
+      request?.approval_required !== false ||
+      request?.provider_simulation_requested !== true ||
+      request?.requires_refresh_after_approval !== false ||
+      !prepared?.swap_capability ||
+      !tx
+    ) {
+      setRobinhoodChainWalletSwapError("Fresh swap-only preparation is missing or unsafe.");
+      return;
+    }
+    const expiresAt = Date.parse(String(prepared?.expires_at || ""));
+    if (!Number.isFinite(expiresAt) || Date.now() >= expiresAt) {
+      setRobinhoodChainWalletSwapError("Swap preflight expired. Prepare a fresh swap.");
+      return;
+    }
+    const currentSymbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
+    const currentAmount = normalizeRobinhoodChainAmountText(side === "buy" ? totalQuote : qty);
+    if (
+      normalizeRobinhoodChainQuoteSymbol(prepared?.symbol) !== currentSymbol ||
+      String(prepared?.side || "").trim().toLowerCase() !== String(side || "").trim().toLowerCase() ||
+      normalizeRobinhoodChainAmountText(prepared?.requested_amount) !== currentAmount
+    ) {
+      setRobinhoodChainWalletSwapError("Ticket context changed after swap preflight. Prepare a fresh swap.");
+      return;
+    }
+    const provider = robinhoodChainMetaMaskProviderRef.current || getRobinhoodChainMetaMaskProvider();
+    if (!provider) {
+      setRobinhoodChainWalletSwapError("MetaMask was not detected.");
+      return;
+    }
+    robinhoodChainWalletSwapSendRef.current = true;
+    setRobinhoodChainWalletSwapBusy(true);
+    setRobinhoodChainWalletSwapError("");
+    try {
+      const accounts = await provider.request({ method: "eth_accounts" });
+      const activeAddress = normalizeRobinhoodChainEvmAddress(Array.isArray(accounts) ? accounts[0] : "");
+      const chainId = normalizeRobinhoodChainEvmChainId(await provider.request({ method: "eth_chainId" }));
+      const preparedWallet = normalizeRobinhoodChainEvmAddress(request?.wallet_address);
+      if (!activeAddress || activeAddress !== robinhoodChainConnectedAddress || activeAddress !== robinhoodChainSavedAddress || activeAddress !== preparedWallet) {
+        throw new Error("MetaMask account no longer matches the saved and preflighted Robinhood Chain wallet.");
+      }
+      if (chainId !== ROBINHOOD_CHAIN_NETWORK.chainIdHex) {
+        throw new Error("MetaMask is not on Robinhood Chain mainnet (chain 4663).");
+      }
+      const txRequest = {
+        from: activeAddress,
+        to: normalizeRobinhoodChainEvmAddress(tx?.to),
+        data: String(tx?.data || ""),
+        value: robinhoodChainHexQuantity(BigInt(String(tx?.value_wei || "0"))),
+        gas: robinhoodChainHexQuantity(BigInt(String(tx?.gas_limit || "0"))),
+      };
+      if (tx?.max_fee_per_gas) {
+        txRequest.maxFeePerGas = robinhoodChainHexQuantity(BigInt(String(tx.max_fee_per_gas)));
+        if (tx?.max_priority_fee_per_gas) txRequest.maxPriorityFeePerGas = robinhoodChainHexQuantity(BigInt(String(tx.max_priority_fee_per_gas)));
+      } else if (tx?.gas_price) {
+        txRequest.gasPrice = robinhoodChainHexQuantity(BigInt(String(tx.gas_price)));
+      } else {
+        throw new Error("Swap transaction has no bounded gas fee field.");
+      }
+
+      // The review card immediately above this button is the UTT review boundary.
+      // One explicit click opens MetaMask; MetaMask itself is the final approve/reject authority.
+      setRobinhoodChainWalletSwapAttempted(true);
+      try {
+        const rawResult = await provider.request({ method: "eth_sendTransaction", params: [txRequest] });
+        const returnedTxHash = normalizeRobinhoodChainTransactionHash(rawResult);
+        if (!returnedTxHash) throw new Error("MetaMask returned no valid transaction hash for the swap.");
+        const result = {
+          ok: true, tranche: "R5C.5D.2F.3", status: "swap_submitted",
+          symbol: prepared?.symbol || currentSymbol, side: prepared?.side || side, action: "swap",
+          transaction_hash: returnedTxHash, successful_broadcast_authorized: true, swap_only: true,
+          approval_request_authorized: false, swap_request_authorized: true,
+          automatic_retry: false, automatic_second_transaction: false,
+        };
+        setRobinhoodChainWalletSwapResult(result);
+        setRobinhoodChainWalletNotice(`SWAP SUBMITTED: ${returnedTxHash}. No automatic second transaction was opened.`);
+        openSubmitResultModal("ok", result, "Robinhood Chain Swap Submitted");
+        onToast?.({ kind: "ok", msg: "Swap submitted. Refresh its receipt after confirmation; no automatic second transaction will open." });
+      } catch (error) {
+        const rejected = Number(error?.code) === 4001 || /reject|denied|declin|cancel/i.test(String(error?.message || ""));
+        if (!rejected) throw error;
+        const result = {
+          ok: true, tranche: "R5C.5D.2F.3", status: "wallet_rejected", transaction_hash: null,
+          successful_broadcast_authorized: true, swap_only: true, approval_request_authorized: false,
+          swap_request_authorized: true, automatic_retry: false, automatic_second_transaction: false,
+        };
+        setRobinhoodChainWalletSwapResult(result);
+        setRobinhoodChainWalletSwapError("Swap request was rejected in MetaMask. No transaction exists and no automatic retry will occur.");
+        openSubmitResultModal("ok", result, "Robinhood Chain Swap Rejected");
+      }
+    } catch (error) {
+      const msg = robinhoodChainWalletErrorMessage(error, "Swap-only MetaMask request failed.");
+      setRobinhoodChainWalletSwapError(msg);
+      onToast?.({ kind: "warn", msg });
+    } finally {
+      robinhoodChainWalletSwapSendRef.current = false;
+      setRobinhoodChainWalletSwapBusy(false);
     }
   }
 
@@ -13315,7 +14194,7 @@ async function submitLimitOrder() {
               </span>
             </div>
 
-            {(robinhoodChainPairNotConfigured || robinhoodChainPairRegistrationBusy || robinhoodChainPairRegistrationError || robinhoodChainPairRegistrationNotice) && (
+            {(robinhoodChainPairVerificationBlocked || robinhoodChainPairNotConfigured || robinhoodChainPairRegistrationBusy || robinhoodChainPairRegistrationError || robinhoodChainPairRegistrationNotice) && (
               <div
                 data-rh-catalog-select="selected-pair-registration"
                 data-provider-contacted="false"
@@ -13324,12 +14203,12 @@ async function submitLimitOrder() {
                   marginTop: 7,
                   padding: "7px 8px",
                   borderRadius: 8,
-                  border: robinhoodChainPairRegistrationError
+                  border: robinhoodChainPairRegistrationError || robinhoodChainPairVerificationBlocked
                     ? "1px solid rgba(251, 113, 133, 0.52)"
                     : robinhoodChainPairNotConfigured
                       ? "1px solid rgba(250, 204, 21, 0.48)"
                       : "1px solid rgba(74, 222, 128, 0.42)",
-                  background: robinhoodChainPairRegistrationError
+                  background: robinhoodChainPairRegistrationError || robinhoodChainPairVerificationBlocked
                     ? "rgba(69, 10, 10, 0.22)"
                     : robinhoodChainPairNotConfigured
                       ? "rgba(66, 48, 4, 0.22)"
@@ -13338,10 +14217,12 @@ async function submitLimitOrder() {
                 }}
               >
                 <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
-                  <b style={{ color: robinhoodChainPairNotConfigured ? "#fde68a" : "#bbf7d0", letterSpacing: 0.35 }}>
-                    {robinhoodChainPairNotConfigured
-                      ? "REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED"
-                      : "SELECTED PAIR REGISTRATION"}
+                  <b style={{ color: robinhoodChainPairVerificationBlocked ? "#fecdd3" : robinhoodChainPairNotConfigured ? "#fde68a" : "#bbf7d0", letterSpacing: 0.35 }}>
+                    {robinhoodChainPairVerificationBlocked
+                      ? "CANONICAL TOKEN VERIFICATION REQUIRED"
+                      : robinhoodChainPairNotConfigured
+                        ? "VERIFIED REGISTRY ASSETS · PAIR NOT CONFIGURED"
+                        : "SELECTED PAIR REGISTRATION"}
                   </b>
                   {robinhoodChainPairNotConfigured && (
                     <button
@@ -13355,9 +14236,14 @@ async function submitLimitOrder() {
                     </button>
                   )}
                 </div>
+                {robinhoodChainPairVerificationBlocked && (
+                  <div style={{ marginTop: 4, color: "#fecdd3" }}>
+                    Pair enrollment is blocked until both Token Registry identities are canonically verified on Robinhood Chain. {robinhoodChainPair.base}: {robinhoodChainRegistryBaseVerified ? "VERIFIED" : String(robinhoodChainRegistryBaseIdentity?.verification?.canonical_status || "NOT VERIFIED").replaceAll("_", " ").toUpperCase()} · {robinhoodChainPair.quote}: {robinhoodChainRegistryQuoteVerified ? "VERIFIED" : String(robinhoodChainRegistryQuoteIdentity?.verification?.canonical_status || "NOT VERIFIED").replaceAll("_", " ").toUpperCase()}. Use Token Registry → Verify on-chain first.
+                  </div>
+                )}
                 {robinhoodChainPairNotConfigured && (
                   <div style={{ marginTop: 4, color: "#e2e8f0" }}>
-                    {robinhoodChainPair.base} registry #{robinhoodChainRegistryBaseIdentity?.registry_id} + {robinhoodChainPair.quote} registry #{robinhoodChainRegistryQuoteIdentity?.registry_id}. Registration is idempotent and review-only. Refresh Selected Market remains a separate explicit action.
+                    {robinhoodChainPair.base} registry #{robinhoodChainRegistryBaseIdentity?.registry_id} + {robinhoodChainPair.quote} registry #{robinhoodChainRegistryQuoteIdentity?.registry_id}. Both identities are canonically verified. Registration is idempotent and review-only. Refresh Selected Market remains a separate explicit action.
                   </div>
                 )}
                 {robinhoodChainPairRegistrationNotice && (
@@ -13776,18 +14662,29 @@ async function submitLimitOrder() {
                 </summary>
                 <div style={{ marginTop: 7, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: 6 }}>
                   {[
+                    ["Provider", String(robinhoodChainFirmPlan.provider || "—")],
                     ["From", robinhoodChainFirmPlan.unsigned_transaction_plan?.from ? shortenWalletAddress(robinhoodChainFirmPlan.unsigned_transaction_plan.from, 8, 6) : "—"],
                     ["Input", `${robinhoodChainFirmPlan.input_amount || "—"} ${robinhoodChainFirmPlan.input_asset || ""}`.trim()],
                     ["Firm output", `${robinhoodChainFirmPlan.output_amount || "—"} ${robinhoodChainFirmPlan.output_asset || ""}`.trim()],
                     ["Minimum received", `${robinhoodChainFirmPlan.minimum_received || "—"} ${robinhoodChainFirmPlan.minimum_received_asset || ""}`.trim()],
                     ["Maximum spent", `${robinhoodChainFirmPlan.maximum_spent || "—"} ${robinhoodChainFirmPlan.maximum_spent_asset || ""}`.trim()],
                     ["Slippage", `${Number(robinhoodChainFirmPlan.slippage_bps || 0) / 100}%`],
-                    ["Allowance", robinhoodChainFirmPlan.allowance?.applicable === false ? `Not applicable — native ${robinhoodChainFirmPlan.input_asset || "input"}` : robinhoodChainFirmPlan.approval_required ? `Shortfall ${robinhoodChainFirmPlan.allowance?.shortfall || "—"} ${robinhoodChainFirmPlan.allowance?.token?.symbol || ""}` : "Sufficient"],
-                    ["Spender", robinhoodChainFirmPlan.allowance?.spender ? shortenWalletAddress(robinhoodChainFirmPlan.allowance.spender, 8, 6) : "—"],
+                    ["Allowance", robinhoodChainFirmPlanAllowance?.applicable === false
+                      ? `Not applicable — native ${robinhoodChainFirmPlan.input_asset || "input"}`
+                      : robinhoodChainFirmPlan.approval_required
+                        ? `Exact ${robinhoodChainFirmPlan.input_amount || "—"} ${robinhoodChainFirmPlan.input_asset || "input"}${robinhoodChainFirmPlanRequiredApprovalAtomic ? ` (${robinhoodChainFirmPlanRequiredApprovalAtomic} atomic)` : ""}`
+                        : "Sufficient — approval skipped"],
+                    ["Provider approval", robinhoodChainFirmPlanProviderApprovedAtomic
+                      ? `${robinhoodChainFirmPlanProviderApprovedAtomic} atomic · ${robinhoodChainFirmPlanApprovalPlan?.provider_approval_rewritten === true ? "REWRITTEN TO EXACT" : "ALREADY EXACT"}`
+                      : "—"],
+                    ["Unlimited approval", robinhoodChainFirmPlanAllowance?.applicable === false ? "Not applicable" : robinhoodChainFirmPlanUnlimitedApproval ? "YES · BLOCKED" : "NO"],
+                    ["Spender", robinhoodChainFirmPlanSpender ? shortenWalletAddress(robinhoodChainFirmPlanSpender, 8, 6) : "—"],
                     ["Destination", robinhoodChainFirmPlan.unsigned_transaction_plan?.to ? shortenWalletAddress(robinhoodChainFirmPlan.unsigned_transaction_plan.to, 8, 6) : "—"],
-                    ["Tx value", robinhoodChainFirmPlan.unsigned_transaction_plan?.value !== undefined ? `${robinhoodChainFirmPlan.unsigned_transaction_plan.value} ${robinhoodChainFirmPlan.unsigned_transaction_plan.value_asset || ""} (${robinhoodChainFirmPlan.unsigned_transaction_plan.value_atomic ?? "—"} atomic)` : `${robinhoodChainFirmPlan.unsigned_transaction_plan?.value_atomic ?? "—"} atomic`],
+                    ["Tx value", robinhoodChainFirmPlanValueWei ? `${robinhoodChainFirmPlanValueWei} wei` : "—"],
                     ["Gas limit", robinhoodChainFirmPlan.unsigned_transaction_plan?.gas_limit || "—"],
-                    ["Calldata", robinhoodChainFirmPlan.unsigned_transaction_plan?.calldata_bytes !== undefined ? `${robinhoodChainFirmPlan.unsigned_transaction_plan.calldata_bytes} bytes` : "—"],
+                    ["Calldata", robinhoodChainFirmPlanDataBytes !== null ? `${robinhoodChainFirmPlanDataBytes} bytes · PRESENT` : robinhoodChainFirmPlanData ? "PRESENT" : "—"],
+                    ["Simulation", robinhoodChainFirmPlanSimulationLabel],
+                    ["Post-approval refresh", robinhoodChainFirmPlanRefreshLabel],
                   ].map(([label, value]) => (
                     <div key={label} style={{ padding: "5px 6px", borderRadius: 7, background: "rgba(2, 6, 23, 0.42)", border: "1px solid rgba(192, 132, 252, 0.14)", minWidth: 0 }}>
                       <div style={{ fontSize: 8.5, textTransform: "uppercase", color: "#a78bfa", fontWeight: 850 }}>{label}</div>
@@ -13801,7 +14698,7 @@ async function submitLimitOrder() {
                 <details style={{ marginTop: 6 }}>
                   <summary style={{ cursor: "pointer", color: "#c4b5fd", fontSize: 10, fontWeight: 900 }}>Unsigned calldata — explicit review only</summary>
                   <pre style={{ margin: "6px 0 0", maxHeight: 160, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", padding: 7, borderRadius: 7, background: "rgba(0,0,0,0.38)", fontSize: 9.5 }}>
-                    {hideTableData ? "••••••••" : robinhoodChainFirmPlan.unsigned_transaction_plan?.calldata || "—"}
+                    {hideTableData ? "••••••••" : robinhoodChainFirmPlanData || "—"}
                   </pre>
                 </details>
               </details>
@@ -15363,7 +16260,7 @@ async function submitLimitOrder() {
             title={
               isRobinhoodChainVenue
                 ? robinhoodChainQuoteReviewEnabled
-                  ? canSubmit
+                  ? canPrepareRobinhoodChainReview
                     ? `Request a bounded read-only ${robinhoodChainFromAsset}→${robinhoodChainToAsset} ${robinhoodChainEffectiveAmountMode.replace("_", " ")} quote. No MetaMask prompt, signature, transaction, or order record.`
                     : "Enter a valid custom amount for the selected Robinhood Chain review mode."
                   : robinhoodChainSelectedMarket?.mechanism === "wrap_unwrap"
@@ -15494,6 +16391,287 @@ async function submitLimitOrder() {
                     {robinhoodChainFirmPlanApprovalLabel}
                   </b>
                   <span>{robinhoodChainFirmPlanApprovalDetail}</span>
+                </div>
+              )}
+              {String(robinhoodChainFirmPlan?.provider || "").trim().toLowerCase() === "uniswap_api" &&
+                robinhoodChainEffectiveAmountMode === ROBINHOOD_CHAIN_AMOUNT_MODE_EXACT_SPEND &&
+                robinhoodChainFirmPlan?.approval_required === true && (
+                <div
+                  data-rh-wallet-approval="r5c-5d-2f-2"
+                  style={{
+                    flexBasis: "100%",
+                    padding: 9,
+                    borderRadius: 10,
+                    border: robinhoodChainWalletApprovalResult?.status === "approval_confirmed"
+                      ? "1px solid rgba(74, 222, 128, 0.62)"
+                      : "1px solid rgba(56, 189, 248, 0.58)",
+                    background: robinhoodChainWalletApprovalResult?.status === "approval_confirmed"
+                      ? "rgba(20, 83, 45, 0.20)"
+                      : "linear-gradient(135deg, rgba(8, 47, 73, 0.24), rgba(30, 41, 59, 0.20))",
+                    display: "grid",
+                    gap: 7,
+                    fontSize: 10.5,
+                  }}
+                >
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <b style={{ color: robinhoodChainWalletApprovalResult?.status === "approval_confirmed" ? "#bbf7d0" : "#bae6fd" }}>
+                      R5C.5D.2F.2 · SUCCESSFUL FINITE APPROVAL ONLY
+                    </b>
+                    <span style={{ ...safePill, color: "#bbf7d0", fontWeight: 900 }}>APPROVAL BROADCAST AUTHORIZED: YES</span>
+                    <span style={{ ...safePill, color: "#fecaca", fontWeight: 900 }}>SWAP REQUEST AUTHORIZED: NO</span>
+                    <span style={{ ...safePill, color: "#bae6fd" }}>AUTO SECOND REQUEST: NO</span>
+                  </div>
+                  <div style={{ color: "#dbeafe", lineHeight: 1.35 }}>
+                    This tranche may broadcast exactly one reviewed finite ERC-20 approval. It does not authorize, prepare, or automatically open a swap request.
+                    After confirmation, the pre-approval swap plan is stale and a fresh post-approval quote/simulation is mandatory.
+                  </div>
+
+                  {!robinhoodChainWalletApprovalPrepared && (
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <button
+                        type="button"
+                        style={{
+                          ...safeButton,
+                          ...(!canPrepareRobinhoodChainWalletApproval ? safeButtonDisabled : {}),
+                          padding: "8px 11px",
+                          fontWeight: 900,
+                          border: "1px solid rgba(56, 189, 248, 0.62)",
+                          color: "#e0f2fe",
+                          background: "rgba(3, 105, 161, 0.26)",
+                        }}
+                        disabled={!canPrepareRobinhoodChainWalletApproval}
+                        onClick={prepareRobinhoodChainSuccessfulApproval}
+                      >
+                        {robinhoodChainWalletApprovalBusy ? "Preflighting…" : "Prepare Successful Finite Approval"}
+                      </button>
+                      <span style={{ color: "#bae6fd" }}>Preparation does not open MetaMask or broadcast anything.</span>
+                    </div>
+                  )}
+
+                  {robinhoodChainWalletApprovalPrepared?.wallet_request && (() => {
+                    const prepared = robinhoodChainWalletApprovalPrepared;
+                    const request = prepared.wallet_request;
+                    const tx = request.transaction || {};
+                    const balances = request.balance_checks || {};
+                    const approval = request.approval || {};
+                    const result = robinhoodChainWalletApprovalResult || {};
+                    const submitted = Boolean(normalizeRobinhoodChainTransactionHash(result.transaction_hash));
+                    const confirmed = result.status === "approval_confirmed" && result.confirmed === true;
+                    const cellStyle = {
+                      padding: "5px 6px", borderRadius: 7, background: "rgba(2, 6, 23, 0.42)",
+                      border: "1px solid rgba(56, 189, 248, 0.20)", minWidth: 0, display: "grid", gap: 2,
+                    };
+                    const keyStyle = { fontSize: 8.5, textTransform: "uppercase", color: "#7dd3fc", fontWeight: 850 };
+                    return (
+                      <>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 6 }}>
+                          <div style={cellStyle}><span style={keyStyle}>ACTION</span><b>APPROVAL ONLY</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>EXACT INPUT</span><b>{hideTableData ? "••••" : `${request.input_amount || prepared.requested_amount || "—"} ${request.input_asset || ""}`.trim()}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>INPUT BALANCE</span><b style={{ color: balances.input_balance_sufficient === true ? "#bbf7d0" : "#fecdd3" }}>{balances.input_balance_sufficient === true ? "SUFFICIENT" : "BLOCKED"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>NATIVE GAS</span><b style={{ color: balances.native_balance_sufficient === true ? "#bbf7d0" : "#fecdd3" }}>{balances.native_balance_sufficient === true ? "SUFFICIENT" : "BLOCKED"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>EXACT APPROVAL</span><b>{hideTableData ? "••••" : `${approval.approved_amount_atomic || "—"} atomic ${approval.token_symbol || request.input_asset || ""}`.trim()}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>UNLIMITED APPROVAL</span><b style={{ color: approval.unlimited_approval === false ? "#bbf7d0" : "#fecdd3" }}>{approval.unlimited_approval === false ? "NO" : "BLOCKED"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>SPENDER</span><b>{hideTableData ? "••••" : shortenWalletAddress(approval.spender || "", 10, 8) || "—"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>TX VALUE</span><b>{hideTableData ? "••••" : `${tx.value_wei || "0"} wei`}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>MAX REVIEWED FEE</span><b>{hideTableData ? "••••" : `${balances.maximum_fee_wei || "—"} wei`}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>PREFLIGHT</span><b style={{ color: robinhoodChainWalletApprovalExpired ? "#fecdd3" : "#bbf7d0" }}>{robinhoodChainWalletApprovalExpired ? "EXPIRED" : "FRESH"}</b></div>
+                        </div>
+
+                        {!submitted && (
+                          <div style={{ display: "grid", gap: 5 }}>
+                            <span style={{ color: "#dbeafe", fontWeight: 800 }}>
+                              Review the exact transaction above. One explicit click opens MetaMask; MetaMask is the final approve/reject decision.
+                            </span>
+                            <button
+                              type="button"
+                              style={{
+                                ...safeButton,
+                                ...(robinhoodChainWalletApprovalAttempted || robinhoodChainWalletApprovalExpired || robinhoodChainWalletApprovalBusy ? safeButtonDisabled : {}),
+                                padding: "8px 11px", fontWeight: 950, border: "1px solid rgba(74, 222, 128, 0.66)",
+                                color: "#dcfce7", background: "rgba(20, 83, 45, 0.34)", justifySelf: "start",
+                              }}
+                              disabled={robinhoodChainWalletApprovalAttempted || robinhoodChainWalletApprovalExpired || robinhoodChainWalletApprovalBusy}
+                              onClick={sendRobinhoodChainSuccessfulApprovalRequest}
+                            >
+                              Open MetaMask — EXACT FINITE APPROVAL
+                            </button>
+                          </div>
+                        )}
+
+                        {submitted && !confirmed && (
+                          <div style={{ display: "grid", gap: 6 }}>
+                            <div style={{ color: "#bae6fd", fontWeight: 850 }}>
+                              APPROVAL SUBMITTED · tx {hideTableData ? "••••" : shortenWalletAddress(result.transaction_hash, 12, 10)} · SWAP REQUEST NONE
+                            </div>
+                            <button
+                              type="button"
+                              style={{ ...safeButton, padding: "7px 10px", justifySelf: "start" }}
+                              disabled={robinhoodChainWalletApprovalBusy}
+                              onClick={refreshRobinhoodChainSuccessfulApprovalReceipt}
+                            >
+                              {robinhoodChainWalletApprovalBusy ? "Checking receipt…" : "Refresh Approval Receipt"}
+                            </button>
+                          </div>
+                        )}
+
+                        {confirmed && (
+                          <div style={{ color: "#bbf7d0", fontWeight: 950, display: "grid", gap: 3 }}>
+                            <span>PASS · EXACT FINITE APPROVAL CONFIRMED · allowance {result.allowance_confirmed_atomic} atomic · unlimited NO</span>
+                            <span>Gas used {result.gas_used || "—"} · effective gas price {result.effective_gas_price_wei || "—"} wei · network fee {result.network_fee_wei || "—"} wei</span>
+                            <span>SWAP REQUEST NONE · AUTOMATIC SECOND TRANSACTION NO · fresh post-approval quote/simulation REQUIRED</span>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
+
+                  {robinhoodChainWalletApprovalError && (
+                    <div style={{ color: "#fecdd3", fontWeight: 800, overflowWrap: "anywhere" }}>
+                      {hideTableData ? "Successful finite approval is blocked or failed." : robinhoodChainWalletApprovalError}
+                    </div>
+                  )}
+                </div>
+              )}
+              {(canPrepareRobinhoodChainWalletSwap || robinhoodChainWalletSwapPrepared || robinhoodChainWalletSwapError) && (
+                <div
+                  data-rh-wallet-swap="r5c-5d-2f-3"
+                  style={{
+                    flexBasis: "100%",
+                    padding: 9,
+                    borderRadius: 10,
+                    border: robinhoodChainWalletSwapResult?.status === "swap_confirmed"
+                      ? "1px solid rgba(74, 222, 128, 0.64)"
+                      : "1px solid rgba(167, 139, 250, 0.60)",
+                    background: robinhoodChainWalletSwapResult?.status === "swap_confirmed"
+                      ? "rgba(20, 83, 45, 0.20)"
+                      : "linear-gradient(135deg, rgba(76, 29, 149, 0.22), rgba(30, 41, 59, 0.22))",
+                    display: "grid",
+                    gap: 7,
+                    fontSize: 10.5,
+                  }}
+                >
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <b style={{ color: robinhoodChainWalletSwapResult?.status === "swap_confirmed" ? "#bbf7d0" : "#ddd6fe" }}>
+                      R5C.5D.2F.3 · FRESH POST-APPROVAL SWAP ONLY
+                    </b>
+                    <span style={{ ...safePill, color: "#fecaca", fontWeight: 900 }}>APPROVAL REQUEST AUTHORIZED: NO</span>
+                    <span style={{ ...safePill, color: "#bbf7d0", fontWeight: 900 }}>SWAP REQUEST AUTHORIZED: YES</span>
+                    <span style={{ ...safePill, color: "#bae6fd" }}>AUTO SECOND REQUEST: NO</span>
+                  </div>
+                  <div style={{ color: "#ede9fe", lineHeight: 1.35 }}>
+                    Preparation always requests a fresh Uniswap plan, current allowance, live balances, native gas, and provider simulation.
+                    The stale pre-approval swap plan is never promoted. One explicit button opens MetaMask; MetaMask is the final approve/reject authority.
+                  </div>
+
+                  {!robinhoodChainWalletSwapPrepared && (
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <button
+                        type="button"
+                        style={{
+                          ...safeButton,
+                          ...(!canPrepareRobinhoodChainWalletSwap ? safeButtonDisabled : {}),
+                          padding: "8px 11px",
+                          fontWeight: 900,
+                          border: "1px solid rgba(167, 139, 250, 0.64)",
+                          color: "#ede9fe",
+                          background: "rgba(91, 33, 182, 0.28)",
+                        }}
+                        disabled={!canPrepareRobinhoodChainWalletSwap}
+                        onClick={prepareRobinhoodChainSuccessfulSwap}
+                      >
+                        {robinhoodChainWalletSwapBusy ? "Refreshing + simulating…" : "Prepare Fresh Swap-Only Preflight"}
+                      </button>
+                      <span style={{ color: "#ddd6fe" }}>Preparation does not open MetaMask or broadcast anything.</span>
+                    </div>
+                  )}
+
+                  {robinhoodChainWalletSwapPrepared?.wallet_request && (() => {
+                    const prepared = robinhoodChainWalletSwapPrepared;
+                    const request = prepared.wallet_request;
+                    const tx = request.transaction || {};
+                    const balances = request.balance_checks || {};
+                    const result = robinhoodChainWalletSwapResult || {};
+                    const submitted = Boolean(normalizeRobinhoodChainTransactionHash(result.transaction_hash));
+                    const confirmed = result.status === "swap_confirmed" && result.confirmed === true;
+                    const calldata = String(tx.data || "");
+                    const calldataBytes = calldata.startsWith("0x") ? Math.max(0, (calldata.length - 2) / 2) : 0;
+                    const cellStyle = {
+                      padding: "5px 6px", borderRadius: 7, background: "rgba(2, 6, 23, 0.42)",
+                      border: "1px solid rgba(167, 139, 250, 0.22)", minWidth: 0, display: "grid", gap: 2,
+                    };
+                    const keyStyle = { fontSize: 8.5, textTransform: "uppercase", color: "#c4b5fd", fontWeight: 850 };
+                    return (
+                      <>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 6 }}>
+                          <div style={cellStyle}><span style={keyStyle}>ACTION</span><b>SWAP ONLY</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>EXACT INPUT</span><b>{hideTableData ? "••••" : `${request.input_amount || prepared.requested_amount || "—"} ${request.input_asset || ""}`.trim()}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>QUOTED OUTPUT</span><b>{hideTableData ? "••••" : `${request.output_amount || "—"} ${request.output_asset || ""}`.trim()}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>MINIMUM RECEIVED</span><b>{hideTableData ? "••••" : `${request.minimum_received || "—"} ${request.output_asset || ""}`.trim()}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>INPUT BALANCE</span><b style={{ color: balances.input_balance_sufficient === true ? "#bbf7d0" : "#fecdd3" }}>{balances.input_balance_sufficient === true ? "SUFFICIENT" : "BLOCKED"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>NATIVE GAS</span><b style={{ color: balances.native_balance_sufficient === true ? "#bbf7d0" : "#fecdd3" }}>{balances.native_balance_sufficient === true ? "SUFFICIENT" : "BLOCKED"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>APPROVAL REQUEST</span><b style={{ color: request.approval_required === false ? "#bbf7d0" : "#fecdd3" }}>{request.approval_required === false ? "NONE" : "BLOCKED"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>PROVIDER SIMULATION</span><b style={{ color: request.provider_simulation_requested === true ? "#bbf7d0" : "#fecdd3" }}>{request.provider_simulation_requested === true ? "COMPLETE" : "BLOCKED"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>DESTINATION</span><b>{hideTableData ? "••••" : shortenWalletAddress(tx.to || "", 10, 8) || "—"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>TX VALUE</span><b>{hideTableData ? "••••" : `${tx.value_wei || "0"} wei`}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>GAS LIMIT</span><b>{hideTableData ? "••••" : tx.gas_limit || "—"}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>MAX REVIEWED FEE</span><b>{hideTableData ? "••••" : `${balances.maximum_fee_wei || "—"} wei`}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>CALLDATA</span><b>{hideTableData ? "••••" : `${calldataBytes} bytes · ${calldataBytes > 0 ? "PRESENT" : "MISSING"}`}</b></div>
+                          <div style={cellStyle}><span style={keyStyle}>PREFLIGHT</span><b style={{ color: robinhoodChainWalletSwapExpired ? "#fecdd3" : "#bbf7d0" }}>{robinhoodChainWalletSwapExpired ? "EXPIRED" : "FRESH"}</b></div>
+                        </div>
+
+                        {!submitted && (
+                          <div style={{ display: "grid", gap: 5 }}>
+                            <span style={{ color: "#ede9fe", fontWeight: 800 }}>
+                              Review the fresh simulated swap above. Opening MetaMask does not imply approval; MetaMask is the final approve/reject decision.
+                            </span>
+                            <button
+                              type="button"
+                              style={{
+                                ...safeButton,
+                                ...(robinhoodChainWalletSwapAttempted || robinhoodChainWalletSwapExpired || robinhoodChainWalletSwapBusy ? safeButtonDisabled : {}),
+                                padding: "8px 11px", fontWeight: 950, border: "1px solid rgba(167, 139, 250, 0.72)",
+                                color: "#f5f3ff", background: "rgba(91, 33, 182, 0.36)", justifySelf: "start",
+                              }}
+                              disabled={robinhoodChainWalletSwapAttempted || robinhoodChainWalletSwapExpired || robinhoodChainWalletSwapBusy}
+                              onClick={sendRobinhoodChainSuccessfulSwapRequest}
+                            >
+                              Open MetaMask — SWAP EXACT INPUT
+                            </button>
+                          </div>
+                        )}
+
+                        {submitted && !confirmed && (
+                          <div style={{ display: "grid", gap: 6 }}>
+                            <div style={{ color: "#ddd6fe", fontWeight: 850 }}>
+                              SWAP SUBMITTED · tx {hideTableData ? "••••" : shortenWalletAddress(result.transaction_hash, 12, 10)} · AUTO SECOND REQUEST NONE
+                            </div>
+                            <button
+                              type="button"
+                              style={{ ...safeButton, padding: "7px 10px", justifySelf: "start" }}
+                              disabled={robinhoodChainWalletSwapBusy}
+                              onClick={refreshRobinhoodChainSuccessfulSwapReceipt}
+                            >
+                              {robinhoodChainWalletSwapBusy ? "Checking receipt…" : "Refresh Swap Receipt"}
+                            </button>
+                          </div>
+                        )}
+
+                        {confirmed && (
+                          <div style={{ color: "#bbf7d0", fontWeight: 950, display: "grid", gap: 3 }}>
+                            <span>PASS · SWAP RECEIPT CONFIRMED · status 1 · automatic second transaction NO</span>
+                            <span>Gas used {result.gas_used || "—"} · effective gas price {result.effective_gas_price_wei || "—"} wei · network fee {result.network_fee_wei || "—"} wei</span>
+                            <span>Accounting/reconciliation remains a separate explicit tranche.</span>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
+
+                  {robinhoodChainWalletSwapError && (
+                    <div style={{ color: "#fecdd3", fontWeight: 800, overflowWrap: "anywhere" }}>
+                      {hideTableData ? "Fresh swap-only execution is blocked or failed." : robinhoodChainWalletSwapError}
+                    </div>
+                  )}
                 </div>
               )}
               {robinhoodChainExecutionAdapter === "native_exact_input" && side === "sell" && (

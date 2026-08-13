@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import hashlib
 import json
 import re
 import time
@@ -34,6 +35,9 @@ _TRANSACTION_TOKEN_CURSOR_KEYS = frozenset({
 _APPROVE_SELECTOR = "0x095ea7b3"
 _MAX_CACHE_ENTRIES = 256
 _MAX_CURSOR_LENGTH = 4096
+_INGEST_SCAN_MAX_ATTEMPTS = 3
+_INGEST_SCAN_RETRY_BASE_S = 1.0
+_INGEST_SCAN_TIMEOUT_S = 30.0
 
 
 def _utc_now() -> datetime:
@@ -401,10 +405,135 @@ def _normalize_transaction(
     }
 
 
+def _normalize_internal_transaction(
+    item: Mapping[str, Any],
+    *,
+    owner: str,
+) -> Optional[Dict[str, Any]]:
+    """Normalize one Blockscout internal native-value transfer.
+
+    Internal traces are required for native ETH proceeds/refunds that do not
+    appear as top-level address transactions. They carry no separate network
+    fee; the top-level transaction row remains the fee authority.
+    """
+    tx_hash = _transaction_hash(
+        item.get("transaction_hash")
+        or item.get("tx_hash")
+        or item.get("hash")
+    )
+    if not tx_hash:
+        return None
+    from_address = _address_hash(item.get("from"))
+    to_address = _address_hash(item.get("to"))
+    direction = _direction(owner, from_address, to_address)
+    if direction not in {"in", "out", "self"}:
+        return None
+
+    value_atomic = max(0, _safe_int(item.get("value"), 0))
+    status_text = str(item.get("success") if item.get("success") is not None else item.get("status") or "").strip().lower()
+    status = "error" if status_text in {"false", "0", "error", "failed", "failure"} else "ok"
+    classification = "failed" if status == "error" else "native_transfer"
+
+    raw_index = (
+        item.get("index")
+        if item.get("index") is not None
+        else item.get("internal_transaction_index")
+    )
+    if raw_index is None:
+        raw_index = item.get("trace_address")
+    if isinstance(raw_index, (list, tuple)):
+        index_text = ".".join(str(part) for part in raw_index)
+    else:
+        index_text = str(raw_index or "").strip()
+    if not index_text:
+        stable = "|".join([
+            tx_hash.lower(),
+            str(from_address or "").lower(),
+            str(to_address or "").lower(),
+            str(value_atomic),
+            str(item.get("block_number") or ""),
+            str(item.get("type") or ""),
+        ])
+        index_text = "h" + hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+
+    return {
+        "id": f"{tx_hash.lower()}:internal:{index_text}",
+        "timestamp": item.get("timestamp"),
+        "transaction_hash": tx_hash,
+        "status": status,
+        "classification": classification,
+        "direction": direction,
+        "asset": "ETH",
+        "amount_atomic": str(value_atomic),
+        "amount": _format_atomic(value_atomic, 18),
+        "decimals": 18,
+        "from_address": from_address,
+        "to_address": to_address,
+        "method": str(item.get("type") or "").strip() or None,
+        "fee_wei": "0",
+        "fee_eth": "0",
+        "block_number": _safe_int(item.get("block_number"), 0) or None,
+        "confirmations": None,
+        "contract_address": None,
+        "registry_id": None,
+        "registry_venue": None,
+        "registry_label": None,
+        "registered": True,
+        "explorer_url": f"{_EXPLORER_URL}/tx/{tx_hash}",
+        "source": _HISTORY_SOURCE,
+        "read_only": True,
+        "provider_raw": {
+            "internal_index": index_text,
+            "type": item.get("type"),
+        },
+    }
+
+
+def _provider_next_page_params(value: Any) -> Optional[Dict[str, Any]]:
+    """Keep scalar provider-returned keyset pagination fields for scanner reads.
+
+    Unlike display cursors, this data never comes from a caller. It is accepted
+    only from the fixed Blockscout response and passed back to that same fixed
+    endpoint during the current scan.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    out: Dict[str, Any] = {}
+    for key, item in value.items():
+        if item is None or isinstance(item, (str, int, float, bool)):
+            if item is not None:
+                out[str(key)] = item
+    return out or None
+
+
 def _sort_key(item: Mapping[str, Any]) -> Tuple[str, int, str]:
     timestamp = str(item.get("timestamp") or "")
     block_number = _safe_int(item.get("block_number"), 0)
     return timestamp, block_number, str(item.get("id") or "")
+
+
+def _provider_error_text(exc: BaseException) -> str:
+    """Return a non-empty, bounded provider error without embedding request URLs."""
+    type_name = type(exc).__name__ or "ProviderError"
+    message = str(exc or "").strip()
+    if message:
+        return f"{type_name}: {message}"[:1000]
+    return type_name
+
+
+def _retryable_scan_error(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    text = str(exc or "")
+    return bool(re.search(r"HTTP\s+(?:429|5\d\d)\b", text))
+
+
+class _ScanProviderError(RuntimeError):
+    def __init__(self, exc: BaseException, attempts: int) -> None:
+        super().__init__(_provider_error_text(exc))
+        self.error_type = type(exc).__name__ or "ProviderError"
+        self.attempts = max(1, int(attempts))
+        self.retryable = _retryable_scan_error(exc)
 
 
 class RobinhoodChainHistoryService:
@@ -514,11 +643,18 @@ class RobinhoodChainHistoryService:
         self._backoff_until_monotonic = 0.0
         self._backoff_until_utc = None
 
-    async def _get_json(self, path: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    async def _get_json(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]],
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> Dict[str, Any]:
         url = f"{self.api_base}/{path.lstrip('/')}"
+        effective_timeout_s = self.timeout_s if timeout_s is None else max(2.0, min(30.0, float(timeout_s)))
         async with self._semaphore:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout_s),
+                timeout=httpx.Timeout(effective_timeout_s),
                 headers={
                     "Accept": "application/json",
                     "User-Agent": "UTT-Robinhood-Chain-History/8.0",
@@ -539,6 +675,25 @@ class RobinhoodChainHistoryService:
         if not isinstance(body, Mapping):
             raise RuntimeError("Robinhood Chain Blockscout returned a non-object payload")
         return dict(body)
+
+    async def _scan_get_json(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Fetch one ingest-scan page with bounded retries for transient provider failures."""
+        last_exc: Optional[BaseException] = None
+        attempts = 0
+        for attempts in range(1, _INGEST_SCAN_MAX_ATTEMPTS + 1):
+            try:
+                return await self._get_json(path, params, timeout_s=_INGEST_SCAN_TIMEOUT_S)
+            except Exception as exc:
+                last_exc = exc
+                if attempts >= _INGEST_SCAN_MAX_ATTEMPTS or not _retryable_scan_error(exc):
+                    break
+                await asyncio.sleep(_INGEST_SCAN_RETRY_BASE_S * attempts)
+        assert last_exc is not None
+        raise _ScanProviderError(last_exc, attempts) from last_exc
 
     async def get_transaction_activity(
         self,
@@ -727,6 +882,219 @@ class RobinhoodChainHistoryService:
         payload["history_status"] = self.status()
         await self._store(cache_key, payload)
         return payload
+
+
+    async def scan_address_history(
+        self,
+        address: str,
+        *,
+        force_refresh: bool,
+        registry_tokens: Mapping[str, Mapping[str, Any]],
+        max_pages: int,
+        stop_at_block: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Read provider history for persistence-oriented scan/preview.
+
+        This is deliberately independent of the bounded display cursor and its
+        five-page default. It still uses only fixed Blockscout resources and is
+        itself read-only; persistence is owned by the wallet-ingest service.
+        """
+        try:
+            normalized_address = validate_evm_address(address)
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_history_request", "message": str(exc), "read_only": True}
+
+        scan_max_pages = max(1, min(1000, int(max_pages)))
+        checkpoint_block = int(stop_at_block) if stop_at_block is not None else None
+
+        if not self.api_base.startswith(("https://", "http://")):
+            return {"ok": False, "error": "history_api_not_configured", "read_only": True}
+
+        chain = await get_robinhood_chain_client().verify_expected_chain(force_refresh=bool(force_refresh))
+        if not chain.get("ok"):
+            return {
+                "ok": False,
+                "error": "chain_id_mismatch_or_unavailable",
+                "expected_chain_id": _EXPECTED_CHAIN_ID,
+                "expected_chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+                "chain": chain,
+                "read_only": True,
+            }
+
+        tx_cursor: Optional[Dict[str, Any]] = None
+        token_cursor: Optional[Dict[str, Any]] = None
+        internal_cursor: Optional[Dict[str, Any]] = None
+        tx_active = token_active = internal_active = True
+        deduped: Dict[str, Dict[str, Any]] = {}
+        provider_errors: List[Dict[str, Any]] = []
+        pages = 0
+        provider_exhausted = False
+        reached_checkpoint = False
+        newest_block: Optional[int] = None
+        oldest_block: Optional[int] = None
+        source_counts = {"transactions": 0, "token_transfers": 0, "internal_transactions": 0}
+
+        for page in range(1, scan_max_pages + 1):
+            pages = page
+            tx_payload: Dict[str, Any] = {"items": [], "next_page_params": None}
+            token_payload: Dict[str, Any] = {"items": [], "next_page_params": None}
+            internal_payload: Dict[str, Any] = {"items": [], "next_page_params": None}
+
+            if tx_active:
+                try:
+                    tx_payload = await self._scan_get_json(
+                        f"addresses/{normalized_address}/transactions",
+                        tx_cursor,
+                    )
+                except Exception as exc:
+                    provider_errors.append({
+                        "source": "transactions",
+                        "page": page,
+                        "error": _provider_error_text(exc),
+                        "error_type": getattr(exc, "error_type", type(exc).__name__),
+                        "attempts": int(getattr(exc, "attempts", 1)),
+                        "retryable": bool(getattr(exc, "retryable", _retryable_scan_error(exc))),
+                    })
+                    tx_active = False
+
+            if token_active:
+                try:
+                    token_params = dict(token_cursor or {})
+                    token_params["type"] = "ERC-20"
+                    token_payload = await self._scan_get_json(
+                        f"addresses/{normalized_address}/token-transfers",
+                        token_params,
+                    )
+                except Exception as exc:
+                    provider_errors.append({
+                        "source": "token_transfers",
+                        "page": page,
+                        "error": _provider_error_text(exc),
+                        "error_type": getattr(exc, "error_type", type(exc).__name__),
+                        "attempts": int(getattr(exc, "attempts", 1)),
+                        "retryable": bool(getattr(exc, "retryable", _retryable_scan_error(exc))),
+                    })
+                    token_active = False
+
+            if internal_active:
+                try:
+                    internal_payload = await self._scan_get_json(
+                        f"addresses/{normalized_address}/internal-transactions",
+                        internal_cursor,
+                    )
+                except Exception as exc:
+                    provider_errors.append({
+                        "source": "internal_transactions",
+                        "page": page,
+                        "error": _provider_error_text(exc),
+                        "error_type": getattr(exc, "error_type", type(exc).__name__),
+                        "attempts": int(getattr(exc, "attempts", 1)),
+                        "retryable": bool(getattr(exc, "retryable", _retryable_scan_error(exc))),
+                    })
+                    internal_active = False
+
+            tx_items = [item for item in tx_payload.get("items") or [] if isinstance(item, Mapping)][:50]
+            token_items = [item for item in token_payload.get("items") or [] if isinstance(item, Mapping)][:50]
+            internal_items = [item for item in internal_payload.get("items") or [] if isinstance(item, Mapping)][:50]
+            source_counts["transactions"] += len(tx_items)
+            source_counts["token_transfers"] += len(token_items)
+            source_counts["internal_transactions"] += len(internal_items)
+
+            tx_lookup: Dict[str, Mapping[str, Any]] = {}
+            for tx in tx_items:
+                tx_hash = _transaction_hash(tx.get("hash") or tx.get("transaction_hash"))
+                if tx_hash:
+                    tx_lookup[tx_hash.lower()] = tx
+
+            token_hashes = {
+                tx_hash.lower()
+                for item in token_items
+                for tx_hash in [_transaction_hash(item.get("transaction_hash") or item.get("tx_hash"))]
+                if tx_hash
+            }
+
+            rows: List[Dict[str, Any]] = []
+            for item in token_items:
+                row = _normalize_token_transfer(
+                    item,
+                    owner=normalized_address,
+                    tx_lookup=tx_lookup,
+                    registry_tokens=registry_tokens,
+                )
+                if row is not None:
+                    rows.append(row)
+            for tx in tx_items:
+                tx_hash = _transaction_hash(tx.get("hash") or tx.get("transaction_hash"))
+                row = _normalize_transaction(
+                    tx,
+                    owner=normalized_address,
+                    has_token_transfer=bool(tx_hash and tx_hash.lower() in token_hashes),
+                    registry_tokens=registry_tokens,
+                )
+                if row is not None:
+                    rows.append(row)
+            for item in internal_items:
+                row = _normalize_internal_transaction(item, owner=normalized_address)
+                if row is not None:
+                    rows.append(row)
+
+            page_blocks: List[int] = []
+            for row in rows:
+                row_id = str(row.get("id") or "")
+                if row_id and row_id not in deduped:
+                    deduped[row_id] = row
+                block = _safe_int(row.get("block_number"), 0)
+                if block > 0:
+                    page_blocks.append(block)
+                    newest_block = block if newest_block is None else max(newest_block, block)
+                    oldest_block = block if oldest_block is None else min(oldest_block, block)
+
+            tx_cursor = _provider_next_page_params(tx_payload.get("next_page_params")) if tx_active else None
+            token_cursor = _provider_next_page_params(token_payload.get("next_page_params")) if token_active else None
+            internal_cursor = _provider_next_page_params(internal_payload.get("next_page_params")) if internal_active else None
+            tx_active = bool(tx_cursor)
+            token_active = bool(token_cursor)
+            internal_active = bool(internal_cursor)
+
+            if checkpoint_block is not None and page_blocks and max(page_blocks) <= checkpoint_block:
+                reached_checkpoint = True
+                break
+            if not (tx_active or token_active or internal_active):
+                provider_exhausted = not bool(provider_errors)
+                break
+
+        remaining_provider_pages = bool(tx_active or token_active or internal_active)
+        items = sorted(deduped.values(), key=_sort_key, reverse=True)
+        transaction_hashes = {
+            str(row.get("transaction_hash") or "").strip().lower()
+            for row in items
+            if _transaction_hash(row.get("transaction_hash"))
+        }
+        return {
+            "ok": True,
+            "venue": "robinhood_chain",
+            "network": "robinhood_chain",
+            "chain_id": _EXPECTED_CHAIN_ID,
+            "chain_id_hex": _EXPECTED_CHAIN_ID_HEX,
+            "address": normalized_address,
+            "items": items,
+            "item_count": len(items),
+            "transaction_count": len(transaction_hashes),
+            "pages_scanned": pages,
+            "max_pages": scan_max_pages,
+            "provider_counts": source_counts,
+            "provider_errors": provider_errors,
+            "partial": bool(provider_errors),
+            "provider_exhausted": provider_exhausted,
+            "reached_checkpoint": reached_checkpoint,
+            "truncated": bool(remaining_provider_pages and not reached_checkpoint),
+            "newest_block_number": newest_block,
+            "oldest_block_number": oldest_block,
+            "stop_at_block": checkpoint_block,
+            "source": _HISTORY_SOURCE,
+            "read_only": True,
+            "will_mutate": False,
+        }
 
 
     async def get_address_history(

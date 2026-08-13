@@ -17,6 +17,7 @@ from ..models import (
     RobinhoodChainExecution,
     RobinhoodChainBuyExecution,
     RobinhoodChainSwapExecution,
+    RobinhoodChainExternalSwap,
 )
 
 # NEW (3.5): realized sourcing from lot_journal
@@ -65,6 +66,29 @@ ALLOWED_SORT_FIELDS = {
 # the terminal SQL filter before _to_unified_swap can normalize it.
 _TERMINAL = {"filled", "canceled", "cancelled", "rejected", "done", "closed", "expired", "failed", "confirmed", "reverted", "verification_failed", "wallet_rejected", "submission_failed"}
 _OPENISH = {"new", "open", "routed", "acked", "partial", "live", "pending"}
+_HIDDEN_CANCEL_REJECT = {"canceled", "cancelled", "rejected"}
+
+
+def _exclude_hidden_cancel_reject(
+    items: List[Dict[str, Any]],
+    *,
+    enabled: bool,
+    explicit_status: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Apply the UI hide policy before total calculation and pagination.
+
+    An explicit exact canceled/cancelled/rejected status request is authoritative
+    and disables the exclusion so an operator can inspect those rows directly.
+    """
+    if not bool(enabled):
+        return items
+    requested = str(explicit_status or "").strip().lower()
+    if requested in _HIDDEN_CANCEL_REJECT:
+        return items
+    return [
+        item for item in items
+        if str(item.get("status") or "").strip().lower() not in _HIDDEN_CANCEL_REJECT
+    ]
 
 
 # ----------------------------
@@ -673,6 +697,89 @@ def _to_unified_robinhood_chain_swap_execution(row: RobinhoodChainSwapExecution)
         "execution_reconciled": confirmed_reconciled,
         "approval_fee": approval_fee,
         "actual_input_numeric": actual_input,
+    }
+
+
+def _view_key_robinhood_chain_external_swap(external_swap_id: str) -> str:
+    return f"RHCHAINEXT:{external_swap_id or ''}"
+
+
+def _to_unified_robinhood_chain_external_swap(row: RobinhoodChainExternalSwap) -> Dict[str, Any]:
+    def _float_or_none(value):
+        try:
+            if value is None or value == "":
+                return None
+            parsed = float(value)
+            return parsed if parsed >= 0 else None
+        except Exception:
+            return None
+
+    actual_input = _float_or_none(row.input_amount)
+    actual_output = _float_or_none(row.output_amount)
+    avg_price = None
+    try:
+        if actual_input is not None and actual_output is not None and actual_output > 0:
+            avg_price = actual_input / actual_output
+    except Exception:
+        avg_price = None
+    network_fee = _float_or_none(row.network_fee)
+    created_at = row.tx_time or row.created_at
+    closed_at = row.tx_time or row.updated_at or row.created_at
+
+    return {
+        "source": "RHCHAIN",
+        "venue": "robinhood_chain",
+        "id": str(row.id),
+        "venue_order_id": str(row.transaction_hash or ""),
+        "client_order_id": "",
+        "symbol": row.symbol,
+        "symbol_canon": row.symbol,
+        "symbol_venue": row.symbol,
+        "side": "buy",
+        "type": "swap",
+        "cross_asset_buy": True,
+        "amount_mode": "observed_actual",
+        "display_mode": "historical_actual",
+        "status": "confirmed",
+        "status_bucket": _status_bucket("confirmed"),
+        "qty": actual_output,
+        "filled_qty": actual_output or 0.0,
+        "limit_price": None,
+        "avg_fill_price": avg_price,
+        "fee": network_fee,
+        "fee_asset": "ETH" if network_fee is not None else None,
+        "total_after_fee": actual_output,
+        "reject_reason": None,
+        "created_at": created_at,
+        "submitted_at": created_at,
+        "updated_at": row.updated_at,
+        "captured_at": row.updated_at,
+        "closed_at": closed_at,
+        "closed_at_inferred": False,
+        "view_key": _view_key_robinhood_chain_external_swap(str(row.id)),
+        "viewed_confirmed": False,
+        "viewed_at": None,
+        "can_cancel": False,
+        "cancel_ref": None,
+        "transaction_id": row.transaction_hash,
+        "txid": row.transaction_hash,
+        "expected_input_asset": None,
+        "expected_input_amount": None,
+        "expected_output_asset": None,
+        "expected_output_amount": None,
+        "minimum_output_amount": None,
+        "actual_input_asset": str(row.input_asset or "").strip().upper() or None,
+        "actual_input_amount": row.input_amount,
+        "actual_input_amount_atomic": row.input_amount_atomic,
+        "actual_output_asset": str(row.output_asset or "").strip().upper() or None,
+        "actual_output_amount": row.output_amount,
+        "actual_output_amount_atomic": row.output_amount_atomic,
+        "actual_network_fee_asset": str(row.network_fee_asset or "ETH").strip().upper() or "ETH",
+        "actual_network_fee": row.network_fee,
+        "actual_network_fee_wei": row.network_fee_wei,
+        "execution_reconciled": True,
+        "external_history": True,
+        "materialization_source": row.source,
     }
 
 
@@ -1787,6 +1894,7 @@ def list_all_orders(
     sort_dir: str,
     page: int,
     page_size: int,
+    exclude_canceled_rejected: bool = False,
 ) -> Tuple[List[Dict[str, Any]], int]:
     page = max(page, 1)
     page_size = min(max(page_size, 1), 200)
@@ -2046,6 +2154,67 @@ def list_all_orders(
             # established Robinhood Chain SELL or exact-receive BUY rows.
             pass
 
+        # Canonical externally-originated wallet-history swaps. These rows are
+        # deliberately separate from UTT planning/signing lifecycles. A
+        # defensive transaction-hash exclusion ensures an existing UTT
+        # lifecycle remains authoritative even if a bad external row exists.
+        try:
+            known_tx_hashes = {
+                str(value or "").strip().lower()
+                for value, in db.query(RobinhoodChainExecution.tx_hash)
+                .filter(RobinhoodChainExecution.tx_hash.is_not(None))
+                .all()
+                if value
+            }
+            known_tx_hashes.update(
+                str(value or "").strip().lower()
+                for value, in db.query(RobinhoodChainBuyExecution.swap_tx_hash)
+                .filter(RobinhoodChainBuyExecution.swap_tx_hash.is_not(None))
+                .all()
+                if value
+            )
+            known_tx_hashes.update(
+                str(value or "").strip().lower()
+                for value, in db.query(RobinhoodChainSwapExecution.swap_tx_hash)
+                .filter(RobinhoodChainSwapExecution.swap_tx_hash.is_not(None))
+                .all()
+                if value
+            )
+
+            external_rows = (
+                db.query(RobinhoodChainExternalSwap)
+                .filter(RobinhoodChainExternalSwap.status == "confirmed")
+                .all()
+            )
+            for row in external_rows:
+                if str(row.transaction_hash or "").strip().lower() in known_tx_hashes:
+                    continue
+                unified = _to_unified_robinhood_chain_external_swap(row)
+                if symbol:
+                    requested_symbol = str(symbol or "").strip()
+                    if requested_symbol not in {
+                        str(unified.get("symbol") or ""),
+                        str(unified.get("symbol_canon") or ""),
+                        str(unified.get("symbol_venue") or ""),
+                    }:
+                        continue
+                if status and str(unified.get("status") or "") != str(status):
+                    continue
+                created_value = unified.get("created_at")
+                if dt_from and created_value and created_value < dt_from:
+                    continue
+                if dt_to and created_value and created_value > dt_to:
+                    continue
+                if status_bucket:
+                    requested_bucket = str(status_bucket).strip().lower()
+                    if str(unified.get("status_bucket") or "").lower() != requested_bucket:
+                        continue
+                robinhood_chain_execution_items.append(unified)
+        except Exception:
+            # External-history visibility is additive and must never hide the
+            # existing Robinhood Chain lifecycle rows.
+            pass
+
     combined: List[Dict[str, Any]] = []
     for o in local_items:
         combined.append(_to_unified_local(o))
@@ -2062,6 +2231,14 @@ def list_all_orders(
         combined = [x for x in combined if (x.get("status_bucket") or "").lower() == sb]
 
     combined = _dedupe_and_enrich_local_with_venue(combined)
+
+    # AO-PAGE.FILTER.1: hide canceled/rejected rows before sorting, total, and
+    # page slicing. This makes page_size mean visible rows instead of raw rows.
+    combined = _exclude_hidden_cancel_reject(
+        combined,
+        enabled=bool(exclude_canceled_rejected),
+        explicit_status=status,
+    )
 
     _reconcile_client_order_ids(db, combined)
     _hydrate_views(db, combined)

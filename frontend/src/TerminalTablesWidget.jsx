@@ -802,6 +802,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       setAoSource,
       aoVenue,
       setAoVenue,
+      resolveAllOrdersVenueInput,
       aoStatusBucket,
       setAoStatusBucket,
       aoSymbol,
@@ -5439,6 +5440,9 @@ function renderAllOrdersHeader(col) {
     const isRobinhoodChainExecutionRow =
       String(o?.venue || "").trim().toLowerCase() === "robinhood_chain" &&
       String(o?.source || "").trim().toUpperCase() === "RHCHAIN";
+    const isRobinhoodChainExternalHistoryRow =
+      isRobinhoodChainExecutionRow &&
+      String(o?.view_key || "").trim().toUpperCase().startsWith("RHCHAINEXT:");
     const isRobinhoodChainCrossAssetBuy =
       isRobinhoodChainExecutionRow &&
       String(o?.side || "").trim().toLowerCase() === "buy" &&
@@ -5917,7 +5921,25 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
     }
 
     if (col === COLS.limit) {
-      return <td style={td}>{hideTableDataGlobal ? "••••" : o.limit_price != null ? fmtPrice?.(o.limit_price) : "—"}</td>;
+      const hasLimitPrice = o.limit_price !== null && o.limit_price !== undefined;
+      const hasHistoricalAvg =
+        isRobinhoodChainExternalHistoryRow &&
+        !hasLimitPrice &&
+        o.avg_fill_price !== null &&
+        o.avg_fill_price !== undefined;
+      const limitDisplay = hasLimitPrice
+        ? fmtPrice?.(o.limit_price)
+        : hasHistoricalAvg
+          ? `≈${fmtPrice?.(o.avg_fill_price)}`
+          : "—";
+      const limitTitle = hasHistoricalAvg
+        ? "Historical external swap: original limit price is unavailable; showing observed average execution price."
+        : undefined;
+      return (
+        <td style={td} title={limitTitle}>
+          {hideTableDataGlobal ? "••••" : limitDisplay}
+        </td>
+      );
     }
 
     if (col === COLS.status) return <td style={td}>{hideTableDataGlobal ? "••••" : st || "—"}</td>;
@@ -6039,6 +6061,11 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aoStatusBucket]);
+
+  const [aoVenueDraft, setAoVenueDraft] = useState(() => aoVenue || "");
+  useEffect(() => {
+    setAoVenueDraft(aoVenue || "");
+  }, [aoVenue]);
 
   const [aoSymbolDraft, setAoSymbolDraft] = useState(() => aoSymbol || "");
   const [aoLocalSymbolFilter, setAoLocalSymbolFilter] = useState("");
@@ -6618,7 +6645,7 @@ useEffect(() => {
     let syncErr = null;
 
     try {
-      await doSyncAndLoadAllOrders?.({ venue: "*" });
+      await doSyncAndLoadAllOrders?.({ venue: String(aoVenue || "").trim() });
     } catch (e) {
       syncErr = e;
       setAoLedgerSyncErr(e?.message ? String(e.message) : String(e));
@@ -6639,7 +6666,7 @@ useEffect(() => {
 
     // If Sync+Load failed, we already surfaced the error above; keep the function resolved so UI doesn't wedge.
     return syncErr ? null : true;
-  }, [aoLedgerSyncOnSyncLoad, aoTaxWithholdEnabled, runLedgerSync, doSyncAndLoadAllOrders]);
+  }, [aoLedgerSyncOnSyncLoad, aoTaxWithholdEnabled, aoVenue, runLedgerSync, doSyncAndLoadAllOrders]);
 
 
   const doAllOrdersLedgerSyncOnly = useCallback(async () => {
@@ -7875,6 +7902,24 @@ function renderFillToasts() {
   function renderAllOrders() {
     const row = { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" };
 
+    const applyAoVenue = () => {
+      const raw = String(aoVenueDraft || "").trim();
+      const resolved = typeof resolveAllOrdersVenueInput === "function"
+        ? resolveAllOrdersVenueInput(raw)
+        : raw;
+      const next = String(resolved ?? raw).trim();
+
+      setAoVenueDraft(next);
+      setAoPage?.(1);
+
+      if (next === String(aoVenue || "").trim()) {
+        doLoadAllOrders?.();
+        return;
+      }
+
+      setAoVenue?.(next);
+    };
+
     const applyAoSymbol = () => {
       const v = String(aoSymbolDraft || "").trim();
       // Important: manual entry in All Orders must honor BOTH the explicit All Orders venue
@@ -8034,14 +8079,24 @@ function renderFillToasts() {
             <span>Venue</span>
             <input
               data-no-drag="1"
-              style={{ ...sx.input, width: 120 }}
-              value={aoVenue || ""}
-              onChange={(e) => {
-                setAoVenue?.(e.target.value);
-                setAoPage?.(1);
+              style={{ ...sx.input, width: 140 }}
+              value={aoVenueDraft}
+              onChange={(e) => setAoVenueDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") applyAoVenue();
               }}
               placeholder="(any)"
+              title="Enter a canonical venue ID or exact venue display name, then Apply"
             />
+            <button
+              data-no-drag="1"
+              style={btn?.(false) ?? smallBtn(false)}
+              disabled={false}
+              onClick={() => applyAoVenue()}
+              title={String(aoVenueDraft || "").trim() ? "Apply venue filter" : "Clear venue filter (show all)"}
+            >
+              Apply
+            </button>
           </div>
 
           <div data-no-drag="1" style={sx.pill}>
@@ -8076,7 +8131,15 @@ function renderFillToasts() {
               data-no-drag="1"
               style={{ ...sx.input, width: 160 }}
               value={aoStatusFilter || ""}
-              onChange={(e) => setAoStatusFilter(e.target.value)}
+              onChange={(e) => {
+                const next = e.target.value;
+                setAoStatusFilter(next);
+                const explicitHidden = parseStatusFilterTokens(next).some((tok) =>
+                  tok === "canceled" || tok === "cancelled" || tok === "rejected"
+                );
+                if (explicitHidden && hideCancelledUnified) setHideCancelledUnified?.(false);
+                setAoPage?.(1);
+              }}
               list="uttAoStatusHints"
               placeholder="(any)"
               onKeyDown={(e) => {

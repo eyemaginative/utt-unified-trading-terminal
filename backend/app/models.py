@@ -539,6 +539,153 @@ class WalletAddressTx(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Robinhood Chain wallet-history evidence + checkpointing (RH-WALLET.INGEST.1C2)
+# ---------------------------------------------------------------------------
+
+class RobinhoodChainWalletEvent(Base):
+    """One normalized Robinhood Chain wallet-history event.
+
+    EVM transaction hashes are not sufficient event identities because one
+    transaction can contain multiple same-direction ERC-20/native legs.  The
+    event_key therefore preserves the normalized provider event identity
+    (transaction row, ERC-20 log index, internal-transfer index, etc.).
+    """
+    __tablename__ = "robinhood_chain_wallet_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    wallet_address_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("wallet_addresses.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663, index=True)
+    event_key: Mapped[str] = mapped_column(String(192), nullable=False)
+    transaction_hash: Mapped[str] = mapped_column(String(66), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    log_index: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    block_number: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    tx_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    classification: Mapped[str] = mapped_column(String(48), nullable=False, default="unknown", index=True)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False, default="other", index=True)
+    asset: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    amount_atomic: Mapped[str] = mapped_column(String(96), nullable=False, default="0")
+    decimals: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fee_wei: Mapped[str] = mapped_column(String(96), nullable=False, default="0")
+
+    contract_address: Mapped[str | None] = mapped_column(String(42), nullable=True, index=True)
+    registry_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    registered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    from_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    to_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    method: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="blockscout_v2")
+    raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    wallet_address: Mapped["WalletAddress"] = relationship("WalletAddress")
+
+    __table_args__ = (
+        UniqueConstraint("wallet_address_id", "event_key", name="uq_rh_wallet_event_key"),
+        Index("ix_rh_wallet_event_tx_wallet", "wallet_address_id", "transaction_hash"),
+        Index("ix_rh_wallet_event_block_wallet", "wallet_address_id", "block_number"),
+    )
+
+
+class RobinhoodChainWalletCheckpoint(Base):
+    """Incremental scan checkpoint for one saved Robinhood Chain wallet row."""
+    __tablename__ = "robinhood_chain_wallet_checkpoints"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    wallet_address_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("wallet_addresses.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663)
+    newest_block_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    oldest_block_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fully_backfilled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    transaction_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_full_scan_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    wallet_address: Mapped["WalletAddress"] = relationship("WalletAddress")
+
+
+# ---------------------------------------------------------------------------
+# Robinhood Chain external wallet-history swap materialization (RH-WALLET.INGEST.1D)
+# ---------------------------------------------------------------------------
+
+class RobinhoodChainExternalSwap(Base):
+    """Canonical transaction-level record for externally-originated RH Chain swaps.
+
+    These rows are derived only from persisted wallet-history evidence and are
+    intentionally separate from UTT planning/signing execution lifecycles.  The
+    transaction hash is the external swap identity for one saved wallet.
+    """
+    __tablename__ = "robinhood_chain_external_swaps"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    wallet_address_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("wallet_addresses.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663, index=True)
+    transaction_hash: Mapped[str] = mapped_column(String(66), nullable=False, index=True)
+
+    symbol: Mapped[str] = mapped_column(String(72), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False, default="buy")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="confirmed", index=True)
+
+    input_asset: Mapped[str] = mapped_column(String(32), nullable=False, default="ETH")
+    input_amount_atomic: Mapped[str] = mapped_column(String(96), nullable=False)
+    input_amount: Mapped[str] = mapped_column(String(96), nullable=False)
+    input_decimals: Mapped[int] = mapped_column(Integer, nullable=False, default=18)
+
+    output_asset: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    output_registry_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    output_amount_atomic: Mapped[str] = mapped_column(String(96), nullable=False)
+    output_amount: Mapped[str] = mapped_column(String(96), nullable=False)
+    output_decimals: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    network_fee_asset: Mapped[str] = mapped_column(String(16), nullable=False, default="ETH")
+    network_fee_wei: Mapped[str] = mapped_column(String(96), nullable=False, default="0")
+    network_fee: Mapped[str] = mapped_column(String(96), nullable=False, default="0")
+
+    block_number: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    tx_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(48), nullable=False, default="wallet_history_external")
+    evidence_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    wallet_address: Mapped["WalletAddress"] = relationship("WalletAddress")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "wallet_address_id",
+            "transaction_hash",
+            name="uq_rh_external_swap_wallet_tx",
+        ),
+        Index("ix_rh_external_swap_wallet_time", "wallet_address_id", "tx_time"),
+        Index("ix_rh_external_swap_symbol_time", "symbol", "tx_time"),
+    )
+
+
 class RuntimeSetting(Base):
     __tablename__ = "runtime_settings"
 

@@ -14,6 +14,7 @@ import {
   cancelOrder,
   getAllOrders,
   refreshVenueOrders,
+  syncRobinhoodChainWalletIncremental,
 
   // safety + order views
   getSafetyStatus,
@@ -1220,7 +1221,9 @@ async function appLoadRobinhoodChainRegistryMap({ force = false } = {}) {
   }
 }
 
-function appRobinhoodChainUsdSourceLabel(registryMeta, px) {
+function appRobinhoodChainUsdSourceLabel(registryMeta, px, backendSource = null) {
+  const resolvedBackendSource = String(backendSource || "").trim();
+  if (resolvedBackendSource) return resolvedBackendSource;
   const source = String(registryMeta?.external_price_source || "").trim().toLowerCase();
   const priceId = String(registryMeta?.external_price_id || "").trim();
   if (px === null || px === undefined) {
@@ -1792,7 +1795,7 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
       );
       const registryMeta = isRobinhoodChain ? robinhoodRegistryMap?.[asset] || null : null;
       const usdSource = isRobinhoodChain
-        ? appRobinhoodChainUsdSourceLabel(registryMeta, px)
+        ? appRobinhoodChainUsdSourceLabel(registryMeta, px, row?.usd_source)
         : (px !== null ? `${asset}-USD` : (totalUsd !== null ? "snapshot" : "—"));
 
       return {
@@ -2313,6 +2316,13 @@ function discoveryViewKey(venue, symbolCanon) {
 
 function normalizeVenue(v) {
   return String(v || "").trim().toLowerCase();
+}
+
+function normalizeVenueAliasKey(v) {
+  return String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
 }
 
 // Converts many possible backend response shapes into: [{ venue, symbolCanon }]
@@ -3257,6 +3267,7 @@ export default function App() {
   // FIX: prevent sync overlap + per-venue backoff state (coinbase “too many errors”)
   const syncInFlightRef = useRef(false);
   const venueBackoffRef = useRef({}); // { [venue]: { until: number, reason: string } }
+  const allOrdersLoadReqIdRef = useRef(0);
   const ledgerSyncInFlightRef = useRef(false);
 
   const [visible, setVisible] = useState(() => {
@@ -4073,6 +4084,40 @@ export default function App() {
     if (value === "hydration") return "Hydration";
     return String(value || "");
   }
+
+  const resolveAllOrdersVenueInput = useCallback((rawValue) => {
+    const raw = String(rawValue ?? "").trim();
+    if (!raw) return "";
+
+    const key = normalizeVenueAliasKey(raw);
+    const matches = new Set();
+
+    const consider = (venueId, aliases = []) => {
+      const id = normalizeVenue(venueId);
+      if (!id) return;
+      const candidates = [id, ...(aliases || [])]
+        .map((value) => normalizeVenueAliasKey(value))
+        .filter(Boolean);
+      if (candidates.includes(key)) matches.add(id);
+    };
+
+    for (const row of Array.isArray(venuesRaw) ? venuesRaw : []) {
+      const id = row?.venue ?? row?.id ?? row?.slug ?? row?.key ?? row?.code ?? row?.name ?? "";
+      consider(id, [
+        row?.display_name,
+        row?.displayName,
+        row?.label,
+        row?.title,
+        row?.name,
+      ]);
+    }
+
+    for (const id of Array.isArray(supportedVenues) ? supportedVenues : []) consider(id);
+
+    // Resolve only an exact, unambiguous registry/display-name match. Invalid or
+    // ambiguous text is preserved so the backend exact filter can return zero rows.
+    return matches.size === 1 ? Array.from(matches)[0] : raw;
+  }, [venuesRaw, supportedVenues]);
 
   async function loadArmStatus({ retry = true } = {}) {
     try {
@@ -4962,6 +5007,20 @@ export default function App() {
   const [aoPage, setAoPage] = useState(1);
   const [aoPageSize, setAoPageSize] = useState(50);
 
+  const setAoVenueCommitted = useCallback((nextValue) => {
+    const next = String(nextValue ?? "").trim();
+    if (next === String(aoVenue || "").trim()) return;
+
+    // Invalidate any request for the previous venue before React schedules the
+    // new load, and clear rows so the UI cannot show the prior venue under the
+    // newly committed filter.
+    allOrdersLoadReqIdRef.current += 1;
+    setAllOrders([]);
+    setAllTotal(0);
+    setAoVenue(next);
+    setAoPage(1);
+  }, [aoVenue]);
+
   const [hideCancelledUnified, setHideCancelledUnified] = useState(() => readBoolLS(LS_HIDE_CANCELLED_UNIFIED, false));
   const [showManualCancelModal, setShowManualCancelModal] = useState(false);
   const [manualCancelVenue, setManualCancelVenue] = useState("solana_jupiter");
@@ -4969,6 +5028,8 @@ export default function App() {
   const [manualCancelBusy, setManualCancelBusy] = useState(false);
   useEffect(() => {
     localStorage.setItem(LS_HIDE_CANCELLED_UNIFIED, JSON.stringify(!!hideCancelledUnified));
+    // AO-PAGE.FILTER.1: a visibility-population change invalidates the current page.
+    setAoPage(1);
   }, [hideCancelledUnified]);
 
   const aoSort = `${aoSortField}:${aoSortDir}`;
@@ -5048,8 +5109,8 @@ export default function App() {
     return c * d;
   }
 
-  async function fetchAllOrdersOneBucket({ scopeNorm, venueVal, symbolVal, bucket, sort, page, pageSize }) {
-    const params = { sort, page, page_size: pageSize };
+  async function fetchAllOrdersOneBucket({ scopeNorm, venueVal, symbolVal, bucket, sort, page, pageSize, excludeCanceledRejected }) {
+    const params = { sort, page, page_size: pageSize, exclude_canceled_rejected: !!excludeCanceledRejected };
     if (scopeNorm) params.scope = scopeNorm;
     if (venueVal) params.venue = venueVal;
     if (symbolVal) params.symbol = symbolVal;
@@ -5058,6 +5119,8 @@ export default function App() {
   }
 
   async function doLoadAllOrders() {
+    const reqId = ++allOrdersLoadReqIdRef.current;
+
     try {
       setLoadingAll(true);
       setError(null);
@@ -5082,7 +5145,7 @@ export default function App() {
         const fetchSize = Math.min(MAX_FETCH, need);
 
         const [openRes, termRes] = await Promise.all([
-          fetchAllOrdersOneBucket({ scopeNorm, venueVal: venueVal || "", symbolVal: symbolVal || "", bucket: "open", sort: aoSort, page: 1, pageSize: fetchSize }),
+          fetchAllOrdersOneBucket({ scopeNorm, venueVal: venueVal || "", symbolVal: symbolVal || "", bucket: "open", sort: aoSort, page: 1, pageSize: fetchSize, excludeCanceledRejected: hideCancelledUnified }),
           fetchAllOrdersOneBucket({
             scopeNorm,
             venueVal: venueVal || "",
@@ -5091,6 +5154,7 @@ export default function App() {
             sort: aoSort,
             page: 1,
             pageSize: fetchSize,
+            excludeCanceledRejected: hideCancelledUnified,
           }),
         ]);
 
@@ -5122,6 +5186,7 @@ export default function App() {
           (Number.isFinite(openTotalNum) ? openTotalNum : openItems.length) +
           (Number.isFinite(termTotalNum) ? termTotalNum : termItems.length);
 
+        if (allOrdersLoadReqIdRef.current !== reqId) return;
         setAllOrders(pageItems);
         setAllTotal(Number.isFinite(total) ? total : pageItems.length);
         return;
@@ -5135,25 +5200,40 @@ export default function App() {
         sort: aoSort,
         page: aoPage,
         pageSize: aoPageSize,
+        excludeCanceledRejected: hideCancelledUnified,
       });
 
       const items = Array.isArray(res?.items) ? res.items : [];
       const totalNum = Number(res?.total);
 
+      if (allOrdersLoadReqIdRef.current !== reqId) return;
       setAllOrders(items);
       setAllTotal(Number.isFinite(totalNum) ? totalNum : items.length);
     } catch (e) {
+      if (allOrdersLoadReqIdRef.current !== reqId) return;
       const msg = e?.response?.data?.detail || e?.message || "Unknown error loading all_orders";
       setError(String(msg));
     } finally {
-      setLoadingAll(false);
+      if (allOrdersLoadReqIdRef.current === reqId) setLoadingAll(false);
     }
   }
 
   // UPDATED: “attempt all venues even if one fails” + coinbase backoff + no overlap
   async function doSyncAndLoadAllOrders(opts = {}) {
-    // avoid overlapping syncs (button spam / poll overlap)
-    if (syncInFlightRef.current) return { performedSync: false, skippedInFlight: true };
+    // Do not silently drop an explicit/manual Sync+Load just because a background
+    // refresh is already using this tab. Wait for the current same-tab sync to
+    // finish, then continue. Cross-tab serialization is handled separately by
+    // runCrossTabHeavyTask below.
+    if (syncInFlightRef.current) {
+      const waitDeadline = Date.now() + 60000;
+      while (syncInFlightRef.current && Date.now() < waitDeadline) {
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (syncInFlightRef.current) {
+        return { performedSync: false, skippedInFlight: true, waitTimedOut: true };
+      }
+    }
     syncInFlightRef.current = true;
 
     try {
@@ -5175,8 +5255,22 @@ export default function App() {
         ...(supportedVenues.includes("cexius") ? ["cexius"] : []),
       ]);
 
-      // If a specific venue was requested and is valid, refresh only that one. Otherwise refresh all candidates.
-      const venuesToRefresh = wantsAllVenues ? refreshCandidates : refreshCandidates.includes(v) ? [v] : refreshCandidates;
+      // If a specific venue was requested, refresh only an exact canonical match.
+      // Unknown/noncanonical text must never fall through to an all-venue refresh.
+      const venuesToRefresh = wantsAllVenues ? refreshCandidates : refreshCandidates.includes(v) ? [v] : [];
+
+      // RH-WALLET.INGEST.1E-R3: Robinhood Chain wallet history is a read-only
+      // order-history source, not a generic trading-capable venue. Do not gate
+      // its incremental scanner on tradingVenuesList / venuesToRefresh. An
+      // explicit canonical robinhood_chain Sync+Load must always request the
+      // RH incremental path; all-venue Sync+Load includes it when RH Chain is
+      // present in the supported venue registry.
+      const shouldSyncRobinhoodChainWallet =
+        scopeNorm !== "LOCAL" &&
+        (
+          v === ROBINHOOD_CHAIN_VENUE ||
+          (wantsAllVenues && supportedVenues.includes(ROBINHOOD_CHAIN_VENUE))
+        );
 
       const performHeavyOrderSync = async () => {
         // Solana DEX (two-stage): preserve the existing ingestion/materialization path,
@@ -5247,9 +5341,6 @@ export default function App() {
           await safeRefreshOne(vv);
         }
 
-        if (opts?.includeLedgerSync) {
-          await doLedgerSyncFromLocalStorage({ silent: true, reloadAllOrders: false });
-        }
         return errors;
       };
 
@@ -5260,9 +5351,49 @@ export default function App() {
         { leaseMs: 180000, waitMs: 45000 }
       );
 
+      const errors = syncResult?.acquired && Array.isArray(syncResult?.value)
+        ? [...syncResult.value]
+        : [];
+
+      // RH-WALLET.INGEST.1E-R2: the RH wallet scan must not live only inside
+      // the general SQLite-heavy leader callback. A follower tab (or a tab
+      // waiting on an older UI bundle) would otherwise reload All Orders
+      // without ever invoking the incremental scanner. Serialize RH wallet
+      // ingest/materialization on its own cross-tab key after the general
+      // venue refresh completes. This guarantees one incremental attempt for
+      // the requested Sync+Load while preserving cross-tab de-duplication.
+      if (shouldSyncRobinhoodChainWallet) {
+        const rhWalletSyncKey = `${syncKey}:robinhood_chain_wallet_incremental`;
+        const rhWalletSyncResult = await runCrossTabHeavyTask(
+          rhWalletSyncKey,
+          async () => {
+            try {
+              await syncRobinhoodChainWalletIncremental();
+              return [];
+            } catch (e) {
+              const msg = e?.response?.data?.detail?.message
+                || e?.response?.data?.detail?.error
+                || e?.response?.data?.detail
+                || e?.message
+                || String(e || "unknown error");
+              return [{ venue: "robinhood_chain:wallet_ingest", msg: String(msg) }];
+            }
+          },
+          { leaseMs: 180000, waitMs: 45000 }
+        );
+        if (rhWalletSyncResult?.acquired && Array.isArray(rhWalletSyncResult?.value)) {
+          errors.push(...rhWalletSyncResult.value);
+        }
+      }
+
+      // Keep automatic Ledger/FIFO after RH evidence/materialization so newly
+      // canonicalized external rows are eligible in the same Sync+Load cycle.
+      if (opts?.includeLedgerSync) {
+        await doLedgerSyncFromLocalStorage({ silent: true, reloadAllOrders: false });
+      }
+
       await doLoadAllOrders();
 
-      const errors = syncResult?.acquired && Array.isArray(syncResult?.value) ? syncResult.value : [];
       if (errors.length > 0) {
         const summary = errors.map((x) => `${x.venue}: ${x.msg}`).join("\n");
         setError(`Some venues failed to refresh:\n${summary}`);
@@ -6197,7 +6328,8 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
                   aoSource={aoScope}
                   setAoSource={setAoScope}
                   aoVenue={aoVenue}
-                  setAoVenue={setAoVenue}
+                  setAoVenue={setAoVenueCommitted}
+                  resolveAllOrdersVenueInput={resolveAllOrdersVenueInput}
                   aoStatusBucket={aoStatusBucket}
                   setAoStatusBucket={setAoStatusBucket}
                   aoSymbol={aoSymbol}

@@ -29,6 +29,7 @@ from ..schemas_wallet_addresses import (
 from ..services.market import prices_usd_from_assets
 from ..services.basis_enrichment import build_basis_summary_map, basis_fields_for_balance
 from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
+from ..services.robinhood_chain_uniswap_quote import get_robinhood_chain_uniswap_quote_service
 from ..config import settings
 
 # Pricing venue used for USD valuation (market data venue, not where funds are held)
@@ -227,11 +228,51 @@ _ROBINHOOD_CHAIN_PRICE_LOCK = threading.Lock()
 _ROBINHOOD_CHAIN_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
 _ROBINHOOD_CHAIN_PRICE_BACKOFF_UNTIL = 0.0
 
+# RH-BAL.PRICE.1: registered Robinhood Chain ERC-20s may not have an external
+# market identifier even though the same Token Registry identity is quoteable
+# against canonical USDG. The quote fallback remains read-only and bounded:
+# one process-local cache entry per exact token-contract/USDG-contract identity,
+# a per-identity retry backoff, no firm plan, no wallet request, no signing, and
+# no broadcast. A transient provider failure preserves a bounded last-good price
+# instead of fabricating a zero-dollar balance.
+_ROBINHOOD_CHAIN_QUOTE_PRICE_MAX_SYMBOLS = 40
+_ROBINHOOD_CHAIN_QUOTE_PRICE_TTL_S = _bounded_env_float(
+    "ROBINHOOD_CHAIN_QUOTE_PRICE_TTL_S",
+    300.0,
+    30.0,
+    3600.0,
+)
+_ROBINHOOD_CHAIN_QUOTE_PRICE_STALE_MAX_S = max(
+    _ROBINHOOD_CHAIN_QUOTE_PRICE_TTL_S,
+    _bounded_env_float("ROBINHOOD_CHAIN_QUOTE_PRICE_STALE_MAX_S", 3600.0, 30.0, 86400.0),
+)
+_ROBINHOOD_CHAIN_QUOTE_PRICE_ERROR_BACKOFF_S = _bounded_env_float(
+    "ROBINHOOD_CHAIN_QUOTE_PRICE_ERROR_BACKOFF_S",
+    120.0,
+    30.0,
+    3600.0,
+)
+_ROBINHOOD_CHAIN_QUOTE_PRICE_BATCH_TIMEOUT_S = _bounded_env_float(
+    "ROBINHOOD_CHAIN_QUOTE_PRICE_BATCH_TIMEOUT_S",
+    20.0,
+    5.0,
+    60.0,
+)
+_ROBINHOOD_CHAIN_QUOTE_PRICE_LOCK = threading.Lock()
+_ROBINHOOD_CHAIN_QUOTE_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
+_ROBINHOOD_CHAIN_QUOTE_PRICE_BACKOFF_UNTIL: Dict[str, float] = {}
+_ROBINHOOD_CHAIN_QUOTE_PRICE_REFRESH_LOCK: Optional[asyncio.Lock] = None
+# R2: pending quote-cache warmers are retained after the request wait budget
+# expires.  The provider service keeps its own concurrency semaphore, while this
+# per-identity task map prevents a later balances poll from scheduling duplicate
+# work for the same exact Token Registry token/USDG identity.
+_ROBINHOOD_CHAIN_QUOTE_PRICE_INFLIGHT: Dict[str, asyncio.Task] = {}
+
 
 def _robinhood_chain_registry_price_metadata(
     db: Session,
     assets: List[str],
-) -> Dict[str, Dict[str, Optional[str]]]:
+) -> Dict[str, Dict[str, object]]:
     wanted = {_norm_asset(asset) for asset in assets or [] if _norm_asset(asset)}
     if not wanted:
         return {}
@@ -240,7 +281,7 @@ def _robinhood_chain_registry_price_metadata(
         rows = db.execute(
             text(
                 """
-                SELECT id, venue, symbol, external_price_source, external_price_id
+                SELECT id, venue, symbol, address, decimals, external_price_source, external_price_id
                 FROM token_registry
                 WHERE chain = :chain
                   AND (venue = :venue OR venue IS NULL OR venue = '')
@@ -264,14 +305,20 @@ def _robinhood_chain_registry_price_metadata(
         ),
     )
 
-    selected: Dict[str, Dict[str, Optional[str]]] = {}
+    selected: Dict[str, Dict[str, object]] = {}
     for row in ordered:
         symbol = _norm_asset(row.get("symbol"))
         if not symbol or symbol not in wanted or symbol in selected:
             continue
+        try:
+            decimals = int(row.get("decimals"))
+        except Exception:
+            decimals = None
         selected[symbol] = {
             "registry_id": str(row.get("id") or "") or None,
             "registry_venue": str(row.get("venue") or "").strip().lower() or None,
+            "contract_address": str(row.get("address") or "").strip() or None,
+            "decimals": decimals,
             "external_price_source": str(row.get("external_price_source") or "").strip().lower() or None,
             "external_price_id": str(row.get("external_price_id") or "").strip() or None,
         }
@@ -359,33 +406,294 @@ def _robinhood_chain_coingecko_prices(price_ids: List[str]) -> Dict[str, float]:
     return resolved
 
 
-def _robinhood_chain_registry_prices(
-    db: Session,
-    assets: List[str],
+def _robinhood_chain_quote_price_cache_key(
+    symbol: str,
+    token_meta: Dict[str, object],
+    usdg_meta: Dict[str, object],
+) -> str:
+    token_address = str(token_meta.get("contract_address") or "").strip().lower()
+    usdg_address = str(usdg_meta.get("contract_address") or "").strip().lower()
+    return f"{_norm_asset(symbol)}|{token_address}|{usdg_address}"
+
+
+def _robinhood_chain_quote_price_probe_amount(
+    quantity: float,
+    decimals: object,
+) -> Optional[str]:
+    try:
+        qty = abs(Decimal(str(quantity)))
+        places = int(decimals)
+    except Exception:
+        return None
+    if not qty.is_finite() or qty <= 0 or places < 0 or places > 18:
+        return None
+
+    probe = min(qty, Decimal("1"))
+    scale = Decimal(10) ** places
+    atomic = int(probe * scale)
+    if atomic <= 0:
+        return None
+    normalized = Decimal(atomic) / scale
+    text_value = format(normalized, "f")
+    if "." in text_value:
+        text_value = text_value.rstrip("0").rstrip(".")
+    return text_value or None
+
+
+def _robinhood_chain_saved_quote_wallet(db: Session) -> Optional[str]:
+    row = (
+        db.query(WalletAddress)
+        .filter(
+            WalletAddress.network == _ROBINHOOD_CHAIN_REGISTRY_CHAIN,
+            WalletAddress.wallet_id == _ROBINHOOD_CHAIN_REGISTRY_VENUE,
+            WalletAddress.asset.in_(["ALL", "*"]),
+        )
+        .order_by(WalletAddress.created_at.desc())
+        .first()
+    )
+    if row is None:
+        return None
+    try:
+        return validate_evm_address(str(row.address or "").strip())
+    except Exception:
+        return None
+
+
+def _robinhood_chain_quote_token_identity(
+    symbol: str,
+    meta: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    try:
+        registry_id = int(str(meta.get("registry_id") or "").strip())
+        decimals = int(meta.get("decimals"))
+        contract_address = validate_evm_address(str(meta.get("contract_address") or "").strip())
+    except Exception:
+        return None
+    if decimals < 0 or decimals > 18:
+        return None
+    return {
+        "symbol": _norm_asset(symbol),
+        "registry_id": registry_id,
+        "decimals": decimals,
+        "native": False,
+        "contract_address": contract_address,
+        "identity_source": "token_registry",
+        "registry_venue": meta.get("registry_venue"),
+    }
+
+
+def _robinhood_chain_quote_refresh_lock() -> asyncio.Lock:
+    global _ROBINHOOD_CHAIN_QUOTE_PRICE_REFRESH_LOCK
+    if _ROBINHOOD_CHAIN_QUOTE_PRICE_REFRESH_LOCK is None:
+        _ROBINHOOD_CHAIN_QUOTE_PRICE_REFRESH_LOCK = asyncio.Lock()
+    return _ROBINHOOD_CHAIN_QUOTE_PRICE_REFRESH_LOCK
+
+
+async def _robinhood_chain_uniswap_quote_prices(
+    metadata: Dict[str, Dict[str, object]],
+    quantities: Dict[str, float],
+    taker_address: str,
 ) -> Tuple[Dict[str, float], Set[str]]:
-    metadata = _robinhood_chain_registry_price_metadata(db, assets)
-    mapped_symbols = set(metadata.keys())
+    usdg_meta = metadata.get("USDG") or {}
+    output_token = _robinhood_chain_quote_token_identity("USDG", usdg_meta)
+    if output_token is None:
+        return {}, set()
+
+    candidates = []
+    for symbol in sorted(metadata.keys()):
+        if symbol == "USDG":
+            continue
+        meta = metadata.get(symbol) or {}
+        source = str(meta.get("external_price_source") or "").strip().lower()
+        if source == "none":
+            continue
+        probe_amount = _robinhood_chain_quote_price_probe_amount(
+            quantities.get(symbol, 0.0),
+            meta.get("decimals"),
+        )
+        input_token = _robinhood_chain_quote_token_identity(symbol, meta)
+        if not probe_amount or input_token is None:
+            continue
+        candidates.append((symbol, meta, input_token, probe_amount))
+        if len(candidates) >= _ROBINHOOD_CHAIN_QUOTE_PRICE_MAX_SYMBOLS:
+            break
+
+    if not candidates:
+        return {}, set()
+
+    resolved: Dict[str, float] = {}
+    stale_symbols: Set[str] = set()
+
+    async def quote_one(item) -> None:
+        symbol, meta, input_token, probe_amount, cache_key = item
+        try:
+            result = await get_robinhood_chain_uniswap_quote_service().quote(
+                symbol=f"{symbol}-USDG",
+                side="sell",
+                amount_mode="exact_input",
+                requested_amount=probe_amount,
+                slippage_bps=50,
+                swapper_address=taker_address,
+                input_token=input_token,
+                output_token=output_token,
+                confirm_quote=True,
+            )
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise RuntimeError(str((result or {}).get("error") or "robinhood_chain_quote_price_unavailable"))
+            price = float(result.get("price_quote_per_base"))
+            if not price > 0:
+                raise RuntimeError("robinhood_chain_quote_price_invalid")
+            fetched_mono = time.monotonic()
+            with _ROBINHOOD_CHAIN_QUOTE_PRICE_LOCK:
+                _ROBINHOOD_CHAIN_QUOTE_PRICE_CACHE[cache_key] = (fetched_mono, float(price))
+                _ROBINHOOD_CHAIN_QUOTE_PRICE_BACKOFF_UNTIL.pop(cache_key, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            with _ROBINHOOD_CHAIN_QUOTE_PRICE_LOCK:
+                _ROBINHOOD_CHAIN_QUOTE_PRICE_BACKOFF_UNTIL[cache_key] = (
+                    time.monotonic() + _ROBINHOOD_CHAIN_QUOTE_PRICE_ERROR_BACKOFF_S
+                )
+
+    def task_done(cache_key: str, task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        current = _ROBINHOOD_CHAIN_QUOTE_PRICE_INFLIGHT.get(cache_key)
+        if current is task:
+            _ROBINHOOD_CHAIN_QUOTE_PRICE_INFLIGHT.pop(cache_key, None)
+
+    async with _robinhood_chain_quote_refresh_lock():
+        now = time.monotonic()
+        missing = []
+        stale: Dict[str, float] = {}
+
+        with _ROBINHOOD_CHAIN_QUOTE_PRICE_LOCK:
+            for symbol, meta, input_token, probe_amount in candidates:
+                cache_key = _robinhood_chain_quote_price_cache_key(symbol, meta, usdg_meta)
+                hit = _ROBINHOOD_CHAIN_QUOTE_PRICE_CACHE.get(cache_key)
+                if hit:
+                    fetched_mono, price = hit
+                    age = max(0.0, now - float(fetched_mono))
+                    if age <= _ROBINHOOD_CHAIN_QUOTE_PRICE_TTL_S:
+                        resolved[symbol] = float(price)
+                        continue
+                    if age <= _ROBINHOOD_CHAIN_QUOTE_PRICE_STALE_MAX_S:
+                        stale[symbol] = float(price)
+                backoff_until = float(_ROBINHOOD_CHAIN_QUOTE_PRICE_BACKOFF_UNTIL.get(cache_key, 0.0) or 0.0)
+                if now >= backoff_until:
+                    missing.append((symbol, meta, input_token, probe_amount, cache_key))
+
+        # R2: do not cancel late alphabetic candidates when the synchronous
+        # request budget expires.  Keep at most one task per exact identity in
+        # flight; the provider's existing semaphore remains authoritative for
+        # network concurrency.  Subsequent balance polls can immediately reuse
+        # completed cache entries without duplicating pending provider work.
+        wait_tasks = []
+        for item in missing:
+            cache_key = item[-1]
+            task = _ROBINHOOD_CHAIN_QUOTE_PRICE_INFLIGHT.get(cache_key)
+            if task is None or task.done():
+                task = asyncio.create_task(quote_one(item))
+                _ROBINHOOD_CHAIN_QUOTE_PRICE_INFLIGHT[cache_key] = task
+                task.add_done_callback(
+                    lambda done_task, key=cache_key: task_done(key, done_task)
+                )
+            wait_tasks.append(task)
+
+        if wait_tasks:
+            await asyncio.wait(
+                set(wait_tasks),
+                timeout=_ROBINHOOD_CHAIN_QUOTE_PRICE_BATCH_TIMEOUT_S,
+            )
+
+        # Re-read the exact cache identities after the wait budget.  Tasks still
+        # pending continue warming the cache in the background rather than being
+        # cancelled; completed tasks can therefore contribute to this response.
+        now_after = time.monotonic()
+        with _ROBINHOOD_CHAIN_QUOTE_PRICE_LOCK:
+            for symbol, meta, input_token, probe_amount in candidates:
+                cache_key = _robinhood_chain_quote_price_cache_key(symbol, meta, usdg_meta)
+                hit = _ROBINHOOD_CHAIN_QUOTE_PRICE_CACHE.get(cache_key)
+                if not hit:
+                    continue
+                fetched_mono, price = hit
+                age = max(0.0, now_after - float(fetched_mono))
+                if age <= _ROBINHOOD_CHAIN_QUOTE_PRICE_TTL_S:
+                    resolved[symbol] = float(price)
+                    stale.pop(symbol, None)
+                elif age <= _ROBINHOOD_CHAIN_QUOTE_PRICE_STALE_MAX_S:
+                    stale[symbol] = float(price)
+
+        # If the provider was transiently unavailable, use only a bounded
+        # last-good value for the same exact registry identities.
+        for symbol, price in stale.items():
+            if symbol not in resolved:
+                resolved[symbol] = float(price)
+                stale_symbols.add(symbol)
+
+    return resolved, stale_symbols
+
+
+async def _robinhood_chain_registry_prices(
+    db: Session,
+    asset_quantities: Dict[str, float],
+) -> Tuple[Dict[str, float], Set[str], Dict[str, str]]:
+    assets = sorted({_norm_asset(asset) for asset in asset_quantities.keys() if _norm_asset(asset)})
+    asset_set = set(assets)
+    metadata = _robinhood_chain_registry_price_metadata(db, [*assets, "USDG"])
+    mapped_symbols = {symbol for symbol in metadata.keys() if symbol in asset_set}
     coingecko_ids = [
         str(meta.get("external_price_id") or "").strip().lower()
-        for meta in metadata.values()
-        if str(meta.get("external_price_source") or "").strip().lower() in {"coingecko", "coingecko_simple"}
+        for symbol, meta in metadata.items()
+        if symbol in mapped_symbols
+        and str(meta.get("external_price_source") or "").strip().lower() in {"coingecko", "coingecko_simple"}
         and str(meta.get("external_price_id") or "").strip()
     ]
     coingecko_prices = _robinhood_chain_coingecko_prices(coingecko_ids)
 
     prices: Dict[str, float] = {}
-    for symbol, meta in metadata.items():
+    sources: Dict[str, str] = {}
+    for symbol in mapped_symbols:
+        meta = metadata.get(symbol) or {}
         source = str(meta.get("external_price_source") or "").strip().lower()
         price_id = str(meta.get("external_price_id") or "").strip().lower()
         if source == "stable":
             prices[symbol] = 1.0
+            sources[symbol] = "Token Registry · stable USD"
         elif source in {"coingecko", "coingecko_simple"} and price_id:
             price = coingecko_prices.get(price_id)
             if price is not None and float(price) > 0:
                 prices[symbol] = float(price)
-        # Explicit none/derived/unresolved mappings remain unpriced here. They
-        # are not silently converted to ambiguous ticker-only matches.
-    return prices, mapped_symbols
+                sources[symbol] = f"Token Registry · CoinGecko {price_id}"
+
+    unresolved_quantities = {
+        symbol: float(asset_quantities.get(symbol, 0.0) or 0.0)
+        for symbol in mapped_symbols
+        if symbol not in prices
+        and str((metadata.get(symbol) or {}).get("external_price_source") or "").strip().lower() != "none"
+        and float(asset_quantities.get(symbol, 0.0) or 0.0) != 0.0
+    }
+
+    if unresolved_quantities:
+        taker_address = _robinhood_chain_saved_quote_wallet(db)
+        if taker_address:
+            quote_prices, stale_symbols = await _robinhood_chain_uniswap_quote_prices(
+                metadata,
+                unresolved_quantities,
+                taker_address,
+            )
+            for symbol, price in quote_prices.items():
+                if symbol in prices:
+                    continue
+                prices[symbol] = float(price)
+                suffix = " · cached" if symbol in stale_symbols else ""
+                sources[symbol] = f"RH Chain quote · {symbol}-USDG{suffix}"
+
+    return prices, mapped_symbols, sources
 
 
 def _robinhood_chain_registered_erc20_rows(
@@ -1105,7 +1413,7 @@ def delete_wallet_address(address_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/balances/latest", response_model=List[WalletAddressBalanceOut])
-def wallet_balances_latest(
+async def wallet_balances_latest(
     db: Session = Depends(get_db),
     with_prices: int = Query(default=1, ge=0, le=1),
     limit: int = Query(default=2000, ge=1, le=5000),
@@ -1156,6 +1464,7 @@ def wallet_balances_latest(
     # account-level ALL row may emit one or more asset-specific snapshots.
     prices_usd = {}
     robinhood_chain_prices: Dict[str, float] = {}
+    robinhood_chain_price_sources: Dict[str, str] = {}
     robinhood_chain_mapped_symbols: Set[str] = set()
     if with_prices:
         assets = sorted({_norm_asset(snap.asset or addr.asset) for snap, addr in latest.values()})
@@ -1164,17 +1473,30 @@ def wallet_balances_latest(
         except Exception:
             prices_usd = {}
 
-        robinhood_assets = sorted({
-            _norm_asset(snap.asset or addr.asset)
-            for snap, addr in latest.values()
-            if _is_robinhood_chain_wallet_row(addr)
-            or str(getattr(snap, "network", None) or "").strip().lower() == _ROBINHOOD_CHAIN_REGISTRY_CHAIN
-        })
-        if robinhood_assets:
+        robinhood_asset_quantities: Dict[str, float] = {}
+        for snap, addr in latest.values():
+            snapshot_asset = _norm_asset(snap.asset or addr.asset)
+            is_robinhood_chain = (
+                _is_robinhood_chain_wallet_row(addr)
+                or str(getattr(snap, "network", None) or "").strip().lower() == _ROBINHOOD_CHAIN_REGISTRY_CHAIN
+            )
+            if not is_robinhood_chain or not snapshot_asset:
+                continue
+            try:
+                qty = float(snap.balance_qty)
+            except Exception:
+                qty = 0.0
+            robinhood_asset_quantities[snapshot_asset] = max(
+                abs(qty),
+                abs(float(robinhood_asset_quantities.get(snapshot_asset, 0.0) or 0.0)),
+            )
+
+        if robinhood_asset_quantities:
             (
                 robinhood_chain_prices,
                 robinhood_chain_mapped_symbols,
-            ) = _robinhood_chain_registry_prices(db, robinhood_assets)
+                robinhood_chain_price_sources,
+            ) = await _robinhood_chain_registry_prices(db, robinhood_asset_quantities)
 
     out: List[WalletAddressBalanceOut] = []
     for snap, addr in latest.values():
@@ -1186,6 +1508,7 @@ def wallet_balances_latest(
         )
 
         usd_price: Optional[float]
+        usd_source: Optional[str] = None
         if not with_prices:
             usd_price = None
         elif is_robinhood_chain and snapshot_asset in robinhood_chain_mapped_symbols:
@@ -1194,6 +1517,7 @@ def wallet_balances_latest(
             # instead of accepting an ambiguous symbol-only match.
             mapped_price = robinhood_chain_prices.get(snapshot_asset)
             usd_price = float(mapped_price) if mapped_price is not None else None
+            usd_source = robinhood_chain_price_sources.get(snapshot_asset)
         else:
             fallback_price = prices_usd.get(snapshot_asset)
             if fallback_price is None:
@@ -1238,6 +1562,7 @@ def wallet_balances_latest(
                 balance=qty,
                 usd_price=usd_price if with_prices else None,
                 usd_value=usd_value if with_prices else None,
+                usd_source=usd_source if with_prices else None,
                 fetched_at=fetched_at,
 
                 # Back-compat (optional in schema)

@@ -237,6 +237,21 @@ class Settings(BaseSettings):
         le=100,
     )
 
+    # RH-WALLET.INGEST.1C2: provider-exhaustive wallet-history ingestion.
+    # Keep these independent from the bounded display-history settings above.
+    robinhood_chain_ingest_max_pages: int = Field(
+        default=200,
+        alias="ROBINHOOD_CHAIN_INGEST_MAX_PAGES",
+        ge=1,
+        le=1000,
+    )
+    robinhood_chain_ingest_overlap_blocks: int = Field(
+        default=25,
+        alias="ROBINHOOD_CHAIN_INGEST_OVERLAP_BLOCKS",
+        ge=0,
+        le=10000,
+    )
+
     # RH-CHAIN.10A: mainnet-only, read-only execution discovery through 0x.
     # The API key is intentionally read from Profile -> API Keys (venue=zerox),
     # never from an environment variable or returned by any status endpoint.

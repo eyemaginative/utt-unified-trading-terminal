@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, List, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func, desc, asc, and_, or_, text, exists
 
-from ..models import BasisLot, Order, VenueOrderRow
+from ..models import BasisLot, Order, RobinhoodChainExternalSwap, RobinhoodChainSwapExecution, VenueOrderRow
 from ..services.lots_ledger import fifo_consume_sell_fifo, impact_to_json
 from ..models_lot_journal import LotJournal
 
@@ -63,6 +63,25 @@ def _fee_usd_estimate(fee: Any, fee_asset: Any) -> Optional[float]:
     if a in ("USD", "USDC"):
         return float(f)
     return None
+
+
+def _robinhood_chain_swap_reconciliation(row: RobinhoodChainSwapExecution) -> Dict[str, Any]:
+    route = row.route if isinstance(row.route, dict) else {}
+    reconciliation = route.get("execution_reconciliation")
+    return reconciliation if isinstance(reconciliation, dict) else {}
+
+
+def _robinhood_chain_swap_price_usd(row: RobinhoodChainSwapExecution, reconciliation: Dict[str, Any]) -> Optional[float]:
+    """Use the realized quote/base price only when the quote asset is USD-like.
+
+    ETH-quoted markets intentionally remain unpriced here; converting network or
+    quote-asset values to USD belongs to the separate market-pricing policy.
+    """
+    symbol = str(row.symbol or "").strip().upper()
+    quote = symbol.split("-", 1)[1] if "-" in symbol else ""
+    if quote not in {"USD", "USDC", "USDT", "USDG"}:
+        return None
+    return _safe_float(reconciliation.get("average_fill_price"))
 
 
 def _parse_cursor(cursor: Optional[str]) -> Optional[Tuple[datetime, str]]:
@@ -447,6 +466,8 @@ def sync_lots_from_activity(
     errors: List[str] = []
 
     rows_fetched = 0
+    robinhood_chain_rows_fetched = 0
+    robinhood_chain_external_rows_fetched = 0
     next_cursor: Optional[str] = None
 
     def _bump_skip(reason: Optional[str]) -> None:
@@ -719,6 +740,183 @@ def sync_lots_from_activity(
                 errors.append(f"VENUE row failed (id={vrow_id}): {e!r}")
                 _bump_skip("missing_data")
 
+    # ---- Robinhood Chain confirmed generic swap executions ----
+    # R5C.5D.2F.4 persists receipt-verified swaps in their dedicated table.
+    # Treat those rows as venue activity so the existing venue-scoped lot/FIFO
+    # policy can account for them without manufacturing duplicate VenueOrderRow rows.
+    if mode_u in ("ALL", "VENUE"):
+        requested_venue = (venue or "").strip().lower()
+        include_rh_chain = not requested_venue or requested_venue == "robinhood_chain"
+        rh_rows: List[RobinhoodChainSwapExecution] = []
+        if include_rh_chain:
+            try:
+                q = select(RobinhoodChainSwapExecution).where(
+                    RobinhoodChainSwapExecution.status == "confirmed",
+                    RobinhoodChainSwapExecution.swap_tx_hash.is_not(None),
+                    ~exists(
+                        select(1)
+                        .select_from(LotJournal)
+                        .where(
+                            LotJournal.origin_type == "RH_CHAIN_SWAP",
+                            LotJournal.origin_ref == RobinhoodChainSwapExecution.id,
+                        )
+                    ),
+                )
+                s_filter = (symbol_canon or "").strip().upper() or None
+                if s_filter:
+                    q = q.where(func.upper(RobinhoodChainSwapExecution.symbol) == s_filter)
+                if since is not None:
+                    q = q.where(RobinhoodChainSwapExecution.updated_at >= since)
+                rh_rows = db.execute(
+                    q.order_by(desc(RobinhoodChainSwapExecution.updated_at)).limit(limit)
+                ).scalars().all()
+                robinhood_chain_rows_fetched = len(rh_rows)
+                rows_fetched += robinhood_chain_rows_fetched
+                rh_rows.sort(key=lambda row: (row.updated_at or row.created_at or _dt_utcnow(), str(row.id or "")))
+            except Exception as e:
+                errors.append(f"ROBINHOOD_CHAIN query/sort failed: {e!r}")
+                rh_rows = []
+
+        for row in rh_rows:
+            row_id = str(getattr(row, "id", "") or "")
+            try:
+                with db.begin_nested():
+                    reconciliation = _robinhood_chain_swap_reconciliation(row)
+                    if reconciliation.get("reconciled") is not True:
+                        _bump_skip("missing_data")
+                        continue
+                    side = str(row.side or "").strip().lower()
+                    actual_input_asset = str(reconciliation.get("input_asset") or row.from_asset or "").strip().upper()
+                    actual_output_asset = str(reconciliation.get("output_asset") or row.to_asset or "").strip().upper()
+                    actual_input_qty = _safe_float(reconciliation.get("input_amount"))
+                    actual_output_qty = _safe_float(reconciliation.get("output_amount"))
+                    price_usd = _robinhood_chain_swap_price_usd(row, reconciliation)
+                    ts = row.updated_at or row.created_at or _dt_utcnow()
+
+                    if side == "buy":
+                        if not actual_output_asset or actual_output_qty is None or actual_output_qty <= 0:
+                            _bump_skip("missing_data")
+                            continue
+                        r = _create_buy_lot_if_needed(
+                            db,
+                            venue="robinhood_chain",
+                            wallet_id=wallet_id,
+                            asset=actual_output_asset,
+                            qty=float(actual_output_qty),
+                            price_usd=price_usd,
+                            fee_usd=None,
+                            acquired_at=ts,
+                            origin_type="RH_CHAIN_SWAP",
+                            origin_ref=row_id,
+                            note="receipt-verified Robinhood Chain swap; ETH network fee retained in execution reconciliation",
+                            dry_run=dry_run,
+                        )
+                        if r.get("skipped"):
+                            _bump_skip(r.get("reason"))
+                        else:
+                            created += 1
+                    elif side == "sell":
+                        if not actual_input_asset or actual_input_qty is None or actual_input_qty <= 0:
+                            _bump_skip("missing_data")
+                            continue
+                        r = _consume_sell_if_needed(
+                            db,
+                            venue="robinhood_chain",
+                            wallet_id=wallet_id,
+                            asset=actual_input_asset,
+                            qty=float(actual_input_qty),
+                            price_usd=price_usd,
+                            fee_usd=None,
+                            effective_at=ts,
+                            origin_type="RH_CHAIN_SWAP",
+                            origin_ref=row_id,
+                            dry_run=dry_run,
+                        )
+                        if r.get("skipped"):
+                            _bump_skip(r.get("reason"))
+                        else:
+                            consumed += 1
+                    else:
+                        _bump_skip("unknown_side")
+            except Exception as e:
+                errors.append(f"ROBINHOOD_CHAIN row failed (id={row_id}): {e!r}")
+                _bump_skip("missing_data")
+
+    # ---- Robinhood Chain externally-originated historical swaps ----
+    # RH-WALLET.INGEST.1D materializes only high-confidence ETH -> registered
+    # ERC-20 acquisitions into a dedicated canonical table.  These rows are
+    # accounted as acquisitions with truthful missing USD basis for ETH-quoted
+    # markets; quote-asset disposal and ETH fee basis remain separate later
+    # policy work rather than being fabricated here.
+    if mode_u in ("ALL", "VENUE"):
+        requested_venue = (venue or "").strip().lower()
+        include_rh_external = not requested_venue or requested_venue == "robinhood_chain"
+        external_rows: List[RobinhoodChainExternalSwap] = []
+        if include_rh_external:
+            try:
+                q = select(RobinhoodChainExternalSwap).where(
+                    RobinhoodChainExternalSwap.status == "confirmed",
+                    ~exists(
+                        select(1)
+                        .select_from(LotJournal)
+                        .where(
+                            LotJournal.origin_type == "RH_CHAIN_EXTERNAL_SWAP",
+                            LotJournal.origin_ref == RobinhoodChainExternalSwap.id,
+                        )
+                    ),
+                )
+                s_filter = (symbol_canon or "").strip().upper() or None
+                if s_filter:
+                    q = q.where(func.upper(RobinhoodChainExternalSwap.symbol) == s_filter)
+                if since is not None:
+                    q = q.where(RobinhoodChainExternalSwap.updated_at >= since)
+                external_rows = db.execute(
+                    q.order_by(desc(RobinhoodChainExternalSwap.updated_at)).limit(limit)
+                ).scalars().all()
+                robinhood_chain_external_rows_fetched = len(external_rows)
+                rows_fetched += robinhood_chain_external_rows_fetched
+                external_rows.sort(
+                    key=lambda row: (row.tx_time or row.updated_at or row.created_at or _dt_utcnow(), str(row.id or ""))
+                )
+            except Exception as e:
+                errors.append(f"ROBINHOOD_CHAIN_EXTERNAL query/sort failed: {e!r}")
+                external_rows = []
+
+        for row in external_rows:
+            row_id = str(getattr(row, "id", "") or "")
+            try:
+                with db.begin_nested():
+                    output_asset = str(row.output_asset or "").strip().upper()
+                    output_qty = _safe_float(row.output_amount)
+                    ts = row.tx_time or row.updated_at or row.created_at or _dt_utcnow()
+                    if not output_asset or output_qty is None or output_qty <= 0:
+                        _bump_skip("missing_data")
+                        continue
+                    r = _create_buy_lot_if_needed(
+                        db,
+                        venue="robinhood_chain",
+                        wallet_id=wallet_id,
+                        asset=output_asset,
+                        qty=float(output_qty),
+                        price_usd=None,
+                        fee_usd=None,
+                        acquired_at=ts,
+                        origin_type="RH_CHAIN_EXTERNAL_SWAP",
+                        origin_ref=row_id,
+                        note=(
+                            "observed external Robinhood Chain ETH-quoted swap; "
+                            "USD basis unresolved and ETH network fee retained separately"
+                        ),
+                        dry_run=dry_run,
+                    )
+                    if r.get("skipped"):
+                        _bump_skip(r.get("reason"))
+                    else:
+                        created += 1
+            except Exception as e:
+                errors.append(f"ROBINHOOD_CHAIN_EXTERNAL row failed (id={row_id}): {e!r}")
+                _bump_skip("missing_data")
+
     out.update(
         {
             "created_lots": int(created),
@@ -730,6 +928,8 @@ def sync_lots_from_activity(
             "skipped_policy_excluded": int(skipped_policy_excluded),
             "errors": errors,
             "rows_fetched": int(rows_fetched),
+            "robinhood_chain_rows_fetched": int(robinhood_chain_rows_fetched),
+            "robinhood_chain_external_rows_fetched": int(robinhood_chain_external_rows_fetched),
             "next_cursor": next_cursor,
         }
     )

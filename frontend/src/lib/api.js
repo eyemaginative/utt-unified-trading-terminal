@@ -563,7 +563,7 @@ export async function getRobinhoodChainSyntheticOrderbook({
 }
 
 export async function getRobinhoodChainIndicativeQuote(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
-  const body = { provider: "0x", ...requireRobinhoodChainReviewRequest(payload) };
+  const body = { provider: String(payload?.provider || "0x").trim().toLowerCase(), ...requireRobinhoodChainReviewRequest(payload) };
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {
     const res = await http.post(`/api/robinhood_chain/quotes/indicative`, body, { timeout: timeout_ms });
@@ -575,7 +575,7 @@ export async function getRobinhoodChainIndicativeQuote(payload = {}, { apiBase, 
 
 export async function getRobinhoodChainFirmQuotePlan(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
   const body = {
-    provider: "0x",
+    provider: String(payload?.provider || "0x").trim().toLowerCase(),
     slippage_bps: 100,
     ...requireRobinhoodChainReviewRequest(payload),
   };
@@ -585,6 +585,86 @@ export async function getRobinhoodChainFirmQuotePlan(payload = {}, { apiBase, ti
     return res.data;
   }
   const res = await axios.post(`${base}/api/robinhood_chain/quotes/firm-plan`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function prepareRobinhoodChainWalletRejection(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
+  const body = {
+    provider: "uniswap_api",
+    slippage_bps: 100,
+    ...requireRobinhoodChainReviewRequest({ ...payload, amount_mode: "exact_input" }),
+    confirm_prepare: true,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/wallet-rejection/prepare`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/wallet-rejection/prepare`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function prepareRobinhoodChainWalletApproval(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
+  const body = {
+    provider: "uniswap_api",
+    slippage_bps: 100,
+    ...requireRobinhoodChainReviewRequest({ ...payload, amount_mode: "exact_input" }),
+    confirm_prepare: true,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/wallet-approval/prepare`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/wallet-approval/prepare`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function refreshRobinhoodChainWalletApprovalReceipt(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
+  const capability = String(payload?.capability || "").trim();
+  const txHash = String(payload?.tx_hash || "").trim();
+  if (!capability || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    throw new Error("Robinhood Chain approval receipt refresh requires capability and transaction hash.");
+  }
+  const body = { capability, tx_hash: txHash };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/wallet-approval/receipt`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/wallet-approval/receipt`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function prepareRobinhoodChainWalletSwap(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
+  const body = {
+    provider: "uniswap_api",
+    slippage_bps: 100,
+    ...requireRobinhoodChainReviewRequest({ ...payload, amount_mode: "exact_input" }),
+    confirm_prepare: true,
+  };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/wallet-swap/prepare`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/wallet-swap/prepare`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
+export async function refreshRobinhoodChainWalletSwapReceipt(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
+  const capability = String(payload?.capability || "").trim();
+  const txHash = String(payload?.tx_hash || "").trim();
+  if (!capability || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    throw new Error("Robinhood Chain swap receipt refresh requires capability and transaction hash.");
+  }
+  const body = { capability, tx_hash: txHash };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/wallet-swap/receipt`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/wallet-swap/receipt`, body, { timeout: timeout_ms });
   return res.data;
 }
 
@@ -1148,6 +1228,11 @@ export async function refreshRobinhoodChainBuySwap(
   return res.data;
 }
 
+export async function syncRobinhoodChainWalletIncremental({ timeout_ms = 120000 } = {}) {
+  const res = await http.post(`/api/robinhood_chain/wallet-sync/incremental`, null, { timeout: timeout_ms });
+  return res.data;
+}
+
 export async function getPricesUSD({ venue, assets } = {}) {
   const assetsCsv = Array.isArray(assets) ? assets.filter(Boolean).join(",") : assets;
   const res = await http.get(`/api/market/prices_usd`, {
@@ -1603,6 +1688,7 @@ export async function getAllOrders({
   sort = "created_at:desc",
   page = 1,
   page_size = 50,
+  exclude_canceled_rejected = false,
 } = {}) {
   // If caller uses scope, also populate source for compatibility.
   const effectiveSource = source ?? scope;
@@ -1620,6 +1706,7 @@ export async function getAllOrders({
       sort,
       page,
       page_size,
+      exclude_canceled_rejected: exclude_canceled_rejected ? 1 : undefined,
     }),
   });
   return res.data;

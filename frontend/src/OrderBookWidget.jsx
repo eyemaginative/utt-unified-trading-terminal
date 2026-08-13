@@ -380,6 +380,15 @@ function robinhoodChainPairParts(symbol) {
   return { base: parts[0], quote: parts[1], symbol: `${parts[0]}-${parts[1]}` };
 }
 
+function robinhoodChainRegistryIdentityVerified(identity) {
+  return Boolean(
+    identity &&
+    !identity?.identity_error &&
+    String(identity?.verification?.canonical_status || "").trim().toLowerCase() === "verified" &&
+    identity?.verification?.registry_match === true
+  );
+}
+
 function robinhoodChainMarketStatusLabel(market) {
   const mechanism = String(market?.mechanism || "").trim().toLowerCase();
   const state = String(market?.indicative_state || "not_tested").trim().toLowerCase();
@@ -1037,12 +1046,24 @@ export default function OrderBookWidget({
   }, [robinhoodChainRegistryAssets]);
   const robinhoodChainRegistryBaseIdentity = robinhoodChainRegistryAssetBySymbol[robinhoodChainSelectedPair.base] || null;
   const robinhoodChainRegistryQuoteIdentity = robinhoodChainRegistryAssetBySymbol[robinhoodChainSelectedPair.quote] || null;
-  const robinhoodChainRegistryPairReady = Boolean(
+  const robinhoodChainRegistryPairResolved = Boolean(
     robinhoodChainSelectedPair.base &&
     robinhoodChainSelectedPair.quote &&
     robinhoodChainRegistryBaseIdentity?.registry_id &&
     robinhoodChainRegistryQuoteIdentity?.registry_id &&
     Number(robinhoodChainRegistryBaseIdentity.registry_id) !== Number(robinhoodChainRegistryQuoteIdentity.registry_id)
+  );
+  const robinhoodChainRegistryBaseVerified = robinhoodChainRegistryIdentityVerified(robinhoodChainRegistryBaseIdentity);
+  const robinhoodChainRegistryQuoteVerified = robinhoodChainRegistryIdentityVerified(robinhoodChainRegistryQuoteIdentity);
+  const robinhoodChainRegistryPairReady = Boolean(
+    robinhoodChainRegistryPairResolved &&
+    robinhoodChainRegistryBaseVerified &&
+    robinhoodChainRegistryQuoteVerified
+  );
+  const robinhoodChainPairVerificationBlocked = Boolean(
+    isRobinhoodChainVenue &&
+    robinhoodChainRegistryPairResolved &&
+    !robinhoodChainRegistryPairReady
   );
   const robinhoodChainPairNotConfigured = Boolean(
     isRobinhoodChainVenue &&
@@ -1171,8 +1192,14 @@ export default function OrderBookWidget({
         },
         { apiBase, timeout_ms: 30000 }
       );
-      if (result?.ok !== true || result?.objective?.review_only !== true || result?.execution_enabled === true) {
-        throw new Error(result?.error || "Selected-pair registration did not return the required review-only state.");
+      if (
+        result?.ok !== true ||
+        result?.objective?.review_only !== true ||
+        result?.execution_enabled === true ||
+        result?.registry_verification_required !== true ||
+        result?.registry_verified !== true
+      ) {
+        throw new Error(result?.error || "Selected-pair registration did not return the required verified, review-only state.");
       }
       if (
         result?.provider_contacted === true ||
@@ -3230,7 +3257,7 @@ function clampBox(next) {
         ) : null}
 
 
-        {(robinhoodChainPairNotConfigured || robinhoodChainPairRegistrationBusy || robinhoodChainPairRegistrationError || robinhoodChainPairRegistrationNotice) && (
+        {(robinhoodChainPairVerificationBlocked || robinhoodChainPairNotConfigured || robinhoodChainPairRegistrationBusy || robinhoodChainPairRegistrationError || robinhoodChainPairRegistrationNotice) && (
           <div
             data-rh-catalog-select="selected-pair-registration"
             data-provider-contacted="false"
@@ -3239,12 +3266,12 @@ function clampBox(next) {
               marginTop: 6,
               padding: 8,
               borderRadius: 8,
-              border: robinhoodChainPairRegistrationError
+              border: robinhoodChainPairRegistrationError || robinhoodChainPairVerificationBlocked
                 ? "1px solid rgba(251, 113, 133, 0.52)"
                 : robinhoodChainPairNotConfigured
                   ? "1px solid rgba(250, 204, 21, 0.48)"
                   : "1px solid rgba(74, 222, 128, 0.42)",
-              background: robinhoodChainPairRegistrationError
+              background: robinhoodChainPairRegistrationError || robinhoodChainPairVerificationBlocked
                 ? "rgba(69, 10, 10, 0.22)"
                 : robinhoodChainPairNotConfigured
                   ? "rgba(66, 48, 4, 0.22)"
@@ -3254,10 +3281,12 @@ function clampBox(next) {
             }}
           >
             <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
-              <b style={{ color: robinhoodChainPairNotConfigured ? "#fde68a" : "#bbf7d0", letterSpacing: 0.35 }}>
-                {robinhoodChainPairNotConfigured
-                  ? "REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED"
-                  : "SELECTED PAIR REGISTRATION"}
+              <b style={{ color: robinhoodChainPairVerificationBlocked ? "#fecdd3" : robinhoodChainPairNotConfigured ? "#fde68a" : "#bbf7d0", letterSpacing: 0.35 }}>
+                {robinhoodChainPairVerificationBlocked
+                  ? "CANONICAL TOKEN VERIFICATION REQUIRED"
+                  : robinhoodChainPairNotConfigured
+                    ? "VERIFIED REGISTRY ASSETS · PAIR NOT CONFIGURED"
+                    : "SELECTED PAIR REGISTRATION"}
               </b>
               {robinhoodChainPairNotConfigured && (
                 <button
@@ -3271,9 +3300,14 @@ function clampBox(next) {
                 </button>
               )}
             </div>
+            {robinhoodChainPairVerificationBlocked && (
+              <div style={{ marginTop: 4, color: "#fecdd3" }}>
+                Pair enrollment is blocked until both Token Registry identities are canonically verified. {robinhoodChainSelectedPair.base}: {robinhoodChainRegistryBaseVerified ? "VERIFIED" : String(robinhoodChainRegistryBaseIdentity?.verification?.canonical_status || "NOT VERIFIED").replaceAll("_", " ").toUpperCase()} · {robinhoodChainSelectedPair.quote}: {robinhoodChainRegistryQuoteVerified ? "VERIFIED" : String(robinhoodChainRegistryQuoteIdentity?.verification?.canonical_status || "NOT VERIFIED").replaceAll("_", " ").toUpperCase()}. Use Token Registry → Verify on-chain first.
+              </div>
+            )}
             {robinhoodChainPairNotConfigured && (
               <div style={{ marginTop: 4 }}>
-                {robinhoodChainSelectedPair.base} registry #{robinhoodChainRegistryBaseIdentity?.registry_id} + {robinhoodChainSelectedPair.quote} registry #{robinhoodChainRegistryQuoteIdentity?.registry_id}. Registration is idempotent and review-only. Refresh remains a separate explicit action.
+                {robinhoodChainSelectedPair.base} registry #{robinhoodChainRegistryBaseIdentity?.registry_id} + {robinhoodChainSelectedPair.quote} registry #{robinhoodChainRegistryQuoteIdentity?.registry_id}. Both identities are canonically verified. Registration is idempotent and review-only. Refresh remains a separate explicit action.
               </div>
             )}
             {robinhoodChainPairRegistrationNotice && (

@@ -117,6 +117,7 @@ class WalletAddressBalanceOut(BaseModel):
     balance: Optional[float] = None
     usd_price: Optional[float] = None
     usd_value: Optional[float] = None
+    usd_source: Optional[str] = None
     fetched_at: Optional[datetime] = None
 
     # Back-compat (optional)

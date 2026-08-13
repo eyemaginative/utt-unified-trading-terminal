@@ -8,6 +8,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -38,6 +41,14 @@ from .robinhood_chain_transaction_planning import (
     ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST,
     get_robinhood_chain_transaction_planning_service,
 )
+from .robinhood_chain_uniswap_quote import (
+    UNISWAP_PROVIDER,
+    get_robinhood_chain_uniswap_quote_service,
+)
+from .robinhood_chain_uniswap_v3_quote import (
+    UNISWAP_V3_RPC_PROVIDER,
+    get_robinhood_chain_uniswap_v3_quote_service,
+)
 
 
 ROBINHOOD_CHAIN_ID = 4663
@@ -45,6 +56,8 @@ AMOUNT_MODE_EXACT_INPUT = "exact_input"
 MECHANISM_SWAP = "swap"
 MECHANISM_WRAP_UNWRAP = "wrap_unwrap"
 PROVIDER_ZEROX = "0x"
+PROVIDER_UNISWAP = UNISWAP_PROVIDER
+PROVIDER_UNISWAP_V3_RPC = UNISWAP_V3_RPC_PROVIDER
 PROVIDER_NATIVE_WRAP = "native_wrap"
 PREPARATION_STATUS = "preparation_verified"
 INDICATIVE_AVAILABLE_STATUSES = {"available", "live_verified"}
@@ -167,11 +180,21 @@ def _classify_probe_result(result: Dict[str, Any]) -> str:
     error = str(result.get("error") or "").strip().lower()
     exact = {
         "execution_discovery_not_configured": "provider_not_configured",
+        "uniswap_quote_not_configured": "provider_not_configured",
+        "uniswap_quote_api_base_invalid": "provider_not_configured",
         "execution_discovery_backoff_active": "backoff_active",
         "execution_discovery_provider_transient_error": "provider_transient_error",
+        "uniswap_quote_provider_transient_error": "provider_transient_error",
         "provider_transient_error": "provider_transient_error",
         "provider_authentication_failed": "provider_authentication_failed",
+        "uniswap_quote_authentication_failed": "provider_authentication_failed",
         "unsupported_discovery_pair": "unsupported",
+        "uniswap_quote_routing_not_allowed": "unsupported",
+        "uniswap_v3_pool_not_found": "no_liquidity",
+        "uniswap_v3_no_quotable_route": "no_liquidity",
+        "uniswap_v3_same_token_pair": "unsupported",
+        "uniswap_v3_rpc_requires_wrapped_native_identity": "identity_invalid",
+        "invalid_uniswap_v3_registry_identity": "identity_invalid",
         "invalid_registry_token_identity": "identity_invalid",
         "execution_discovery_provider_identity_mismatch": "identity_invalid",
         "chain_id_mismatch_or_unavailable": "identity_invalid",
@@ -303,6 +326,168 @@ def _select_registry_rows(db: Session) -> List[TokenRegistry]:
     )
 
 
+def _provider_exception_result(provider: str, exc: Exception) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "selected_market_provider_exception",
+        "provider": str(provider or "").strip().lower(),
+        "provider_contacted": False,
+        "liquidity_available": False,
+        "provider_error": {
+            "name": type(exc).__name__,
+            "message": _clean_text(exc, 1000),
+        },
+        "read_only": True,
+        "transaction_constructed": False,
+        "will_mutate": False,
+    }
+
+
+def _safe_http_status(value: Any) -> Optional[int]:
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _ensure_provider_scoped_capability_schema(db: Session) -> Dict[str, Any]:
+    """Repair the legacy SQLite uniqueness boundary that omitted provider.
+
+    Early RH-REG databases could contain a unique constraint on objective,
+    direction, and amount mode without the provider column. The model now
+    requires provider-scoped evidence, but SQLite create_all cannot alter an
+    existing unique constraint. This bounded compatibility migration preserves
+    every row and rebuilds only this local review-evidence table.
+    """
+    bind = db.get_bind()
+    dialect = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+    if dialect != "sqlite":
+        return {"checked": False, "migrated": False, "dialect": dialect or None}
+
+    db.commit()
+    indexes = db.execute(text("PRAGMA index_list('robinhood_chain_pair_capabilities')")).mappings().all()
+    unique_column_sets: List[Tuple[str, ...]] = []
+    for index in indexes:
+        if not bool(index.get("unique")):
+            continue
+        index_name = str(index.get("name") or "").replace("'", "''")
+        columns = db.execute(text(f"PRAGMA index_info('{index_name}')")).mappings().all()
+        unique_column_sets.append(tuple(str(item.get("name") or "") for item in columns))
+
+    current_columns = (
+        "objective_id",
+        "from_token_registry_id",
+        "to_token_registry_id",
+        "amount_mode",
+        "provider",
+    )
+    legacy_columns = current_columns[:-1]
+    if current_columns in unique_column_sets:
+        return {"checked": True, "migrated": False, "dialect": "sqlite"}
+    if legacy_columns not in unique_column_sets:
+        # No incompatible unique boundary was found. A later insert can still
+        # surface any unrelated schema defect through the sanitized endpoint.
+        return {
+            "checked": True,
+            "migrated": False,
+            "dialect": "sqlite",
+            "unique_columns": [list(item) for item in unique_column_sets],
+        }
+
+    temp_table = "robinhood_chain_pair_capabilities_r5c5d2er1"
+    try:
+        source_row_count = int(
+            db.execute(text("SELECT COUNT(*) FROM robinhood_chain_pair_capabilities")).scalar_one()
+        )
+        db.execute(text(f"DROP TABLE IF EXISTS {temp_table}"))
+        db.execute(text(f"""
+            CREATE TABLE {temp_table} (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                objective_id VARCHAR(36) NOT NULL,
+                from_token_registry_id INTEGER NOT NULL,
+                to_token_registry_id INTEGER NOT NULL,
+                amount_mode VARCHAR(24) NOT NULL,
+                provider VARCHAR(32) NOT NULL,
+                indicative_status VARCHAR(32) NOT NULL,
+                firm_plan_status VARCHAR(32) NOT NULL,
+                execution_status VARCHAR(32) NOT NULL,
+                enabled BOOLEAN NOT NULL,
+                route_sources JSON,
+                probe_amount VARCHAR(80),
+                price_impact_bps FLOAT,
+                provider_error JSON,
+                backoff_until DATETIME,
+                evidence JSON,
+                last_verified_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT uq_rh_chain_pair_capability_direction
+                    UNIQUE (objective_id, from_token_registry_id, to_token_registry_id, amount_mode, provider),
+                FOREIGN KEY(objective_id) REFERENCES robinhood_chain_pair_objectives (id) ON DELETE CASCADE,
+                FOREIGN KEY(from_token_registry_id) REFERENCES token_registry (id) ON DELETE CASCADE,
+                FOREIGN KEY(to_token_registry_id) REFERENCES token_registry (id) ON DELETE CASCADE
+            )
+        """))
+        db.execute(text(f"""
+            INSERT INTO {temp_table} (
+                id, objective_id, from_token_registry_id, to_token_registry_id,
+                amount_mode, provider, indicative_status, firm_plan_status,
+                execution_status, enabled, route_sources, probe_amount,
+                price_impact_bps, provider_error, backoff_until, evidence,
+                last_verified_at, created_at, updated_at
+            )
+            SELECT
+                id, objective_id, from_token_registry_id, to_token_registry_id,
+                amount_mode, COALESCE(NULLIF(provider, ''), '0x'),
+                indicative_status, firm_plan_status, execution_status, enabled,
+                route_sources, probe_amount, price_impact_bps, provider_error,
+                backoff_until, evidence, last_verified_at, created_at, updated_at
+            FROM robinhood_chain_pair_capabilities
+        """))
+        copied_row_count = int(
+            db.execute(text(f"SELECT COUNT(*) FROM {temp_table}")).scalar_one()
+        )
+        if copied_row_count != source_row_count:
+            raise RuntimeError("provider_scoped_capability_schema_copy_count_mismatch")
+        db.execute(text("DROP TABLE robinhood_chain_pair_capabilities"))
+        db.execute(text(
+            f"ALTER TABLE {temp_table} RENAME TO robinhood_chain_pair_capabilities"
+        ))
+        db.execute(text(
+            "CREATE INDEX ix_robinhood_chain_pair_capabilities_objective_id "
+            "ON robinhood_chain_pair_capabilities (objective_id)"
+        ))
+        db.execute(text(
+            "CREATE INDEX ix_robinhood_chain_pair_capabilities_from_token_registry_id "
+            "ON robinhood_chain_pair_capabilities (from_token_registry_id)"
+        ))
+        db.execute(text(
+            "CREATE INDEX ix_robinhood_chain_pair_capabilities_to_token_registry_id "
+            "ON robinhood_chain_pair_capabilities (to_token_registry_id)"
+        ))
+        db.execute(text(
+            "CREATE INDEX ix_rh_chain_pair_capability_status "
+            "ON robinhood_chain_pair_capabilities (indicative_status, last_verified_at)"
+        ))
+        db.execute(text(
+            "CREATE INDEX ix_rh_chain_pair_capability_enabled "
+            "ON robinhood_chain_pair_capabilities (enabled, execution_status)"
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "checked": True,
+        "migrated": True,
+        "dialect": "sqlite",
+        "legacy_unique_columns": list(legacy_columns),
+        "current_unique_columns": list(current_columns),
+        "preserved_row_count": source_row_count,
+    }
+
+
 class RobinhoodChainRegistryDiscoveryService:
     """TokenRegistry-backed, review-only Robinhood Chain discovery service.
 
@@ -317,10 +502,14 @@ class RobinhoodChainRegistryDiscoveryService:
         rpc_client: Any = None,
         discovery_service: Any = None,
         planning_service: Any = None,
+        uniswap_service: Any = None,
+        uniswap_v3_service: Any = None,
     ) -> None:
         self.rpc_client = rpc_client or get_robinhood_chain_client()
         self.discovery_service = discovery_service or get_robinhood_chain_execution_discovery_service()
         self.planning_service = planning_service or get_robinhood_chain_transaction_planning_service()
+        self.uniswap_service = uniswap_service or get_robinhood_chain_uniswap_quote_service()
+        self.uniswap_v3_service = uniswap_v3_service or get_robinhood_chain_uniswap_v3_quote_service()
 
     def status(self, db: Session) -> Dict[str, Any]:
         try:
@@ -347,6 +536,8 @@ class RobinhoodChainRegistryDiscoveryService:
             "capability_count": db.query(RobinhoodChainPairCapability).count(),
             "supported_mechanisms": [MECHANISM_SWAP, MECHANISM_WRAP_UNWRAP],
             "supported_amount_modes": [AMOUNT_MODE_EXACT_INPUT],
+            "review_providers": [PROVIDER_ZEROX, PROVIDER_UNISWAP, PROVIDER_UNISWAP_V3_RPC],
+            "selected_pair_provider_probing": True,
             "database_writes_require_confirmation": True,
             "blockchain_read_only": True,
             "execution_enabled": False,
@@ -418,6 +609,11 @@ class RobinhoodChainRegistryDiscoveryService:
     def resolve_token(self, db: Session, symbol: str) -> Dict[str, Any]:
         return self.token_identity(db, self._registry_row_by_symbol(db, symbol))
 
+    def resolve_verified_token(self, db: Session, symbol: str) -> Dict[str, Any]:
+        row = self._registry_row_by_symbol(db, symbol)
+        self._verified_identity_required(db, int(row.id))
+        return self.token_identity(db, row)
+
     def native_identity(self, db: Session) -> Dict[str, Any]:
         try:
             row = effective_native_row(db, venue=ROBINHOOD_CHAIN_VENUE)
@@ -455,6 +651,33 @@ class RobinhoodChainRegistryDiscoveryService:
             "updated_at": iso_or_none(row.updated_at),
         }
 
+    def _verification_matches_current_registry_identity(
+        self,
+        verification: Optional[RobinhoodChainRegistryVerification],
+        identity: Dict[str, Any],
+    ) -> bool:
+        if verification is None:
+            return False
+        evidence = verification.evidence if isinstance(verification.evidence, dict) else {}
+        try:
+            evidence_decimals = int(evidence.get("registry_decimals"))
+            current_decimals = int(identity.get("decimals"))
+        except Exception:
+            return False
+        evidence_symbol = str(evidence.get("registry_symbol") or "").strip().upper()
+        current_symbol = str(identity.get("symbol") or "").strip().upper()
+        evidence_address = str(evidence.get("registry_contract_address") or "").strip().lower()
+        current_address = str(identity.get("registry_contract_address") or "").strip().lower()
+        current_kind = str(identity.get("asset_kind") or "").strip().lower()
+        return bool(
+            int(verification.chain_id) == ROBINHOOD_CHAIN_ID
+            and str(verification.asset_kind or "").strip().lower() == current_kind
+            and evidence_symbol
+            and evidence_symbol == current_symbol
+            and evidence_decimals == current_decimals
+            and evidence_address == current_address
+        )
+
     def assets(self, db: Session) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for row in self.registry_rows(db):
@@ -472,7 +695,18 @@ class RobinhoodChainRegistryDiscoveryService:
                 }
                 identity_error = str(exc)
             identity["identity_error"] = identity_error
-            identity["verification"] = self._verification_dict(self._verification_row(db, int(row.id)))
+            verification_row = self._verification_row(db, int(row.id))
+            verification = self._verification_dict(verification_row)
+            if (
+                identity_error is None
+                and verification is not None
+                and str(verification.get("canonical_status") or "").strip().lower() == "verified"
+                and not self._verification_matches_current_registry_identity(verification_row, identity)
+            ):
+                verification["canonical_status"] = "registry_changed_since_verification"
+                verification["registry_match"] = False
+                verification["verification_error"] = "registry_changed_since_verification"
+            identity["verification"] = verification
             out.append(identity)
         return out
 
@@ -679,6 +913,25 @@ class RobinhoodChainRegistryDiscoveryService:
             raise ValueError("robinhood_chain_pair_objective_not_found")
         return self._objective_dict(db, row)
 
+    def market_by_symbol(
+        self,
+        db: Session,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        """Return one enabled market with derived provider/order-book state."""
+        normalized = _normalize_market_symbol(symbol)
+        market = next(
+            (
+                item
+                for item in self.market_catalog(db)
+                if str(item.get("symbol") or "").strip().upper() == normalized
+            ),
+            None,
+        )
+        if market is None:
+            raise ValueError("robinhood_chain_pair_objective_not_found")
+        return market
+
     @staticmethod
     def _market_indicative_state(capabilities: List[Dict[str, Any]]) -> str:
         statuses = {
@@ -717,14 +970,52 @@ class RobinhoodChainRegistryDiscoveryService:
                 ),
             }
             available_statuses = INDICATIVE_AVAILABLE_STATUSES
-            available_directions = {
-                (
+            available_by_provider: Dict[str, set] = {}
+            for item in capabilities:
+                if str(item.get("indicative_status") or "").strip().lower() not in available_statuses:
+                    continue
+                provider = str(item.get("provider") or "").strip().lower()
+                if not provider:
+                    continue
+                available_by_provider.setdefault(provider, set()).add((
                     str(item.get("from_asset") or "").strip().upper(),
                     str(item.get("to_asset") or "").strip().upper(),
+                ))
+            complete_orderbook_providers = sorted(
+                provider
+                for provider, directions in available_by_provider.items()
+                if expected_directions.issubset(directions)
+            )
+            live_execution_by_provider: Dict[str, set] = {}
+            for item in capabilities:
+                if not (
+                    item.get("enabled") is True
+                    and str(item.get("execution_status") or "").strip().lower() == "live_verified"
+                ):
+                    continue
+                provider = str(item.get("provider") or "").strip().lower()
+                if not provider:
+                    continue
+                live_execution_by_provider.setdefault(provider, set()).add((
+                    str(item.get("from_asset") or "").strip().upper(),
+                    str(item.get("to_asset") or "").strip().upper(),
+                ))
+            complete_live_execution_providers = sorted(
+                provider
+                for provider, directions in live_execution_by_provider.items()
+                if expected_directions.issubset(directions)
+                and provider in complete_orderbook_providers
+            )
+            preferred_orderbook_provider = (
+                complete_live_execution_providers[0]
+                if complete_live_execution_providers
+                else (
+                    PROVIDER_UNISWAP
+                    if PROVIDER_UNISWAP in complete_orderbook_providers
+                    else (complete_orderbook_providers[0] if complete_orderbook_providers else None)
                 )
-                for item in capabilities
-                if str(item.get("indicative_status") or "").strip().lower() in available_statuses
-            }
+            )
+            available_directions = set().union(*available_by_provider.values()) if available_by_provider else set()
             provider_errors = [
                 item for item in capabilities
                 if str(item.get("indicative_status") or "").strip().lower() == "provider_error"
@@ -738,7 +1029,7 @@ class RobinhoodChainRegistryDiscoveryService:
                 if str(item.get("indicative_status") or "").strip().lower() not in available_statuses
             ]
             direction_statuses = {
-                f"{str(item.get('from_asset') or '').strip().upper()}->{str(item.get('to_asset') or '').strip().upper()}":
+                f"{str(item.get('provider') or '').strip().lower()}:{str(item.get('from_asset') or '').strip().upper()}->{str(item.get('to_asset') or '').strip().upper()}":
                     str(item.get("indicative_status") or "not_yet_probed").strip().lower()
                 for item in capabilities
             }
@@ -757,8 +1048,7 @@ class RobinhoodChainRegistryDiscoveryService:
             )
             orderbook_enabled = bool(
                 mechanism == MECHANISM_SWAP
-                and expected_directions
-                and expected_directions.issubset(available_directions)
+                and complete_orderbook_providers
             )
             if orderbook_enabled:
                 orderbook_reason = None
@@ -766,14 +1056,17 @@ class RobinhoodChainRegistryDiscoveryService:
                 orderbook_reason = "wrap_unwrap_uses_dedicated_mechanism_view"
             else:
                 unavailable_state = self._market_indicative_state(unavailable_capabilities)
-                orderbook_reason = (
-                    unavailable_state
-                    if unavailable_state not in {"available", "live_verified", "mechanism_configured"}
-                    else "both_exact_input_directions_not_available"
-                )
+                if expected_directions.issubset(available_directions):
+                    orderbook_reason = "same_provider_both_exact_input_directions_not_available"
+                else:
+                    orderbook_reason = (
+                        unavailable_state
+                        if unavailable_state not in {"available", "live_verified", "mechanism_configured"}
+                        else "same_provider_both_exact_input_directions_not_available"
+                    )
 
             providers = sorted({
-                str(item.get("provider") or "").strip()
+                str(item.get("provider") or "").strip().lower()
                 for item in capabilities
                 if str(item.get("provider") or "").strip()
             })
@@ -790,6 +1083,9 @@ class RobinhoodChainRegistryDiscoveryService:
                 "capability_source": "database",
                 "indicative_state": indicative_state,
                 "providers": providers,
+                "orderbook_providers": complete_orderbook_providers,
+                "live_execution_orderbook_providers": complete_live_execution_providers,
+                "preferred_orderbook_provider": preferred_orderbook_provider,
                 "orderbook_enabled": orderbook_enabled,
                 "orderbook_reason": orderbook_reason,
                 "mechanism_configured": mechanism_configured,
@@ -816,6 +1112,7 @@ class RobinhoodChainRegistryDiscoveryService:
         mechanism: str,
         notes: Optional[str],
         confirm_create: bool,
+        require_verified_registry_identities: bool = False,
     ) -> Dict[str, Any]:
         if confirm_create is not True:
             raise ValueError("confirm_pair_objective_create_required")
@@ -835,6 +1132,10 @@ class RobinhoodChainRegistryDiscoveryService:
         }
         if not requested_registry_ids.issubset(effective_registry_ids):
             raise ValueError("pair_objective_requires_effective_registry_identity")
+
+        if require_verified_registry_identities:
+            self._verified_identity_required(db, int(base_row.id))
+            self._verified_identity_required(db, int(quote_row.id))
 
         normalized_mechanism = str(mechanism or MECHANISM_SWAP).strip().lower()
         if normalized_mechanism not in {MECHANISM_SWAP, MECHANISM_WRAP_UNWRAP}:
@@ -907,6 +1208,8 @@ class RobinhoodChainRegistryDiscoveryService:
             "broadcast_enabled": False,
             "automatic_execution_promotion": False,
             "execution_enabled": False,
+            "registry_verification_required": bool(require_verified_registry_identities),
+            "registry_verified": bool(require_verified_registry_identities),
             "will_mutate_chain": False,
         }
 
@@ -943,26 +1246,94 @@ class RobinhoodChainRegistryDiscoveryService:
         amount_mode: str,
         provider: str,
     ) -> RobinhoodChainPairCapability:
+        """Atomically get or create one provider-scoped capability row.
+
+        Selected-market refreshes can overlap with foreground Order Book or
+        Order Ticket refreshes. A query-then-insert sequence allows two
+        requests to observe the same missing row and race on the provider-
+        scoped unique constraint. SQLite/PostgreSQL therefore use a single
+        conflict-safe insert before reading the canonical row.
+        """
+        objective_key = str(objective_id or "").strip()
+        amount_mode_key = str(amount_mode or "").strip().lower()
+        provider_key = str(provider or "").strip().lower()
+        from_id = int(from_token_registry_id)
+        to_id = int(to_token_registry_id)
+        now = utc_now()
+
+        if not objective_key or not amount_mode_key or not provider_key:
+            raise ValueError("invalid_robinhood_chain_capability_identity")
+
+        identity_filters = (
+            RobinhoodChainPairCapability.objective_id == objective_key,
+            RobinhoodChainPairCapability.from_token_registry_id == from_id,
+            RobinhoodChainPairCapability.to_token_registry_id == to_id,
+            RobinhoodChainPairCapability.amount_mode == amount_mode_key,
+            RobinhoodChainPairCapability.provider == provider_key,
+        )
+        table = RobinhoodChainPairCapability.__table__
+        identity_columns = (
+            table.c.objective_id,
+            table.c.from_token_registry_id,
+            table.c.to_token_registry_id,
+            table.c.amount_mode,
+            table.c.provider,
+        )
+        insert_values = {
+            "id": str(uuid.uuid4()),
+            "objective_id": objective_key,
+            "from_token_registry_id": from_id,
+            "to_token_registry_id": to_id,
+            "amount_mode": amount_mode_key,
+            "provider": provider_key,
+            "indicative_status": "not_tested",
+            "firm_plan_status": "not_tested",
+            "execution_status": "disabled",
+            "enabled": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        bind = db.get_bind()
+        dialect = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+
+        if dialect == "sqlite":
+            statement = (
+                sqlite_insert(table)
+                .values(**insert_values)
+                .on_conflict_do_nothing(index_elements=identity_columns)
+            )
+            db.execute(statement)
+            db.flush()
+        elif dialect == "postgresql":
+            statement = (
+                postgresql_insert(table)
+                .values(**insert_values)
+                .on_conflict_do_nothing(index_elements=identity_columns)
+            )
+            db.execute(statement)
+            db.flush()
+        else:
+            row = db.query(RobinhoodChainPairCapability).filter(*identity_filters).first()
+            if row is None:
+                try:
+                    with db.begin_nested():
+                        row = RobinhoodChainPairCapability(**insert_values)
+                        db.add(row)
+                        db.flush()
+                except IntegrityError:
+                    db.expire_all()
+            row = db.query(RobinhoodChainPairCapability).filter(*identity_filters).first()
+            if row is not None:
+                return row
+
         row = (
             db.query(RobinhoodChainPairCapability)
-            .filter(
-                RobinhoodChainPairCapability.objective_id == objective_id,
-                RobinhoodChainPairCapability.from_token_registry_id == int(from_token_registry_id),
-                RobinhoodChainPairCapability.to_token_registry_id == int(to_token_registry_id),
-                RobinhoodChainPairCapability.amount_mode == amount_mode,
-                RobinhoodChainPairCapability.provider == provider,
-            )
+            .filter(*identity_filters)
+            .populate_existing()
             .first()
         )
         if row is None:
-            row = RobinhoodChainPairCapability(
-                objective_id=objective_id,
-                from_token_registry_id=int(from_token_registry_id),
-                to_token_registry_id=int(to_token_registry_id),
-                amount_mode=amount_mode,
-                provider=provider,
-            )
-            db.add(row)
+            raise RuntimeError("robinhood_chain_capability_atomic_upsert_failed")
         return row
 
     def _capability_dict(self, db: Session, row: RobinhoodChainPairCapability) -> Dict[str, Any]:
@@ -1066,6 +1437,10 @@ class RobinhoodChainRegistryDiscoveryService:
     def _verified_identity_required(self, db: Session, token_registry_id: int) -> None:
         record = self._verification_row(db, token_registry_id)
         if record is None or record.canonical_status != "verified" or not bool(record.registry_match):
+            raise ValueError("pair_discovery_requires_verified_registry_identity")
+        registry_row = self._registry_row_by_id(db, token_registry_id)
+        identity = self.token_identity(db, registry_row)
+        if not self._verification_matches_current_registry_identity(record, identity):
             raise ValueError("pair_discovery_requires_verified_registry_identity")
 
     def _persist_probe_result(
@@ -1246,6 +1621,15 @@ class RobinhoodChainRegistryDiscoveryService:
             "will_mutate_chain": False,
         }
 
+    @staticmethod
+    def _default_selected_probe_amount(identity: Dict[str, Any]) -> str:
+        symbol = str(identity.get("symbol") or "").strip().upper()
+        if bool(identity.get("native")):
+            return "0.0001"
+        if symbol == "USDG":
+            return "1"
+        return "1"
+
     async def refresh_selected_market(
         self,
         db: Session,
@@ -1255,15 +1639,17 @@ class RobinhoodChainRegistryDiscoveryService:
         force_refresh: bool,
         confirm_refresh: bool,
     ) -> Dict[str, Any]:
-        """Refresh only the persisted exact-input directions for one selected market.
+        """Refresh provider-scoped exact-input evidence for one selected market.
 
-        This explicit operator action may perform bounded read-only provider/RPC
-        calls and update local review-only capability evidence. It never promotes
-        firm-plan or execution authority and never constructs transaction data.
+        Every provider/direction is isolated. Provider and persistence failures
+        are returned as sanitized capability diagnostics and cannot erase a
+        successful result from another provider or direction. Direct Uniswap v3
+        Factory + QuoterV2 reads are an independent fallback to the Trading API.
         """
         if confirm_refresh is not True:
             raise ValueError("confirm_selected_market_refresh_required")
 
+        schema_compatibility = _ensure_provider_scoped_capability_schema(db)
         normalized_symbol = _normalize_market_symbol(symbol)
         objective = (
             db.query(RobinhoodChainPairObjective)
@@ -1288,6 +1674,7 @@ class RobinhoodChainRegistryDiscoveryService:
         )
         results: List[Dict[str, Any]] = []
         provider_contacted = False
+        persistence_errors: List[Dict[str, Any]] = []
 
         identity_error: Optional[str] = None
         try:
@@ -1296,67 +1683,190 @@ class RobinhoodChainRegistryDiscoveryService:
         except ValueError as exc:
             identity_error = str(exc)
 
-        for from_row, to_row, from_identity, to_identity in directions:
-            capability = self._capability_row(
-                db,
-                objective_id=objective.id,
-                from_token_registry_id=int(from_row.id),
-                to_token_registry_id=int(to_row.id),
-                amount_mode=AMOUNT_MODE_EXACT_INPUT,
-                provider=PROVIDER_ZEROX,
-            )
-            probe_amount = str(capability.probe_amount or "").strip()
-            classification_result: Optional[Dict[str, Any]] = None
+        weth_identity: Optional[Dict[str, Any]] = None
+        weth_identity_error: Optional[str] = None
+        try:
+            weth_row = self._registry_row_by_symbol(db, "WETH")
+            self._verified_identity_required(db, int(weth_row.id))
+            weth_identity = self.token_identity(db, weth_row)
+        except ValueError as exc:
+            weth_identity_error = str(exc)
 
-            if identity_error:
-                classification_result = {
-                    "ok": False,
-                    "error": identity_error,
-                    "provider_contacted": False,
-                    "liquidity_available": False,
-                    "read_only": True,
-                    "will_mutate": False,
-                }
-            else:
-                try:
-                    probe_amount = _parse_probe_amount(probe_amount, int(from_row.decimals))
-                except ValueError:
+        providers = (PROVIDER_ZEROX, PROVIDER_UNISWAP, PROVIDER_UNISWAP_V3_RPC)
+        for from_row, to_row, from_identity, to_identity in directions:
+            side = "sell" if int(from_row.id) == int(base_row.id) else "buy"
+            direction_probe_row = (
+                db.query(RobinhoodChainPairCapability)
+                .filter(
+                    RobinhoodChainPairCapability.objective_id == objective.id,
+                    RobinhoodChainPairCapability.from_token_registry_id == int(from_row.id),
+                    RobinhoodChainPairCapability.to_token_registry_id == int(to_row.id),
+                    RobinhoodChainPairCapability.amount_mode == AMOUNT_MODE_EXACT_INPUT,
+                    RobinhoodChainPairCapability.probe_amount.isnot(None),
+                    RobinhoodChainPairCapability.probe_amount != "",
+                )
+                .order_by(RobinhoodChainPairCapability.last_verified_at.desc().nullslast())
+                .first()
+            )
+            direction_probe_amount = str(getattr(direction_probe_row, "probe_amount", "") or "").strip()
+            for provider in providers:
+                capability = self._capability_row(
+                    db,
+                    objective_id=objective.id,
+                    from_token_registry_id=int(from_row.id),
+                    to_token_registry_id=int(to_row.id),
+                    amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                    provider=provider,
+                )
+                probe_amount = str(capability.probe_amount or "").strip()
+                if not probe_amount:
+                    probe_amount = direction_probe_amount or self._default_selected_probe_amount(from_identity)
+                classification_result: Optional[Dict[str, Any]] = None
+
+                if identity_error:
                     classification_result = {
                         "ok": False,
-                        "error": "not_yet_probed",
+                        "error": identity_error,
+                        "provider": provider,
                         "provider_contacted": False,
                         "liquidity_available": False,
                         "read_only": True,
                         "will_mutate": False,
                     }
+                else:
+                    try:
+                        probe_amount = _parse_probe_amount(probe_amount, int(from_row.decimals))
+                    except ValueError as exc:
+                        classification_result = {
+                            "ok": False,
+                            "error": str(exc),
+                            "provider": provider,
+                            "provider_contacted": False,
+                            "liquidity_available": False,
+                            "read_only": True,
+                            "will_mutate": False,
+                        }
 
-            if classification_result is None:
-                classification_result = await self.discovery_service.probe(
-                    sell_token=from_identity,
-                    buy_token=to_identity,
-                    sell_amount=probe_amount,
-                    buy_amount=None,
-                    taker_address=taker,
-                    force_refresh=force_refresh,
-                    route_capability=None,
-                    require_live_verified=False,
-                    max_probe_amount=probe_amount,
-                )
+                if classification_result is None:
+                    try:
+                        if provider == PROVIDER_ZEROX:
+                            classification_result = await self.discovery_service.probe(
+                                sell_token=from_identity,
+                                buy_token=to_identity,
+                                sell_amount=probe_amount,
+                                buy_amount=None,
+                                taker_address=taker,
+                                force_refresh=force_refresh,
+                                route_capability=None,
+                                require_live_verified=False,
+                                max_probe_amount=probe_amount,
+                            )
+                        elif provider == PROVIDER_UNISWAP:
+                            classification_result = await self.uniswap_service.probe(
+                                symbol=normalized_symbol,
+                                side=side,
+                                requested_amount=probe_amount,
+                                swapper_address=taker,
+                                input_token=from_identity,
+                                output_token=to_identity,
+                                slippage_bps=50,
+                            )
+                        else:
+                            native_route = bool(from_identity.get("native")) or bool(to_identity.get("native"))
+                            if native_route and weth_identity is None:
+                                classification_result = {
+                                    "ok": False,
+                                    "error": weth_identity_error or "verified_weth_registry_identity_required",
+                                    "provider": provider,
+                                    "provider_contacted": False,
+                                    "liquidity_available": False,
+                                    "read_only": True,
+                                    "will_mutate": False,
+                                }
+                            else:
+                                provider_from = (
+                                    weth_identity
+                                    if bool(from_identity.get("native"))
+                                    else from_identity
+                                )
+                                provider_to = (
+                                    weth_identity
+                                    if bool(to_identity.get("native"))
+                                    else to_identity
+                                )
+                                classification_result = await self.uniswap_v3_service.probe(
+                                    requested_amount=probe_amount,
+                                    input_token=provider_from,
+                                    output_token=provider_to,
+                                    bridge_token=weth_identity,
+                                    display_input_symbol=from_identity.get("symbol"),
+                                    display_output_symbol=to_identity.get("symbol"),
+                                    force_refresh=force_refresh,
+                                )
+                    except Exception as exc:
+                        classification_result = _provider_exception_result(provider, exc)
 
-            provider_contacted = provider_contacted or _probe_provider_contacted(classification_result)
-            row = self._persist_probe_result(
-                db,
-                objective=objective,
-                from_row=from_row,
-                to_row=to_row,
-                provider=PROVIDER_ZEROX,
-                probe_amount=probe_amount or str(capability.probe_amount or ""),
-                result=classification_result,
-            )
-            db.flush()
-            results.append(self._capability_dict(db, row))
+                provider_contacted = provider_contacted or _probe_provider_contacted(classification_result)
+                try:
+                    row = self._persist_probe_result(
+                        db,
+                        objective=objective,
+                        from_row=from_row,
+                        to_row=to_row,
+                        provider=provider,
+                        probe_amount=probe_amount,
+                        result=classification_result,
+                    )
+                    db.flush()
+                    db.commit()
+                    db.refresh(row)
+                    results.append(self._capability_dict(db, row))
+                except Exception as exc:
+                    db.rollback()
+                    persistence_error = {
+                        "provider": provider,
+                        "from_asset": str(from_identity.get("symbol") or "").strip().upper(),
+                        "to_asset": str(to_identity.get("symbol") or "").strip().upper(),
+                        "error": "capability_persistence_failed",
+                        "failure_type": type(exc).__name__,
+                        "message": _clean_text(exc, 1000),
+                    }
+                    persistence_errors.append(persistence_error)
+                    results.append({
+                        "id": None,
+                        "objective_id": objective.id,
+                        "symbol": normalized_symbol,
+                        "mechanism": objective.mechanism,
+                        "from_token_registry_id": int(from_row.id),
+                        "to_token_registry_id": int(to_row.id),
+                        "from_asset": persistence_error["from_asset"],
+                        "to_asset": persistence_error["to_asset"],
+                        "amount_mode": AMOUNT_MODE_EXACT_INPUT,
+                        "display_mode": "exact_spend",
+                        "provider": provider,
+                        "indicative_status": "provider_error",
+                        "persisted_indicative_status": "not_persisted",
+                        "classification_source": "persistence_exception",
+                        "firm_plan_status": "not_tested",
+                        "execution_status": "disabled",
+                        "enabled": False,
+                        "route_sources": {},
+                        "probe_amount": probe_amount,
+                        "price_impact_bps": None,
+                        "provider_error": persistence_error,
+                        "evidence": {
+                            "classification": "provider_error",
+                            "provider_contacted": _probe_provider_contacted(classification_result),
+                            "read_only": True,
+                            "transaction_constructed": False,
+                        },
+                        "last_verified_at": None,
+                        "reason": "Capability evidence could not be persisted; other providers remain isolated.",
+                        "review_only": True,
+                        "execution_enabled": False,
+                        "preparation_enabled": False,
+                    })
 
-        db.commit()
         market = next(
             (item for item in self.market_catalog(db) if item.get("symbol") == normalized_symbol),
             None,
@@ -1372,11 +1882,12 @@ class RobinhoodChainRegistryDiscoveryService:
             and item["evidence"].get("provider_contacted") is True
         )
         provider_http_statuses = sorted({
-            int(item["provider_error"]["http_status"])
+            status
             for item in results
             if isinstance(item, dict)
             and isinstance(item.get("provider_error"), dict)
-            and item["provider_error"].get("http_status") is not None
+            for status in [_safe_http_status(item["provider_error"].get("http_status"))]
+            if status is not None
         })
         provider_error_names = sorted({
             str(item["provider_error"]["provider_error"].get("name") or "").strip()
@@ -1397,7 +1908,7 @@ class RobinhoodChainRegistryDiscoveryService:
 
         return {
             "ok": True,
-            "tranche": "R5C.5D.2A",
+            "tranche": "R5C.5D.2E-R1",
             "symbol": normalized_symbol,
             "market": market,
             "results": results,
@@ -1406,8 +1917,12 @@ class RobinhoodChainRegistryDiscoveryService:
             "provider_http_statuses": provider_http_statuses,
             "provider_error_names": provider_error_names,
             "provider_error_messages": provider_error_messages,
+            "persistence_errors": persistence_errors,
+            "schema_compatibility": schema_compatibility,
             "selected_pair_only": True,
             "probe_direction_count": len(results),
+            "provider_count": len(providers),
+            "providers": list(providers),
             "database_mutated": True,
             "blockchain_read_only": True,
             "provider_read_only": True,

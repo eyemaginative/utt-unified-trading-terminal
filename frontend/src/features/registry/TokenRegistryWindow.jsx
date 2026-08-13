@@ -697,6 +697,9 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState(null);
+  const [robinhoodDiscoveryAssets, setRobinhoodDiscoveryAssets] = useState([]);
+  const [robinhoodDiscoveryLoading, setRobinhoodDiscoveryLoading] = useState(false);
+  const [robinhoodDiscoveryError, setRobinhoodDiscoveryError] = useState("");
   const [suggestions, setSuggestions] = useState([]);
   const [dismissed, setDismissed] = useState(() => new Set());
 
@@ -756,6 +759,31 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     const c = String(chain || "").trim().toLowerCase();
     return c === "hydration" || c === "polkadot";
   }, [chain]);
+
+  const robinhoodDiscoveryByRegistryId = useMemo(() => {
+    const out = {};
+    for (const asset of robinhoodDiscoveryAssets || []) {
+      const id = Number(asset?.registry_id);
+      if (Number.isInteger(id) && id > 0) out[String(id)] = asset;
+    }
+    return out;
+  }, [robinhoodDiscoveryAssets]);
+
+  const robinhoodDiscoveryBySymbol = useMemo(() => {
+    const out = {};
+    for (const asset of robinhoodDiscoveryAssets || []) {
+      const symbol = String(asset?.symbol || "").trim().toUpperCase();
+      if (symbol && !out[symbol]) out[symbol] = asset;
+    }
+    return out;
+  }, [robinhoodDiscoveryAssets]);
+
+  const robinhoodDiscoveryVerified = useCallback((asset) => Boolean(
+    asset &&
+    !asset?.identity_error &&
+    String(asset?.verification?.canonical_status || "").trim().toLowerCase() === "verified" &&
+    asset?.verification?.registry_match === true
+  ), []);
 
   const routeTemplateOptions = useMemo(() => {
     const out = [];
@@ -844,6 +872,35 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
     }
   }, [routeMode, routeSymbol, routeJsonText]);
 
+  const loadRobinhoodDiscoveryAssets = useCallback(async () => {
+    if (!isRobinhoodChain(chain)) {
+      setRobinhoodDiscoveryAssets([]);
+      setRobinhoodDiscoveryLoading(false);
+      setRobinhoodDiscoveryError("");
+      return [];
+    }
+    setRobinhoodDiscoveryLoading(true);
+    setRobinhoodDiscoveryError("");
+    try {
+      const r = await fetch(`${API_BASE}/api/robinhood_chain/registry-discovery/assets`, {
+        method: "GET",
+        headers: { accept: "application/json" },
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
+      const arr = Array.isArray(j?.items) ? j.items : [];
+      setRobinhoodDiscoveryAssets(arr);
+      return arr;
+    } catch (e) {
+      const message = String(e?.message || e);
+      setRobinhoodDiscoveryAssets([]);
+      setRobinhoodDiscoveryError(message);
+      return [];
+    } finally {
+      setRobinhoodDiscoveryLoading(false);
+    }
+  }, [API_BASE, chain]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setErr(null);
@@ -913,8 +970,9 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
   useEffect(() => {
     load();
+    loadRobinhoodDiscoveryAssets();
     loadSuggestions();
-  }, [load, loadSuggestions]);
+  }, [load, loadRobinhoodDiscoveryAssets, loadSuggestions]);
 
   useEffect(() => {
     loadRoutes();
@@ -1007,13 +1065,14 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       setExternalPriceSource("");
       setExternalPriceId("");
       await load();
+      if (isRobinhoodChain(chain)) await loadRobinhoodDiscoveryAssets();
       loadSuggestions();
     } catch (e) {
       setErr(String(e?.message || e));
     } finally {
       setSaving(false);
     }
-  }, [API_BASE, canAdd, chain, symbol, address, assetKind, decimals, label, venue, externalPriceSource, externalPriceId, load, loadSuggestions]);
+  }, [API_BASE, canAdd, chain, symbol, address, assetKind, decimals, label, venue, externalPriceSource, externalPriceId, load, loadRobinhoodDiscoveryAssets, loadSuggestions]);
 
   const startEdit = useCallback((row) => {
     setEditId(row?.id || null);
@@ -1075,13 +1134,14 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
 
       cancelEdit();
       await load();
+      if (isRobinhoodChain(chain)) await loadRobinhoodDiscoveryAssets();
       loadSuggestions();
     } catch (e) {
       setErr(String(e?.message || e));
     } finally {
       setSaving(false);
     }
-  }, [API_BASE, chain, editId, editRow, load, cancelEdit]);
+  }, [API_BASE, chain, editId, editRow, load, loadRobinhoodDiscoveryAssets, loadSuggestions, cancelEdit]);
 
   const delRow = useCallback(
     async (row) => {
@@ -1100,6 +1160,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         const j = await r.json().catch(() => null);
         if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
         await load();
+        if (isRobinhoodChain(chain)) await loadRobinhoodDiscoveryAssets();
         loadSuggestions();
       } catch (e) {
         setErr(String(e?.message || e));
@@ -1107,7 +1168,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         setSaving(false);
       }
     },
-    [API_BASE, load]
+    [API_BASE, chain, load, loadRobinhoodDiscoveryAssets, loadSuggestions]
   );
 
   const testResolve = useCallback(
@@ -1134,7 +1195,37 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
           if (!validation.ok) {
             throw new Error(validation.message);
           }
-          alert(`Registry identity valid:\n\nchain=robinhood_chain\nsymbol=${row?.symbol || a.toUpperCase()}\nkind=${validation.native ? "native" : "ERC-20 contract"}\naddress=${row?.address || "(blank native address)"}\ndecimals=${row?.decimals}\nvenue=${row?.venue || "global"}\npriceSource=${row?.external_price_source || "—"}\npriceId=${row?.external_price_id || "—"}\n\nNo RPC balance read or wallet request was performed.`);
+          const registryId = Number(row?.id);
+          if (!Number.isInteger(registryId) || registryId <= 0) {
+            throw new Error(`Robinhood Chain registry ID is invalid for ${a.toUpperCase()}.`);
+          }
+          const r = await fetch(`${API_BASE}/api/robinhood_chain/registry-discovery/assets/${registryId}/verify`, {
+            method: "POST",
+            headers: { "content-type": "application/json", accept: "application/json" },
+            body: JSON.stringify({ force_refresh: true, confirm_verify: true }),
+          });
+          const j = await r.json().catch(() => null);
+          if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
+          await loadRobinhoodDiscoveryAssets();
+          const verification = j?.verification || {};
+          const status = String(verification?.canonical_status || "verification_failed").trim();
+          const registryMatch = verification?.registry_match === true;
+          if (j?.ok !== true || status !== "verified" || !registryMatch) {
+            throw new Error(`On-chain verification did not pass: status=${status}; registry_match=${registryMatch}; error=${verification?.verification_error || "—"}`);
+          }
+          alert(`On-chain identity verified:
+
+chain=robinhood_chain
+symbol=${row?.symbol || a.toUpperCase()}
+kind=${validation.native ? "native" : "ERC-20 contract"}
+address=${row?.address || "(blank native address)"}
+decimals=${row?.decimals}
+onchainSymbol=${verification?.onchain_symbol || row?.symbol || "—"}
+onchainDecimals=${verification?.onchain_decimals ?? row?.decimals ?? "—"}
+registryMatch=YES
+status=VERIFIED
+
+This performed read-only Robinhood Chain RPC verification and persisted local verification evidence. It did not request a wallet, sign, broadcast, or contact a swap provider.`);
           return;
         }
 
@@ -1179,8 +1270,33 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
         setErr(String(e?.message || e));
       }
     },
-    [API_BASE, chain, items]
+    [API_BASE, chain, items, loadRobinhoodDiscoveryAssets]
   );
+
+  const openRobinhoodChainReviewPair = useCallback((row, quoteSymbol) => {
+    const baseSymbol = String(row?.symbol || "").trim().toUpperCase();
+    const quote = String(quoteSymbol || "").trim().toUpperCase();
+    const discovery = robinhoodDiscoveryByRegistryId[String(row?.id || "")] || null;
+    const quoteDiscovery = robinhoodDiscoveryBySymbol[quote] || null;
+    if (!baseSymbol || !quote || baseSymbol === quote) {
+      setErr("Choose two different Robinhood Chain assets for review.");
+      return;
+    }
+    if (!robinhoodDiscoveryVerified(discovery) || !robinhoodDiscoveryVerified(quoteDiscovery)) {
+      setErr(`Canonical on-chain verification is required for both ${baseSymbol} and ${quote} before opening a review pair.`);
+      return;
+    }
+    const pair = `${baseSymbol}-${quote}`;
+    try {
+      const nextPath = `/market/robinhood_chain/${encodeURIComponent(pair)}`;
+      const nextUrl = `${nextPath}${window.location.search || ""}${window.location.hash || ""}`;
+      window.history.pushState(null, "", nextUrl);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      setErr(null);
+    } catch (e) {
+      setErr(String(e?.message || e || `Unable to open ${pair}.`));
+    }
+  }, [robinhoodDiscoveryByRegistryId, robinhoodDiscoveryBySymbol, robinhoodDiscoveryVerified]);
 
   const clearRouteForm = useCallback(() => {
     setRouteSymbol("UTTT-HDX");
@@ -2050,6 +2166,11 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
       )}
 
       {err && <div style={{ ...panelStyle, borderColor: "rgba(255,120,120,0.35)", background: "rgba(40,10,10,0.45)" }}>{err}</div>}
+      {isRobinhoodChain(chain) && robinhoodDiscoveryError && (
+        <div style={{ ...panelStyle, borderColor: "rgba(250,204,21,0.35)", background: "rgba(66,48,4,0.30)" }}>
+          Robinhood Chain verification status unavailable: {robinhoodDiscoveryError}
+        </div>
+      )}
 
       <div style={{ marginTop: 10 }}>
         <div style={panelHeadingRowStyle}>
@@ -2077,6 +2198,18 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
             <tbody>
               {(items || []).map((row) => {
                 const isEdit = String(editId || "") === String(row?.id || "");
+                const robinhoodDiscovery = isRobinhoodChain(chain)
+                  ? robinhoodDiscoveryByRegistryId[String(row?.id || "")] || null
+                  : null;
+                const robinhoodVerified = isRobinhoodChain(chain) && robinhoodDiscoveryVerified(robinhoodDiscovery);
+                const robinhoodVerificationStatus = isRobinhoodChain(chain)
+                  ? String(robinhoodDiscovery?.verification?.canonical_status || "not_verified").trim().toUpperCase().replaceAll("_", " ")
+                  : "";
+                const robinhoodIsErc20 = isRobinhoodChain(chain) && normalizeRobinhoodAssetKind(row?.asset_kind, row?.address) === "erc20";
+                const robinhoodSymbol = String(row?.symbol || "").trim().toUpperCase();
+                const robinhoodReviewBaseEligible = robinhoodIsErc20 && !["ETH", "WETH", "USDG"].includes(robinhoodSymbol);
+                const robinhoodEthVerified = robinhoodDiscoveryVerified(robinhoodDiscoveryBySymbol.ETH || null);
+                const robinhoodUsdgVerified = robinhoodDiscoveryVerified(robinhoodDiscoveryBySymbol.USDG || null);
                 return (
                   <tr key={row.id} style={{ borderTop: "1px solid rgba(255,255,255,0.08)" }}>
                     <td style={tdStyle}>
@@ -2158,10 +2291,42 @@ export default function TokenRegistryWindow({ apiBase = "", onClose }) {
                     </td>
                     <td style={tdStyle}>
                       {!isEdit ? (
-                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                          {isRobinhoodChain(chain) && (
+                            <span
+                              title={robinhoodDiscovery?.verification?.verification_error || "Canonical Robinhood Chain identity status"}
+                              style={{
+                                ...mappingCountBadgeStyle,
+                                borderColor: robinhoodVerified ? "rgba(74,222,128,0.45)" : "rgba(250,204,21,0.45)",
+                                color: robinhoodVerified ? "#bbf7d0" : "#fde68a",
+                              }}
+                            >
+                              {robinhoodDiscoveryLoading ? "VERIFY STATUS…" : robinhoodVerified ? "ON-CHAIN VERIFIED" : robinhoodVerificationStatus}
+                            </span>
+                          )}
                           <button type="button" style={btnStyle} onClick={() => testResolve(row.symbol)}>
-                            {chain === "counterparty" ? "Test price" : (isRobinhoodChain(chain) ? "Validate identity" : "Test resolve")}
+                            {chain === "counterparty" ? "Test price" : (isRobinhoodChain(chain) ? "Verify on-chain" : "Test resolve")}
                           </button>
+                          {robinhoodReviewBaseEligible && robinhoodVerified && robinhoodEthVerified && (
+                            <button
+                              type="button"
+                              style={btnStyle}
+                              onClick={() => openRobinhoodChainReviewPair(row, "ETH")}
+                              title="Open this canonically verified Token Registry asset against native ETH. If the selected pair objective is missing, Order Book / Order Ticket will offer one review-only Add Selected Pair action before any provider Refresh."
+                            >
+                              Review vs ETH
+                            </button>
+                          )}
+                          {robinhoodReviewBaseEligible && robinhoodVerified && robinhoodUsdgVerified && (
+                            <button
+                              type="button"
+                              style={btnStyle}
+                              onClick={() => openRobinhoodChainReviewPair(row, "USDG")}
+                              title="Open this canonically verified Token Registry asset against USDG. Pair enrollment remains review-only and provider-free until explicit Refresh."
+                            >
+                              Review vs USDG
+                            </button>
+                          )}
                           <button type="button" style={btnStyle} onClick={() => startEdit(row)}>
                             Edit
                           </button>

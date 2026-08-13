@@ -2,7 +2,7 @@
 
 UTT (Unified Trading Terminal) is a local-first, multi-venue crypto trading terminal built with **FastAPI** on the backend and **React** on the frontend. It is designed to unify centralized exchange (CEX) workflows and selected decentralized exchange (DEX) flows under a single operator-focused interface.
 
-> **Current documented baseline:** this README reflects the cumulative codebase through the published Counterparty / UniSat and controlled Robinhood Chain series, SEC-VAULT.1 credential-vault hardening, review-only Robinhood Chain selected-pair registration and provider-scoped indicative quotes, the accepted Cexius REST trading lifecycle, generic read-only Order Details windows, and the managed Arbitrage snapshot window. Generic Robinhood Chain custom-pair live execution, Cexius market orders, Cexius Cancel All, and automated arbitrage execution are not implied by the current scope.
+> **Current documented baseline:** this README is prepared for the cumulative publication following published baseline `977a6396a9215a80c6ba98663a50398613114b4d`. It retains the previously published Counterparty / UniSat, SEC-VAULT.1, Cexius, generic Order Details, managed Arbitrage, Solana, Hydration, Market Metrics, and Spread / Bridge capabilities and adds the accepted generic Robinhood Chain execution, historical/incremental wallet-ingestion, external-swap materialization, All Orders Sync+Load orchestration, known-UTT/external idempotency, and ERC-20 USD balance-pricing work. Cexius market orders, Cexius Cancel All, automated arbitrage execution, and generic Robinhood Chain Cost Basis / Cost Avg reconstruction are not implied by the current scope.
 
 At a high level, UTT provides one place to:
 
@@ -12,7 +12,7 @@ At a high level, UTT provides one place to:
 - submit and track CEX orders, cancel supported venue orders, and monitor venue-native order snapshots
 - trade through supported live-gated CEX adapters such as Coinbase, Crypto.com, Cexius, Dex-Trade, Gemini, Kraken, Robinhood, and OKX where configured
 - use Counterparty / UniSat workflows for Bitcoin-metaprotocol assets, collectibles, orderbook context, unsigned compose review, explicit PSBT signing, and separately gated broadcast
-- use Robinhood Chain for registry-backed EVM balances, 0x and provider-scoped read-only indicative quote discovery, review-only selected-pair registration, synthetic books, bounded unsigned planning, controlled browser-wallet execution, receipt reconciliation, and All Orders reflection
+- use Robinhood Chain for registry-backed EVM balances, 0x and provider-scoped read-only indicative quote discovery, Token Registry-driven selected-pair registration, synthetic books, bounded exact-input planning, controlled browser-wallet execution, receipt reconciliation, historical/incremental wallet ingestion, external-swap materialization, All Orders Sync+Load, and deterministic ERC-20 USD balance pricing
 - submit and track Solana swaps / limit-style flows and confirmed Hydration manual-route swaps
 - monitor scanners, discovery tools, Ordinals / Counterparty collectibles, wallet activity, market-cap data, volume data, and self-custody balances
 - filter Market Cap and Volume windows by All / Owned / Unowned and by venue/source such as Coinbase, Crypto.com, Dex-Trade, Gemini, Hydration, Kraken, OKX, Robinhood, self-custody, Solana, and Solana-Jupiter
@@ -55,7 +55,7 @@ UTT is best understood as a local operator workstation rather than a single exch
 - OKX gated live submit and cancel support using the OKX trade endpoint and cancel endpoint, while leaving withdrawals unsupported.
 - Cexius public and authenticated REST integration with complete paginated order snapshots, normalized balances and rules, selected-order cancellation, and limit BUY / SELL submission behind the shared live gates.
 - Counterparty read-only market / balance discovery, unsigned compose previews, explicit UniSat `signPsbt`, and separately gated `pushPsbt` broadcast with no backend signing or automatic broadcast.
-- Robinhood Chain registry-backed quote discovery, unsigned transaction planning, bounded exact-input execution authority, finite ERC-20 approval, separate browser-wallet requests, and receipt reconciliation.
+- Robinhood Chain registry-backed quote discovery, unsigned transaction planning, generic Token Registry-backed exact-input execution authority, finite ERC-20 approval, separate browser-wallet requests, receipt reconciliation, historical/incremental wallet ingestion, and external-swap materialization.
 - Solana DEX swap and limit-style flow integration where the selected wallet and route support the requested pair.
 - Hydration manual XYK and confirmed manual Router swap-transaction preparation for known route-registry rows.
 
@@ -80,7 +80,7 @@ UTT is best understood as a local operator workstation rather than a single exch
 - USD pricing enrichment for balances when requested.
 - AppHeader portfolio totals across CEX, Counterparty / Bitcoin, Robinhood Chain, Solana DEX, Hydration DEX, and cached self-custody balances where configured.
 - Counterparty asset and BTC balances resolved from the configured Wallet Addresses account, with direct or ASSET-BTC-derived USD valuation when sufficiently authoritative.
-- Robinhood Chain native ETH and Token Registry-authorized ERC-20 balances using bounded EVM RPC reads and cached pricing context.
+- Robinhood Chain native ETH and Token Registry-authorized ERC-20 balances using bounded EVM RPC reads plus deterministic USD pricing from stable mappings, explicit CoinGecko IDs, or exact registered ASSET→USDG read-only quote fallback.
 - Cost basis and average cost columns on balance rows.
 - Basis status indicators such as OK, partial, missing, unmatched, no lots, and not applicable.
 - Basis lot drilldown from balance rows.
@@ -115,7 +115,7 @@ UTT is best understood as a local operator workstation rather than a single exch
 - Hydration wallet-history ingestion into cached wallet-address transaction rows.
 - Deposit and withdrawal materialization from trusted cached wallet transactions.
 - Counterparty purchase accounting previews that separate acquired asset quantity, BTC consideration, Bitcoin miner fee, historical BTC/USD context, custody scope, and candidate source-lot impact without mutating ledger or FIFO state.
-- Robinhood Chain transaction-history and accounting previews that remain separate from execution and passive balance reads.
+- Robinhood Chain transaction-history/accounting previews plus checkpointed historical/incremental wallet evidence ingestion, known-UTT lifecycle reuse, and high-confidence external-swap materialization with idempotent downstream accounting.
 - Internal transfer and bridge planning surfaces that avoid treating transfers as taxable disposals by default.
 
 ### UTTT-specific workflows and use cases
@@ -267,26 +267,31 @@ Current Robinhood Chain capabilities include:
 - explicit separation between approval and swap wallet requests
 - short-lived provider plans and claim IDs that fail closed when stale, mismatched, or already consumed
 - read-only lifecycle restoration by exact execution ID or latest matching pair / direction / wallet lookup
-- controlled, live-validated WETH-USDG BUY and SELL lifecycles
+- controlled, live-validated WETH-USDG BUY and SELL lifecycles retained as regression controls
+- generic Token Registry-backed exact-input execution for selected registered pairs when the current pair/direction/provider capability passes the same bounded authority and preflight gates
 - exact on-chain receipt reconciliation, actual input/output calculation, network-fee calculation, and submission-count evidence
 - receipt-log reconciliation for the explicit case where a non-archive RPC serves the transaction and receipt but cannot serve the required historical ERC-20 balance snapshots
-- direction-correct All Orders normalization for both BUY and SELL rows
+- checkpointed historical/incremental wallet-evidence ingestion for configured Robinhood Chain Wallet Addresses
+- known-UTT lifecycle reuse so scanner evidence does not create duplicate external orders, journals, or lots
+- strict high-confidence external-swap materialization for outside-UTT MetaMask / DEX activity
+- All Orders `Sync+Load` integration with the same incremental scanner/materializer path
+- direction-correct All Orders normalization, exact canonical venue identity, and pre-pagination canceled/rejected filtering
+- deterministic ERC-20 USD balance pricing with bounded caching and read-only quote fallback
 
-Current live-validated scope is intentionally narrow:
+Current accepted execution scope is **registry-driven but still explicitly gated**:
 
 ```text
-WETH-USDG BUY
-  input: USDG
-  output: WETH
-  amount mode: exact input / exact spend
-
-WETH-USDG SELL
-  input: WETH
-  output: USDG
-  amount mode: exact input / exact spend
+selected Token Registry pair
+→ supported direction and exact-input amount mode
+→ explicit execution authority
+→ fresh provider plan
+→ finite approval only when required
+→ fresh post-approval swap-only preflight
+→ one explicit browser-wallet swap request
+→ confirmed receipt reconciliation
 ```
 
-The current code does **not** imply that every Token Registry pair is live-authorized. Generic custom-pair execution, arbitrary custom-token books, and broader pair acceptance remain later work. Read-only discovery, registry identity, quote context, and unsigned planning do not automatically promote a pair into live execution.
+Previously validated WETH-USDG BUY / SELL remains covered, and generic selected-pair execution has now also been validated through the same safety model. A registered token or successful quote still does **not** automatically grant live authority: the pair/direction must pass the current capability, amount, wallet, provider, freshness, simulation, balance, and gas gates.
 
 Robinhood Chain safety boundaries include:
 
@@ -624,9 +629,12 @@ The exact state of each venue may evolve over time, but the repository currently
   - synthetic provider-backed pair books
   - unsigned exact-input planning
   - finite approval plus separate swap requests
-  - controlled WETH-USDG BUY and SELL execution lifecycles
+  - controlled WETH-USDG BUY / SELL regression controls plus accepted generic Token Registry-backed selected-pair execution
   - receipt and fee reconciliation, including explicit non-archive RPC fallback
-  - All Orders BUY / SELL normalization and evidence isolation
+  - historical full-backfill and incremental wallet-evidence ingestion with checkpointing
+  - known-UTT lifecycle reuse and high-confidence external MetaMask / DEX swap materialization
+  - All Orders Sync+Load incremental orchestration, canonical venue identity, BUY / SELL normalization, and evidence isolation
+  - deterministic registered ERC-20 USD pricing with cached explicit CoinGecko-ID priority and exact ASSET→USDG read-only fallback
 - Counterparty / UniSat
   - Counterparty mainnet asset, balance, send, dispenser, and order discovery
   - Wallet Addresses-controlled source account
@@ -1130,7 +1138,7 @@ select venue: robinhood_chain
 → prepare an unsigned plan only when the pair capability allows it
 ```
 
-Current controlled WETH-USDG execution flow:
+Representative controlled exact-input execution flow (WETH-USDG remains a regression-control example):
 
 ```text
 select WETH-USDG and BUY or SELL
@@ -1158,8 +1166,28 @@ Important Robinhood Chain rules:
 - transaction value for ERC-20 approval and ERC-20 swap is expected to be `0 wei`
 - no automatic retry or automatic second transaction is permitted
 - an accepted lifecycle is restored by read-only lookup rather than recreated
-- current live-validated execution scope is WETH-USDG; arbitrary registry pairs are not automatically authorized
+- accepted execution now supports selected generic Token Registry-backed pairs under the same explicit pair/direction/provider/amount authority; registration or quoteability alone never authorizes a trade
 - All Orders must preserve BUY / SELL direction and pair economics
+
+Historical and future wallet synchronization uses the same configured Robinhood Chain Wallet Address evidence layer:
+
+```text
+Wallet Addresses historical backfill
+→ checkpointed evidence
+→ known UTT lifecycle reuse
+or safe external-swap materialization
+→ All Orders
+→ existing background ledger / lot sync
+
+All Orders → Sync+Load
+→ incremental scan only
+→ new evidence / materialization
+→ reload All Orders
+```
+
+Repeated scans are expected to be idempotent. Known UTT transactions must remain in their UTT lifecycle, external canonical rows must remain unique by transaction, and ledger/lot synchronization must not duplicate already-applied accounting.
+
+Robinhood Chain balance pricing is read-only. Registered balances can resolve USD value from an explicit stable mapping, an explicit Token Registry CoinGecko ID, or an exact registered ASSET→USDG indicative quote. Unresolved assets remain unpriced rather than receiving a guessed ticker mapping.
 
 ### 13) Wallet addresses and self-custody visibility
 
@@ -1873,7 +1901,32 @@ Historical balances that are available but disagree still fail closed. The fallb
 
 ### Current execution boundary
 
-The currently live-validated path is the bounded WETH-USDG exact-input BUY / SELL lifecycle. Generic registry pair discovery and custom-pair Order Book work may exist as preparation or future roadmap items, but arbitrary live custom-token execution is not represented as complete by this README.
+WETH-USDG BUY / SELL remains a live-validated regression control, but the accepted execution architecture now supports selected generic Token Registry-backed exact-input pairs when the current pair/direction/provider capability and all bounded execution gates pass. A Token Registry row, synthetic book, or successful indicative quote is not sufficient by itself to authorize a live transaction.
+
+The execution boundary remains explicit: finite approval when required, fresh post-approval planning, provider simulation, current balance/gas checks, one explicit browser-wallet request per transaction stage, no automatic retry, and receipt reconciliation before confirmed state.
+
+### Historical and incremental wallet evidence
+
+Robinhood Chain Wallet Addresses now support a checkpointed evidence scanner covering historical backfill and future incremental scans. The scanner retains transaction/log evidence for known UTT activity, external MetaMask / DEX activity, ERC-20 transfers, approvals, native activity, gas-bearing transactions, and unresolved interactions.
+
+Known UTT transaction hashes are reused by the existing execution lifecycle and are excluded from external canonical materialization. High-confidence external swaps are materialized separately and reflected into All Orders without implying that UTT planned or authorized them. Repeated materialization and Sync+Load scans are idempotent.
+
+`All Orders → Sync+Load` uses the same incremental scanner/materializer path and does not request another full historical backfill after the checkpoint is established.
+
+### Robinhood Chain balance pricing
+
+Registered Robinhood Chain balances use deterministic read-only price enrichment in this priority order:
+
+```text
+stable mapping
+→ explicit Token Registry CoinGecko external_price_id
+→ exact registered ASSET→USDG read-only indicative quote
+→ Unpriced
+```
+
+The quote fallback uses bounded provider concurrency, cache/in-flight deduplication, and late cache warming. It does not request MetaMask, create an approval/swap plan, sign, broadcast, or mutate the database. Ticker-only CoinGecko discovery is not used as authoritative token identity for this balance path.
+
+Price availability does not imply that historical USD basis is complete. Cost Basis / Cost Avg can remain Missing until the separate Robinhood Chain basis-reconstruction work establishes authoritative historical basis.
 
 ## Solana DEX notes
 
@@ -2667,8 +2720,11 @@ The repository includes many execution and accounting surfaces, but several boun
 - Robinhood Chain passive reads and database-only authority changes do not request MetaMask.
 - Robinhood Chain backend services do not sign or send transactions.
 - Robinhood Chain unlimited approval, automatic retry, and automatic second transactions remain disabled.
-- Robinhood Chain live-validated execution is currently bounded to the accepted WETH-USDG BUY / SELL lifecycle; arbitrary custom-pair live execution is not implied.
+- Robinhood Chain selected generic Token Registry-backed execution remains capability-gated; token registration, synthetic-book visibility, or quoteability alone does not imply live authority.
 - Market Cap / Volume windows are discovery and monitoring tools, not order execution tools.
+- Robinhood Chain ERC-20 USD pricing is accepted, but generic Robinhood Chain Cost Basis / Cost Avg reconstruction remains follow-up work; missing historical basis must not be fabricated.
+- Some Robinhood Chain synthetic books may display crossed directional snapshots; crossed-book diagnosis/correction remains a follow-up while raw provider evidence is preserved.
+
 
 ---
 
@@ -2732,7 +2788,7 @@ UTT is an actively evolving trading terminal codebase with current accepted work
 
 - SEC-VAULT.1 owner-scoped encrypted credential storage, explicit vault ownership, active/disabled lifecycle metadata, metadata-only inventory, scope declarations, and panic-disable containment
 - Counterparty / UniSat mainnet integration, balances, collectibles, market context, dispenser / order modes, unsigned compose review, explicit PSBT signing, separately gated broadcast, All Orders reflection, and BTC accounting previews
-- Robinhood Chain chain-ID-4663 integration, MetaMask linkage, Token Registry identity, balances, history, 0x execution quoting, provider-scoped read-only Uniswap indicative quotes, review-only selected-pair registration, bounded WETH-USDG BUY / SELL execution, non-archive RPC reconciliation, and direction-correct All Orders economics
+- Robinhood Chain chain-ID-4663 integration, MetaMask linkage, Token Registry identity, selected generic exact-input execution, finite approval and fresh swap-only preflight, receipt reconciliation, historical/incremental wallet scanning, known-UTT reuse, external MetaMask/DEX swap materialization, All Orders Sync+Load, deterministic ERC-20 USD balance pricing, and idempotent downstream accounting
 - Cexius public/authenticated REST integration, normalized balances and rules, complete order histories, fast orderbooks, selected cancellation, limit BUY / SELL submission, truthful dry-run simulation, and insufficient-inventory presentation
 - generic read-only Order Details windows with transaction metadata, draggable/resizable top-layer presentation, persistent geometry, and Reset controls
 - managed Arbitrage snapshot window with canonical WindowManager routing, no duplicate popover, best bid/ask and spread display, manual/auto refresh, request coalescing, and privacy handoff
@@ -2748,6 +2804,6 @@ UTT is an actively evolving trading terminal codebase with current accepted work
 - wallet-address and self-custody portfolio visibility
 - unified order and ledger workflows
 
-Current deliberate boundaries remain: Cexius market orders, Cancel All, withdrawals, deposit-address generation, and automatic retry are disabled; the Arbitrage window is monitoring-only; generic Robinhood Chain custom-pair live execution remains later work; and organic Cexius fill-accounting revalidation remains an operational follow-up rather than a publication blocker.
+Current deliberate boundaries remain: Cexius market orders, Cancel All, withdrawals, deposit-address generation, and automatic retry are disabled; the Arbitrage window is monitoring-only; Robinhood Chain registration/quoteability does not bypass execution authority; generic Robinhood Chain Cost Basis / Cost Avg reconstruction and crossed synthetic-book remediation remain follow-up work; and organic Cexius fill-accounting revalidation remains an operational follow-up rather than a publication blocker.
 
-Expect active iteration rather than a frozen, final product. Current live-validated Robinhood Chain execution should be read as the accepted WETH-USDG bounded workflow, not as universal support for every registry pair.
+Expect active iteration rather than a frozen, final product. Robinhood Chain generic selected-pair execution should be read as capability-gated exact-input support under the accepted finite-approval/fresh-preflight safety model, not as universal authorization for every registry pair or direction.

@@ -381,6 +381,14 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
   // the explicit user action that permits a bounded history read.
   const [historyWallet, setHistoryWallet] = useState(null);
   const [historyLoadRequestId, setHistoryLoadRequestId] = useState(0);
+  const [rhIngestPreview, setRhIngestPreview] = useState(null);
+  const [rhIngestResult, setRhIngestResult] = useState(null);
+  const [rhIngestBusy, setRhIngestBusy] = useState(false);
+  const [rhIngestError, setRhIngestError] = useState("");
+  const [rhMaterializePreview, setRhMaterializePreview] = useState(null);
+  const [rhMaterializeResult, setRhMaterializeResult] = useState(null);
+  const [rhMaterializeBusy, setRhMaterializeBusy] = useState(false);
+  const [rhMaterializeError, setRhMaterializeError] = useState("");
 
   const txStats = useMemo(() => deriveTxStats(txLastResult), [txLastResult]);
 
@@ -1251,8 +1259,152 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
   function openRobinhoodChainHistory(row) {
     setErr("");
     setHistoryWallet(row);
+    setRhIngestPreview(null);
+    setRhIngestResult(null);
+    setRhIngestError("");
+    setRhMaterializePreview(null);
+    setRhMaterializeResult(null);
+    setRhMaterializeError("");
     setTab("transactions");
     setHistoryLoadRequestId((current) => current + 1);
+  }
+
+  async function previewRobinhoodChainIngest({ forceFull = false } = {}) {
+    if (!historyWallet?.id) return;
+    setRhIngestBusy(true);
+    setRhIngestError("");
+    setRhIngestResult(null);
+    try {
+      const result = await api(`/api/robinhood_chain/wallet-ingest/preview`, {
+        method: "POST",
+        body: {
+          wallet_address_id: historyWallet.id,
+          force_full: !!forceFull,
+          force_refresh: true,
+          confirm_ingest: false,
+        },
+      });
+      setRhIngestPreview(result || null);
+    } catch (previewError) {
+      setRhIngestError(previewError?.message || String(previewError));
+    } finally {
+      setRhIngestBusy(false);
+    }
+  }
+
+  async function commitRobinhoodChainIngest() {
+    if (!historyWallet?.id || !rhIngestPreview) return;
+    const summary = rhIngestPreview?.summary || {};
+    const incomplete =
+      summary.partial === true ||
+      summary.truncated === true ||
+      (String(summary.mode || "") === "full_backfill" && summary.provider_exhausted !== true);
+    if (incomplete) {
+      setRhIngestError(
+        "Robinhood Chain history preview is incomplete. Evidence ingest is blocked until partial=false, truncated=false, and a full backfill reports provider_exhausted=true."
+      );
+      return;
+    }
+    const message = [
+      "Persist the scanned Robinhood Chain history evidence?",
+      "",
+      `Transactions: ${Number(summary.transaction_count || 0)}`,
+      `Events: ${Number(summary.event_count || 0)}`,
+      `Known UTT matches: ${Number(summary.known_utt_transaction_matches || 0)}`,
+      `Unregistered contracts: ${Number(summary.unregistered_unique_contracts || 0)}`,
+      "",
+      "This tranche stores chain evidence/checkpoint state only.",
+      "It does NOT yet create All Orders, Ledger, FIFO, or basis mutations.",
+    ].join("\n");
+    if (!window.confirm(message)) return;
+
+    setRhIngestBusy(true);
+    setRhIngestError("");
+    try {
+      const result = await api(`/api/robinhood_chain/wallet-ingest/commit`, {
+        method: "POST",
+        body: {
+          wallet_address_id: historyWallet.id,
+          force_full: String(summary.mode || "") === "full_backfill",
+          force_refresh: true,
+          confirm_ingest: true,
+        },
+      });
+      setRhIngestResult(result || null);
+      setRhIngestPreview(null);
+      setHistoryLoadRequestId((current) => current + 1);
+    } catch (ingestError) {
+      setRhIngestError(ingestError?.message || String(ingestError));
+    } finally {
+      setRhIngestBusy(false);
+    }
+  }
+
+  async function previewRobinhoodChainMaterialization() {
+    if (!historyWallet?.id) return;
+    setRhMaterializeBusy(true);
+    setRhMaterializeError("");
+    setRhMaterializeResult(null);
+    try {
+      const result = await api(`/api/robinhood_chain/wallet-materialization/preview`, {
+        method: "POST",
+        body: {
+          wallet_address_id: historyWallet.id,
+          confirm_materialize: false,
+        },
+      });
+      setRhMaterializePreview(result || null);
+    } catch (previewError) {
+      setRhMaterializeError(previewError?.message || String(previewError));
+    } finally {
+      setRhMaterializeBusy(false);
+    }
+  }
+
+  async function commitRobinhoodChainMaterialization() {
+    if (!historyWallet?.id || !rhMaterializePreview) return;
+    const summary = rhMaterializePreview?.summary || {};
+    if (summary.ready_for_materialization !== true) {
+      setRhMaterializeError(
+        `Materialization is blocked: ${(summary.blockers || []).join(", ") || "persisted evidence checkpoint is not complete"}.`
+      );
+      return;
+    }
+
+    const message = [
+      "Materialize high-confidence external Robinhood Chain swaps?",
+      "",
+      `Ready external swaps: ${Number(summary.external_swap_ready || 0)}`,
+      `New canonical rows: ${Number(summary.external_swap_new || 0)}`,
+      `Existing canonical rows: ${Number(summary.external_swap_existing || 0)}`,
+      `Known UTT swap groups reused/excluded: ${Number(summary.known_utt_swap_groups || 0)}`,
+      `Known UTT approval groups reused/excluded: ${Number(summary.known_utt_approval_groups || 0)}`,
+      `Deposit candidates held for later: ${Number(summary.deposit_candidate_groups || 0)}`,
+      `Withdrawal candidates held for later: ${Number(summary.withdrawal_candidate_groups || 0)}`,
+      "",
+      "This writes only dedicated external-swap canonical rows.",
+      "It does NOT write the orders table, run Ledger/FIFO, mutate basis, sign, or broadcast.",
+    ].join("\n");
+
+    if (!window.confirm(message)) return;
+
+    setRhMaterializeBusy(true);
+    setRhMaterializeError("");
+    try {
+      const result = await api(`/api/robinhood_chain/wallet-materialization/commit`, {
+        method: "POST",
+        body: {
+          wallet_address_id: historyWallet.id,
+          confirm_materialize: true,
+        },
+      });
+      setRhMaterializeResult(result || null);
+      setRhMaterializePreview(null);
+    } catch (materializeError) {
+      setRhMaterializeError(materializeError?.message || String(materializeError));
+    } finally {
+      setRhMaterializeBusy(false);
+    }
   }
 
   async function ingestTx(ids = null) {
@@ -1845,12 +1997,198 @@ export default function WalletAddressesWindow({ apiBase = "", hideTableData = fa
       )}
 
       {tab === "transactions" && (
-        <RobinhoodChainHistoryPanel
-          api={api}
-          wallet={historyWallet}
-          hideTableData={hideTableData}
-          loadRequestId={historyLoadRequestId}
-        />
+        <>
+          {historyWallet && isRobinhoodChainAddressRow(historyWallet) ? (
+            <div className="utt-wallet-panel">
+              <div className="utt-wallet-panel-title">Robinhood Chain Historical Ingest</div>
+              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
+                Scan uses provider-exhaustive history independent of the bounded display view. Preview is read-only.
+                Evidence ingest stores normalized events/checkpoint state. RH-WALLET.INGEST.1D materialization below creates only high-confidence external swap canonical rows; Ledger/FIFO remains a separate acceptance step.
+              </div>
+              <div className="utt-wallet-action-row">
+                <button
+                  type="button"
+                  onClick={() => previewRobinhoodChainIngest()}
+                  disabled={rhIngestBusy}
+                >
+                  {rhIngestBusy ? "Scanning…" : "Scan / Preview"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => previewRobinhoodChainIngest({ forceFull: true })}
+                  disabled={rhIngestBusy}
+                >
+                  Full rescan preview
+                </button>
+                <button
+                  type="button"
+                  onClick={commitRobinhoodChainIngest}
+                  disabled={
+                    rhIngestBusy ||
+                    !rhIngestPreview ||
+                    rhIngestPreview?.summary?.partial === true ||
+                    rhIngestPreview?.summary?.truncated === true ||
+                    (String(rhIngestPreview?.summary?.mode || "") === "full_backfill" &&
+                      rhIngestPreview?.summary?.provider_exhausted !== true)
+                  }
+                  title={
+                    rhIngestPreview?.summary?.partial === true ||
+                    rhIngestPreview?.summary?.truncated === true ||
+                    (String(rhIngestPreview?.summary?.mode || "") === "full_backfill" &&
+                      rhIngestPreview?.summary?.provider_exhausted !== true)
+                      ? "Evidence ingest is blocked until the preview is complete."
+                      : "Persist normalized chain evidence and checkpoint state."
+                  }
+                >
+                  Ingest History Evidence
+                </button>
+              </div>
+
+              {rhIngestError ? (
+                <div style={{ marginTop: 8, color: "#ff5f7a", whiteSpace: "pre-wrap" }}>{rhIngestError}</div>
+              ) : null}
+
+              {rhIngestPreview?.summary?.partial === true || rhIngestPreview?.summary?.truncated === true ? (
+                <div style={{ marginTop: 8, color: "#ffd166", whiteSpace: "pre-wrap", fontSize: 12 }}>
+                  Incomplete provider scan. Evidence ingest is blocked.
+                  {Array.isArray(rhIngestPreview?.summary?.provider_errors) && rhIngestPreview.summary.provider_errors.length ? (
+                    <pre style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 11 }}>
+                      {JSON.stringify(
+                        rhIngestPreview.summary.provider_errors.map((item) => ({
+                          source: item?.source,
+                          page: item?.page,
+                          error_type: item?.error_type,
+                          attempts: item?.attempts,
+                          retryable: item?.retryable,
+                          error: item?.error,
+                        })),
+                        null,
+                        2
+                      )}
+                    </pre>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {rhIngestPreview?.summary ? (
+                <pre style={{ marginTop: 8, whiteSpace: "pre-wrap", fontSize: 11 }}>
+                  {JSON.stringify({
+                    mode: rhIngestPreview.summary.mode,
+                    pages_scanned: rhIngestPreview.summary.pages_scanned,
+                    provider_exhausted: rhIngestPreview.summary.provider_exhausted,
+                    truncated: rhIngestPreview.summary.truncated,
+                    partial: rhIngestPreview.summary.partial,
+                    event_count: rhIngestPreview.summary.event_count,
+                    transaction_count: rhIngestPreview.summary.transaction_count,
+                    known_utt_transaction_matches: rhIngestPreview.summary.known_utt_transaction_matches,
+                    history_only_transactions: rhIngestPreview.summary.history_only_transactions,
+                    potential_swap_transactions: rhIngestPreview.summary.potential_swap_transactions,
+                    registered_contract_items: rhIngestPreview.summary.registered_contract_items,
+                    unregistered_contract_items: rhIngestPreview.summary.unregistered_contract_items,
+                    unregistered_unique_contracts: rhIngestPreview.summary.unregistered_unique_contracts,
+                    newest_block_number: rhIngestPreview.summary.newest_block_number,
+                    oldest_block_number: rhIngestPreview.summary.oldest_block_number,
+                  }, null, 2)}
+                </pre>
+              ) : null}
+
+              {rhIngestResult ? (
+                <pre style={{ marginTop: 8, whiteSpace: "pre-wrap", fontSize: 11 }}>
+                  {JSON.stringify({
+                    ok: rhIngestResult.ok,
+                    created_events: rhIngestResult.created_events,
+                    updated_events: rhIngestResult.updated_events,
+                    checkpoint: rhIngestResult.summary?.checkpoint,
+                    next_stage: rhIngestResult.next_stage,
+                  }, null, 2)}
+                </pre>
+              ) : null}
+
+              <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid rgba(66,232,255,0.18)" }}>
+                <div className="utt-wallet-panel-title" style={{ marginBottom: 6 }}>Transaction Materialization</div>
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
+                  Preview groups the persisted evidence by transaction hash. Only single-in/single-out native ETH → registered ERC-20 external swaps are eligible. Known UTT lifecycle transactions are reused/excluded; deposits, withdrawals, and ambiguous activity remain evidence-only.
+                </div>
+                <div className="utt-wallet-action-row">
+                  <button
+                    type="button"
+                    onClick={previewRobinhoodChainMaterialization}
+                    disabled={rhMaterializeBusy || rhIngestBusy}
+                  >
+                    {rhMaterializeBusy ? "Classifying…" : "Preview Materialization"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={commitRobinhoodChainMaterialization}
+                    disabled={
+                      rhMaterializeBusy ||
+                      rhIngestBusy ||
+                      !rhMaterializePreview ||
+                      rhMaterializePreview?.summary?.ready_for_materialization !== true
+                    }
+                    title={
+                      rhMaterializePreview?.summary?.ready_for_materialization === false
+                        ? `Blocked: ${(rhMaterializePreview?.summary?.blockers || []).join(", ") || "checkpoint incomplete"}`
+                        : "Persist canonical external-swap rows only; Ledger/FIFO remains separate."
+                    }
+                  >
+                    Materialize External Swaps
+                  </button>
+                </div>
+
+                {rhMaterializeError ? (
+                  <div style={{ marginTop: 8, color: "#ff5f7a", whiteSpace: "pre-wrap" }}>{rhMaterializeError}</div>
+                ) : null}
+
+                {rhMaterializePreview?.summary ? (
+                  <pre style={{ marginTop: 8, whiteSpace: "pre-wrap", fontSize: 11 }}>
+                    {JSON.stringify({
+                      event_count: rhMaterializePreview.summary.event_count,
+                      transaction_count: rhMaterializePreview.summary.transaction_count,
+                      known_utt_swap_groups: rhMaterializePreview.summary.known_utt_swap_groups,
+                      known_utt_approval_groups: rhMaterializePreview.summary.known_utt_approval_groups,
+                      history_only_groups: rhMaterializePreview.summary.history_only_groups,
+                      external_swap_ready: rhMaterializePreview.summary.external_swap_ready,
+                      external_swap_existing: rhMaterializePreview.summary.external_swap_existing,
+                      external_swap_new: rhMaterializePreview.summary.external_swap_new,
+                      spcx_external_swap_ready: rhMaterializePreview.summary.spcx_external_swap_ready,
+                      deposit_candidate_groups: rhMaterializePreview.summary.deposit_candidate_groups,
+                      withdrawal_candidate_groups: rhMaterializePreview.summary.withdrawal_candidate_groups,
+                      quarantined_groups: rhMaterializePreview.summary.quarantined_groups,
+                      external_asset_pairs: rhMaterializePreview.summary.external_asset_pairs,
+                      checkpoint: rhMaterializePreview.summary.checkpoint,
+                      ready_for_materialization: rhMaterializePreview.summary.ready_for_materialization,
+                      blockers: rhMaterializePreview.summary.blockers,
+                    }, null, 2)}
+                  </pre>
+                ) : null}
+
+                {rhMaterializeResult ? (
+                  <pre style={{ marginTop: 8, whiteSpace: "pre-wrap", fontSize: 11 }}>
+                    {JSON.stringify({
+                      ok: rhMaterializeResult.ok,
+                      created_external_swaps: rhMaterializeResult.created_external_swaps,
+                      updated_external_swaps: rhMaterializeResult.updated_external_swaps,
+                      unchanged_external_swaps: rhMaterializeResult.unchanged_external_swaps,
+                      external_swap_existing: rhMaterializeResult.summary?.external_swap_existing,
+                      ledger_mutation: rhMaterializeResult.ledger_mutation,
+                      fifo_mutation: rhMaterializeResult.fifo_mutation,
+                      basis_mutation: rhMaterializeResult.basis_mutation,
+                      next_stage: rhMaterializeResult.next_stage,
+                    }, null, 2)}
+                  </pre>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+
+          <RobinhoodChainHistoryPanel
+            api={api}
+            wallet={historyWallet}
+            hideTableData={hideTableData}
+            loadRequestId={historyLoadRequestId}
+          />
+        </>
       )}
 
       {tab === "balances" && (

@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import (
@@ -22,6 +22,7 @@ from app.services.robinhood_chain_registry_discovery import (
     PREPARATION_STATUS,
     RobinhoodChainRegistryDiscoveryService,
     _classify_probe_result,
+    _ensure_provider_scoped_capability_schema,
     _parse_probe_amount,
 )
 
@@ -120,6 +121,60 @@ class _FakeDiscoveryService:
         }
 
 
+class _FakeUniswapService:
+    def __init__(self, results: List[Dict[str, Any]] | None = None) -> None:
+        self.results = list(results or [])
+        self.calls: List[Dict[str, Any]] = []
+
+    async def probe(self, **kwargs: Any) -> Dict[str, Any]:
+        self.calls.append(dict(kwargs))
+        if self.results:
+            return self.results.pop(0)
+        amount = str(kwargs.get("requested_amount") or "1")
+        return {
+            "ok": True,
+            "provider": "uniswap_api",
+            "provider_contacted": True,
+            "liquidity_available": True,
+            "sell_amount": amount,
+            "buy_amount": "0.75",
+            "price_buy_per_sell": "0.75",
+            "route": {"fills": [{"source": "UNISWAP_V3"}]},
+            "provider_warnings": [],
+            "read_only": True,
+            "execution_enabled": False,
+            "transaction_calldata": None,
+            "will_mutate": False,
+        }
+
+
+class _FakeUniswapV3Service:
+    def __init__(self, results: List[Dict[str, Any]] | None = None) -> None:
+        self.results = list(results or [])
+        self.calls: List[Dict[str, Any]] = []
+
+    async def probe(self, **kwargs: Any) -> Dict[str, Any]:
+        self.calls.append(dict(kwargs))
+        if self.results:
+            return self.results.pop(0)
+        amount = str(kwargs.get("requested_amount") or "1")
+        return {
+            "ok": True,
+            "provider": "uniswap_v3_rpc",
+            "provider_contacted": True,
+            "liquidity_available": True,
+            "sell_amount": amount,
+            "buy_amount": "0.8",
+            "price_buy_per_sell": "0.8",
+            "route": {"fills": [{"source": "UNISWAP_V3_RPC_DIRECT"}]},
+            "provider_warnings": [],
+            "read_only": True,
+            "execution_enabled": False,
+            "transaction_calldata": None,
+            "will_mutate": False,
+        }
+
+
 class _FakePlanningService:
     def __init__(self, *, ok: bool = True) -> None:
         self.ok = bool(ok)
@@ -200,10 +255,14 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.fake_rpc = _FakeRpcClient()
         self.fake_discovery = _FakeDiscoveryService()
         self.fake_planning = _FakePlanningService()
+        self.fake_uniswap = _FakeUniswapService()
+        self.fake_uniswap_v3 = _FakeUniswapV3Service()
         self.service = RobinhoodChainRegistryDiscoveryService(
             rpc_client=self.fake_rpc,
             discovery_service=self.fake_discovery,
             planning_service=self.fake_planning,
+            uniswap_service=self.fake_uniswap,
+            uniswap_v3_service=self.fake_uniswap_v3,
         )
 
     def tearDown(self) -> None:
@@ -253,7 +312,12 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 onchain_decimals=int(row.decimals),
                 registry_match=True,
                 canonical_status="verified",
-                evidence={"test": True},
+                evidence={
+                    "test": True,
+                    "registry_symbol": str(row.symbol or "").strip().upper(),
+                    "registry_decimals": int(row.decimals),
+                    "registry_contract_address": row.address,
+                },
             )
         )
         self.db.commit()
@@ -452,6 +516,73 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(objective["quote"]["registry_id"], quote.id)
         self.assertTrue(objective["review_only"])
         self.assertFalse(result["execution_enabled"])
+
+    def test_selected_pair_objective_can_require_verified_registry_identities(self) -> None:
+        base = self._token("AAA", "0x" + "7c" * 20, 18)
+        quote = self._token("BBB", "0x" + "9d" * 20, 6)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "pair_discovery_requires_verified_registry_identity",
+        ):
+            self.service.create_objective(
+                self.db,
+                base_token_registry_id=base.id,
+                quote_token_registry_id=quote.id,
+                mechanism=MECHANISM_SWAP,
+                notes=None,
+                confirm_create=True,
+                require_verified_registry_identities=True,
+            )
+
+        self._mark_verified(base)
+        self._mark_verified(quote)
+        result = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes=None,
+            confirm_create=True,
+            require_verified_registry_identities=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["registry_verification_required"])
+        self.assertTrue(result["registry_verified"])
+        self.assertTrue(result["objective"]["review_only"])
+        self.assertFalse(result["provider_contacted"])
+        self.assertFalse(result["rpc_contacted"])
+        self.assertFalse(result["execution_enabled"])
+        self.assertEqual(self.fake_rpc.calls, [])
+        self.assertEqual(self.fake_discovery.calls, [])
+        self.assertEqual(self.fake_planning.calls, [])
+
+        base.address = "0x" + "7e" * 20
+        self.db.commit()
+        with self.assertRaisesRegex(
+            ValueError,
+            "pair_discovery_requires_verified_registry_identity",
+        ):
+            self.service.create_objective(
+                self.db,
+                base_token_registry_id=base.id,
+                quote_token_registry_id=quote.id,
+                mechanism=MECHANISM_SWAP,
+                notes=None,
+                confirm_create=True,
+                require_verified_registry_identities=True,
+            )
+
+        stale_asset = next(
+            item for item in self.service.assets(self.db)
+            if int(item["registry_id"]) == int(base.id)
+        )
+        self.assertEqual(
+            stale_asset["verification"]["canonical_status"],
+            "registry_changed_since_verification",
+        )
+        self.assertFalse(stale_asset["verification"]["registry_match"])
 
     def test_create_objective_is_idempotent_and_provider_free(self) -> None:
         base = self._token("AAA", "0x" + "79" * 20, 18)
@@ -1187,6 +1318,9 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             ({"ok": False, "error": "execution_discovery_not_configured"}, "provider_not_configured"),
             ({"ok": False, "error": "execution_discovery_backoff_active"}, "backoff_active"),
             ({"ok": False, "error": "invalid_registry_token_identity"}, "identity_invalid"),
+            ({"ok": False, "error": "uniswap_v3_pool_not_found"}, "no_liquidity"),
+            ({"ok": False, "error": "uniswap_v3_no_quotable_route"}, "no_liquidity"),
+            ({"ok": False, "error": "uniswap_v3_rpc_requires_wrapped_native_identity"}, "identity_invalid"),
             ({"ok": False, "error": "not_yet_probed"}, "not_yet_probed"),
             (
                 {
@@ -1298,18 +1432,25 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["selected_pair_only"])
-        self.assertEqual(result["probe_direction_count"], 2)
+        self.assertEqual(result["probe_direction_count"], 6)
+        self.assertEqual(result["providers"], ["0x", "uniswap_api", "uniswap_v3_rpc"])
         self.assertTrue(result["provider_contacted"])
         self.assertEqual(len(self.fake_discovery.calls), 2)
+        self.assertEqual(len(self.fake_uniswap.calls), 2)
+        self.assertEqual(len(self.fake_uniswap_v3.calls), 2)
         self.assertEqual([call["sell_amount"] for call in self.fake_discovery.calls], ["0.01", "1"])
         self.assertEqual([call["max_probe_amount"] for call in self.fake_discovery.calls], ["0.01", "1"])
+        self.assertEqual([call["requested_amount"] for call in self.fake_uniswap.calls], ["0.01", "1"])
+        self.assertEqual([call["requested_amount"] for call in self.fake_uniswap_v3.calls], ["0.01", "1"])
         self.assertTrue(all(call["require_live_verified"] is False for call in self.fake_discovery.calls))
         self.assertEqual(
             [item["indicative_status"] for item in result["results"]],
-            ["no_liquidity", "legal_restriction"],
+            ["no_liquidity", "available", "available", "legal_restriction", "available", "available"],
         )
-        self.assertEqual(result["market"]["orderbook_reason"], "legal_restriction")
-        self.assertEqual(result["provider_contacted_direction_count"], 2)
+        self.assertIsNone(result["market"]["orderbook_reason"])
+        self.assertEqual(result["market"]["preferred_orderbook_provider"], "uniswap_api")
+        self.assertEqual(result["market"]["orderbook_providers"], ["uniswap_api", "uniswap_v3_rpc"])
+        self.assertEqual(result["provider_contacted_direction_count"], 6)
         self.assertEqual(result["provider_http_statuses"], [422])
         self.assertEqual(
             result["provider_error_names"],
@@ -1319,7 +1460,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             result["provider_error_messages"],
             ["The sell token is not authorized for trade due to legal restrictions"],
         )
-        self.assertFalse(result["market"]["orderbook_enabled"])
+        self.assertTrue(result["market"]["orderbook_enabled"])
         self.assertFalse(result["execution_enabled"])
         self.assertFalse(result["automatic_execution_promotion"])
         self.assertIsNone(result["transaction_calldata"])
@@ -1390,7 +1531,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(live_row.firm_plan_status, "live_verified")
         self.assertEqual(live_row.execution_status, "live_verified")
 
-    async def test_selected_market_refresh_without_persisted_probe_amount_never_contacts_provider(self) -> None:
+    async def test_selected_market_refresh_seeds_generic_probe_amounts_for_new_pair(self) -> None:
         base = self._token("ALPHA", "0x" + "d1" * 20, 18)
         quote = self._token("BETA", "0x" + "d2" * 20, 6)
         self._mark_verified(base)
@@ -1412,15 +1553,399 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             confirm_refresh=True,
         )
 
-        self.assertEqual(self.fake_discovery.calls, [])
-        self.assertFalse(result["provider_contacted"])
+        self.assertEqual(len(self.fake_discovery.calls), 2)
+        self.assertEqual(len(self.fake_uniswap.calls), 2)
+        self.assertEqual(len(self.fake_uniswap_v3.calls), 2)
+        self.assertEqual([call["sell_amount"] for call in self.fake_discovery.calls], ["1", "1"])
+        self.assertEqual([call["requested_amount"] for call in self.fake_uniswap.calls], ["1", "1"])
+        self.assertEqual([call["requested_amount"] for call in self.fake_uniswap_v3.calls], ["1", "1"])
+        self.assertTrue(result["provider_contacted"])
         self.assertEqual(
             [item["indicative_status"] for item in result["results"]],
-            ["not_yet_probed", "not_yet_probed"],
+            ["available", "available", "available", "available", "available", "available"],
         )
-        self.assertEqual(result["market"]["orderbook_reason"], "not_yet_probed")
-        self.assertFalse(result["market"]["orderbook_enabled"])
+        self.assertEqual(result["market"]["preferred_orderbook_provider"], "uniswap_api")
+        self.assertTrue(result["market"]["orderbook_enabled"])
         self.assertFalse(result["automatic_execution_promotion"])
+
+    def test_market_by_symbol_returns_derived_provider_orderbook_state(self) -> None:
+        base = self._token("ALPHA", "0x" + "c1" * 20, 18)
+        quote = self._token("USDG", "0x" + "c2" * 20, 6, price_source="stable")
+        objective = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="enriched market lookup",
+            confirm_create=True,
+        )["objective"]
+        self.db.add_all([
+            RobinhoodChainPairCapability(
+                objective_id=objective["id"],
+                from_token_registry_id=from_row.id,
+                to_token_registry_id=to_row.id,
+                amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                provider="uniswap_api",
+                indicative_status="available",
+                firm_plan_status="not_tested",
+                execution_status="disabled",
+                enabled=False,
+                probe_amount=amount,
+                evidence={"provider_contacted": True},
+            )
+            for from_row, to_row, amount in (
+                (base, quote, "1"),
+                (quote, base, "1"),
+            )
+        ])
+        self.db.commit()
+
+        market = self.service.market_by_symbol(self.db, "alpha-usdg")
+
+        self.assertEqual(market["symbol"], "ALPHA-USDG")
+        self.assertTrue(market["orderbook_enabled"])
+        self.assertEqual(market["orderbook_providers"], ["uniswap_api"])
+        self.assertEqual(market["preferred_orderbook_provider"], "uniswap_api")
+
+    def test_orderbook_route_uses_enriched_market_lookup(self) -> None:
+        router_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "robinhood_chain.py"
+        source = router_path.read_text(encoding="utf-8")
+        start = source.index('@router.get("/orderbook")')
+        end = source.find("\n@router.", start + 1)
+        orderbook_source = source[start:] if end < 0 else source[start:end]
+
+        self.assertIn(
+            "market = registry_service.market_by_symbol(db, symbol)",
+            orderbook_source,
+        )
+        self.assertNotIn(
+            "market = registry_service.objective_by_symbol(db, symbol)",
+            orderbook_source,
+        )
+
+    def test_market_catalog_preserves_complete_live_execution_provider_preference(self) -> None:
+        base = self._token("ALPHA", "0x" + "e4" * 20, 18)
+        quote = self._token("USDG", "0x" + "e5" * 20, 6, price_source="stable")
+        objective = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="preserve live provider",
+            confirm_create=True,
+        )["objective"]
+        rows = []
+        for provider, enabled, execution_status in (
+            ("0x", True, "live_verified"),
+            ("uniswap_api", False, "disabled"),
+        ):
+            for from_row, to_row, amount in (
+                (base, quote, "1"),
+                (quote, base, "1"),
+            ):
+                rows.append(
+                    RobinhoodChainPairCapability(
+                        objective_id=objective["id"],
+                        from_token_registry_id=from_row.id,
+                        to_token_registry_id=to_row.id,
+                        amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                        provider=provider,
+                        indicative_status="live_verified" if enabled else "available",
+                        firm_plan_status="live_verified" if enabled else "not_tested",
+                        execution_status=execution_status,
+                        enabled=enabled,
+                        probe_amount=amount,
+                        route_sources={},
+                        provider_error={},
+                        evidence={"provider_contacted": True},
+                    )
+                )
+        self.db.add_all(rows)
+        self.db.commit()
+
+        market = self.service.market_catalog(self.db)[0]
+
+        self.assertEqual(market["orderbook_providers"], ["0x", "uniswap_api"])
+        self.assertEqual(market["live_execution_orderbook_providers"], ["0x"])
+        self.assertEqual(market["preferred_orderbook_provider"], "0x")
+        self.assertTrue(market["orderbook_enabled"])
+
+    def test_market_catalog_never_combines_directions_from_different_providers(self) -> None:
+        base = self._token("ALPHA", "0x" + "f1" * 20, 18)
+        quote = self._token("USDG", "0x" + "f2" * 20, 6, price_source="stable")
+        objective = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="same provider book",
+            confirm_create=True,
+        )["objective"]
+        self.db.add_all([
+            RobinhoodChainPairCapability(
+                objective_id=objective["id"],
+                from_token_registry_id=base.id,
+                to_token_registry_id=quote.id,
+                amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                provider="0x",
+                indicative_status="available",
+                firm_plan_status="not_tested",
+                execution_status="disabled",
+                enabled=False,
+                probe_amount="1",
+            ),
+            RobinhoodChainPairCapability(
+                objective_id=objective["id"],
+                from_token_registry_id=quote.id,
+                to_token_registry_id=base.id,
+                amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                provider="uniswap_api",
+                indicative_status="available",
+                firm_plan_status="not_tested",
+                execution_status="disabled",
+                enabled=False,
+                probe_amount="1",
+            ),
+        ])
+        self.db.commit()
+        market = self.service.market_catalog(self.db)[0]
+        self.assertFalse(market["orderbook_enabled"])
+        self.assertEqual(market["orderbook_providers"], [])
+        self.assertIsNone(market["preferred_orderbook_provider"])
+        self.assertEqual(
+            market["orderbook_reason"],
+            "same_provider_both_exact_input_directions_not_available",
+        )
+
+    async def test_selected_market_refresh_isolates_provider_exception(self) -> None:
+        class _ExplodingV3:
+            async def probe(self, **kwargs: Any) -> Dict[str, Any]:
+                raise RuntimeError("synthetic provider failure")
+
+        self.service.uniswap_v3_service = _ExplodingV3()
+        base = self._token("ALPHA", "0x" + "a7" * 20, 18)
+        quote = self._token("BETA", "0x" + "a8" * 20, 6)
+        self._mark_verified(base)
+        self._mark_verified(quote)
+        self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="provider isolation",
+            confirm_create=True,
+        )
+
+        result = await self.service.refresh_selected_market(
+            self.db,
+            symbol="ALPHA-BETA",
+            taker_address="0x" + "a9" * 20,
+            force_refresh=True,
+            confirm_refresh=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["probe_direction_count"], 6)
+        v3_rows = [item for item in result["results"] if item["provider"] == "uniswap_v3_rpc"]
+        self.assertEqual(len(v3_rows), 2)
+        self.assertTrue(all(item["indicative_status"] == "provider_error" for item in v3_rows))
+        self.assertEqual(result["market"]["preferred_orderbook_provider"], "uniswap_api")
+        self.assertTrue(result["market"]["orderbook_enabled"])
+
+    def test_capability_get_or_create_uses_atomic_sqlite_conflict_handling(self) -> None:
+        base = self._token("ALPHA", "0x" + "b1" * 20, 18)
+        quote = self._token("BETA", "0x" + "b2" * 20, 6)
+        self._mark_verified(base)
+        self._mark_verified(quote)
+        objective = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="atomic capability row",
+            confirm_create=True,
+        )
+
+        statements: List[str] = []
+
+        def capture_statement(
+            connection: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: bool,
+        ) -> None:
+            statements.append(str(statement))
+
+        bind = self.db.get_bind()
+        event.listen(bind, "before_cursor_execute", capture_statement)
+        try:
+            first = self.service._capability_row(
+                self.db,
+                objective_id=objective["objective"]["id"],
+                from_token_registry_id=base.id,
+                to_token_registry_id=quote.id,
+                amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                provider="uniswap_api",
+            )
+            self.db.commit()
+            first_id = first.id
+
+            second = self.service._capability_row(
+                self.db,
+                objective_id=objective["objective"]["id"],
+                from_token_registry_id=base.id,
+                to_token_registry_id=quote.id,
+                amount_mode=AMOUNT_MODE_EXACT_INPUT,
+                provider="uniswap_api",
+            )
+            self.db.commit()
+        finally:
+            event.remove(bind, "before_cursor_execute", capture_statement)
+
+        self.assertEqual(second.id, first_id)
+        self.assertEqual(
+            self.db.query(RobinhoodChainPairCapability)
+            .filter(
+                RobinhoodChainPairCapability.objective_id == objective["objective"]["id"],
+                RobinhoodChainPairCapability.from_token_registry_id == base.id,
+                RobinhoodChainPairCapability.to_token_registry_id == quote.id,
+                RobinhoodChainPairCapability.amount_mode == AMOUNT_MODE_EXACT_INPUT,
+                RobinhoodChainPairCapability.provider == "uniswap_api",
+            )
+            .count(),
+            1,
+        )
+        normalized = " ".join(statements).upper()
+        self.assertIn("ON CONFLICT", normalized)
+        self.assertIn("DO NOTHING", normalized)
+
+    def test_provider_scoped_schema_compatibility_is_idempotent_on_current_schema(self) -> None:
+        result = _ensure_provider_scoped_capability_schema(self.db)
+        self.assertTrue(result["checked"])
+        self.assertFalse(result["migrated"])
+
+    def test_provider_scoped_schema_compatibility_migrates_legacy_unique_boundary(self) -> None:
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+        with engine.begin() as connection:
+            connection.execute(text("""
+                CREATE TABLE token_registry (
+                    id INTEGER NOT NULL PRIMARY KEY
+                )
+            """))
+            connection.execute(text("""
+                CREATE TABLE robinhood_chain_pair_objectives (
+                    id VARCHAR(36) NOT NULL PRIMARY KEY
+                )
+            """))
+            connection.execute(text("""
+                CREATE TABLE robinhood_chain_pair_capabilities (
+                    id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    objective_id VARCHAR(36) NOT NULL,
+                    from_token_registry_id INTEGER NOT NULL,
+                    to_token_registry_id INTEGER NOT NULL,
+                    amount_mode VARCHAR(24) NOT NULL,
+                    provider VARCHAR(32) NOT NULL,
+                    indicative_status VARCHAR(32) NOT NULL,
+                    firm_plan_status VARCHAR(32) NOT NULL,
+                    execution_status VARCHAR(32) NOT NULL,
+                    enabled BOOLEAN NOT NULL,
+                    route_sources JSON,
+                    probe_amount VARCHAR(80),
+                    price_impact_bps FLOAT,
+                    provider_error JSON,
+                    backoff_until DATETIME,
+                    evidence JSON,
+                    last_verified_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    UNIQUE (
+                        objective_id,
+                        from_token_registry_id,
+                        to_token_registry_id,
+                        amount_mode
+                    )
+                )
+            """))
+            connection.execute(text("""
+                INSERT INTO token_registry (id) VALUES (1), (2)
+            """))
+            connection.execute(text("""
+                INSERT INTO robinhood_chain_pair_objectives (id) VALUES ('objective-1')
+            """))
+            connection.execute(text("""
+                INSERT INTO robinhood_chain_pair_capabilities (
+                    id, objective_id, from_token_registry_id, to_token_registry_id,
+                    amount_mode, provider, indicative_status, firm_plan_status,
+                    execution_status, enabled, created_at, updated_at
+                ) VALUES (
+                    'capability-1', 'objective-1', 1, 2,
+                    'exact_input', '0x', 'available', 'not_tested',
+                    'disabled', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+            """))
+
+        db = SessionLocal()
+        try:
+            result = _ensure_provider_scoped_capability_schema(db)
+            self.assertTrue(result["checked"])
+            self.assertTrue(result["migrated"])
+            self.assertEqual(result["preserved_row_count"], 1)
+
+            indexes = db.execute(
+                text("PRAGMA index_list('robinhood_chain_pair_capabilities')")
+            ).mappings().all()
+            unique_sets = []
+            for index in indexes:
+                if not bool(index.get("unique")):
+                    continue
+                name = str(index.get("name") or "").replace("'", "''")
+                columns = db.execute(
+                    text(f"PRAGMA index_info('{name}')")
+                ).mappings().all()
+                unique_sets.append(tuple(str(item.get("name") or "") for item in columns))
+
+            self.assertIn(
+                (
+                    "objective_id",
+                    "from_token_registry_id",
+                    "to_token_registry_id",
+                    "amount_mode",
+                    "provider",
+                ),
+                unique_sets,
+            )
+            preserved = db.execute(
+                text("""
+                    SELECT id, provider, indicative_status
+                    FROM robinhood_chain_pair_capabilities
+                """)
+            ).mappings().one()
+            self.assertEqual(preserved["id"], "capability-1")
+            self.assertEqual(preserved["provider"], "0x")
+            self.assertEqual(preserved["indicative_status"], "available")
+
+            db.execute(text("""
+                INSERT INTO robinhood_chain_pair_capabilities (
+                    id, objective_id, from_token_registry_id, to_token_registry_id,
+                    amount_mode, provider, indicative_status, firm_plan_status,
+                    execution_status, enabled, created_at, updated_at
+                ) VALUES (
+                    'capability-2', 'objective-1', 1, 2,
+                    'exact_input', 'uniswap_api', 'available', 'not_tested',
+                    'disabled', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+            """))
+            db.commit()
+            count = db.execute(
+                text("SELECT COUNT(*) FROM robinhood_chain_pair_capabilities")
+            ).scalar_one()
+            self.assertEqual(count, 2)
+        finally:
+            db.close()
+            engine.dispose()
 
     def test_selected_pair_registration_frontend_is_explicit_and_provider_free(self) -> None:
         test_path = Path(__file__).resolve()
@@ -1439,6 +1964,8 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         api_source = (root / "frontend" / "src" / "lib" / "api.js").read_text(encoding="utf-8")
         ticket_source = (root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
         orderbook_source = (root / "frontend" / "src" / "OrderBookWidget.jsx").read_text(encoding="utf-8")
+        registry_source = (root / "frontend" / "src" / "features" / "registry" / "TokenRegistryWindow.jsx").read_text(encoding="utf-8")
+        router_source = (root / "backend" / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
 
         helper_start = api_source.index("export async function addRobinhoodChainSelectedPair")
         helper_end = api_source.index("function requireRobinhoodChainReviewRequest", helper_start)
@@ -1455,11 +1982,21 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
         for source in (ticket_source, orderbook_source):
             self.assertIn("REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED", source)
+            self.assertIn("CANONICAL TOKEN VERIFICATION REQUIRED", source)
             self.assertIn("Add Selected Pair", source)
+            self.assertIn("registry_verification_required", source)
+            self.assertIn("registry_verified", source)
             self.assertIn('data-provider-contacted="false"', source)
             self.assertIn('data-execution-enabled="false"', source)
             self.assertIn("review-only", source)
             self.assertIn("separate explicit action", source)
+
+        self.assertIn("require_verified_registry_identities=True", router_source)
+        self.assertIn("Verify on-chain", registry_source)
+        self.assertIn("Review vs ETH", registry_source)
+        self.assertIn("Review vs USDG", registry_source)
+        self.assertIn("confirm_verify: true", registry_source)
+        self.assertIn("force_refresh: true", registry_source)
 
         self.assertIn("onClick={addSelectedRobinhoodChainPair}", ticket_source)
         self.assertIn("onClick={addSelectedRobinhoodChainPairFromBook}", orderbook_source)

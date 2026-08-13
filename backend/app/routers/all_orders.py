@@ -69,6 +69,10 @@ def get_all_orders(
     sort: Optional[str] = Query(default="closed_at:desc"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
+    exclude_canceled_rejected: bool = Query(
+        default=False,
+        description="Exclude canceled/cancelled/rejected rows before total calculation and pagination.",
+    ),
     db: Session = Depends(get_db),
 ):
     sb_norm = _normalize_status_bucket(status_bucket)
@@ -115,6 +119,7 @@ def get_all_orders(
         sort_dir=sort_dir,
         page=page,
         page_size=page_size,
+        exclude_canceled_rejected=exclude_canceled_rejected,
     )
 
     total_pages = _ceil_div(int(total), int(page_size))

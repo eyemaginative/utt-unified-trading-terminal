@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from pathlib import Path
 from datetime import datetime
 from unittest.mock import patch
 
@@ -54,17 +55,28 @@ class _FakeRegistryService:
         return {
             "base": {
                 "symbol": "INDEX",
+                "registry_id": 103,
                 "registry_contract_address": INDEX,
                 "decimals": 18,
                 "native": False,
             },
             "quote": {
                 "symbol": "USDG",
+                "registry_id": 102,
                 "registry_contract_address": USDG,
                 "decimals": 6,
                 "native": False,
             },
         }
+
+    def resolve_verified_token(self, db, symbol: str):
+        value = str(symbol).upper()
+        market = self.market_by_symbol(db, "INDEX-USDG")
+        if value == "INDEX":
+            return dict(market["base"])
+        if value == "USDG":
+            return dict(market["quote"])
+        raise ValueError("unexpected token")
 
 
 
@@ -262,6 +274,81 @@ class RobinhoodChainGenericCloseoutTests(unittest.TestCase):
         self.db.close()
         self.engine.dispose()
 
+    def _prepared_lifecycle(self, *, include_capability_economics: bool = True):
+        capability_token = "capability-" + ("a" * 64)
+        capability = {
+            "wallet_address": WALLET,
+            "symbol": "INDEX-USDG",
+            "side": "buy",
+            "input_asset": "USDG",
+            "input_registry_id": 102,
+            "input_amount": "1",
+            "input_amount_atomic": "1000000",
+            "output_asset": "INDEX",
+            "output_registry_id": 103,
+            "output_amount": "77.75713332971542716",
+            "output_amount_atomic": "77757133329715427160",
+            "minimum_received": "76.979561996418272888",
+            "minimum_received_atomic": "76979561996418272888",
+            "requested_amount": "1",
+            "approval_tx_hash": APPROVAL_HASH,
+        }
+        if not include_capability_economics:
+            for key in (
+                "input_amount",
+                "input_amount_atomic",
+                "output_amount",
+                "output_amount_atomic",
+                "minimum_received",
+                "minimum_received_atomic",
+            ):
+                capability.pop(key, None)
+
+        handoff = {
+            "wallet_address": WALLET,
+            "action": "swap",
+            "approval_required": False,
+            "provider_simulation_requested": True,
+            "requires_refresh_after_approval": False,
+            "input_asset": "USDG",
+            "input_amount": "1",
+            "output_asset": "INDEX",
+            "output_amount": "77.75713332971542716",
+            "minimum_received": "76.979561996418272888",
+            "transaction": {
+                "to": ROUTER,
+                "data": self.rpc.swap_calldata,
+                "value_wei": "0",
+                "gas_limit": "220000",
+                "gas_price": "28350000",
+            },
+        }
+        fresh_preflight = {
+            "ok": True,
+            "symbol": "INDEX-USDG",
+            "side": "buy",
+            "requested_amount": "1",
+            "prepared_at": "2026-08-15T10:00:00+00:00",
+            "expires_at": "2026-08-15T10:01:00+00:00",
+            "ttl_seconds": 60,
+            "wallet_request": handoff,
+        }
+        with (
+            patch.object(rh_router, "_resolve_robinhood_chain_execution_taker", return_value=WALLET),
+            patch.object(rh_router, "get_robinhood_chain_registry_discovery_service", return_value=_FakeRegistryService()),
+        ):
+            row, created = rh_router._persist_generic_wallet_swap_prepared_lifecycle(
+                self.db,
+                fresh_preflight=fresh_preflight,
+                handoff=handoff,
+                capability_token=capability_token,
+                capability=capability,
+                slippage_bps=100,
+                approval_tx_hash=APPROVAL_HASH,
+            )
+            self.db.commit()
+        return row, created, capability_token, capability
+
     def _reconcile(self):
         with (
             patch.object(rh_router, "_resolve_robinhood_chain_execution_taker", return_value=WALLET),
@@ -329,6 +416,171 @@ class RobinhoodChainGenericCloseoutTests(unittest.TestCase):
         self.assertEqual(lifecycle["approval"]["gas_used"], "58118")
         self.assertEqual(lifecycle["swap"]["gas_used"], "163556")
         self.assertEqual(reconciliation["fee_asset"], "ETH")
+
+    def test_durable_generic_lifecycle_exists_before_wallet_and_receipt_reuses_same_owner(self) -> None:
+        row, created, capability_token, capability = self._prepared_lifecycle()
+        execution_id = str(row.id)
+        self.assertTrue(created)
+        self.assertEqual(self.db.query(RobinhoodChainSwapExecution).count(), 1)
+        self.assertEqual(row.status, "swap_prepared")
+        self.assertEqual(row.swap_status, "prepared")
+        self.assertIsNone(row.swap_tx_hash)
+        self.assertTrue(row.route["generic_wallet_lifecycle"]["durable_before_wallet_request"])
+        self.assertTrue(row.route["generic_wallet_lifecycle"]["historical_preflight_available"])
+
+        bound, changed = rh_router._record_generic_wallet_swap_submission(
+            self.db,
+            execution_id=execution_id,
+            tx_hash=SWAP_HASH,
+            capability_token=capability_token,
+            capability=capability,
+        )
+        self.db.commit()
+        self.assertTrue(changed)
+        self.assertEqual(str(bound.id), execution_id)
+        self.assertEqual(bound.swap_tx_hash.lower(), SWAP_HASH.lower())
+        self.assertEqual(bound.status, "swap_pending")
+        self.assertEqual(self.db.query(RobinhoodChainSwapExecution).count(), 1)
+
+        result = self._reconcile()
+        self.assertFalse(result["created"])
+        self.assertFalse(result["idempotent"])
+        self.assertEqual(result["execution_id"], execution_id)
+        self.assertEqual(self.db.query(RobinhoodChainSwapExecution).count(), 1)
+        final = self.db.get(RobinhoodChainSwapExecution, execution_id)
+        self.assertEqual(final.status, "confirmed")
+        self.assertEqual(final.swap_status, "confirmed")
+        self.assertTrue(final.route["generic_wallet_lifecycle"]["historical_preflight_available"])
+        self.assertEqual(final.expected_output_amount, "77.75713332971542716")
+        self.assertEqual(final.minimum_output_amount, "76.979561996418272888")
+
+    def test_prepared_lifecycle_uses_validated_handoff_economics_when_capability_omits_duplicates(self) -> None:
+        row, created, _capability_token, capability = self._prepared_lifecycle(
+            include_capability_economics=False
+        )
+        self.assertTrue(created)
+        self.assertNotIn("output_amount", capability)
+        self.assertNotIn("minimum_received", capability)
+        self.assertEqual(row.status, "swap_prepared")
+        self.assertEqual(row.exact_input_amount, "1")
+        self.assertEqual(row.exact_input_amount_atomic, "1000000")
+        self.assertEqual(row.expected_output_amount, "77.75713332971542716")
+        self.assertEqual(row.expected_output_amount_atomic, "77757133329715427160")
+        self.assertEqual(row.minimum_output_amount, "76.979561996418272888")
+        self.assertEqual(row.minimum_output_amount_atomic, "76979561996418272888")
+        self.assertTrue(row.route["generic_wallet_lifecycle"]["historical_preflight_available"])
+
+    def test_generic_wallet_receipt_confirmation_refreshes_order_ticket_balances(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        ticket_path = repo_root / "frontend" / "src" / "OrderTicketWidget.jsx"
+        ticket_text = ticket_path.read_text(encoding="utf-8")
+        start = ticket_text.index("async function refreshRobinhoodChainSuccessfulSwapReceipt()")
+        end = ticket_text.index("async function sendRobinhoodChainSuccessfulSwapRequest()", start)
+        receipt_block = ticket_text[start:end]
+
+        self.assertIn(
+            "await refreshRobinhoodChainTicketBalancesAfterConfirmation({",
+            receipt_block,
+        )
+        self.assertIn('source: "generic_wallet_swap_receipt"', receipt_block)
+        self.assertIn("order_ticket_balance_refresh: ticketBalanceRefresh", receipt_block)
+        self.assertIn(
+            "Order Ticket balances were refreshed automatically",
+            receipt_block,
+        )
+
+    def test_generic_submission_record_is_idempotent_and_never_rebinds_hash(self) -> None:
+        row, _, capability_token, capability = self._prepared_lifecycle()
+        first, first_changed = rh_router._record_generic_wallet_swap_submission(
+            self.db,
+            execution_id=row.id,
+            tx_hash=SWAP_HASH,
+            capability_token=capability_token,
+            capability=capability,
+        )
+        self.db.commit()
+        second, second_changed = rh_router._record_generic_wallet_swap_submission(
+            self.db,
+            execution_id=row.id,
+            tx_hash=SWAP_HASH,
+            capability_token=capability_token,
+            capability=capability,
+        )
+        self.assertTrue(first_changed)
+        self.assertFalse(second_changed)
+        self.assertEqual(str(first.id), str(second.id))
+        with self.assertRaises(rh_router.HTTPException) as ctx:
+            rh_router._record_generic_wallet_swap_submission(
+                self.db,
+                execution_id=row.id,
+                tx_hash=NATIVE_SWAP_HASH,
+                capability_token=capability_token,
+                capability=capability,
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail["error"], "wallet_swap_submission_hash_conflict")
+
+    def test_lost_historical_preflight_preview_and_recovery_do_not_invent_quote_or_minimum(self) -> None:
+        with (
+            patch.object(rh_router, "_resolve_robinhood_chain_execution_taker", return_value=WALLET),
+            patch.object(rh_router, "get_robinhood_chain_registry_discovery_service", return_value=_FakeRegistryService()),
+            patch.object(rh_router, "get_robinhood_chain_client", return_value=self.rpc),
+        ):
+            preview = asyncio.run(
+                rh_router._persist_generic_wallet_swap_reconciliation(
+                    self.db,
+                    tx_hash=SWAP_HASH,
+                    symbol="INDEX-USDG",
+                    side="buy",
+                    requested_amount="1",
+                    quoted_output_amount=None,
+                    minimum_received=None,
+                    approval_tx_hash=APPROVAL_HASH,
+                    source="rh_order_miss_1b_orphan_recovery",
+                    historical_preflight_available=False,
+                    expected_actual_output_amount="77.75",
+                    persist=False,
+                )
+            )
+        self.assertTrue(preview["preview"])
+        self.assertFalse(preview["historical_preflight_available"])
+        self.assertIsNone(preview["quoted_output_amount"])
+        self.assertIsNone(preview["minimum_received"])
+        self.assertEqual(self.db.query(RobinhoodChainSwapExecution).count(), 0)
+
+        with (
+            patch.object(rh_router, "_resolve_robinhood_chain_execution_taker", return_value=WALLET),
+            patch.object(rh_router, "get_robinhood_chain_registry_discovery_service", return_value=_FakeRegistryService()),
+            patch.object(rh_router, "get_robinhood_chain_client", return_value=self.rpc),
+        ):
+            recovered = asyncio.run(
+                rh_router._persist_generic_wallet_swap_reconciliation(
+                    self.db,
+                    tx_hash=SWAP_HASH,
+                    symbol="INDEX-USDG",
+                    side="buy",
+                    requested_amount="1",
+                    quoted_output_amount=None,
+                    minimum_received=None,
+                    approval_tx_hash=APPROVAL_HASH,
+                    source="rh_order_miss_1b_orphan_recovery",
+                    historical_preflight_available=False,
+                    expected_actual_output_amount="77.75",
+                    persist=True,
+                )
+            )
+            self.db.commit()
+        self.assertTrue(recovered["created"])
+        self.assertFalse(recovered["historical_preflight_available"])
+        row = self.db.query(RobinhoodChainSwapExecution).one()
+        self.assertEqual(row.expected_output_amount, "0")
+        self.assertEqual(row.expected_output_amount_atomic, "0")
+        self.assertEqual(row.minimum_output_amount, "0")
+        self.assertEqual(row.minimum_output_amount_atomic, "0")
+        self.assertFalse(row.route["historical_preflight"]["available"])
+        self.assertEqual(row.route["execution_reconciliation"]["output_amount"], "77.75")
+        unified = _to_unified_robinhood_chain_swap_execution(row)
+        self.assertAlmostEqual(unified["filled_qty"], 77.75)
 
     def test_native_eth_input_reconciliation_uses_transaction_value_and_erc20_output_logs(self) -> None:
         rpc = _FakeNativeRpcClient()

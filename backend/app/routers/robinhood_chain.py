@@ -15,7 +15,14 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..models import RobinhoodChainSwapExecution, TokenRegistry, WalletAddress, WalletAddressSnapshot
+from ..models import (
+    RobinhoodChainExternalSwap,
+    RobinhoodChainSwapExecution,
+    RobinhoodChainWalletEvent,
+    TokenRegistry,
+    WalletAddress,
+    WalletAddressSnapshot,
+)
 from ..services.evm_rpc import get_robinhood_chain_client, validate_evm_address
 from ..services.robinhood_chain_accounting_preview import build_robinhood_chain_accounting_preview
 from ..services.robinhood_chain_wallet_ingest import (
@@ -762,6 +769,29 @@ class RobinhoodChainWalletSwapPrepareRequest(BaseModel):
 class RobinhoodChainWalletSwapReceiptRequest(BaseModel):
     capability: str = Field(min_length=32, max_length=8192)
     tx_hash: str = Field(min_length=66, max_length=66)
+    execution_id: Optional[str] = Field(
+        default=None,
+        max_length=36,
+        description="Optional durable generic lifecycle owner. When present, receipt refresh re-binds the MetaMask hash idempotently before verification.",
+    )
+
+
+class RobinhoodChainWalletSwapSubmissionRequest(BaseModel):
+    capability: str = Field(min_length=32, max_length=8192)
+    tx_hash: str = Field(min_length=66, max_length=66)
+    confirm_record: bool = Field(
+        default=False,
+        description="Must be true to persist the MetaMask-returned swap hash against the prepared generic lifecycle.",
+    )
+
+
+class RobinhoodChainWalletSwapOrphanRecoveryRequest(BaseModel):
+    tx_hash: str = Field(min_length=66, max_length=66)
+    approval_tx_hash: str = Field(min_length=66, max_length=66)
+    confirm_recovery: bool = Field(
+        default=False,
+        description="Must be true only for the explicit apply endpoint; preview is read-only.",
+    )
 
 
 class RobinhoodChainWalletSwapReconcileRequest(BaseModel):
@@ -954,6 +984,17 @@ _ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55
 _ERC20_APPROVE_SELECTOR = "0x095ea7b3"
 _WEI_PER_ETH_DECIMAL = Decimal(10) ** 18
 
+# RH-ORDER.MISS.1B target-specific orphan guard.  Raw transaction hashes are
+# intentionally not embedded in source; only irreversible SHA-256 fingerprints
+# from the accepted D2/D3 diagnostics are retained.
+_RH_ORDER_MISS_1B_TARGET_TX_SHA256 = "43545b67d2e62f240bd36613b17da68dad368d0e31e094c719f212bd617bc42a"
+_RH_ORDER_MISS_1B_TARGET_APPROVAL_SHA256 = "5bef4b09b8345d550028392376fb3cf722df12c535ca39a6cd92c2eaf1723c11"
+_RH_ORDER_MISS_1B_TARGET_SYMBOL = "INDEX-USDG"
+_RH_ORDER_MISS_1B_TARGET_SIDE = "buy"
+_RH_ORDER_MISS_1B_TARGET_INPUT_AMOUNT = "2"
+_RH_ORDER_MISS_1B_TARGET_OUTPUT_AMOUNT = "273.765361829109662072"
+
+
 
 def _decimal_text_exact(value: Decimal) -> str:
     text = format(value, "f")
@@ -1082,6 +1123,513 @@ def _decode_exact_approval_transaction(
     }
 
 
+
+def _generic_wallet_swap_sha256_text(value: Any) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _generic_wallet_swap_utc_naive(value: Any, *, fallback: Optional[datetime] = None) -> datetime:
+    text = str(value or "").strip()
+    if text:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
+        except Exception:
+            pass
+    return fallback or datetime.utcnow()
+
+
+def _generic_wallet_swap_contract(identity: Dict[str, Any]) -> str:
+    if bool(identity.get("native")):
+        return validate_evm_address(UNISWAP_NATIVE_TOKEN)
+    return validate_evm_address(str(identity.get("registry_contract_address") or ""))
+
+
+def _generic_wallet_swap_calldata_evidence(transaction: Dict[str, Any]) -> Tuple[str, int]:
+    calldata = str(transaction.get("data") or transaction.get("input") or "").strip().lower()
+    if not calldata.startswith("0x") or len(calldata) <= 2 or len(calldata[2:]) % 2:
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_calldata_invalid"})
+    try:
+        payload = bytes.fromhex(calldata[2:])
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_calldata_invalid"}) from exc
+    return hashlib.sha256(payload).hexdigest(), len(payload)
+
+
+def _persist_generic_wallet_swap_prepared_lifecycle(
+    db: Session,
+    *,
+    fresh_preflight: Dict[str, Any],
+    handoff: Dict[str, Any],
+    capability_token: str,
+    capability: Dict[str, Any],
+    slippage_bps: int,
+    approval_tx_hash: Optional[str],
+) -> Tuple[RobinhoodChainSwapExecution, bool]:
+    """Persist the generic exact-input owner before a browser wallet request.
+
+    The complete accepted preflight/handoff remains in route JSON. Required ORM
+    convenience fields are populated from the same capability evidence so a
+    later MetaMask hash can be attached without reconstructing the plan.
+    """
+    wallet = _resolve_robinhood_chain_execution_taker(
+        db,
+        str(capability.get("wallet_address") or handoff.get("wallet_address") or ""),
+    )
+    symbol = str(capability.get("symbol") or fresh_preflight.get("symbol") or "").strip().upper().replace("/", "-").replace("_", "-")
+    side = str(capability.get("side") or fresh_preflight.get("side") or "").strip().lower()
+    if not symbol or side not in {"buy", "sell"}:
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_identity_invalid"})
+
+    registry_service = get_robinhood_chain_registry_discovery_service()
+    try:
+        input_identity = registry_service.resolve_verified_token(db, str(capability.get("input_asset") or ""))
+        output_identity = registry_service.resolve_verified_token(db, str(capability.get("output_asset") or ""))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "wallet_swap_prepared_verified_registry_identity_required", "message": str(exc)},
+        ) from exc
+    if (
+        int(input_identity.get("registry_id") or 0) != int(capability.get("input_registry_id") or 0)
+        or int(output_identity.get("registry_id") or 0) != int(capability.get("output_registry_id") or 0)
+    ):
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_registry_identity_changed"})
+
+    # The signed wallet capability is an authorization/identity envelope and does
+    # not duplicate every reviewed economic field.  The validated fresh handoff
+    # remains the authoritative source for expected/minimum output, while Token
+    # Registry decimals provide deterministic atomic conversion.  Any economic
+    # duplicates that are present in the capability must still match exactly.
+    input_decimals = int(input_identity.get("decimals"))
+    output_decimals = int(output_identity.get("decimals"))
+    input_amount = str(
+        handoff.get("input_amount")
+        or capability.get("input_amount")
+        or capability.get("requested_amount")
+        or fresh_preflight.get("requested_amount")
+        or ""
+    ).strip()
+    output_amount = str(handoff.get("output_amount") or capability.get("output_amount") or "").strip()
+    minimum_amount = str(handoff.get("minimum_received") or capability.get("minimum_received") or "").strip()
+    if not all([input_amount, output_amount, minimum_amount]):
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_economics_missing"})
+
+    input_atomic = str(
+        _display_amount_to_atomic(
+            input_amount,
+            input_decimals,
+            field="wallet_swap_prepared_input_amount",
+        )
+    )
+    output_atomic = str(
+        _display_amount_to_atomic(
+            output_amount,
+            output_decimals,
+            field="wallet_swap_prepared_output_amount",
+        )
+    )
+    minimum_atomic = str(
+        _display_amount_to_atomic(
+            minimum_amount,
+            output_decimals,
+            field="wallet_swap_prepared_minimum_received",
+        )
+    )
+
+    capability_display_checks = (
+        ("input_amount", input_decimals, input_atomic),
+        ("requested_amount", input_decimals, input_atomic),
+        ("output_amount", output_decimals, output_atomic),
+        ("minimum_received", output_decimals, minimum_atomic),
+    )
+    for field_name, decimals, expected_atomic in capability_display_checks:
+        capability_value = str(capability.get(field_name) or "").strip()
+        if not capability_value:
+            continue
+        try:
+            capability_atomic = _display_amount_to_atomic(
+                capability_value,
+                decimals,
+                field=f"wallet_swap_prepared_capability_{field_name}",
+            )
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "wallet_swap_prepared_economics_mismatch", "field": field_name},
+            ) from exc
+        if str(capability_atomic) != expected_atomic:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "wallet_swap_prepared_economics_mismatch", "field": field_name},
+            )
+
+    capability_atomic_checks = (
+        ("input_amount_atomic", input_atomic),
+        ("output_amount_atomic", output_atomic),
+        ("minimum_received_atomic", minimum_atomic),
+    )
+    for field_name, expected_atomic in capability_atomic_checks:
+        capability_value = str(capability.get(field_name) or "").strip()
+        if capability_value and capability_value != expected_atomic:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "wallet_swap_prepared_economics_mismatch", "field": field_name},
+            )
+
+    transaction = handoff.get("transaction") if isinstance(handoff.get("transaction"), dict) else {}
+    destination = validate_evm_address(str(transaction.get("to") or ""))
+    calldata_sha, calldata_bytes = _generic_wallet_swap_calldata_evidence(transaction)
+    tx_value_wei = str(transaction.get("value_wei") or "0").strip() or "0"
+    gas_limit = str(transaction.get("gas_limit") or "0").strip() or "0"
+    gas_price_wei = str(
+        transaction.get("gas_price")
+        or transaction.get("max_fee_per_gas")
+        or handoff.get("gas_price_wei")
+        or "0"
+    ).strip() or "0"
+
+    capability_sha = _generic_wallet_swap_sha256_text(capability_token)
+    quote_id_source = str(handoff.get("quote_id") or fresh_preflight.get("quote_id") or "").strip()
+    quote_id = quote_id_source or _generic_wallet_swap_sha256_text("generic-wallet-quote:" + capability_sha)
+    swap_plan_hash = str(handoff.get("plan_hash") or "").strip() or _generic_wallet_swap_sha256_text(
+        "|".join([
+            "generic-wallet-plan-v1", wallet.lower(), symbol, side, input_atomic, output_atomic,
+            minimum_atomic, destination.lower(), calldata_sha, capability_sha,
+        ])
+    )
+    normalized_approval_hash = validate_transaction_hash(approval_tx_hash).lower() if approval_tx_hash else None
+    approval_plan_hash = _generic_wallet_swap_sha256_text(
+        "generic-wallet-approval:" + str(normalized_approval_hash or "not-required") + ":" + input_atomic
+    )
+
+    prepared_at = _generic_wallet_swap_utc_naive(
+        handoff.get("fetched_at") or handoff.get("prepared_at") or fresh_preflight.get("prepared_at")
+    )
+    expires_at = _generic_wallet_swap_utc_naive(
+        handoff.get("plan_expires_at") or handoff.get("expires_at") or fresh_preflight.get("expires_at"),
+        fallback=prepared_at + timedelta(seconds=max(1, int(fresh_preflight.get("ttl_seconds") or 60))),
+    )
+    if expires_at <= prepared_at:
+        expires_at = prepared_at + timedelta(seconds=max(1, int(fresh_preflight.get("ttl_seconds") or 60)))
+
+    existing = db.query(RobinhoodChainSwapExecution).filter(RobinhoodChainSwapExecution.quote_id == quote_id).first()
+    if existing is not None:
+        existing_route = existing.route if isinstance(existing.route, dict) else {}
+        durable = existing_route.get("generic_wallet_lifecycle") if isinstance(existing_route.get("generic_wallet_lifecycle"), dict) else {}
+        if durable.get("swap_capability_sha256") != capability_sha:
+            raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_quote_id_conflict"})
+        return existing, False
+
+    input_native = bool(input_identity.get("native"))
+    output_native = bool(output_identity.get("native"))
+    input_contract = _generic_wallet_swap_contract(input_identity)
+    output_contract = _generic_wallet_swap_contract(output_identity)
+    approval_required = bool(handoff.get("approval_required"))
+    if approval_required:
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_approval_still_required"})
+
+    allowance_spender_raw = str(
+        handoff.get("allowance_spender")
+        or handoff.get("spender")
+        or transaction.get("allowance_spender")
+        or destination
+    ).strip()
+    allowance_spender = validate_evm_address(allowance_spender_raw)
+    exact_allowance = str(
+        handoff.get("allowance_current_atomic")
+        or handoff.get("current_allowance_atomic")
+        or ""
+    ).strip()
+    allowance_current = "0" if input_native else (exact_allowance if exact_allowance.isdigit() else input_atomic)
+    allowance_semantics = "not_applicable_native" if input_native else (
+        "exact_preflight" if exact_allowance.isdigit() else "known_sufficient_lower_bound"
+    )
+
+    now = datetime.utcnow()
+    route = {
+        "provider": UNISWAP_PROVIDER,
+        "generic_wallet_lifecycle": {
+            "version": "RH-ORDER.MISS.1B",
+            "durable_before_wallet_request": True,
+            "historical_preflight_available": True,
+            "swap_capability_sha256": capability_sha,
+            "quote_id_source": "provider_preflight" if quote_id_source else "capability_sha256_identity",
+            "allowance_current_model_semantics": allowance_semantics,
+            "source_preflight": copy.deepcopy(fresh_preflight),
+            "wallet_request": copy.deepcopy(handoff),
+        },
+        "execution_lifecycle": {
+            "approval": {
+                "tx_hash": normalized_approval_hash,
+                "status": "confirmed" if normalized_approval_hash else "not_required",
+            },
+            "swap": {
+                "prepared_at": prepared_at.isoformat(),
+                "tx_hash": None,
+                "submission_recorded": False,
+            },
+        },
+    }
+    row = RobinhoodChainSwapExecution(
+        chain_id=_EXPECTED_CHAIN_ID_DECIMAL,
+        wallet_address=wallet,
+        provider=UNISWAP_PROVIDER,
+        symbol=symbol,
+        side=side,
+        from_asset=str(capability.get("input_asset") or "").strip().upper(),
+        from_contract_address=input_contract,
+        from_decimals=int(input_identity.get("decimals")),
+        from_native=input_native,
+        to_asset=str(capability.get("output_asset") or "").strip().upper(),
+        to_contract_address=output_contract,
+        to_decimals=int(output_identity.get("decimals")),
+        to_native=output_native,
+        amount_mode="exact_input",
+        exact_input_amount=input_amount,
+        exact_input_amount_atomic=input_atomic,
+        expected_output_amount=output_amount,
+        expected_output_amount_atomic=output_atomic,
+        minimum_output_amount=minimum_amount,
+        minimum_output_amount_atomic=minimum_atomic,
+        slippage_bps=int(slippage_bps),
+        quote_id=quote_id,
+        plan_fetched_at=prepared_at,
+        plan_expires_at=expires_at,
+        allowance_read_method="not_applicable" if input_native else "eth_call",
+        allowance_token_address=input_contract,
+        allowance_spender=allowance_spender,
+        allowance_current_atomic=allowance_current,
+        allowance_required_atomic="0" if input_native else input_atomic,
+        allowance_shortfall_atomic="0",
+        approval_required=False,
+        approval_amount="0" if input_native else input_amount,
+        approval_amount_atomic="0" if input_native else input_atomic,
+        approval_plan_hash=approval_plan_hash,
+        approval_transaction_to=input_contract,
+        approval_transaction_value_wei="0",
+        approval_calldata_sha256=hashlib.sha256(b"").hexdigest(),
+        approval_calldata_bytes=0,
+        approval_gas_limit="0",
+        approval_gas_price_wei="0",
+        approval_status="confirmed" if normalized_approval_hash else "not_required",
+        approval_tx_hash=normalized_approval_hash,
+        swap_plan_hash=swap_plan_hash,
+        swap_transaction_to=destination,
+        swap_transaction_value_wei=tx_value_wei,
+        swap_calldata_sha256=calldata_sha,
+        swap_calldata_bytes=calldata_bytes,
+        swap_gas_limit=gas_limit,
+        swap_gas_price_wei=gas_price_wei,
+        swap_status="prepared",
+        swap_tx_hash=None,
+        route=route,
+        status="swap_prepared",
+        error_code=None,
+        error_message=None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    db.flush()
+    return row, True
+
+
+def _record_generic_wallet_swap_submission(
+    db: Session,
+    *,
+    execution_id: str,
+    tx_hash: str,
+    capability_token: str,
+    capability: Dict[str, Any],
+) -> Tuple[RobinhoodChainSwapExecution, bool]:
+    execution_key = str(execution_id or "").strip()
+    if not execution_key:
+        raise HTTPException(status_code=400, detail={"error": "wallet_swap_execution_id_required"})
+    row = db.get(RobinhoodChainSwapExecution, execution_key)
+    if row is None:
+        raise HTTPException(status_code=404, detail={"error": "wallet_swap_execution_not_found"})
+    route = row.route if isinstance(row.route, dict) else {}
+    durable = route.get("generic_wallet_lifecycle") if isinstance(route.get("generic_wallet_lifecycle"), dict) else {}
+    if durable.get("version") != "RH-ORDER.MISS.1B" or durable.get("durable_before_wallet_request") is not True:
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_execution_not_generic_durable"})
+    capability_sha = _generic_wallet_swap_sha256_text(capability_token)
+    if durable.get("swap_capability_sha256") != capability_sha:
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_submission_capability_mismatch"})
+    if str(row.wallet_address or "").strip().lower() != str(capability.get("wallet_address") or "").strip().lower():
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_submission_wallet_mismatch"})
+    if str(row.symbol or "").strip().upper() != str(capability.get("symbol") or "").strip().upper():
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_submission_symbol_mismatch"})
+    if str(row.side or "").strip().lower() != str(capability.get("side") or "").strip().lower():
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_submission_side_mismatch"})
+
+    normalized_tx_hash = validate_transaction_hash(tx_hash).lower()
+    owner = (
+        db.query(RobinhoodChainSwapExecution)
+        .filter(
+            RobinhoodChainSwapExecution.swap_tx_hash == normalized_tx_hash,
+            RobinhoodChainSwapExecution.id != row.id,
+        )
+        .first()
+    )
+    if owner is not None:
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_submission_hash_owned_by_other_execution"})
+    current_hash = str(row.swap_tx_hash or "").strip().lower()
+    if current_hash:
+        if current_hash != normalized_tx_hash:
+            raise HTTPException(status_code=409, detail={"error": "wallet_swap_submission_hash_conflict"})
+        return row, False
+
+    now = datetime.utcnow()
+    lifecycle = route.get("execution_lifecycle") if isinstance(route.get("execution_lifecycle"), dict) else {}
+    lifecycle = copy.deepcopy(lifecycle)
+    swap_lifecycle = lifecycle.get("swap") if isinstance(lifecycle.get("swap"), dict) else {}
+    swap_lifecycle = dict(swap_lifecycle)
+    swap_lifecycle.update({
+        "tx_hash": normalized_tx_hash,
+        "submitted_at": now.isoformat(),
+        "submission_recorded": True,
+        "automatic_retry": False,
+        "automatic_second_transaction": False,
+    })
+    lifecycle["swap"] = swap_lifecycle
+    route = copy.deepcopy(route)
+    route["execution_lifecycle"] = lifecycle
+    row.route = route
+    row.swap_tx_hash = normalized_tx_hash
+    row.swap_status = "submitted"
+    row.status = "swap_pending"
+    row.updated_at = now
+    db.flush()
+    return row, True
+
+
+def _mark_generic_wallet_swap_reverted(
+    db: Session,
+    *,
+    execution_id: Optional[str],
+    tx_hash: str,
+    block_number: Optional[int],
+    gas_used: Optional[int],
+    effective_gas_price: Optional[int],
+) -> bool:
+    normalized_tx_hash = validate_transaction_hash(tx_hash).lower()
+    row = db.get(RobinhoodChainSwapExecution, str(execution_id or "").strip()) if execution_id else None
+    if row is None:
+        row = db.query(RobinhoodChainSwapExecution).filter(RobinhoodChainSwapExecution.swap_tx_hash == normalized_tx_hash).first()
+    if row is None or str(row.swap_tx_hash or "").strip().lower() != normalized_tx_hash:
+        return False
+    if row.status == "swap_reverted" and row.swap_status == "reverted":
+        return False
+    now = datetime.utcnow()
+    route = copy.deepcopy(row.route if isinstance(row.route, dict) else {})
+    lifecycle = route.get("execution_lifecycle") if isinstance(route.get("execution_lifecycle"), dict) else {}
+    lifecycle = copy.deepcopy(lifecycle)
+    swap = lifecycle.get("swap") if isinstance(lifecycle.get("swap"), dict) else {}
+    swap = dict(swap)
+    swap.update({
+        "tx_hash": normalized_tx_hash,
+        "receipt_status": 0,
+        "reverted_at": now.isoformat(),
+        "block_number": block_number,
+        "gas_used": str(gas_used) if gas_used is not None else None,
+        "effective_gas_price_wei": str(effective_gas_price) if effective_gas_price is not None else None,
+    })
+    lifecycle["swap"] = swap
+    route["execution_lifecycle"] = lifecycle
+    row.route = route
+    row.swap_status = "reverted"
+    row.status = "swap_reverted"
+    row.updated_at = now
+    db.flush()
+    return True
+
+
+def _rh_order_miss_1b_target_hash_guard(tx_hash: str, approval_tx_hash: str) -> Tuple[str, str]:
+    normalized_tx_hash = validate_transaction_hash(tx_hash).lower()
+    normalized_approval_hash = validate_transaction_hash(approval_tx_hash).lower()
+    if _generic_wallet_swap_sha256_text(normalized_tx_hash) != _RH_ORDER_MISS_1B_TARGET_TX_SHA256:
+        raise HTTPException(status_code=409, detail={"error": "rh_order_miss_1b_target_tx_mismatch"})
+    if _generic_wallet_swap_sha256_text(normalized_approval_hash) != _RH_ORDER_MISS_1B_TARGET_APPROVAL_SHA256:
+        raise HTTPException(status_code=409, detail={"error": "rh_order_miss_1b_target_approval_mismatch"})
+    return normalized_tx_hash, normalized_approval_hash
+
+
+def _rh_order_miss_1b_wallet_evidence(db: Session, tx_hash: str) -> Dict[str, Any]:
+    wallet = (
+        db.query(WalletAddress)
+        .filter(
+            WalletAddress.asset == "ALL",
+            WalletAddress.network == _TOKEN_REGISTRY_CHAIN,
+            WalletAddress.wallet_id == _TOKEN_REGISTRY_VENUE,
+        )
+        .order_by(WalletAddress.created_at.desc())
+        .first()
+    )
+    if wallet is None:
+        raise HTTPException(status_code=409, detail={"error": "rh_order_miss_1b_wallet_missing"})
+    rows = (
+        db.query(RobinhoodChainWalletEvent)
+        .filter(
+            RobinhoodChainWalletEvent.wallet_address_id == wallet.id,
+            RobinhoodChainWalletEvent.transaction_hash == tx_hash,
+        )
+        .all()
+    )
+    positive = []
+    for row in rows:
+        try:
+            atomic = int(str(row.amount_atomic or "0"))
+        except Exception:
+            atomic = 0
+        if atomic <= 0:
+            continue
+        positive.append({
+            "event_type": str(row.event_type or ""),
+            "direction": str(row.direction or "").strip().lower(),
+            "asset": str(row.asset or "").strip().upper(),
+            "amount_atomic": str(atomic),
+            "decimals": int(row.decimals) if row.decimals is not None else None,
+            "registered": row.registered is True,
+            "registry_id": int(row.registry_id) if row.registry_id is not None else None,
+            "tx_time": row.tx_time.isoformat() if row.tx_time is not None else None,
+        })
+    expected_usdg = [item for item in positive if item["direction"] == "out" and item["asset"] == "USDG" and item["amount_atomic"] == "2000000"]
+    expected_index = [item for item in positive if item["direction"] == "in" and item["asset"] == "INDEX" and item["amount_atomic"] == "273765361829109662072"]
+    if len(expected_usdg) != 1 or len(expected_index) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "rh_order_miss_1b_wallet_evidence_mismatch",
+                "event_rows": len(rows),
+                "positive_rows": len(positive),
+                "usdg_out_matches": len(expected_usdg),
+                "index_in_matches": len(expected_index),
+            },
+        )
+    lifecycle_count = db.query(RobinhoodChainSwapExecution).filter(RobinhoodChainSwapExecution.swap_tx_hash == tx_hash).count()
+    external_count = (
+        db.query(RobinhoodChainExternalSwap)
+        .filter(
+            RobinhoodChainExternalSwap.wallet_address_id == wallet.id,
+            RobinhoodChainExternalSwap.transaction_hash == tx_hash,
+        )
+        .count()
+    )
+    return {
+        "wallet_address_id": str(wallet.id),
+        "event_rows": len(rows),
+        "positive_rows": len(positive),
+        "usdg_out_matches": len(expected_usdg),
+        "index_in_matches": len(expected_index),
+        "lifecycle_owner_count": int(lifecycle_count),
+        "external_owner_count": int(external_count),
+        "target_tx_time": expected_index[0].get("tx_time") or expected_usdg[0].get("tx_time"),
+    }
+
+
 async def _persist_generic_wallet_swap_reconciliation(
     db: Session,
     *,
@@ -1089,10 +1637,13 @@ async def _persist_generic_wallet_swap_reconciliation(
     symbol: str,
     side: str,
     requested_amount: str,
-    quoted_output_amount: str,
-    minimum_received: str,
+    quoted_output_amount: Optional[str],
+    minimum_received: Optional[str],
     approval_tx_hash: Optional[str] = None,
     source: str = "wallet_swap_receipt",
+    historical_preflight_available: bool = True,
+    expected_actual_output_amount: Optional[str] = None,
+    persist: bool = True,
 ) -> Dict[str, Any]:
     normalized_tx_hash = validate_transaction_hash(tx_hash).lower()
     normalized_approval_hash = validate_transaction_hash(approval_tx_hash).lower() if approval_tx_hash else None
@@ -1118,13 +1669,18 @@ async def _persist_generic_wallet_swap_reconciliation(
                 raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_existing_symbol_mismatch"})
             if str(existing_row.side or "").strip().lower() != normalized_side:
                 raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_existing_side_mismatch"})
+            existing_historical_preflight = existing_reconciliation.get("historical_preflight_available") is not False
             try:
                 if Decimal(str(existing_row.exact_input_amount)) != Decimal(str(requested_amount)):
                     raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_existing_input_mismatch"})
-                if Decimal(str(existing_row.expected_output_amount)) != Decimal(str(quoted_output_amount)):
-                    raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_existing_quote_mismatch"})
-                if Decimal(str(existing_row.minimum_output_amount)) != Decimal(str(minimum_received)):
-                    raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_existing_minimum_mismatch"})
+                if existing_historical_preflight:
+                    if Decimal(str(existing_row.expected_output_amount)) != Decimal(str(quoted_output_amount)):
+                        raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_existing_quote_mismatch"})
+                    if Decimal(str(existing_row.minimum_output_amount)) != Decimal(str(minimum_received)):
+                        raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_existing_minimum_mismatch"})
+                elif expected_actual_output_amount is not None:
+                    if Decimal(str(existing_reconciliation.get("output_amount"))) != Decimal(str(expected_actual_output_amount)):
+                        raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_existing_actual_output_mismatch"})
             except HTTPException:
                 raise
             except Exception as exc:
@@ -1153,7 +1709,8 @@ async def _persist_generic_wallet_swap_reconciliation(
                 "actual_output_amount_atomic": existing_reconciliation.get("output_amount_atomic"),
                 "quoted_output_amount": existing_reconciliation.get("quoted_output_amount"),
                 "minimum_received": existing_reconciliation.get("minimum_output_amount"),
-                "minimum_received_satisfied": existing_reconciliation.get("minimum_received_satisfied") is True,
+                "minimum_received_satisfied": existing_reconciliation.get("minimum_received_satisfied"),
+                "historical_preflight_available": existing_historical_preflight,
                 "average_fill_price": existing_reconciliation.get("average_fill_price"),
                 "swap_network_fee_wei": existing_reconciliation.get("swap_network_fee_wei"),
                 "approval_network_fee_wei": existing_reconciliation.get("approval_network_fee_wei"),
@@ -1208,8 +1765,17 @@ async def _persist_generic_wallet_swap_reconciliation(
     input_decimals = int(input_token.get("decimals"))
     output_decimals = int(output_token.get("decimals"))
     requested_atomic = _display_amount_to_atomic(requested_amount, input_decimals, field="wallet_swap_reconcile_requested_amount")
-    quoted_output_atomic = _display_amount_to_atomic(quoted_output_amount, output_decimals, field="wallet_swap_reconcile_quoted_output")
-    minimum_atomic = _display_amount_to_atomic(minimum_received, output_decimals, field="wallet_swap_reconcile_minimum_received")
+    if historical_preflight_available:
+        quoted_output_atomic = _display_amount_to_atomic(quoted_output_amount, output_decimals, field="wallet_swap_reconcile_quoted_output")
+        minimum_atomic = _display_amount_to_atomic(minimum_received, output_decimals, field="wallet_swap_reconcile_minimum_received")
+    else:
+        quoted_output_atomic = 0
+        minimum_atomic = 0
+    expected_actual_output_atomic = (
+        _display_amount_to_atomic(expected_actual_output_amount, output_decimals, field="wallet_swap_reconcile_expected_actual_output")
+        if expected_actual_output_amount is not None
+        else None
+    )
 
     rpc = get_robinhood_chain_client()
     chain = await rpc.verify_expected_chain(force_refresh=True)
@@ -1270,10 +1836,17 @@ async def _persist_generic_wallet_swap_reconciliation(
             status_code=409,
             detail={"error": "wallet_swap_reconcile_input_amount_mismatch", "expected_atomic": str(requested_atomic), "actual_atomic": str(actual_input_atomic)},
         )
-    if actual_output_atomic <= 0 or actual_output_atomic < minimum_atomic:
+    if actual_output_atomic <= 0:
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_output_missing"})
+    if historical_preflight_available and actual_output_atomic < minimum_atomic:
         raise HTTPException(
             status_code=409,
             detail={"error": "wallet_swap_reconcile_output_below_minimum", "minimum_atomic": str(minimum_atomic), "actual_atomic": str(actual_output_atomic)},
+        )
+    if expected_actual_output_atomic is not None and actual_output_atomic != expected_actual_output_atomic:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "wallet_swap_reconcile_actual_output_mismatch", "expected_atomic": str(expected_actual_output_atomic), "actual_atomic": str(actual_output_atomic)},
         )
 
     block_number = _decode_robinhood_chain_rpc_quantity(receipt.get("blockNumber"), field="wallet_swap_reconcile_block_number")
@@ -1355,9 +1928,29 @@ async def _persist_generic_wallet_swap_reconciliation(
     total_fee_eth = Decimal(total_fee_wei) / _WEI_PER_ETH_DECIMAL
     approval_fee_eth = Decimal(approval_fee_wei) / _WEI_PER_ETH_DECIMAL
     now = datetime.utcnow()
-    quote_id = hashlib.sha256(("wallet-swap-reconcile:quote:" + normalized_tx_hash).encode("utf-8")).hexdigest()
-    swap_plan_hash = hashlib.sha256(("wallet-swap-reconcile:plan:" + normalized_tx_hash + ":" + swap_calldata_sha).encode("utf-8")).hexdigest()
-    approval_plan_hash = hashlib.sha256(("wallet-swap-reconcile:approval:" + str(normalized_approval_hash or "none") + ":" + approval_calldata_sha).encode("utf-8")).hexdigest()
+    existing_route_base = copy.deepcopy(existing_row.route) if existing_row is not None and isinstance(existing_row.route, dict) else {}
+    existing_generic = existing_route_base.get("generic_wallet_lifecycle") if isinstance(existing_route_base.get("generic_wallet_lifecycle"), dict) else {}
+    preserve_durable_preflight = bool(
+        historical_preflight_available
+        and existing_row is not None
+        and existing_generic.get("durable_before_wallet_request") is True
+        and existing_generic.get("historical_preflight_available") is True
+    )
+    quote_id = (
+        str(existing_row.quote_id)
+        if preserve_durable_preflight
+        else hashlib.sha256(("wallet-swap-reconcile:quote:" + normalized_tx_hash).encode("utf-8")).hexdigest()
+    )
+    swap_plan_hash = (
+        str(existing_row.swap_plan_hash)
+        if preserve_durable_preflight
+        else hashlib.sha256(("wallet-swap-reconcile:plan:" + normalized_tx_hash + ":" + swap_calldata_sha).encode("utf-8")).hexdigest()
+    )
+    approval_plan_hash = (
+        str(existing_row.approval_plan_hash)
+        if preserve_durable_preflight
+        else hashlib.sha256(("wallet-swap-reconcile:approval:" + str(normalized_approval_hash or "none") + ":" + approval_calldata_sha).encode("utf-8")).hexdigest()
+    )
     reconciliation = {
         "version": "R5C.5D.2F.4",
         "reconciled": True,
@@ -1372,11 +1965,12 @@ async def _persist_generic_wallet_swap_reconciliation(
         "output_native": output_native,
         "output_amount_atomic": str(actual_output_atomic),
         "output_amount": _decimal_text_exact(actual_output),
-        "quoted_output_amount_atomic": str(quoted_output_atomic),
-        "quoted_output_amount": _atomic_amount_to_display(quoted_output_atomic, output_decimals),
-        "minimum_output_amount_atomic": str(minimum_atomic),
-        "minimum_output_amount": _atomic_amount_to_display(minimum_atomic, output_decimals),
-        "minimum_received_satisfied": actual_output_atomic >= minimum_atomic,
+        "historical_preflight_available": bool(historical_preflight_available),
+        "quoted_output_amount_atomic": str(quoted_output_atomic) if historical_preflight_available else None,
+        "quoted_output_amount": _atomic_amount_to_display(quoted_output_atomic, output_decimals) if historical_preflight_available else None,
+        "minimum_output_amount_atomic": str(minimum_atomic) if historical_preflight_available else None,
+        "minimum_output_amount": _atomic_amount_to_display(minimum_atomic, output_decimals) if historical_preflight_available else None,
+        "minimum_received_satisfied": (actual_output_atomic >= minimum_atomic) if historical_preflight_available else None,
         "average_fill_price": _decimal_text_exact(average_fill_price),
         "fee_asset": "ETH",
         "swap_network_fee_wei": str(swap_fee_wei),
@@ -1394,8 +1988,21 @@ async def _persist_generic_wallet_swap_reconciliation(
         "block_number": block_number,
     }
     route = {
+        **existing_route_base,
         "provider": UNISWAP_PROVIDER,
         "execution_reconciliation": reconciliation,
+        "historical_preflight": {
+            "available": bool(historical_preflight_available),
+            "reason": None if historical_preflight_available else "original_preflight_lost_before_durable_lifecycle",
+            "model_schema_placeholders": None if historical_preflight_available else {
+                "expected_output_amount": "0",
+                "expected_output_amount_atomic": "0",
+                "minimum_output_amount": "0",
+                "minimum_output_amount_atomic": "0",
+                "plan_fetched_at": "confirmed_at",
+                "plan_expires_at": "confirmed_at",
+            },
+        },
         "execution_lifecycle": {
             "approval": {
                 "tx_hash": normalized_approval_hash,
@@ -1412,6 +2019,44 @@ async def _persist_generic_wallet_swap_reconciliation(
             },
         },
     }
+
+    if not persist:
+        return {
+            "ok": True,
+            "tranche": "RH-ORDER.MISS.1B",
+            "preview": True,
+            "created": False,
+            "idempotent": False,
+            "execution_id": None,
+            "symbol": normalized_symbol,
+            "side": normalized_side,
+            "tx_hash": normalized_tx_hash,
+            "approval_tx_hash": normalized_approval_hash,
+            "receipt_status": 1,
+            "block_number": block_number,
+            "actual_input_asset": reconciliation["input_asset"],
+            "actual_input_amount": reconciliation["input_amount"],
+            "actual_input_amount_atomic": str(actual_input_atomic),
+            "actual_output_asset": reconciliation["output_asset"],
+            "actual_output_amount": reconciliation["output_amount"],
+            "actual_output_amount_atomic": str(actual_output_atomic),
+            "quoted_output_amount": reconciliation["quoted_output_amount"],
+            "minimum_received": reconciliation["minimum_output_amount"],
+            "minimum_received_satisfied": reconciliation["minimum_received_satisfied"],
+            "historical_preflight_available": bool(historical_preflight_available),
+            "average_fill_price": reconciliation["average_fill_price"],
+            "swap_network_fee_wei": str(swap_fee_wei),
+            "approval_network_fee_wei": str(approval_fee_wei),
+            "total_network_fee_wei": str(total_fee_wei),
+            "residual_allowance_atomic": residual_allowance_atomic,
+            "order_mutation": False,
+            "ledger_mutation": False,
+            "fifo_mutation": False,
+            "basis_mutation": False,
+            "tax_mutation": False,
+            "database_mutation": False,
+            "will_mutate": False,
+        }
 
     row = db.query(RobinhoodChainSwapExecution).filter(RobinhoodChainSwapExecution.swap_tx_hash == normalized_tx_hash).first()
     created = row is None
@@ -1434,14 +2079,18 @@ async def _persist_generic_wallet_swap_reconciliation(
     row.amount_mode = "exact_input"
     row.exact_input_amount = reconciliation["input_amount"]
     row.exact_input_amount_atomic = str(actual_input_atomic)
-    row.expected_output_amount = _atomic_amount_to_display(quoted_output_atomic, output_decimals)
-    row.expected_output_amount_atomic = str(quoted_output_atomic)
-    row.minimum_output_amount = _atomic_amount_to_display(minimum_atomic, output_decimals)
-    row.minimum_output_amount_atomic = str(minimum_atomic)
+    row.expected_output_amount = _atomic_amount_to_display(quoted_output_atomic, output_decimals) if historical_preflight_available else "0"
+    row.expected_output_amount_atomic = str(quoted_output_atomic) if historical_preflight_available else "0"
+    row.minimum_output_amount = _atomic_amount_to_display(minimum_atomic, output_decimals) if historical_preflight_available else "0"
+    row.minimum_output_amount_atomic = str(minimum_atomic) if historical_preflight_available else "0"
     row.slippage_bps = 100
     row.quote_id = quote_id
-    row.plan_fetched_at = confirmed_at
-    row.plan_expires_at = confirmed_at + timedelta(seconds=60)
+    row.plan_fetched_at = existing_row.plan_fetched_at if preserve_durable_preflight else confirmed_at
+    row.plan_expires_at = (
+        existing_row.plan_expires_at
+        if preserve_durable_preflight
+        else (confirmed_at + timedelta(seconds=60) if historical_preflight_available else confirmed_at)
+    )
     row.allowance_read_method = "not_applicable" if input_native else "eth_call"
     row.allowance_token_address = input_contract
     row.allowance_spender = spender
@@ -1484,7 +2133,7 @@ async def _persist_generic_wallet_swap_reconciliation(
         "ok": True,
         "tranche": "R5C.5D.2F.4",
         "created": created,
-        "idempotent": not created,
+        "idempotent": False,
         "execution_id": str(row.id),
         "symbol": normalized_symbol,
         "side": normalized_side,
@@ -1500,7 +2149,8 @@ async def _persist_generic_wallet_swap_reconciliation(
         "actual_output_amount_atomic": str(actual_output_atomic),
         "quoted_output_amount": reconciliation["quoted_output_amount"],
         "minimum_received": reconciliation["minimum_output_amount"],
-        "minimum_received_satisfied": True,
+        "minimum_received_satisfied": reconciliation["minimum_received_satisfied"],
+        "historical_preflight_available": bool(historical_preflight_available),
         "average_fill_price": reconciliation["average_fill_price"],
         "swap_network_fee_wei": str(swap_fee_wei),
         "approval_network_fee_wei": str(approval_fee_wei),
@@ -3759,6 +4409,31 @@ async def robinhood_chain_wallet_swap_prepare(
             },
         ) from exc
 
+    try:
+        decoded_capability = decode_wallet_swap_capability(capability["token"])
+        lifecycle_row, lifecycle_created = _persist_generic_wallet_swap_prepared_lifecycle(
+            db,
+            fresh_preflight=fresh_preflight,
+            handoff=handoff,
+            capability_token=capability["token"],
+            capability=decoded_capability,
+            slippage_bps=int(request.slippage_bps),
+            approval_tx_hash=request.approval_tx_hash,
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "wallet_swap_durable_lifecycle_create_failed", "message": str(exc)},
+        ) from exc
+
     gate = dict(fresh_preflight.get("gate") or {})
     gate.update({
         "reject_only": False,
@@ -3768,16 +4443,20 @@ async def robinhood_chain_wallet_swap_prepare(
         "swap_request_authorized": True,
         "automatic_retry": False,
         "automatic_second_transaction": False,
+        "durable_lifecycle_required": True,
+        "durable_lifecycle_created": True,
     })
-    db.rollback()
     return {
         **fresh_preflight,
-        "tranche": "R5C.5D.2F.3",
+        "tranche": "RH-ORDER.MISS.1B",
         "wallet_request": handoff,
         "gate": gate,
         "swap_capability": capability["token"],
         "swap_receipt_expires_at_epoch": capability["expires_at_epoch"],
         "swap_receipt_ttl_seconds": capability["ttl_seconds"],
+        "execution_id": str(lifecycle_row.id),
+        "durable_lifecycle_created": True,
+        "durable_lifecycle_idempotent": not lifecycle_created,
         "successful_broadcast_authorized": True,
         "reject_only": False,
         "swap_only": True,
@@ -3793,8 +4472,177 @@ async def robinhood_chain_wallet_swap_prepare(
         "fifo_mutation": False,
         "basis_mutation": False,
         "tax_mutation": False,
+        "database_mutation": bool(lifecycle_created),
         "will_mutate": False,
     }
+
+
+@router.post("/wallet-swap/execution/{execution_id}/submission")
+def robinhood_chain_wallet_swap_submission(
+    execution_id: str,
+    request: RobinhoodChainWalletSwapSubmissionRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Persist the MetaMask-returned hash immediately against the durable owner."""
+    if request.confirm_record is not True:
+        raise HTTPException(status_code=400, detail={"error": "wallet_swap_submission_confirmation_required"})
+    try:
+        capability = decode_wallet_swap_capability(request.capability)
+        row, changed = _record_generic_wallet_swap_submission(
+            db,
+            execution_id=execution_id,
+            tx_hash=request.tx_hash,
+            capability_token=request.capability,
+            capability=capability,
+        )
+        db.commit()
+        return {
+            "ok": True,
+            "tranche": "RH-ORDER.MISS.1B",
+            "execution_id": str(row.id),
+            "tx_hash": str(row.swap_tx_hash or ""),
+            "status": str(row.status or ""),
+            "submission_recorded": True,
+            "idempotent": not changed,
+            "automatic_retry": False,
+            "automatic_second_transaction": False,
+            "order_mutation": False,
+            "ledger_mutation": False,
+            "fifo_mutation": False,
+            "basis_mutation": False,
+            "tax_mutation": False,
+            "database_mutation": bool(changed),
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail={"error": "wallet_swap_submission_record_failed", "message": str(exc)}) from exc
+
+
+async def _rh_order_miss_1b_orphan_recovery(
+    db: Session,
+    *,
+    tx_hash: str,
+    approval_tx_hash: str,
+    persist: bool,
+) -> Dict[str, Any]:
+    normalized_tx_hash, normalized_approval_hash = _rh_order_miss_1b_target_hash_guard(tx_hash, approval_tx_hash)
+    evidence = _rh_order_miss_1b_wallet_evidence(db, normalized_tx_hash)
+    if evidence["external_owner_count"] != 0:
+        raise HTTPException(status_code=409, detail={"error": "rh_order_miss_1b_external_owner_present"})
+    if evidence["lifecycle_owner_count"] > 1:
+        raise HTTPException(status_code=409, detail={"error": "rh_order_miss_1b_multiple_lifecycle_owners"})
+    if evidence["lifecycle_owner_count"] == 1:
+        existing = (
+            db.query(RobinhoodChainSwapExecution)
+            .filter(RobinhoodChainSwapExecution.swap_tx_hash == normalized_tx_hash)
+            .first()
+        )
+        route = existing.route if existing is not None and isinstance(existing.route, dict) else {}
+        historical = route.get("historical_preflight") if isinstance(route.get("historical_preflight"), dict) else {}
+        reconciliation = route.get("execution_reconciliation") if isinstance(route.get("execution_reconciliation"), dict) else {}
+        if not (
+            existing is not None
+            and existing.status == "confirmed"
+            and historical.get("available") is False
+            and reconciliation.get("reconciled") is True
+            and reconciliation.get("source") == "rh_order_miss_1b_orphan_recovery"
+        ):
+            raise HTTPException(status_code=409, detail={"error": "rh_order_miss_1b_unexpected_lifecycle_owner"})
+
+    reconciliation = await _persist_generic_wallet_swap_reconciliation(
+        db,
+        tx_hash=normalized_tx_hash,
+        symbol=_RH_ORDER_MISS_1B_TARGET_SYMBOL,
+        side=_RH_ORDER_MISS_1B_TARGET_SIDE,
+        requested_amount=_RH_ORDER_MISS_1B_TARGET_INPUT_AMOUNT,
+        quoted_output_amount=None,
+        minimum_received=None,
+        approval_tx_hash=normalized_approval_hash,
+        source="rh_order_miss_1b_orphan_recovery",
+        historical_preflight_available=False,
+        expected_actual_output_amount=_RH_ORDER_MISS_1B_TARGET_OUTPUT_AMOUNT,
+        persist=persist,
+    )
+    return {
+        "ok": True,
+        "tranche": "RH-ORDER.MISS.1B",
+        "target": "INDEX-USDG",
+        "preview": not persist,
+        "apply": bool(persist),
+        "target_hash_guard": True,
+        "wallet_evidence": evidence,
+        "historical_preflight_available": False,
+        "original_quote_available": False,
+        "original_minimum_available": False,
+        "original_plan_timestamps_available": False,
+        "recovery_provenance": "utt_orphan",
+        "canonical_source": "RHCHAINSWAP",
+        "external_materialization": False,
+        "reconciliation": reconciliation,
+        "order_mutation": bool(reconciliation.get("order_mutation")) if persist else False,
+        "ledger_mutation": False,
+        "fifo_mutation": False,
+        "basis_mutation": False,
+        "tax_mutation": False,
+        "database_mutation": bool(reconciliation.get("database_mutation")) if persist else False,
+        "will_mutate": False if not persist else bool(reconciliation.get("database_mutation")),
+    }
+
+
+@router.post("/wallet-swap/orphan-recovery/preview")
+async def robinhood_chain_wallet_swap_orphan_recovery_preview(
+    request: RobinhoodChainWalletSwapOrphanRecoveryRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Target-specific read-only preview for the accepted August 14 INDEX-USDG orphan."""
+    try:
+        result = await _rh_order_miss_1b_orphan_recovery(
+            db,
+            tx_hash=request.tx_hash,
+            approval_tx_hash=request.approval_tx_hash,
+            persist=False,
+        )
+        db.rollback()
+        result["database_mutation"] = False
+        result["will_mutate"] = False
+        return result
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail={"error": "rh_order_miss_1b_preview_failed", "message": str(exc)}) from exc
+
+
+@router.post("/wallet-swap/orphan-recovery/apply")
+async def robinhood_chain_wallet_swap_orphan_recovery_apply(
+    request: RobinhoodChainWalletSwapOrphanRecoveryRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Explicitly recover only the fingerprint-guarded accepted INDEX-USDG orphan."""
+    if request.confirm_recovery is not True:
+        raise HTTPException(status_code=400, detail={"error": "rh_order_miss_1b_recovery_confirmation_required"})
+    try:
+        result = await _rh_order_miss_1b_orphan_recovery(
+            db,
+            tx_hash=request.tx_hash,
+            approval_tx_hash=request.approval_tx_hash,
+            persist=True,
+        )
+        db.commit()
+        return result
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail={"error": "rh_order_miss_1b_recovery_failed", "message": str(exc)}) from exc
 
 
 @router.post("/wallet-swap/reconcile-confirmed")
@@ -3871,6 +4719,21 @@ async def robinhood_chain_wallet_swap_receipt(
         db.rollback()
         raise HTTPException(status_code=409, detail={"error": "wallet_swap_registry_identity_changed"})
 
+    submission_changed = False
+    if request.execution_id:
+        try:
+            _, submission_changed = _record_generic_wallet_swap_submission(
+                db,
+                execution_id=request.execution_id,
+                tx_hash=tx_hash,
+                capability_token=request.capability,
+                capability=capability,
+            )
+            db.commit()
+        except HTTPException:
+            db.rollback()
+            raise
+
     rpc = get_robinhood_chain_client()
     chain = await rpc.verify_expected_chain(force_refresh=True)
     if chain.get("ok") is not True or chain.get("chain_id_matches") is not True:
@@ -3896,10 +4759,11 @@ async def robinhood_chain_wallet_swap_receipt(
             "pending": True,
             "confirmed": False,
             "tx_hash": tx_hash,
+            "execution_id": request.execution_id,
             "swap_only": True,
             "approval_request_authorized": False,
             "automatic_second_transaction": False,
-            "database_mutation": False,
+            "database_mutation": bool(submission_changed),
         }
     try:
         verified_tx = validate_wallet_swap_transaction(
@@ -3930,11 +4794,12 @@ async def robinhood_chain_wallet_swap_receipt(
             "pending": True,
             "confirmed": False,
             "tx_hash": tx_hash,
+            "execution_id": request.execution_id,
             "transaction": verified_tx,
             "swap_only": True,
             "approval_request_authorized": False,
             "automatic_second_transaction": False,
-            "database_mutation": False,
+            "database_mutation": bool(submission_changed),
         }
 
     receipt_status = _decode_robinhood_chain_rpc_quantity(receipt.get("status"), field="wallet_swap_receipt_status")
@@ -3943,7 +4808,18 @@ async def robinhood_chain_wallet_swap_receipt(
     effective_gas_price = _decode_robinhood_chain_rpc_quantity(receipt.get("effectiveGasPrice"), field="wallet_swap_effective_gas_price") if receipt.get("effectiveGasPrice") is not None else None
     network_fee_wei = gas_used * effective_gas_price if gas_used is not None and effective_gas_price is not None else None
     if receipt_status == 0:
-        db.rollback()
+        reverted_changed = _mark_generic_wallet_swap_reverted(
+            db,
+            execution_id=request.execution_id,
+            tx_hash=tx_hash,
+            block_number=block_number,
+            gas_used=gas_used,
+            effective_gas_price=effective_gas_price,
+        )
+        if reverted_changed:
+            db.commit()
+        else:
+            db.rollback()
         return {
             "ok": True,
             "tranche": "R5C.5D.2F.3",
@@ -3952,6 +4828,7 @@ async def robinhood_chain_wallet_swap_receipt(
             "confirmed": False,
             "reverted": True,
             "tx_hash": tx_hash,
+            "execution_id": request.execution_id,
             "transaction": verified_tx,
             "receipt_status": 0,
             "block_number": block_number,
@@ -3959,7 +4836,7 @@ async def robinhood_chain_wallet_swap_receipt(
             "effective_gas_price_wei": str(effective_gas_price) if effective_gas_price is not None else None,
             "network_fee_wei": str(network_fee_wei) if network_fee_wei is not None else None,
             "automatic_second_transaction": False,
-            "database_mutation": False,
+            "database_mutation": bool(submission_changed or reverted_changed),
         }
     if receipt_status != 1:
         db.rollback()
@@ -3992,6 +4869,8 @@ async def robinhood_chain_wallet_swap_receipt(
         "confirmed": True,
         "reverted": False,
         "tx_hash": tx_hash,
+        "execution_id": request.execution_id or (reconciliation_result or {}).get("execution_id"),
+        "submission_recorded": bool(request.execution_id),
         "symbol": capability.get("symbol"),
         "side": capability.get("side"),
         "input_asset": capability.get("input_asset"),
@@ -4021,7 +4900,7 @@ async def robinhood_chain_wallet_swap_receipt(
         "fifo_mutation": False,
         "basis_mutation": False,
         "tax_mutation": False,
-        "database_mutation": bool(reconciliation_result and reconciliation_result.get("database_mutation")),
+        "database_mutation": bool(submission_changed or (reconciliation_result and reconciliation_result.get("database_mutation"))),
         "will_mutate": False,
     }
 

@@ -1361,8 +1361,8 @@ def _infer_fee_usd_from_row(it: Dict[str, Any], existing_fee_usd: Optional[float
       - If journal didn't populate fee_usd,
       - and unified row has fee numeric,
       - and fee_asset is null/empty,
-      - and the symbol is USD/USDC quoted,
-    then treat fee as USD/USDC.
+      - and the symbol is USD-like stable quoted,
+    then treat fee as USD-like.
     """
     if isinstance(existing_fee_usd, (int, float)):
         return float(existing_fee_usd)
@@ -1377,7 +1377,7 @@ def _infer_fee_usd_from_row(it: Dict[str, Any], existing_fee_usd: Optional[float
 
     sym = str(it.get("symbol_canon") or it.get("symbol") or "").strip().upper()
     # Common canonical format in your app: BASE-QUOTE
-    if sym.endswith("-USD") or sym.endswith("-USDC"):
+    if any(sym.endswith(f"-{quote}") for quote in ("USD", "USDC", "USDT", "USDG")):
         return float(fee)
 
     return existing_fee_usd
@@ -1394,28 +1394,24 @@ def _compute_net_pnl_usd(
     Compute realized pnl net-of-fee if not already provided.
 
     Priority:
-      1) If pnl is provided by impact, treat it as authoritative (already net or intended by writer).
-      2) Else derive gross_gain:
-         - gross_gain if provided
-         - else proceeds - basis_used if both exist
-      3) If fee known, net = gross_gain - fee
-         Else net = gross_gain (best-available)
+      1) If pnl is provided by impact, treat it as authoritative.
+      2) If realized proceeds and basis are present, use proceeds - basis. The
+         current FIFO writer's proceeds_usd is already net of fee, so subtracting
+         fee again here would double-charge the trading fee.
+      3) Otherwise, if only a gross/pre-fee gain is available, subtract a known fee.
     """
     if isinstance(pnl, (int, float)):
         return float(pnl)
 
-    gg: Optional[float] = None
-    if isinstance(gross_gain, (int, float)):
-        gg = float(gross_gain)
-    elif isinstance(proceeds, (int, float)) and isinstance(basis_used, (int, float)):
-        gg = float(proceeds) - float(basis_used)
+    if isinstance(proceeds, (int, float)) and isinstance(basis_used, (int, float)):
+        return float(proceeds) - float(basis_used)
 
-    if gg is None:
+    if not isinstance(gross_gain, (int, float)):
         return None
 
+    gg = float(gross_gain)
     if isinstance(fee_usd, (int, float)):
         return gg - float(fee_usd)
-
     return gg
 
 

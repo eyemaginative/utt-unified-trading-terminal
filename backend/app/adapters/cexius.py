@@ -832,6 +832,53 @@ class CexiusAdapter(ExchangeAdapter):
         )
         fee = self._float(self._dict_value(row, "fee", "fees", "commission"))
         fee_asset = self._asset(self._dict_value(row, "fee_asset", "fee_currency", "commission_asset")) or None
+
+        # Cexius order/trade payloads expose the fee amount but omit its asset.
+        # Live read-only evidence establishes the venue convention:
+        #   BUY  -> fee is charged in the acquired/base asset
+        #   SELL -> fee is charged in the received/quote asset
+        # Keep any explicit future fee-asset field authoritative; infer only when absent.
+        base_asset = None
+        quote_asset = None
+        if "-" in symbol_canon:
+            base_raw, quote_raw = symbol_canon.split("-", 1)
+            base_asset = self._asset(base_raw) or None
+            quote_asset = self._asset(quote_raw) or None
+        if fee is not None and not fee_asset:
+            if side == "buy" and base_asset:
+                fee_asset = base_asset
+            elif side == "sell" and quote_asset:
+                fee_asset = quote_asset
+
+        # total_after_fee is a quote-unit monetary field. Never subtract a
+        # base-asset fee from quote proceeds/cost. Use an executed quote value
+        # when supplied; otherwise derive it from executed base quantity and price.
+        gross_quote = self._float(
+            self._dict_value(
+                row,
+                "executed_volume",
+                "executedVolume",
+                "cumulative_value",
+                "filled_value",
+                "executed_value",
+                "notional",
+            )
+        )
+        if gross_quote is None and filled > 0.0:
+            exec_price = avg_fill_price if (avg_fill_price is not None and avg_fill_price > 0.0) else limit_price
+            if exec_price is not None and exec_price > 0.0:
+                gross_quote = float(filled) * float(exec_price)
+
+        total_after_fee = gross_quote
+        if (
+            gross_quote is not None
+            and fee is not None
+            and fee_asset
+            and quote_asset
+            and fee_asset == quote_asset
+        ):
+            total_after_fee = float(gross_quote) - float(fee)
+
         created = self._parse_datetime(
             self._dict_value(row, "created_at", "createdAt", "created", "timestamp", "time")
         )
@@ -854,6 +901,7 @@ class CexiusAdapter(ExchangeAdapter):
             "avg_fill_price": avg_fill_price,
             "fee": fee,
             "fee_asset": fee_asset,
+            "total_after_fee": total_after_fee,
             "created_at": created,
             "updated_at": updated,
         }

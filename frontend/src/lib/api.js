@@ -652,13 +652,36 @@ export async function prepareRobinhoodChainWalletSwap(payload = {}, { apiBase, t
   return res.data;
 }
 
+export async function recordRobinhoodChainWalletSwapSubmission(
+  executionId,
+  payload = {},
+  { apiBase, timeout_ms = 30000 } = {}
+) {
+  const id = encodeURIComponent(String(executionId || "").trim());
+  const capability = String(payload?.capability || "").trim();
+  const txHash = String(payload?.tx_hash || "").trim();
+  if (!id || !capability || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    throw new Error("Robinhood Chain swap submission recording requires execution id, capability, and transaction hash.");
+  }
+  const body = { capability, tx_hash: txHash, confirm_record: true };
+  const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  if (base === API_BASE) {
+    const res = await http.post(`/api/robinhood_chain/wallet-swap/execution/${id}/submission`, body, { timeout: timeout_ms });
+    return res.data;
+  }
+  const res = await axios.post(`${base}/api/robinhood_chain/wallet-swap/execution/${id}/submission`, body, { timeout: timeout_ms });
+  return res.data;
+}
+
 export async function refreshRobinhoodChainWalletSwapReceipt(payload = {}, { apiBase, timeout_ms = 60000 } = {}) {
   const capability = String(payload?.capability || "").trim();
   const txHash = String(payload?.tx_hash || "").trim();
+  const executionId = String(payload?.execution_id || "").trim();
   if (!capability || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
     throw new Error("Robinhood Chain swap receipt refresh requires capability and transaction hash.");
   }
   const body = { capability, tx_hash: txHash };
+  if (executionId) body.execution_id = executionId;
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {
     const res = await http.post(`/api/robinhood_chain/wallet-swap/receipt`, body, { timeout: timeout_ms });

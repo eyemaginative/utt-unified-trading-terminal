@@ -43,6 +43,7 @@ import {
   recordRobinhoodChainSwapApprovalSubmissionFailure,
   recordRobinhoodChainSwapSubmission,
   recordRobinhoodChainSwapSubmissionFailure,
+  recordRobinhoodChainWalletSwapSubmission,
   recordRobinhoodChainExecutionSubmission,
   recordRobinhoodChainExecutionSubmissionFailure,
   refreshRobinhoodChainBuyApproval,
@@ -89,6 +90,7 @@ const ROBINHOOD_CHAIN_NETWORK = Object.freeze({
 });
 const ROBINHOOD_CHAIN_PENDING_EXECUTION_KEY = "utt_robinhood_chain_pending_execution_v2";
 const ROBINHOOD_CHAIN_SWAP_LIFECYCLE_KEY = "utt_robinhood_chain_swap_lifecycle_v1";
+const ROBINHOOD_CHAIN_GENERIC_SWAP_RECOVERY_KEY = "utt_robinhood_chain_generic_swap_recovery_v1";
 const ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_ETH = "0.001";
 const ROBINHOOD_CHAIN_BUY_EXACT_OUTPUT_WEI = 1000000000000000n;
 const ROBINHOOD_CHAIN_BUY_MAXIMUM_USDG = "2";
@@ -220,6 +222,44 @@ function writeRobinhoodChainSwapLifecycleIdentity(value) {
     }));
   } catch {
     // Read-only lifecycle recovery storage is best-effort.
+  }
+}
+
+function readRobinhoodChainGenericSwapRecovery() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(ROBINHOOD_CHAIN_GENERIC_SWAP_RECOVERY_KEY) || "null");
+    if (!parsed || typeof parsed !== "object") return null;
+    const executionId = String(parsed.executionId || "").trim();
+    const capability = String(parsed.capability || "").trim();
+    const txHash = normalizeRobinhoodChainTransactionHash(parsed.txHash);
+    const symbol = normalizeRobinhoodChainQuoteSymbol(parsed.symbol);
+    const side = String(parsed.side || "").trim().toLowerCase();
+    const walletAddress = normalizeRobinhoodChainEvmAddress(parsed.walletAddress);
+    if (!executionId || !capability || !txHash || !symbol || !["buy", "sell"].includes(side) || !walletAddress) return null;
+    return { executionId, capability, txHash, symbol, side, walletAddress, savedAt: parsed.savedAt || null };
+  } catch {
+    return null;
+  }
+}
+
+function writeRobinhoodChainGenericSwapRecovery(value) {
+  try {
+    if (!value) {
+      localStorage.removeItem(ROBINHOOD_CHAIN_GENERIC_SWAP_RECOVERY_KEY);
+      return;
+    }
+    const executionId = String(value.executionId || "").trim();
+    const capability = String(value.capability || "").trim();
+    const txHash = normalizeRobinhoodChainTransactionHash(value.txHash);
+    const symbol = normalizeRobinhoodChainQuoteSymbol(value.symbol);
+    const side = String(value.side || "").trim().toLowerCase();
+    const walletAddress = normalizeRobinhoodChainEvmAddress(value.walletAddress);
+    if (!executionId || !capability || !txHash || !symbol || !["buy", "sell"].includes(side) || !walletAddress) return;
+    localStorage.setItem(ROBINHOOD_CHAIN_GENERIC_SWAP_RECOVERY_KEY, JSON.stringify({
+      executionId, capability, txHash, symbol, side, walletAddress, savedAt: new Date().toISOString(),
+    }));
+  } catch {
+    // Recovery storage is best-effort; the durable backend lifecycle remains authoritative.
   }
 }
 
@@ -3686,6 +3726,7 @@ export default function OrderTicketWidget({
   const [robinhoodChainWalletSwapError, setRobinhoodChainWalletSwapError] = useState("");
   const [robinhoodChainWalletSwapAttempted, setRobinhoodChainWalletSwapAttempted] = useState(false);
   const [robinhoodChainWalletSwapResult, setRobinhoodChainWalletSwapResult] = useState(null);
+  const [robinhoodChainGenericSwapRecovery, setRobinhoodChainGenericSwapRecovery] = useState(() => readRobinhoodChainGenericSwapRecovery());
   const robinhoodChainWalletSwapSendRef = useRef(false);
   const [robinhoodChainAutoPreparationPhase, setRobinhoodChainAutoPreparationPhase] = useState("idle");
   const [robinhoodChainAutoPreparationDetail, setRobinhoodChainAutoPreparationDetail] = useState("");
@@ -8463,6 +8504,7 @@ export default function OrderTicketWidget({
       robinhoodChainFirmPlan?.approval_required === false ||
       robinhoodChainApprovalConfirmedForCurrentContext
     ) &&
+    !robinhoodChainGenericSwapRecovery &&
     !robinhoodChainWalletSwapBusy
   );
 
@@ -11054,12 +11096,14 @@ async function submitLimitOrder() {
         data?.wallet_request?.provider_simulation_requested !== true ||
         data?.wallet_request?.requires_refresh_after_approval !== false ||
         !data?.swap_capability ||
+        !String(data?.execution_id || "").trim() ||
+        data?.durable_lifecycle_created !== true ||
         !data?.wallet_request?.transaction
       ) {
         throw new Error("Fresh swap-only preflight returned an unsafe or incomplete response.");
       }
       setRobinhoodChainWalletSwapPrepared(data);
-      setRobinhoodChainWalletNotice("R5C.5D.2F.3 fresh post-approval swap prepared and simulated. No MetaMask request has occurred yet.");
+      setRobinhoodChainWalletNotice("RH-ORDER.MISS.1B durable swap lifecycle persisted before MetaMask. Fresh post-approval swap is prepared and simulated; no wallet request has occurred yet.");
       onToast?.({ kind: "warn", msg: "Fresh swap-only preflight passed. Review the transaction; MetaMask will be the final approve/reject decision." });
     } catch (error) {
       if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
@@ -11073,35 +11117,67 @@ async function submitLimitOrder() {
 
   async function refreshRobinhoodChainSuccessfulSwapReceipt() {
     const prepared = robinhoodChainWalletSwapPrepared;
-    const txHash = normalizeRobinhoodChainTransactionHash(robinhoodChainWalletSwapResult?.transaction_hash);
-    if (!prepared?.swap_capability || !txHash || robinhoodChainWalletSwapBusy) return;
+    const recovery = robinhoodChainGenericSwapRecovery;
+    const capability = String(prepared?.swap_capability || recovery?.capability || "").trim();
+    const executionId = String(prepared?.execution_id || recovery?.executionId || "").trim();
+    const txHash = normalizeRobinhoodChainTransactionHash(
+      robinhoodChainWalletSwapResult?.transaction_hash || recovery?.txHash
+    );
+    if (!capability || !executionId || !txHash || robinhoodChainWalletSwapBusy) return;
     setRobinhoodChainWalletSwapBusy(true);
     setRobinhoodChainWalletSwapError("");
     try {
       const data = await refreshRobinhoodChainWalletSwapReceipt(
-        { capability: prepared.swap_capability, tx_hash: txHash },
+        { capability, tx_hash: txHash, execution_id: executionId },
         { apiBase, timeout_ms: 60000 }
       );
       setRobinhoodChainWalletSwapResult((current) => ({ ...(current || {}), ...(data || {}), transaction_hash: txHash }));
       if (data?.confirmed === true && data?.status === "swap_confirmed") {
         if (data?.order_mutation === true) requestAllOrdersRefresh();
+
+        let ticketBalanceRefresh = null;
+        let ticketBalanceRefreshError = "";
+        try {
+          ticketBalanceRefresh = await refreshRobinhoodChainTicketBalancesAfterConfirmation({
+            executionId,
+            transactionHash: txHash,
+            source: "generic_wallet_swap_receipt",
+          });
+        } catch (balanceError) {
+          ticketBalanceRefreshError = robinhoodChainQuoteError(balanceError);
+        }
+
+        if (!data?.reconciliation_error) {
+          writeRobinhoodChainGenericSwapRecovery(null);
+          setRobinhoodChainGenericSwapRecovery(null);
+        }
         setRobinhoodChainWalletNotice(
           data?.order_mutation === true
-            ? "SWAP CONFIRMED + RECONCILED — All Orders persistence completed; no automatic second transaction occurred."
-            : "SWAP CONFIRMED — accounting reconciliation is held; no automatic second transaction occurred."
+            ? "SWAP CONFIRMED + RECONCILED — the same durable lifecycle is now visible to All Orders; balances were refreshed automatically; no automatic second transaction occurred."
+            : "SWAP CONFIRMED — reconciliation is held and recovery identity remains saved; balances were refreshed automatically; no automatic second transaction occurred."
         );
-        openSubmitResultModal("ok", data, "Robinhood Chain Swap Confirmed");
+        const confirmationPayload = {
+          ...(data || {}),
+          transaction_hash: txHash,
+          order_ticket_balance_refresh: ticketBalanceRefresh,
+          order_ticket_balance_refresh_error: ticketBalanceRefreshError || null,
+        };
+        openSubmitResultModal("ok", confirmationPayload, "Robinhood Chain Swap Confirmed");
         onToast?.({
-          kind: data?.order_mutation === true ? "ok" : "warn",
+          kind: data?.order_mutation === true && !ticketBalanceRefreshError ? "ok" : "warn",
           msg: data?.order_mutation === true
-            ? "Swap receipt confirmed and persisted for All Orders. No automatic second transaction occurred."
-            : "Swap confirmed, but accounting reconciliation did not persist. Review the reconciliation error before continuing.",
+            ? ticketBalanceRefreshError
+              ? `Swap receipt confirmed and reconciled on the original durable lifecycle, but automatic balance refresh reported: ${ticketBalanceRefreshError}`
+              : "Swap receipt confirmed and reconciled on the original durable lifecycle. Order Ticket balances were refreshed automatically; no automatic second transaction occurred."
+            : "Swap confirmed, but reconciliation did not persist. The execution id and transaction hash remain locally recoverable.",
         });
       } else if (data?.reverted === true) {
-        setRobinhoodChainWalletSwapError("Swap transaction reverted. No automatic retry or second wallet request is authorized.");
+        writeRobinhoodChainGenericSwapRecovery(null);
+        setRobinhoodChainGenericSwapRecovery(null);
+        setRobinhoodChainWalletSwapError("Swap transaction reverted. The durable lifecycle was marked reverted; no automatic retry or second wallet request is authorized.");
         openSubmitResultModal("error", data, "Robinhood Chain Swap Reverted");
       } else {
-        onToast?.({ kind: "info", msg: "Swap transaction is still pending. Refresh the receipt again after confirmation." });
+        onToast?.({ kind: "info", msg: "Swap transaction is still pending. Recovery identity remains saved; refresh the receipt again after confirmation." });
       }
     } catch (error) {
       const msg = robinhoodChainWalletErrorMessage(error, "Swap receipt verification failed.");
@@ -11134,6 +11210,8 @@ async function submitLimitOrder() {
       request?.provider_simulation_requested !== true ||
       request?.requires_refresh_after_approval !== false ||
       !prepared?.swap_capability ||
+      !String(prepared?.execution_id || "").trim() ||
+      prepared?.durable_lifecycle_created !== true ||
       !tx
     ) {
       setRobinhoodChainWalletSwapError("Fresh swap-only preparation is missing or unsafe.");
@@ -11196,17 +11274,57 @@ async function submitLimitOrder() {
         const rawResult = await provider.request({ method: "eth_sendTransaction", params: [txRequest] });
         const returnedTxHash = normalizeRobinhoodChainTransactionHash(rawResult);
         if (!returnedTxHash) throw new Error("MetaMask returned no valid transaction hash for the swap.");
+        const executionId = String(prepared?.execution_id || "").trim();
+        const recovery = {
+          executionId,
+          capability: prepared.swap_capability,
+          txHash: returnedTxHash,
+          symbol: prepared?.symbol || currentSymbol,
+          side: prepared?.side || side,
+          walletAddress: activeAddress,
+        };
+        // Persist browser recovery identity before the backend recording call.
+        // If that call fails, the already-broadcast transaction is never retried.
+        writeRobinhoodChainGenericSwapRecovery(recovery);
+        setRobinhoodChainGenericSwapRecovery(recovery);
+
+        let recording = null;
+        let recordingError = "";
+        try {
+          recording = await recordRobinhoodChainWalletSwapSubmission(
+            executionId,
+            { capability: prepared.swap_capability, tx_hash: returnedTxHash },
+            { apiBase, timeout_ms: 30000 }
+          );
+        } catch (recordError) {
+          recordingError = robinhoodChainQuoteError(recordError);
+        }
+
         const result = {
-          ok: true, tranche: "R5C.5D.2F.3", status: "swap_submitted",
+          ok: true, tranche: "RH-ORDER.MISS.1B",
+          status: recordingError ? "swap_submitted_recording_recovery" : "swap_submitted",
+          execution_id: executionId,
           symbol: prepared?.symbol || currentSymbol, side: prepared?.side || side, action: "swap",
           transaction_hash: returnedTxHash, successful_broadcast_authorized: true, swap_only: true,
           approval_request_authorized: false, swap_request_authorized: true,
+          submission_recorded: recording?.submission_recorded === true,
+          recording_error: recordingError || null,
+          recovery_identity_saved: true,
           automatic_retry: false, automatic_second_transaction: false,
         };
         setRobinhoodChainWalletSwapResult(result);
-        setRobinhoodChainWalletNotice(`SWAP SUBMITTED: ${returnedTxHash}. No automatic second transaction was opened.`);
-        openSubmitResultModal("ok", result, "Robinhood Chain Swap Submitted");
-        onToast?.({ kind: "ok", msg: "Swap submitted. Refresh its receipt after confirmation; no automatic second transaction will open." });
+        setRobinhoodChainWalletNotice(
+          recordingError
+            ? `SWAP SUBMITTED: ${returnedTxHash}. Backend hash recording needs recovery; execution id + tx hash are saved locally. No retry was attempted.`
+            : `SWAP SUBMITTED + RECORDED: ${returnedTxHash}. Durable execution ${executionId} owns the hash; no automatic second transaction was opened.`
+        );
+        openSubmitResultModal(recordingError ? "error" : "ok", result, recordingError ? "Robinhood Chain Swap Submitted — Recording Recovery Required" : "Robinhood Chain Swap Submitted");
+        onToast?.({
+          kind: recordingError ? "warn" : "ok",
+          msg: recordingError
+            ? "Swap was broadcast, but immediate backend recording failed. Recovery identity is saved; do not submit again—use Refresh Swap Receipt."
+            : "Swap submitted and its hash was recorded on the durable lifecycle. Refresh receipt after confirmation; no automatic second transaction will open.",
+        });
       } catch (error) {
         const rejected = Number(error?.code) === 4001 || /reject|denied|declin|cancel/i.test(String(error?.message || ""));
         if (!rejected) throw error;
@@ -16532,7 +16650,7 @@ async function submitLimitOrder() {
                   )}
                 </div>
               )}
-              {(canPrepareRobinhoodChainWalletSwap || robinhoodChainWalletSwapPrepared || robinhoodChainWalletSwapError) && (
+              {(canPrepareRobinhoodChainWalletSwap || robinhoodChainWalletSwapPrepared || robinhoodChainGenericSwapRecovery || robinhoodChainWalletSwapError) && (
                 <div
                   data-rh-wallet-swap="r5c-5d-2f-3"
                   style={{
@@ -16552,7 +16670,7 @@ async function submitLimitOrder() {
                 >
                   <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                     <b style={{ color: robinhoodChainWalletSwapResult?.status === "swap_confirmed" ? "#bbf7d0" : "#ddd6fe" }}>
-                      R5C.5D.2F.3 · FRESH POST-APPROVAL SWAP ONLY
+                      RH-ORDER.MISS.1B · FRESH POST-APPROVAL SWAP ONLY · DURABLE LIFECYCLE
                     </b>
                     <span style={{ ...safePill, color: "#fecaca", fontWeight: 900 }}>APPROVAL REQUEST AUTHORIZED: NO</span>
                     <span style={{ ...safePill, color: "#bbf7d0", fontWeight: 900 }}>SWAP REQUEST AUTHORIZED: YES</span>
@@ -16560,10 +16678,10 @@ async function submitLimitOrder() {
                   </div>
                   <div style={{ color: "#ede9fe", lineHeight: 1.35 }}>
                     Preparation always requests a fresh Uniswap plan, current allowance, live balances, native gas, and provider simulation.
-                    The stale pre-approval swap plan is never promoted. One explicit button opens MetaMask; MetaMask is the final approve/reject authority.
+                    The stale pre-approval swap plan is never promoted. A durable lifecycle is persisted before the button can open MetaMask; MetaMask remains the final approve/reject authority.
                   </div>
 
-                  {!robinhoodChainWalletSwapPrepared && (
+                  {!robinhoodChainWalletSwapPrepared && !robinhoodChainGenericSwapRecovery && (
                     <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                       <button
                         type="button"
@@ -16582,6 +16700,26 @@ async function submitLimitOrder() {
                         {robinhoodChainWalletSwapBusy ? "Refreshing + simulating…" : "Prepare Fresh Swap-Only Preflight"}
                       </button>
                       <span style={{ color: "#ddd6fe" }}>Preparation does not open MetaMask or broadcast anything.</span>
+                    </div>
+                  )}
+
+                  {robinhoodChainGenericSwapRecovery && !robinhoodChainWalletSwapPrepared?.wallet_request && (
+                    <div style={{ display: "grid", gap: 6, padding: 7, borderRadius: 8, border: "1px solid rgba(251, 191, 36, 0.45)", background: "rgba(120, 53, 15, 0.18)" }}>
+                      <b style={{ color: "#fde68a" }}>RECOVERY IDENTITY PRESENT · DO NOT SUBMIT AGAIN</b>
+                      <span style={{ color: "#fef3c7" }}>
+                        A prior MetaMask swap already returned a transaction hash. UTT retained the durable execution id and hash locally so receipt refresh can re-bind backend state without another wallet request.
+                      </span>
+                      <span style={{ color: "#ddd6fe" }}>
+                        Execution {hideTableData ? "••••" : String(robinhoodChainGenericSwapRecovery.executionId)} · tx {hideTableData ? "••••" : shortenWalletAddress(robinhoodChainGenericSwapRecovery.txHash, 12, 10)}
+                      </span>
+                      <button
+                        type="button"
+                        style={{ ...safeButton, padding: "7px 10px", justifySelf: "start" }}
+                        disabled={robinhoodChainWalletSwapBusy}
+                        onClick={refreshRobinhoodChainSuccessfulSwapReceipt}
+                      >
+                        {robinhoodChainWalletSwapBusy ? "Checking receipt…" : "Refresh Swap Receipt — Recovery"}
+                      </button>
                     </div>
                   )}
 
@@ -16660,7 +16798,7 @@ async function submitLimitOrder() {
                           <div style={{ color: "#bbf7d0", fontWeight: 950, display: "grid", gap: 3 }}>
                             <span>PASS · SWAP RECEIPT CONFIRMED · status 1 · automatic second transaction NO</span>
                             <span>Gas used {result.gas_used || "—"} · effective gas price {result.effective_gas_price_wei || "—"} wei · network fee {result.network_fee_wei || "—"} wei</span>
-                            <span>Accounting/reconciliation remains a separate explicit tranche.</span>
+                            <span>{result.reconciliation_error ? "Reconciliation is held; recovery identity remains available." : "The same durable lifecycle is reconciled for canonical RHCHAINSWAP / All Orders visibility."}</span>
                           </div>
                         )}
                       </>

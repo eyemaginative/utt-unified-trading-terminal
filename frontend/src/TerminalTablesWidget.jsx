@@ -13,6 +13,7 @@ function getAuthToken() {
 const LS_KEY = "utt_all_orders_columns_v1";
 // One-time migration flag: ensure new All Orders columns are injected into existing custom layouts.
 const LS_AO_COLS_MIG_V2 = "utt_all_orders_columns_mig_v2_tax_netaftertax_v1";
+const LS_AO_COLS_MIG_V3 = "utt_all_orders_columns_mig_v3_qty_after_fee_v1";
 
 // Store ONLY y/h for tables; x/w are derived from app container each render (or chart when docked).
 const LS_GEOM_KEY = "utt_tables_widget_geom_v2_yh";
@@ -91,6 +92,7 @@ const COLS = {
   symbol: "symbol",
   side: "side",
   qty: "qty",
+  qtyAfterFee: "qty_after_fee",
   gross: "gross",
   net: "net",
   tax: "tax",
@@ -124,6 +126,27 @@ const PREFERRED_ORDER_V1 = [
   COLS.bucket,
 ];
 
+const PREFERRED_ORDER_V2 = [
+  COLS.created,
+  COLS.closed,
+  COLS.actions,
+  COLS.viewed,
+  COLS.symbol,
+  COLS.side,
+  COLS.qty,
+  COLS.gross,
+  COLS.net,
+  COLS.tax,
+  COLS.netAfterTax,
+  COLS.fee,
+  COLS.limit,
+  COLS.status,
+  COLS.type,
+  COLS.source,
+  COLS.venue,
+  COLS.bucket,
+];
+
 const PREFERRED_ORDER = [
   COLS.created,
   COLS.closed,
@@ -132,6 +155,7 @@ const PREFERRED_ORDER = [
   COLS.symbol,
   COLS.side,
   COLS.qty,
+  COLS.qtyAfterFee,
   COLS.gross,
   COLS.net,
   COLS.tax,
@@ -164,6 +188,27 @@ const LEGACY_ORDER_V1 = [
   COLS.viewed,
 ];
 
+const LEGACY_ORDER_V2 = [
+  COLS.created,
+  COLS.actions,
+  COLS.source,
+  COLS.venue,
+  COLS.symbol,
+  COLS.side,
+  COLS.type,
+  COLS.qty,
+  COLS.limit,
+  COLS.status,
+  COLS.bucket,
+  COLS.closed,
+  COLS.fee,
+  COLS.gross,
+  COLS.net,
+  COLS.tax,
+  COLS.netAfterTax,
+  COLS.viewed,
+];
+
 const LEGACY_ORDER = [
   COLS.created,
   COLS.actions,
@@ -173,6 +218,7 @@ const LEGACY_ORDER = [
   COLS.side,
   COLS.type,
   COLS.qty,
+  COLS.qtyAfterFee,
   COLS.limit,
   COLS.status,
   COLS.bucket,
@@ -4321,59 +4367,62 @@ async function refreshSolanaOnchainBalances() {
   const [columnPreset, setColumnPreset] = useState(() => {
     const saved = safeParseJson(localStorage.getItem(LS_KEY) || "");
     const cols = sanitizeColumns(saved);
-    if (arraysEqual(cols, LEGACY_ORDER) || arraysEqual(cols, LEGACY_ORDER_V1)) return "legacy";
-    if (arraysEqual(cols, PREFERRED_ORDER) || arraysEqual(cols, PREFERRED_ORDER_V1)) return "preferred";
+    if (arraysEqual(cols, LEGACY_ORDER) || arraysEqual(cols, LEGACY_ORDER_V2) || arraysEqual(cols, LEGACY_ORDER_V1)) return "legacy";
+    if (arraysEqual(cols, PREFERRED_ORDER) || arraysEqual(cols, PREFERRED_ORDER_V2) || arraysEqual(cols, PREFERRED_ORDER_V1)) return "preferred";
     return "custom";
   });
 
-    // Migration: if a user is on the old preset layouts, upgrade them to include the new Net After Tax column.
-  // - Preferred/Legacy presets get auto-upgraded.
-  // - Custom layouts are left untouched; the new column can be added via the Column Manager.
+    // Migration: upgrade old presets and inject newly introduced optional columns once.
+  // Existing custom layouts retain their order; new columns are inserted at their semantic anchors.
   useEffect(() => {
-    // Migration A: upgrade old preset layouts (V1) to the current preset definitions.
-    if (arraysEqual(columns, PREFERRED_ORDER_V1)) {
+    // Preset migrations: any historical preferred/legacy preset upgrades directly
+    // to the current definition, including Qty a/fee.
+    if (arraysEqual(columns, PREFERRED_ORDER_V1) || arraysEqual(columns, PREFERRED_ORDER_V2)) {
       setColumns([...PREFERRED_ORDER]);
+      localStorage.setItem(LS_AO_COLS_MIG_V2, "1");
+      localStorage.setItem(LS_AO_COLS_MIG_V3, "1");
       return;
     }
-    if (arraysEqual(columns, LEGACY_ORDER_V1)) {
+    if (arraysEqual(columns, LEGACY_ORDER_V1) || arraysEqual(columns, LEGACY_ORDER_V2)) {
       setColumns([...LEGACY_ORDER]);
+      localStorage.setItem(LS_AO_COLS_MIG_V2, "1");
+      localStorage.setItem(LS_AO_COLS_MIG_V3, "1");
       return;
     }
 
-    // Migration B (one-time): if the user is on a custom column layout, inject new columns
-    // (Tax + Net After Tax) into their existing order so they become visible immediately.
-    // We only do this once per browser profile; afterwards, the Column Manager controls it.
-    const alreadyMigrated = localStorage.getItem(LS_AO_COLS_MIG_V2) === "1";
-    if (alreadyMigrated) return;
+    const taxMigrated = localStorage.getItem(LS_AO_COLS_MIG_V2) === "1";
+    const qtyAfterFeeMigrated = localStorage.getItem(LS_AO_COLS_MIG_V3) === "1";
+    const next = [...columns];
+    let changed = false;
 
-    const hasNet = columns.includes(COLS.net);
-    const hasTax = columns.includes(COLS.tax);
-    const hasNetAfterTax = columns.includes(COLS.netAfterTax);
-
-    if (!hasTax || !hasNetAfterTax) {
-      const next = [...columns];
-
-      // Insert after Net (or append if Net not found).
-      const idxNet = next.indexOf(COLS.net);
-
-      // Add Tax first
+    if (!taxMigrated) {
+      const hasTax = next.includes(COLS.tax);
+      const hasNetAfterTax = next.includes(COLS.netAfterTax);
       if (!hasTax) {
-        const insertAt = idxNet >= 0 ? idxNet + 1 : next.length;
-        next.splice(insertAt, 0, COLS.tax);
+        const idxNet = next.indexOf(COLS.net);
+        next.splice(idxNet >= 0 ? idxNet + 1 : next.length, 0, COLS.tax);
+        changed = true;
       }
-
-      // Add Net After Tax after Tax (if present) else after Net
       if (!hasNetAfterTax) {
         const idxTax = next.indexOf(COLS.tax);
+        const idxNet = next.indexOf(COLS.net);
         const baseIdx = idxTax >= 0 ? idxTax : idxNet;
-        const insertAt = baseIdx >= 0 ? baseIdx + 1 : next.length;
-        next.splice(insertAt, 0, COLS.netAfterTax);
+        next.splice(baseIdx >= 0 ? baseIdx + 1 : next.length, 0, COLS.netAfterTax);
+        changed = true;
       }
-
-      setColumns(next);
+      localStorage.setItem(LS_AO_COLS_MIG_V2, "1");
     }
 
-    localStorage.setItem(LS_AO_COLS_MIG_V2, "1");
+    if (!qtyAfterFeeMigrated) {
+      if (!next.includes(COLS.qtyAfterFee)) {
+        const idxQty = next.indexOf(COLS.qty);
+        next.splice(idxQty >= 0 ? idxQty + 1 : next.length, 0, COLS.qtyAfterFee);
+        changed = true;
+      }
+      localStorage.setItem(LS_AO_COLS_MIG_V3, "1");
+    }
+
+    if (changed) setColumns(next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -4388,8 +4437,8 @@ async function refreshSolanaOnchainBalances() {
     }
 
     localStorage.setItem(LS_KEY, JSON.stringify(columns));
-    if (arraysEqual(columns, LEGACY_ORDER) || arraysEqual(columns, LEGACY_ORDER_V1)) setColumnPreset("legacy");
-    else if (arraysEqual(columns, PREFERRED_ORDER) || arraysEqual(columns, PREFERRED_ORDER_V1)) setColumnPreset("preferred");
+    if (arraysEqual(columns, LEGACY_ORDER) || arraysEqual(columns, LEGACY_ORDER_V2) || arraysEqual(columns, LEGACY_ORDER_V1)) setColumnPreset("legacy");
+    else if (arraysEqual(columns, PREFERRED_ORDER) || arraysEqual(columns, PREFERRED_ORDER_V2) || arraysEqual(columns, PREFERRED_ORDER_V1)) setColumnPreset("preferred");
     else setColumnPreset("custom");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [columns]);
@@ -5355,16 +5404,49 @@ function pickOrderSymbolStr(o) {
   return "";
 }
 
+const USD_LIKE_QUOTES = new Set(["USD", "USDC", "USDT", "USDG"]);
+
 function isUsdQuotedSymbol(sym) {
   const s = String(sym || "").trim();
   if (!s) return false;
-  // Normalize common delimiters: "DOGE-USD", "DOGE/USD", "DOGE_USD"
+  // USD-like stable quotes are treated as USD-denominated for realized-tax display.
   const norm = s.replace(/\s+/g, "").replace(/\//g, "-").replace(/_/g, "-").toUpperCase();
   const parts = norm.split("-").filter(Boolean);
   if (parts.length < 2) return false;
   const quote = parts[parts.length - 1];
-  return quote === "USD";
+  return USD_LIKE_QUOTES.has(quote);
 }
+
+function hasAppliedRealizedBasisGap(o) {
+  if (!o || typeof o !== "object") return false;
+  const status = String(o?.realized_status || "").trim().toLowerCase();
+  if (status !== "applied") return false;
+  const gain = pickOrderGainUsdMaybe(o);
+  if (gain !== null) return false;
+  const basisCandidates = [
+    o.realized_basis_used_usd,
+    o.realizedBasisUsedUsd,
+    o.basis_used_usd,
+    o.basisUsedUsd,
+  ];
+  return !basisCandidates.some((value) => {
+    if (value === null || value === undefined || value === "") return false;
+    return Number.isFinite(Number(value));
+  });
+}
+function formatAllOrdersTimeCompact(value) {
+    if (value === null || value === undefined || value === "") return "—";
+    try {
+      const d = new Date(value);
+      if (!Number.isFinite(d.getTime())) return fmtTime?.(value) || String(value);
+      const pad2 = (n) => String(n).padStart(2, "0");
+      const yy = pad2(d.getFullYear() % 100);
+      return `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())}/${yy} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+    } catch {
+      return fmtTime?.(value) || String(value);
+    }
+  }
+
 function renderAllOrdersHeader(col) {
     const th = { ...sx.th, whiteSpace: "nowrap" };
 
@@ -5397,6 +5479,7 @@ function renderAllOrdersHeader(col) {
 
     if (col === COLS.side) return <th style={th}>Side</th>;
     if (col === COLS.qty) return <th style={th}>Quantity</th>;
+    if (col === COLS.qtyAfterFee) return <th style={th} title={`Quantity after fee\nBUY base-asset fee: adjusted quantity.\nUse Qty: fee does not reduce purchased quantity.`}>Qty a/fee</th>;
     if (col === COLS.gross) return <th style={th}>Gross</th>;
     if (col === COLS.net) return <th style={th}>Net</th>;
     if (col === COLS.tax) return <th style={th}>Tax</th>;
@@ -5430,13 +5513,40 @@ function renderAllOrdersHeader(col) {
   function renderAllOrdersCell(o, col) {
     const td = sx.td;
 
-    const created = o.created_at ? fmtTime?.(o.created_at) : "—";
-    const closed = o.closed_at ? fmtTime?.(o.closed_at) : "—";
+    const created = o.created_at ? formatAllOrdersTimeCompact(o.created_at) : "—";
+    const closed = o.closed_at ? formatAllOrdersTimeCompact(o.closed_at) : "—";
 
     const gross = calcGrossTotal?.(o);
     const fee = calcFee?.(o);
     const net = calcNetTotal?.(o);
     const feeAsset = String(o?.fee_asset || o?.feeAsset || "").trim().toUpperCase();
+    const orderSymbolForFee = normalizeMarketSymbolMaybe(pickOrderSymbolStr(o));
+    const orderSymbolParts = orderSymbolForFee.split("-").filter(Boolean);
+    const baseAssetForFee = orderSymbolParts.length >= 2 ? String(orderSymbolParts[0] || "").trim().toUpperCase() : "";
+    const filledQtyForFee = Number(o?.filled_qty);
+    const numericFee = Number(fee);
+    const sideForFee = String(o?.side || "").trim().toLowerCase();
+    const hasFilledQtyForFee = Number.isFinite(filledQtyForFee) && filledQtyForFee > 0;
+    const hasNumericFee =
+      fee !== null &&
+      fee !== undefined &&
+      fee !== "" &&
+      Number.isFinite(numericFee) &&
+      numericFee >= 0;
+    const qtyAfterFee =
+      sideForFee === "buy" &&
+      baseAssetForFee &&
+      feeAsset === baseAssetForFee &&
+      hasFilledQtyForFee &&
+      hasNumericFee &&
+      numericFee <= filledQtyForFee
+        ? filledQtyForFee - numericFee
+        : null;
+    const qtyAfterFeeUseQty =
+      sideForFee === "buy" &&
+      hasFilledQtyForFee &&
+      ((hasNumericFee && numericFee === 0) ||
+        (baseAssetForFee && feeAsset && feeAsset !== baseAssetForFee));
     const isRobinhoodChainExecutionRow =
       String(o?.venue || "").trim().toLowerCase() === "robinhood_chain" &&
       String(o?.source || "").trim().toUpperCase() === "RHCHAIN";
@@ -5461,11 +5571,13 @@ const symForTax = pickOrderSymbolStr(o);
 const isUsdQuote = isUsdQuotedSymbol(symForTax);
 
 const gainUsd = pickOrderGainUsdMaybe(o);
+const realizedBasisGap = hasAppliedRealizedBasisGap(o);
 
 const shouldFallbackTax =
   !isRobinhoodChainExecutionRow &&
   !!aoTaxWithholdEnabled &&
   backendTax === null &&
+  !realizedBasisGap &&
   isUsdQuote &&
   isFilledSellOrder(o) &&
   net !== null &&
@@ -5490,14 +5602,14 @@ const fallbackTax =
 const taxUsed = backendTax !== null ? backendTax : fallbackTax !== null ? fallbackTax : 0;
 
 const netAfterTax =
-  isRobinhoodChainExecutionRow || net === null || net === undefined
+  isRobinhoodChainExecutionRow || realizedBasisGap || net === null || net === undefined
     ? null
     : Number(net) - Number(taxUsed);
 const bucket = orderBucket(o);
     const st = normalizeStatus(pickOrderStatus(o));
 
-    if (col === COLS.created) return <td style={td}>{maskMaybe?.(created)}</td>;
-    if (col === COLS.closed) return <td style={td}>{maskMaybe?.(closed)}</td>;
+    if (col === COLS.created) return <td style={td} title={hideTableDataGlobal ? undefined : String(o?.created_at || "")}>{maskMaybe?.(created)}</td>;
+    if (col === COLS.closed) return <td style={td} title={hideTableDataGlobal ? undefined : String(o?.closed_at || "")}>{maskMaybe?.(closed)}</td>;
 
     if (col === COLS.actions) {
       const terminal = isTerminalBucket?.(bucket) || isTerminalStatus?.(st);
@@ -5873,6 +5985,31 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
 
     // UPDATED: use high-precision formatter
     if (col === COLS.qty) return <td style={td}>{mask?.(fmtQty?.(o.qty ?? o.filled_qty))}</td>;
+    if (col === COLS.qtyAfterFee) {
+      let qtyAfterFeeText = "—";
+      let qtyAfterFeeTitle;
+
+      if (qtyAfterFee !== null) {
+        qtyAfterFeeText = fmtQty?.(qtyAfterFee);
+        if (!hideTableDataGlobal) {
+          qtyAfterFeeTitle = `Quantity after fee\nAsset: ${baseAssetForFee}`;
+        }
+      } else if (qtyAfterFeeUseQty) {
+        qtyAfterFeeText = "Use Qty";
+        if (!hideTableDataGlobal) {
+          qtyAfterFeeTitle = `Quantity after fee\nFee does not reduce purchased ${baseAssetForFee || "base asset"}; use Quantity.`;
+        }
+      } else if (sideForFee === "sell") {
+        qtyAfterFeeText = "N/A";
+        if (!hideTableDataGlobal) {
+          qtyAfterFeeTitle = "Quantity after fee applies to BUY rows.";
+        }
+      } else if (!hideTableDataGlobal && sideForFee === "buy" && hasNumericFee && numericFee > 0 && !feeAsset) {
+        qtyAfterFeeTitle = "Fee asset unknown; quantity after fee cannot be confirmed.";
+      }
+
+      return <td style={td} title={qtyAfterFeeTitle}>{maskMaybe?.(qtyAfterFeeText)}</td>;
+    }
     if (col === COLS.gross) {
       const grossText = gross === null
         ? "—"
@@ -5894,7 +6031,7 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
       const isInventoryError =
         String(o?.realized_status || "").trim().toLowerCase() === "unapplied" &&
         String(o?.realized_error || "").trim().toLowerCase() === "insufficient_inventory";
-      const displayTax = isRobinhoodChainExecutionRow
+      const displayTax = isRobinhoodChainExecutionRow || realizedBasisGap
         ? null
         : backendTax !== null
           ? backendTax
@@ -5906,7 +6043,13 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
       return (
         <td
           style={td}
-          title={isInventoryError && displayTax === null ? "Insufficient inventory" : undefined}
+          title={
+            realizedBasisGap && displayTax === null
+              ? "Cost basis missing; realized tax cannot be computed"
+              : isInventoryError && displayTax === null
+                ? "Insufficient inventory"
+                : undefined
+          }
         >
           {maskMaybe?.(displayText)}
         </td>
@@ -8981,11 +9124,13 @@ function renderFillToasts() {
 
     const backendTax = pickOrderTaxUsdMaybe(o);
     const gainUsd = pickOrderGainUsdMaybe(o);
+    const realizedBasisGap = hasAppliedRealizedBasisGap(o);
     const symbolForTax = pickOrderSymbolStr(o);
     const shouldFallbackTax =
       !isCanceled &&
       !!aoTaxWithholdEnabled &&
       backendTax === null &&
+      !realizedBasisGap &&
       isUsdQuotedSymbol(symbolForTax) &&
       isFilledSellOrder(o) &&
       net !== null &&
@@ -9010,7 +9155,7 @@ function renderFillToasts() {
       String(o?.realized_status || "").trim().toLowerCase() === "unapplied" &&
       String(o?.realized_error || "").trim().toLowerCase() === "insufficient_inventory";
 
-    const taxValue = isCanceled
+    const taxValue = isCanceled || realizedBasisGap
       ? null
       : backendTax !== null
         ? backendTax
@@ -9026,7 +9171,7 @@ function renderFillToasts() {
 
     const taxForNet = taxValue === null ? 0 : Number(taxValue);
     const netAfterTax =
-      net === null || net === undefined || !Number.isFinite(Number(net))
+      realizedBasisGap || net === null || net === undefined || !Number.isFinite(Number(net))
         ? null
         : Number(net) - (Number.isFinite(taxForNet) ? taxForNet : 0);
 

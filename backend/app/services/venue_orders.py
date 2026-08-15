@@ -579,6 +579,16 @@ def refresh_venue_orders(db: Session, venue: str, force: bool = False) -> int:
     except Exception:
         pass
 
+    # CEXIUS-BASIS.TAX.1B: keep authenticated deposit history materialized so
+    # normal Sync+Load provides the quantity leg needed by venue-scoped FIFO.
+    # Basis is deliberately left missing unless authoritative source provenance exists.
+    if str(venue or "").strip().lower() == "cexius":
+        try:
+            from .cexius_basis_tax import sync_cexius_deposits
+            sync_cexius_deposits(db, adapter=adapter, wallet_id="default", dry_run=False, commit=True)
+        except Exception as exc:
+            logger.warning("Cexius deposit-history materialization failed: %r", exc)
+
     return upsert_count
 
 

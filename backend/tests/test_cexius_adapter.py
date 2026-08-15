@@ -465,6 +465,61 @@ class CexiusAdapterTests(unittest.TestCase):
         self.assertEqual([row["venue_order_id"] for row in rows], ["one", "two", "three"])
         self.assertEqual(request.call_count, 2)
 
+    def test_fee_asset_and_quote_net_are_inferred_from_cexius_side_semantics(self):
+        buy = self.adapter._normalize_order(
+            {
+                "id": "buy-skydoge",
+                "market": "SKYDOGE-USDT",
+                "side": "buy",
+                "type": "limit",
+                "status": "closed",
+                "amount": "7846.15",
+                "executed_amount": "7846.15",
+                "executed_volume": "0.050999975",
+                "price": "0.0000065",
+                "fee": "7.84615",
+            }
+        )
+        self.assertIsNotNone(buy)
+        self.assertEqual(buy["fee_asset"], "SKYDOGE")
+        self.assertAlmostEqual(buy["total_after_fee"], 0.050999975, places=12)
+
+        sell = self.adapter._normalize_order(
+            {
+                "id": "sell-skydoge",
+                "market": "SKYDOGE-USDT",
+                "side": "sell",
+                "type": "limit",
+                "status": "filled",
+                "quantity": "8325",
+                "filled_quantity": "8325",
+                "price": "0.000007",
+                "fee": "0.000058275",
+            }
+        )
+        self.assertIsNotNone(sell)
+        self.assertEqual(sell["fee_asset"], "USDT")
+        self.assertAlmostEqual(sell["total_after_fee"], 0.058216725, places=12)
+
+    def test_explicit_cexius_fee_asset_remains_authoritative(self):
+        row = self.adapter._normalize_order(
+            {
+                "id": "explicit-fee",
+                "market": "DOGE-USDT",
+                "side": "buy",
+                "type": "limit",
+                "status": "filled",
+                "quantity": "10",
+                "filled_quantity": "10",
+                "price": "0.1",
+                "fee": "0.001",
+                "fee_currency": "USDT",
+            }
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row["fee_asset"], "USDT")
+        self.assertAlmostEqual(row["total_after_fee"], 0.999, places=12)
+
     def test_dry_run_order_create_and_cancel_are_non_mutating(self):
         with patch.object(self.adapter, "_request_json") as request:
             placed = self.adapter.place_order(

@@ -1309,6 +1309,31 @@ class GeminiAdapter(ExchangeAdapter):
 
         return agg
 
+    def _quote_total_after_fee(
+        self,
+        *,
+        notional: Optional[float],
+        fee: Optional[float],
+        fee_asset: Optional[str],
+        symbol_canon: Optional[str],
+    ) -> Optional[float]:
+        """Return quote-unit total without mixing a differently denominated fee."""
+        if notional is None:
+            return None
+
+        total = float(notional)
+        quote_asset = None
+        canon = str(symbol_canon or "").strip().upper()
+        if "-" in canon:
+            quote_asset = (canon.split("-", 1)[1] or "").strip().upper() or None
+
+        fee_asset_u = str(fee_asset or "").strip().upper() or None
+        if fee is not None and quote_asset and fee_asset_u == quote_asset:
+            # Preserve Gemini's existing quote-fee Net behavior; only prevent
+            # subtraction when fee and notional are in different assets.
+            total = float(notional) - float(fee)
+        return total
+
     def fetch_orders(self, dry_run: bool) -> List[VenueOrder]:
         """
         IMPORTANT: dry_run should NOT disable read-only ingestion.
@@ -1444,12 +1469,15 @@ class GeminiAdapter(ExchangeAdapter):
                 elif filled_qty is not None and avg_fill_price is not None and filled_qty > 0 and avg_fill_price > 0:
                     notional_used = float(filled_qty) * float(avg_fill_price)
 
-                # Net: "Total minus fee" (per your requirement)
+                # Net remains quote-denominated. A base-asset fee must not be
+                # subtracted from quote notional; fee/fee_asset stay separate.
                 if notional_used is not None and notional_used > 0:
-                    if fee is not None:
-                        total_after_fee = float(notional_used) - float(fee)
-                    else:
-                        total_after_fee = float(notional_used)
+                    total_after_fee = self._quote_total_after_fee(
+                        notional=notional_used,
+                        fee=fee,
+                        fee_asset=fee_asset,
+                        symbol_canon=symbol_canon,
+                    )
 
                 status = self._infer_status(o)
                 created_at, updated_at = self._order_times(o, status)
@@ -1516,17 +1544,19 @@ class GeminiAdapter(ExchangeAdapter):
                 fee = a.get("fee") if isinstance(a.get("fee"), (int, float)) else None
                 fee_asset = a.get("fee_asset") if isinstance(a.get("fee_asset"), str) else None
 
-                total_after_fee = None
-                if fee is not None:
-                    total_after_fee = float(notional) - float(fee)
-                else:
-                    total_after_fee = float(notional)
+                symbol_canon = self._canon_from_symbol_venue(str(sym).lower())
+                total_after_fee = self._quote_total_after_fee(
+                    notional=float(notional),
+                    fee=float(fee) if fee is not None else None,
+                    fee_asset=fee_asset,
+                    symbol_canon=symbol_canon,
+                )
 
                 mapped: VenueOrder = {
                     "venue": self.venue,
                     "venue_order_id": str(oid),
                     "symbol_venue": str(sym).lower(),
-                    "symbol_canon": self._canon_from_symbol_venue(str(sym).lower()),
+                    "symbol_canon": symbol_canon,
                     "side": side,
                     "type": "exchange limit",
                     "status": "filled",

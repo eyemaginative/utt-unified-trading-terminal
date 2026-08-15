@@ -2254,13 +2254,20 @@ class CryptoComExchangeAdapter(ExchangeAdapter):
         total_after_fee = None
         cum_value = self._safe_float(r.get("cumulative_value") or r.get("filled_value") or r.get("notional"))
         if cum_value is not None:
-            if fee is not None:
+            # cumulative_value is quote-denominated. Only combine a fee with it
+            # when the API explicitly says the fee is charged in that same quote
+            # asset. Base-token fees remain separate and are exposed via
+            # fee/fee_asset for the All Orders quantity-after-fee display.
+            total_after_fee = float(cum_value)
+            quote_asset = None
+            if symbol_canon and "-" in symbol_canon:
+                quote_asset = self._canon_asset(symbol_canon.split("-", 1)[1]).upper() or None
+            fee_asset_canon = self._canon_asset(fee_asset).upper() if fee_asset else None
+            if fee is not None and quote_asset and fee_asset_canon == quote_asset:
                 if side == "buy":
                     total_after_fee = float(cum_value) + float(fee)
                 elif side == "sell":
                     total_after_fee = float(cum_value) - float(fee)
-            else:
-                total_after_fee = float(cum_value)
 
         venue_order_id = str(r.get("order_id") or r.get("orderId") or r.get("id") or "").strip()
 

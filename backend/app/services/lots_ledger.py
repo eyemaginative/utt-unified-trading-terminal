@@ -414,16 +414,19 @@ def fifo_consume_sell_fifo(
 
     effective_at = as_of
 
-    stmt = (
-        select(BasisLot)
-        .where(
-            BasisLot.venue == v,
-            BasisLot.wallet_id == w,
-            BasisLot.asset == a,
-            BasisLot.qty_remaining > 0,
-        )
-        # IMPORTANT: stable FIFO tie-breaker
-        .order_by(asc(BasisLot.acquired_at), asc(BasisLot.created_at), asc(BasisLot.id))
+    stmt = select(BasisLot).where(
+        BasisLot.venue == v,
+        BasisLot.wallet_id == w,
+        BasisLot.asset == a,
+        BasisLot.qty_remaining > 0,
+    )
+    if effective_at is not None:
+        # A historical sell must never consume inventory acquired after the sell.
+        stmt = stmt.where(BasisLot.acquired_at <= effective_at)
+    stmt = stmt.order_by(
+        asc(BasisLot.acquired_at),
+        asc(BasisLot.created_at),
+        asc(BasisLot.id),
     )
     lots = db.execute(stmt).scalars().all()
 

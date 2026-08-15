@@ -55,14 +55,95 @@ def _parse_base_asset(symbol_canon: Optional[str], symbol_venue: Optional[str]) 
     return None
 
 
+_USD_LIKE_ASSETS = {"USD", "USDC", "USDT", "USDG"}
+
+
 def _fee_usd_estimate(fee: Any, fee_asset: Any) -> Optional[float]:
     f = _safe_float(fee)
     a = str(fee_asset or "").strip().upper()
     if f is None:
         return None
-    if a in ("USD", "USDC"):
+    if a in _USD_LIKE_ASSETS:
         return float(f)
     return None
+
+
+def _parse_market_assets(symbol_canon: Optional[str], symbol_venue: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    s = (symbol_canon or symbol_venue or "").strip().upper()
+    if not s:
+        return None, None
+    for sep in ("-", "/", "_", ":"):
+        if sep in s:
+            left, right = s.split(sep, 1)
+            return (left.strip().upper() or None, right.strip().upper() or None)
+    return None, None
+
+
+def _venue_order_accounting_values(vrow: VenueOrderRow) -> Dict[str, Any]:
+    """Return quantity/price/fee inputs for the existing lot/FIFO engine.
+
+    Generic venues preserve the pre-existing behavior. Cexius gets the narrow
+    accounting semantics established by CEXIUS-BASIS.TAX.1A evidence:
+      * BUY base-asset fees reduce acquired quantity; USDT consideration is basis.
+      * SELL quote-asset fees reduce net proceeds; gross quote reconstructs price.
+    """
+    venue = _norm_venue(getattr(vrow, "venue", None))
+    side = str(getattr(vrow, "side", "") or "").strip().lower()
+    base, quote = _parse_market_assets(
+        getattr(vrow, "symbol_canon", None),
+        getattr(vrow, "symbol_venue", None),
+    )
+
+    filled_qty = _safe_float(getattr(vrow, "filled_qty", None))
+    order_qty = _safe_float(getattr(vrow, "qty", None))
+    qty = filled_qty if (filled_qty is not None and filled_qty > 0) else (order_qty or 0.0)
+    price_usd = _safe_float(getattr(vrow, "avg_fill_price", None))
+    fee = _safe_float(getattr(vrow, "fee", None))
+    fee_asset = str(getattr(vrow, "fee_asset", None) or "").strip().upper()
+    fee_usd = _fee_usd_estimate(fee, fee_asset)
+
+    if venue != "cexius" or quote not in _USD_LIKE_ASSETS or qty <= 0:
+        return {
+            "venue": venue, "side": side, "base": base, "quote": quote,
+            "qty": float(qty), "price_usd": price_usd, "fee_usd": fee_usd,
+        }
+
+    quote_value = _safe_float(getattr(vrow, "total_after_fee", None))
+
+    if side == "buy" and base and fee_asset == base and quote_value is not None and quote_value >= 0:
+        acquired_qty = float(qty) - float(fee or 0.0)
+        if acquired_qty > 0:
+            return {
+                "venue": venue, "side": side, "base": base, "quote": quote,
+                "qty": acquired_qty,
+                "price_usd": (float(quote_value) / acquired_qty) if quote_value > 0 else None,
+                "fee_usd": None,
+            }
+
+    if side == "sell" and quote_value is not None and quote_value >= 0:
+        # The accepted Cexius adapter makes total_after_fee net quote proceeds.
+        # Reconstruct gross quote only when the fee is explicitly quote-denominated.
+        if fee_asset == quote:
+            quote_fee = float(fee or 0.0)
+            gross_quote = float(quote_value) + quote_fee
+            return {
+                "venue": venue, "side": side, "base": base, "quote": quote,
+                "qty": float(qty),
+                "price_usd": (gross_quote / float(qty)) if gross_quote > 0 else None,
+                "fee_usd": quote_fee,
+            }
+        if not fee_asset and (fee is None or fee == 0):
+            return {
+                "venue": venue, "side": side, "base": base, "quote": quote,
+                "qty": float(qty),
+                "price_usd": (float(quote_value) / float(qty)) if quote_value > 0 else None,
+                "fee_usd": None,
+            }
+
+    return {
+        "venue": venue, "side": side, "base": base, "quote": quote,
+        "qty": float(qty), "price_usd": price_usd, "fee_usd": fee_usd,
+    }
 
 
 def _robinhood_chain_swap_reconciliation(row: RobinhoodChainSwapExecution) -> Dict[str, Any]:
@@ -104,19 +185,28 @@ def _parse_cursor(cursor: Optional[str]) -> Optional[Tuple[datetime, str]]:
     return (ts, id_s)
 
 
-def _available_qty(db: Session, *, venue: str, wallet_id: str, asset: str) -> float:
+def _available_qty(
+    db: Session,
+    *,
+    venue: str,
+    wallet_id: str,
+    asset: str,
+    as_of: Optional[datetime] = None,
+) -> float:
     v = _norm_venue(venue)
     w = _norm_wallet(wallet_id)
     a = str(asset or "").strip().upper()
 
-    x = db.execute(
-        select(func.coalesce(func.sum(BasisLot.qty_remaining), 0.0)).where(
-            BasisLot.venue == v,
-            BasisLot.wallet_id == w,
-            BasisLot.asset == a,
-            BasisLot.qty_remaining > 0,
-        )
-    ).scalar()
+    stmt = select(func.coalesce(func.sum(BasisLot.qty_remaining), 0.0)).where(
+        BasisLot.venue == v,
+        BasisLot.wallet_id == w,
+        BasisLot.asset == a,
+        BasisLot.qty_remaining > 0,
+    )
+    if as_of is not None:
+        stmt = stmt.where(BasisLot.acquired_at <= as_of)
+
+    x = db.execute(stmt).scalar()
     try:
         return float(x or 0.0)
     except Exception:
@@ -326,7 +416,7 @@ def _consume_sell_if_needed(
     if j.applied:
         return {"skipped": True, "reason": "already_applied", "journal_id": j.id}
 
-    avail = _available_qty(db, venue=venue, wallet_id=wallet_id, asset=asset)
+    avail = _available_qty(db, venue=venue, wallet_id=wallet_id, asset=asset, as_of=effective_at)
 
     if dry_run:
         if float(avail) + 1e-12 < float(qty):
@@ -673,19 +763,14 @@ def sync_lots_from_activity(
                         _bump_skip("missing_data")
                         continue
 
-                    # qty selection: prefer filled_qty if >0, else fall back to qty if >0
-                    filled_qty = _safe_float(getattr(vrow, "filled_qty", None))
-                    order_qty = _safe_float(getattr(vrow, "qty", None))
-                    qty = (filled_qty if (filled_qty is not None and filled_qty > 0) else (order_qty or 0.0))
+                    accounting = _venue_order_accounting_values(vrow)
+                    qty = float(accounting.get("qty") or 0.0)
+                    price = _safe_float(accounting.get("price_usd"))
+                    fee_usd = _safe_float(accounting.get("fee_usd"))
 
                     if qty <= 0:
                         _bump_skip("missing_data")
                         continue
-
-                    price = _safe_float(getattr(vrow, "avg_fill_price", None))
-                    fee = _safe_float(getattr(vrow, "fee", None))
-                    fee_asset = getattr(vrow, "fee_asset", None)
-                    fee_usd = _fee_usd_estimate(fee, fee_asset)
 
                     ts = (
                         getattr(vrow, "updated_at", None)

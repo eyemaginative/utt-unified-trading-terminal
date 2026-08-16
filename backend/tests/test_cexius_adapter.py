@@ -39,7 +39,7 @@ class CexiusAdapterTests(unittest.TestCase):
         self.adapter = CexiusAdapter()
 
     def test_vault_token_requires_read_scope_prefers_secret_and_falls_back_to_key(self):
-        settings = Settings(_env_file=None, SQLITE_PATH="unused.db")
+        settings = Settings(_env_file=None, SQLITE_PATH=":memory:")
         record = {
             "scope_read": True,
             "scope_trade": True,

@@ -71,7 +71,7 @@ class CredentialVaultSecurityTests(unittest.TestCase):
             self.assertGreaterEqual(len(signing_secret), 48)
             self.assertNotEqual(signing_secret, "utt-dev-secret")
 
-            settings = Settings(_env_file=None, SQLITE_PATH="unused.db")
+            settings = Settings(_env_file=None, SQLITE_PATH=":memory:")
             self.assertIsNone(settings._vault_fernet())
 
     def test_legacy_schema_migrates_without_reencrypting_existing_rows(self):

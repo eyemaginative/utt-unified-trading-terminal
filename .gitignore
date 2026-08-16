@@ -46,6 +46,7 @@ frontend/src/assets/*
 !frontend/src/assets/utt-banner.jpg
 
 # Local DB / runtime artifacts
+*.db
 *.sqlite
 *.sqlite3
 backend/data/*.db

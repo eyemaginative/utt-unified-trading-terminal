@@ -320,6 +320,8 @@ const workspaceShellStyles = {
 
 const ALL_VENUES_VALUE = "ALL";
 const ROBINHOOD_CHAIN_VENUE = "robinhood_chain";
+const SOLANA_JUPITER_VENUE = "solana_jupiter";
+const LEGACY_SOLANA_DEX_VENUE = "solana_dex";
 
 // NOTE: This list is used for *core trading/balances polling* fallback.
 // Do not restrict it to “discovery-capable” venues.
@@ -1756,6 +1758,82 @@ async function appFetchWalletAddressSnapshotPortfolioTotalsUsd() {
   }
 }
 
+async function appFetchRobinhoodChainUnregisteredBalanceRows(opts = {}) {
+  try {
+    const limitRaw = Number(opts?.limit ?? 50);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, Math.trunc(limitRaw))) : 50;
+    const qs = new URLSearchParams({
+      limit: String(limit),
+      positive_only: "true",
+      force_refresh: opts?.force_refresh ? "true" : "false",
+    });
+    const walletAddressId = String(opts?.wallet_address_id || opts?.walletAddressId || "").trim();
+    if (walletAddressId) qs.set("wallet_address_id", walletAddressId);
+
+    const payload = await appFetchJson(
+      `/api/robinhood_chain/registry-discovery/unregistered-wallet-assets?${qs.toString()}`
+    );
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    return items.map((item) => {
+      const asset = String(item?.symbol || item?.onchain_symbol || item?.provider_symbol || "UNKNOWN")
+        .trim()
+        .toUpperCase() || "UNKNOWN";
+      const exactBalance = String(item?.balance_token ?? "").trim();
+      const qty = appFiniteNumberOrNull(exactBalance) ?? 0;
+      const contract = String(item?.contract_address || "").trim();
+      const walletAddress = String(item?.wallet_address || "").trim();
+      return {
+        venue: ROBINHOOD_CHAIN_VENUE,
+        source_type: "Wallet Addresses / Robinhood Chain discovery",
+        network: ROBINHOOD_CHAIN_VENUE,
+        chain: ROBINHOOD_CHAIN_VENUE,
+        wallet_id: ROBINHOOD_CHAIN_VENUE,
+        wallet_address_id: item?.wallet_address_id || null,
+        address: walletAddress,
+        wallet_address: walletAddress,
+        asset,
+        symbol: asset,
+        total: qty,
+        available: qty,
+        hold: 0,
+        px_usd: null,
+        total_usd: null,
+        available_usd: null,
+        hold_usd: 0,
+        usd_source_symbol: "—",
+        price_status: "unpriced",
+        price_basis: null,
+        registry_id: null,
+        registry_venue: null,
+        registry_status: "unregistered",
+        contract_address: contract,
+        token_decimals: item?.decimals ?? null,
+        balance_exact: exactBalance || null,
+        balance_atomic: item?.balance_atomic ?? null,
+        unregistered_token: true,
+        candidate_ready_to_register: item?.ready_to_register === true,
+        candidate_metadata_status: String(item?.metadata_status || "").trim() || null,
+        candidate_symbol_conflict: item?.symbol_conflict === true,
+        candidate_conflicting_registry_ids: Array.isArray(item?.conflicting_registry_ids)
+          ? item.conflicting_registry_ids
+          : [],
+        candidate_name: item?.name || item?.onchain_name || null,
+        provider_symbol: item?.provider_symbol || null,
+        provider_decimals: item?.provider_decimals ?? null,
+        last_seen_at: item?.last_seen_at || null,
+        event_count: Number(item?.event_count || 0),
+        read_only: true,
+        portfolio_included: false,
+        balance_status: "unregistered",
+        fetched_at: item?.last_seen_at || null,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+
 async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
   try {
     const networkFilter = String(opts?.network || "").trim().toLowerCase() || undefined;
@@ -1778,7 +1856,7 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
       ? await appLoadRobinhoodChainRegistryMap()
       : {};
 
-    return (rows || []).map((row) => {
+    const snapshotRows = (rows || []).map((row) => {
       const asset = String(row?.asset || row?.symbol || "").toUpperCase().trim();
       if (!asset || !appWalletSnapshotIsUserPortfolioRow(row)) return null;
 
@@ -1830,6 +1908,18 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
         fetched_at: row?.fetched_at || row?.captured_at || row?.created_at || null,
       };
     }).filter(Boolean);
+
+    const includeRobinhoodCandidates = (
+      (!networkFilter || networkFilter === ROBINHOOD_CHAIN_VENUE) &&
+      (!walletIdFilter || walletIdFilter.toLowerCase() === ROBINHOOD_CHAIN_VENUE)
+    );
+    if (!includeRobinhoodCandidates) return snapshotRows;
+
+    const unregisteredRows = await appFetchRobinhoodChainUnregisteredBalanceRows({
+      limit: 50,
+      force_refresh: false,
+    });
+    return [...snapshotRows, ...unregisteredRows];
   } catch {
     return [];
   }
@@ -1859,6 +1949,23 @@ function appFilterLiveDexRowsAlreadyCoveredByWalletSnapshots(dexRows, walletRows
   return (dexRows || []).filter((row) => {
     const key = appPortfolioBalanceDedupKey(row);
     return !key || !walletKeys.has(key);
+  });
+}
+
+function appFilterCounterpartyBtcAlreadyCoveredByWalletSnapshots(counterpartyRows, walletRows) {
+  const walletBtcAddresses = new Set(
+    (walletRows || [])
+      .filter((row) => String(row?.asset || row?.symbol || "").trim().toUpperCase() === "BTC")
+      .map((row) => String(row?.address || row?.wallet_address || row?.walletAddress || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  if (!walletBtcAddresses.size) return counterpartyRows || [];
+
+  return (counterpartyRows || []).filter((row) => {
+    const asset = String(row?.asset || row?.symbol || "").trim().toUpperCase();
+    if (asset !== "BTC") return true;
+    const address = String(row?.address || row?.wallet_address || row?.walletAddress || "").trim().toLowerCase();
+    return !address || !walletBtcAddresses.has(address);
   });
 }
 
@@ -2316,6 +2423,16 @@ function discoveryViewKey(venue, symbolCanon) {
 
 function normalizeVenue(v) {
   return String(v || "").trim().toLowerCase();
+}
+
+function isAllVenuesValue(v) {
+  return normalizeVenue(v) === normalizeVenue(ALL_VENUES_VALUE);
+}
+
+function canonicalizeUserVenue(v) {
+  const venue = normalizeVenue(v);
+  if (isAllVenuesValue(venue)) return ALL_VENUES_VALUE;
+  return venue === LEGACY_SOLANA_DEX_VENUE ? SOLANA_JUPITER_VENUE : venue;
 }
 
 function normalizeVenueAliasKey(v) {
@@ -2841,14 +2958,30 @@ export default function App() {
       const raw = localStorage.getItem(LS_VENUE_OVERRIDES_KEY);
       if (!raw) return {};
       const obj = JSON.parse(raw);
-      return obj && typeof obj === "object" ? obj : {};
+      if (!obj || typeof obj !== "object") return {};
+
+      if (Object.prototype.hasOwnProperty.call(obj, LEGACY_SOLANA_DEX_VENUE)) {
+        const next = { ...obj };
+        if (!Object.prototype.hasOwnProperty.call(next, SOLANA_JUPITER_VENUE)) {
+          next[SOLANA_JUPITER_VENUE] = !!next[LEGACY_SOLANA_DEX_VENUE];
+        }
+        delete next[LEGACY_SOLANA_DEX_VENUE];
+        try {
+          localStorage.setItem(LS_VENUE_OVERRIDES_KEY, JSON.stringify(next));
+        } catch {
+          // ignore
+        }
+        return next;
+      }
+
+      return obj;
     } catch {
       return {};
     }
   });
 
   const setVenueOverride = useCallback((venueId, enabled) => {
-    const k = String(venueId || "").trim().toLowerCase();
+    const k = canonicalizeUserVenue(venueId);
     if (!k) return;
     setVenueOverrides((prev) => {
       const next = { ...(prev && typeof prev === "object" ? prev : {}) };
@@ -2892,8 +3025,17 @@ export default function App() {
       if (Object.prototype.hasOwnProperty.call(venueOverrides || {}, id)) return !!venueOverrides[id];
       return true;
     });
-    return normalizeVenueList([...(venuesEnabled || []), ...localDexVenues]);
+    return normalizeVenueList([...(venuesEnabled || []), ...localDexVenues]).filter(
+      (v) => v !== LEGACY_SOLANA_DEX_VENUE
+    );
   }, [venuesEnabled, venueOverrides]);
+
+  const venuesRawForHeader = useMemo(() => {
+    return (Array.isArray(venuesRaw) ? venuesRaw : []).filter((row) => {
+      const id = normalizeVenue(row?.venue ?? row?.id ?? row?.slug ?? row?.key ?? row?.code ?? row?.name ?? "");
+      return id !== LEGACY_SOLANA_DEX_VENUE;
+    });
+  }, [venuesRaw]);
 
   const tradingVenues = useMemo(() => venuesEnabled.filter((v) => !!v?.supports?.trading), [venuesEnabled]);
   const orderbookVenues = useMemo(() => venuesEnabled.filter((v) => !!v?.supports?.orderbook), [venuesEnabled]);
@@ -3085,10 +3227,18 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (venue === ALL_VENUES_VALUE) return;
+    if (isAllVenuesValue(venue)) {
+      if (venue !== ALL_VENUES_VALUE) setVenue(ALL_VENUES_VALUE);
+      return;
+    }
 
     const v = String(venue || "").trim().toLowerCase();
     if (!v) return;
+
+    if (v === LEGACY_SOLANA_DEX_VENUE) {
+      setVenue(SOLANA_JUPITER_VENUE);
+      return;
+    }
 
     // While we're syncing from the URL, do not force venue fallback.
     if (routeSyncRef.current) return;
@@ -3096,7 +3246,7 @@ export default function App() {
     // If the URL encodes a venue that isn't loaded yet, allow the route-sync logic to reconcile.
     try {
       const parsed = parseMarketRoute(window.location.pathname);
-      const urlVenue = parsed ? normalizeVenue(parsed.venue) : "";
+      const urlVenue = parsed ? canonicalizeUserVenue(parsed.venue) : "";
       if (urlVenue && urlVenue === v) return;
     } catch {
       // ignore
@@ -3143,7 +3293,7 @@ export default function App() {
   const suppressAllOrdersReloadOnceRef = useRef(false);
 
   function setUrlForMarket(nextVenue, nextSymbol, { replace = false } = {}) {
-    const v = normalizeVenue(nextVenue);
+    const v = canonicalizeUserVenue(nextVenue);
     const s = normalizeSymbolCanon(nextSymbol);
 
     const basePath = buildMarketRoute(v, s);
@@ -3158,24 +3308,28 @@ export default function App() {
 
   // Wrapper so changing the Venue dropdown also updates the URL (using current Market, if present)
   function setVenueFromHeader(nextVenue) {
-    setVenue(nextVenue);
+    const canonicalVenue = canonicalizeUserVenue(nextVenue);
+    setVenue(canonicalVenue);
+
+    // ALL is a UI aggregate mode, not a backend trading venue or /market/:venue route.
+    if (isAllVenuesValue(canonicalVenue)) return;
 
     // If we are currently syncing *from* the URL, do not write back into it.
     if (routeSyncRef.current) return;
 
     const sym = String(marketInput || "").trim().toUpperCase();
     // Keep URL in sync even if sym is empty (then route becomes /market/:venue)
-    setUrlForMarket(nextVenue, sym, { replace: true });
+    setUrlForMarket(canonicalVenue, sym, { replace: true });
   }
 
   // Picks a safe venue string for URL routes.
   // - Never writes ALL/unknown venues into the URL (because /market/:venue is validated against supportedVenues)
   // - Prefers an explicitly provided venue if valid; otherwise falls back to current venue; otherwise first supported venue.
   function pickUrlVenue(preferredVenue) {
-    const cand = normalizeVenue(preferredVenue);
+    const cand = canonicalizeUserVenue(preferredVenue);
     if (cand && Array.isArray(supportedVenues) && supportedVenues.includes(cand)) return cand;
 
-    const cur = normalizeVenue(venue);
+    const cur = canonicalizeUserVenue(venue);
     const allNorm = normalizeVenue(ALL_VENUES_VALUE);
     if (cur && cur !== allNorm && Array.isArray(supportedVenues) && supportedVenues.includes(cur)) return cur;
 
@@ -3190,7 +3344,7 @@ export default function App() {
       const parsed = parseMarketRoute(pathname);
       if (!parsed) return;
 
-      const nextVenue = normalizeVenue(parsed.venue);
+      const nextVenue = canonicalizeUserVenue(parsed.venue);
       const nextSymbol = normalizeSymbolCanon(parsed.symbol);
 
       const sup = Array.isArray(supportedVenuesRef.current) ? supportedVenuesRef.current : [];
@@ -3247,7 +3401,7 @@ export default function App() {
       routeSyncRef.current = true;
       const parsed = parseMarketRoute(window.location.pathname);
       if (!parsed) return;
-      const nextVenue = normalizeVenue(parsed.venue);
+      const nextVenue = canonicalizeUserVenue(parsed.venue);
       const nextSymbol = normalizeSymbolCanon(parsed.symbol);
       if (nextVenue && supportedVenues.includes(nextVenue)) setVenue(nextVenue);
       if (nextSymbol) setMarketInput(nextSymbol);
@@ -4398,7 +4552,7 @@ export default function App() {
 
     const reqId = ++balancesReqIdRef.current;
 
-    const isAllVenuesView = venue === ALL_VENUES_VALUE;
+    const isAllVenuesView = isAllVenuesValue(venue);
     const isCounterpartyView = normalizeVenue(venue) === "counterparty";
     const isRobinhoodChainView = normalizeVenue(venue) === ROBINHOOD_CHAIN_VENUE;
 
@@ -4418,7 +4572,7 @@ export default function App() {
       (arr || []).filter((v) => {
         const vNorm = normalizeVenue(v);
         if (!vNorm) return false;
-        if (vNorm === ALL_VENUES_VALUE) return false;
+        if (isAllVenuesValue(vNorm)) return false;
         if (POISON_BALANCES_REFRESH_VENUES.has(vNorm)) return false;
         return venueSupports(vNorm, "balances");
       });
@@ -4589,7 +4743,11 @@ export default function App() {
           const walletSnapshotRowsForEmptyAllView = await appFetchWalletAddressSnapshotPortfolioBalanceRows();
           const liveDexRowsForEmptyAllView = await appFetchDexPortfolioBalanceRows();
           const dexBalanceRowsForEmptyAllView = appFilterLiveDexRowsAlreadyCoveredByWalletSnapshots(liveDexRowsForEmptyAllView, walletSnapshotRowsForEmptyAllView);
-          const counterpartyRowsForEmptyAllView = await appFetchCounterpartyPortfolioBalanceRows();
+          const rawCounterpartyRowsForEmptyAllView = await appFetchCounterpartyPortfolioBalanceRows();
+          const counterpartyRowsForEmptyAllView = appFilterCounterpartyBtcAlreadyCoveredByWalletSnapshots(
+            rawCounterpartyRowsForEmptyAllView,
+            walletSnapshotRowsForEmptyAllView
+          );
           const emptyDisplayRows = [
             ...walletSnapshotRowsForEmptyAllView,
             ...dexBalanceRowsForEmptyAllView,
@@ -4669,7 +4827,11 @@ export default function App() {
         walletSnapshotRowsForCurrentAllView = await appFetchWalletAddressSnapshotPortfolioBalanceRows();
         const liveDexRows = await appFetchDexPortfolioBalanceRows();
         dexBalanceRowsForCurrentAllView = appFilterLiveDexRowsAlreadyCoveredByWalletSnapshots(liveDexRows, walletSnapshotRowsForCurrentAllView);
-        counterpartyRowsForCurrentAllView = await appFetchCounterpartyPortfolioBalanceRows();
+        const rawCounterpartyRowsForCurrentAllView = await appFetchCounterpartyPortfolioBalanceRows();
+        counterpartyRowsForCurrentAllView = appFilterCounterpartyBtcAlreadyCoveredByWalletSnapshots(
+          rawCounterpartyRowsForCurrentAllView,
+          walletSnapshotRowsForCurrentAllView
+        );
 
         for (const row of [...walletSnapshotRowsForCurrentAllView, ...dexBalanceRowsForCurrentAllView, ...counterpartyRowsForCurrentAllView]) {
           const tu = Number(row?.total_usd);
@@ -4733,7 +4895,12 @@ export default function App() {
       const dexTotals = await appFetchDexPortfolioTotalsUsd();
       const dexTotal = Number.isFinite(Number(dexTotals?.totalUsd)) ? Number(dexTotals.totalUsd) : 0;
       allTotal += dexTotal;
-      const counterpartyRowsForTotal = await appFetchCounterpartyPortfolioBalanceRows();
+      const walletSnapshotRowsForTotal = await appFetchWalletAddressSnapshotPortfolioBalanceRows();
+      const rawCounterpartyRowsForTotal = await appFetchCounterpartyPortfolioBalanceRows();
+      const counterpartyRowsForTotal = appFilterCounterpartyBtcAlreadyCoveredByWalletSnapshots(
+        rawCounterpartyRowsForTotal,
+        walletSnapshotRowsForTotal
+      );
       const counterpartyTotalForTotal = appCounterpartyRowsTotalUsd(counterpartyRowsForTotal);
       if (counterpartyTotalForTotal !== null) allTotal += counterpartyTotalForTotal;
 
@@ -4760,6 +4927,101 @@ export default function App() {
     }
   }
 
+  async function doRegisterRobinhoodChainCandidate(candidate) {
+    const symbol = String(candidate?.symbol || candidate?.asset || "").trim().toUpperCase();
+    const contract = String(candidate?.contract_address || "").trim();
+    const decimals = Number(candidate?.token_decimals ?? candidate?.decimals);
+    const exactBalance = String(candidate?.balance_exact ?? candidate?.total ?? "").trim();
+    const ready = candidate?.candidate_ready_to_register === true;
+
+    try {
+      if (!ready || !symbol || !/^0x[0-9a-fA-F]{40}$/.test(contract) || !Number.isInteger(decimals) || decimals < 0 || decimals > 18) {
+        throw new Error(
+          `Robinhood Chain candidate is not ready for direct registration (${String(candidate?.candidate_metadata_status || "identity incomplete")}).`
+        );
+      }
+
+      const confirmed = window.confirm(
+        [
+          "Add this detected Robinhood Chain ERC-20 to Token Registry?",
+          "",
+          `Symbol: ${symbol}`,
+          `Contract: ${contract}`,
+          `Decimals: ${decimals}`,
+          `Current balance: ${exactBalance || "unknown"}`,
+          "",
+          "Identity is keyed by Robinhood Chain + exact contract address. Registration is explicit and does not request a wallet signature.",
+        ].join("\\n")
+      );
+      if (!confirmed) return { ok: false, cancelled: true };
+
+      setError(null);
+      const base = String(API_BASE || "").replace(/\/+$/, "");
+      const headers = {
+        ...appAuthHeaders(),
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      };
+      const response = await fetch(`${base}/api/token_registry`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          chain: ROBINHOOD_CHAIN_VENUE,
+          symbol,
+          address: contract,
+          asset_kind: "erc20",
+          decimals,
+          label: String(candidate?.candidate_name || symbol).trim() || symbol,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.ok === false) {
+        const detail = payload?.detail ?? payload?.error ?? `HTTP ${response.status}`;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+
+      const tokenId = Number(payload?.item?.id);
+      if (Number.isInteger(tokenId) && tokenId > 0) {
+        const verifyResponse = await fetch(
+          `${base}/api/robinhood_chain/registry-discovery/assets/${encodeURIComponent(String(tokenId))}/verify`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ force_refresh: true, confirm_verify: true }),
+          }
+        );
+        const verifyPayload = await verifyResponse.json().catch(() => ({}));
+        if (!verifyResponse.ok || verifyPayload?.ok === false) {
+          const detail = verifyPayload?.detail ?? verifyPayload?.error ?? `HTTP ${verifyResponse.status}`;
+          throw new Error(
+            `Token Registry row was created, but Robinhood Chain verification failed: ${
+              typeof detail === "string" ? detail : JSON.stringify(detail)
+            }`
+          );
+        }
+      }
+
+      appRobinhoodChainRegistryCache = { fetchedAt: 0, bySymbol: {} };
+      const refreshResult = await appRefreshRobinhoodChainWalletBalances();
+      const refreshErrors = Array.isArray(refreshResult?.errors) ? refreshResult.errors : [];
+      if (refreshErrors.length) {
+        setError(
+          `Token ${symbol} was registered, but Robinhood Chain balance refresh reported ${refreshErrors.length} token/address error${refreshErrors.length === 1 ? "" : "s"}.`
+        );
+      }
+      await doRefreshBalances({
+        forceAllVenuesTotal: true,
+        refreshRobinhoodChain: false,
+        liveRefresh: false,
+      });
+      return payload;
+    } catch (e) {
+      const message = String(e?.message || e || "Robinhood Chain token registration failed");
+      setError(message);
+      throw e;
+    }
+  }
+
   // Recompute ONLY the header “All Venues” total without depending on current tab/venue.
   async function refreshAllVenuesTotalOnlySafe() {
     try {
@@ -4770,7 +5032,7 @@ export default function App() {
           : supportedVenues
       )
         .map((v) => normalizeVenue(v))
-        .filter((v) => v && v !== ALL_VENUES_VALUE)
+        .filter((v) => v && !isAllVenuesValue(v))
         .filter((v) => !POISON_BALANCES_REFRESH_VENUES.has(v))
         .filter((v) => venueSupports(v, "balances"));
 
@@ -4814,7 +5076,12 @@ export default function App() {
       const dexTotals = await appFetchDexPortfolioTotalsUsd();
       const dexTotal = Number.isFinite(Number(dexTotals?.totalUsd)) ? Number(dexTotals.totalUsd) : 0;
       totalUsd += dexTotal;
-      const counterpartyRows = await appFetchCounterpartyPortfolioBalanceRows();
+      const walletSnapshotRowsForTotal = await appFetchWalletAddressSnapshotPortfolioBalanceRows();
+      const rawCounterpartyRows = await appFetchCounterpartyPortfolioBalanceRows();
+      const counterpartyRows = appFilterCounterpartyBtcAlreadyCoveredByWalletSnapshots(
+        rawCounterpartyRows,
+        walletSnapshotRowsForTotal
+      );
       const counterpartyTotal = appCounterpartyRowsTotalUsd(counterpartyRows);
       if (counterpartyTotal !== null) totalUsd += counterpartyTotal;
 
@@ -4857,7 +5124,7 @@ export default function App() {
 
   async function doLoadOrders() {
     try {
-      if (venue === ALL_VENUES_VALUE) {
+      if (isAllVenuesValue(venue)) {
         setOrders([]);
         setError("Local Orders requires a single venue. Please select a venue (not ALL).");
         return;
@@ -5257,7 +5524,19 @@ export default function App() {
 
       // If a specific venue was requested, refresh only an exact canonical match.
       // Unknown/noncanonical text must never fall through to an all-venue refresh.
-      const venuesToRefresh = wantsAllVenues ? refreshCandidates : refreshCandidates.includes(v) ? [v] : [];
+      //
+      // SOL-JUP.VOREFRESH.1B: Jupiter already has the dedicated Solana
+      // ingest/materialization path below and is not accepted by the generic
+      // /api/venue_orders/refresh schema. Keep it out of the generic fan-out
+      // instead of broadening the CEX-style venue-order refresh contract.
+      const genericVenueOrderRefreshCandidates = refreshCandidates.filter(
+        (vv) => vv !== SOLANA_JUPITER_VENUE
+      );
+      const venuesToRefresh = wantsAllVenues
+        ? genericVenueOrderRefreshCandidates
+        : genericVenueOrderRefreshCandidates.includes(v)
+          ? [v]
+          : [];
 
       // RH-WALLET.INGEST.1E-R3: Robinhood Chain wallet history is a read-only
       // order-history source, not a generic trading-capable venue. Do not gate
@@ -5367,9 +5646,9 @@ export default function App() {
         const rhWalletSyncResult = await runCrossTabHeavyTask(
           rhWalletSyncKey,
           async () => {
+            const rhErrors = [];
             try {
               await syncRobinhoodChainWalletIncremental();
-              return [];
             } catch (e) {
               const msg = e?.response?.data?.detail?.message
                 || e?.response?.data?.detail?.error
@@ -5378,6 +5657,32 @@ export default function App() {
                 || String(e || "unknown error");
               return [{ venue: "robinhood_chain:wallet_ingest", msg: String(msg) }];
             }
+
+            // RH-CUSTOM.BAL.AUTO.1B: once external wallet evidence has been
+            // ingested/materialized, refresh the same saved ALL / robinhood_chain
+            // account-level balance snapshots from UTT's registry + RPC path.
+            // This is best-effort: balance-refresh errors are surfaced without
+            // blocking All Orders visibility or the following Ledger/FIFO sync.
+            try {
+              const balanceRefresh = await appRefreshRobinhoodChainWalletBalances();
+              appRobinhoodChainRegistryCache = { fetchedAt: 0, bySymbol: {} };
+              const balanceErrors = Array.isArray(balanceRefresh?.errors) ? balanceRefresh.errors : [];
+              if (balanceErrors.length) {
+                rhErrors.push({
+                  venue: "robinhood_chain:balances",
+                  msg: `balance refresh reported ${balanceErrors.length} token/address error${balanceErrors.length === 1 ? "" : "s"}`,
+                });
+              }
+            } catch (e) {
+              const msg = e?.response?.data?.detail?.message
+                || e?.response?.data?.detail?.error
+                || e?.response?.data?.detail
+                || e?.message
+                || String(e || "unknown error");
+              rhErrors.push({ venue: "robinhood_chain:balances", msg: String(msg) });
+            }
+
+            return rhErrors;
           },
           { leaseMs: 180000, waitMs: 45000 }
         );
@@ -5563,7 +5868,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
     const v = String(discVenue || "").trim().toLowerCase();
     if (v && supportedVenues.includes(v)) return v;
 
-    const cur = venue === ALL_VENUES_VALUE ? supportedVenues[0] || "gemini" : String(venue || "").trim().toLowerCase();
+    const cur = isAllVenuesValue(venue) ? supportedVenues[0] || "gemini" : String(venue || "").trim().toLowerCase();
     if (cur && supportedVenues.includes(cur)) return cur;
 
     return supportedVenues[0] || "gemini";
@@ -5746,7 +6051,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
 
     if (!didInitDiscoverRef.current) {
       didInitDiscoverRef.current = true;
-      const cur = venue === ALL_VENUES_VALUE ? supportedVenues[0] || "gemini" : String(venue || "").trim().toLowerCase();
+      const cur = isAllVenuesValue(venue) ? supportedVenues[0] || "gemini" : String(venue || "").trim().toLowerCase();
       if (cur && supportedVenues.includes(cur)) setDiscVenue(cur);
       else setDiscVenue(supportedVenues[0] || "gemini");
     }
@@ -5775,13 +6080,11 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
   const [obDepth, setObDepth] = useState(25);
 
   const selectedVenueNorm = normalizeVenue(venue);
-  const isAllMode = venue === ALL_VENUES_VALUE;
+  const isAllMode = isAllVenuesValue(venue);
 
-  const canShowOrderBook = isAllMode ? orderbookVenuesList.length > 0 : venueSupports(selectedVenueNorm, "orderbook");
+  const canShowOrderBook = !isAllMode && venueSupports(selectedVenueNorm, "orderbook");
   const selectedVenueReadOnlyTicket = READ_ONLY_ORDER_TICKET_VENUES.has(selectedVenueNorm) && venueSupports(selectedVenueNorm, "orderbook");
-  const canShowOrderTicket = isAllMode
-    ? tradingVenuesList.length > 0
-    : (venueSupports(selectedVenueNorm, "trading") || selectedVenueReadOnlyTicket);
+  const canShowOrderTicket = !isAllMode && (venueSupports(selectedVenueNorm, "trading") || selectedVenueReadOnlyTicket);
 
   const fallbackObVenue = orderbookVenuesList[0] || supportedVenues[0] || "gemini";
   const fallbackTradeVenue = tradingVenuesList[0] || supportedVenues[0] || "gemini";
@@ -5844,7 +6147,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
     if (setInput) setMarketInput(sym);
     setActiveMarketSymbol(sym);
 
-    const v = String(venueCandidate || "").trim().toLowerCase();
+    const v = canonicalizeUserVenue(venueCandidate);
     const vOk = v && supportedVenues.includes(v);
 
     if (suppressAllOrdersReloadOnce) suppressAllOrdersReloadOnceRef.current = true;
@@ -5971,7 +6274,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
       try {
         if (tab === "balances") await doRefreshBalancesSafe();
         else if (tab === "localOrders") {
-          if (venue !== ALL_VENUES_VALUE) await doLoadOrders();
+          if (!isAllVenuesValue(venue)) await doLoadOrders();
         } else if (tab === "allOrders") {
           // Venue-order writes and ledger writes stay inside the same shared
           // SQLite-heavy task lease used by all-venue balance refresh.
@@ -6008,7 +6311,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
         const POISON_BALANCES_REFRESH_VENUES = new Set(["solana_dex", "solana_jupiter", "polkadot_hydration", "polkadot_dex", "hydration", "counterparty", ROBINHOOD_CHAIN_VENUE]);
         const balancesVenueCandidates = (balancesVenuesList.length > 0 ? balancesVenuesList : supportedVenues)
           .map((v) => normalizeVenue(v))
-          .filter((v) => v && v !== ALL_VENUES_VALUE)
+          .filter((v) => v && !isAllVenuesValue(v))
           .filter((v) => !POISON_BALANCES_REFRESH_VENUES.has(v))
           .filter((v) => venueSupports(v, "balances"));
 
@@ -6048,7 +6351,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
     ...(disabled ? styles.buttonDisabled : {}),
   });
 
-  const balancesColSpan = venue === ALL_VENUES_VALUE ? 13 : 12;
+  const balancesColSpan = isAllVenuesValue(venue) ? 13 : 12;
 
   const statusIsCanceledLocal = isHiddenByHideCancelled(statusFilter);
 
@@ -6154,7 +6457,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
             venue={venue}
             setVenue={setVenueFromHeader}
             supportedVenues={supportedVenuesForSelector}
-            venuesRaw={venuesRaw}
+            venuesRaw={venuesRawForHeader}
             venueOverrides={venueOverrides}
             setVenueOverride={setVenueOverride}
             ALL_VENUES_VALUE={ALL_VENUES_VALUE}
@@ -6287,6 +6590,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
                   balancesColSpan={balancesColSpan}
                   loadingBalances={loadingBalances}
                   doRefreshBalances={doRefreshBalances}
+                  onRegisterRobinhoodChainCandidate={doRegisterRobinhoodChainCandidate}
                   hideBalancesView={hideBalancesView}
                   setHideBalancesView={setHideBalancesView}
                   hideZeroBalances={hideZeroBalances}
@@ -6381,7 +6685,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
             )}
           </div>
 
-          {!!(visible.orderBook || visible.orderTicket) && (
+          {!isAllMode && !!(visible.orderBook || visible.orderTicket) && (
             <div ref={railShellRef} style={workspaceStyles.rail}>
               <div
                 style={workspaceStyles.railResizeHandle}
@@ -6558,7 +6862,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
                 {...common}
                 enabledVenues={supportedVenues}
                 hideTableData={hideTableDataGlobal}
-                initialVenueFilter={venue === ALL_VENUES_VALUE ? "" : venue}
+                initialVenueFilter={isAllVenuesValue(venue) ? "" : venue}
               />
             );
 
@@ -6568,7 +6872,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
                 {...common}
                 enabledVenues={supportedVenues}
                 hideTableData={hideTableDataGlobal}
-                initialVenueFilter={venue === ALL_VENUES_VALUE ? "" : venue}
+                initialVenueFilter={isAllVenuesValue(venue) ? "" : venue}
               />
             );
 
@@ -6578,7 +6882,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
                 {...common}
                 enabledVenues={supportedVenues}
                 hideTableData={hideTableDataGlobal}
-                initialVenueFilter={venue === ALL_VENUES_VALUE ? "" : venue}
+                initialVenueFilter={isAllVenuesValue(venue) ? "" : venue}
               />
             );
 
@@ -6621,6 +6925,8 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
               <TokenRegistryWindow
                 {...common}
                 apiBase={API_BASE}
+                backgroundRefreshEnabled={pollEnabled}
+                backgroundRefreshSeconds={pollSeconds}
                 onClose={() => closeToolWindow(TOOL_IDS.tokenRegistry)}
               />
             );

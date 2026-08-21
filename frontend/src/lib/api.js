@@ -1665,7 +1665,20 @@ async function _refreshVenueOrdersImpl(venue = "", forceOrOpts = false) {
     let detail = "";
     try {
       const j = await res.json();
-      detail = j?.detail ? `: ${j.detail}` : "";
+      const rawDetail = j?.detail;
+      if (rawDetail != null) {
+        let renderedDetail = "";
+        if (typeof rawDetail === "string") {
+          renderedDetail = rawDetail;
+        } else {
+          try {
+            renderedDetail = JSON.stringify(rawDetail);
+          } catch {
+            renderedDetail = String(rawDetail);
+          }
+        }
+        detail = renderedDetail ? `: ${renderedDetail}` : "";
+      }
     } catch {
       // ignore JSON parse errors
     }

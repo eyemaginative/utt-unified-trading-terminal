@@ -29,7 +29,9 @@ WALLET = "0x" + "a" * 40
 ROUTER = "0x" + "b" * 40
 TOKEN = "0x" + "c" * 40
 COUNTERPARTY = "0x" + "d" * 40
+INPUT_TOKEN = "0x" + "e" * 40
 TX_HASH = "0x" + "1" * 64
+TOKEN_TO_TOKEN_TX_HASH = "0x" + "2" * 64
 
 
 def _session(*, with_lot_tables: bool = False):
@@ -147,6 +149,115 @@ def _swap_events(
         )
     db.flush()
     return out_row, in_row
+
+
+def _erc20_to_erc20_swap_events(
+    db,
+    wallet,
+    *,
+    tx_hash: str = TOKEN_TO_TOKEN_TX_HASH,
+    input_registered: bool = True,
+    output_registered: bool = True,
+):
+    tx_time = datetime(2026, 8, 15, 1, 2, 3)
+    transaction_row = RobinhoodChainWalletEvent(
+        wallet_address_id=wallet.id,
+        chain_id=4663,
+        event_key=f"{tx_hash}:transaction",
+        transaction_hash=tx_hash,
+        event_type="transaction",
+        block_number=456,
+        tx_time=tx_time,
+        status="ok",
+        classification="contract_call",
+        direction="out",
+        asset="",
+        amount_atomic="0",
+        decimals=18,
+        fee_wei="32897760000",
+        contract_address=ROUTER,
+        registry_id=None,
+        registered=False,
+        from_address=WALLET,
+        to_address=ROUTER,
+        source="blockscout_v2",
+        raw={"synthetic": True},
+    )
+    out_row = RobinhoodChainWalletEvent(
+        wallet_address_id=wallet.id,
+        chain_id=4663,
+        event_key=f"{tx_hash}:erc20:1",
+        transaction_hash=tx_hash,
+        event_type="erc20_transfer",
+        log_index="1",
+        block_number=456,
+        tx_time=tx_time,
+        status="ok",
+        classification="erc20_transfer",
+        direction="out",
+        asset="USDG",
+        amount_atomic="1000000",
+        decimals=6,
+        fee_wei="0",
+        contract_address=INPUT_TOKEN,
+        registry_id=8 if input_registered else None,
+        registered=input_registered,
+        from_address=WALLET,
+        to_address=COUNTERPARTY,
+        source="blockscout_v2",
+        raw={"synthetic": True},
+    )
+    in_row = RobinhoodChainWalletEvent(
+        wallet_address_id=wallet.id,
+        chain_id=4663,
+        event_key=f"{tx_hash}:erc20:2",
+        transaction_hash=tx_hash,
+        event_type="erc20_transfer",
+        log_index="2",
+        block_number=456,
+        tx_time=tx_time,
+        status="ok",
+        classification="erc20_transfer",
+        direction="in",
+        asset="QHOLE",
+        amount_atomic="17287732342527412055645",
+        decimals=18,
+        fee_wei="0",
+        contract_address=TOKEN,
+        registry_id=9 if output_registered else None,
+        registered=output_registered,
+        from_address=COUNTERPARTY,
+        to_address=WALLET,
+        source="blockscout_v2",
+        raw={"synthetic": True},
+    )
+    db.add_all([transaction_row, out_row, in_row])
+    if input_registered:
+        db.add(
+            TokenRegistry(
+                id=8,
+                chain="robinhood_chain",
+                venue=None,
+                symbol="USDG",
+                address=INPUT_TOKEN,
+                decimals=6,
+                label="Synthetic input token",
+            )
+        )
+    if output_registered:
+        db.add(
+            TokenRegistry(
+                id=9,
+                chain="robinhood_chain",
+                venue=None,
+                symbol="QHOLE",
+                address=TOKEN,
+                decimals=18,
+                label="Synthetic output token",
+            )
+        )
+    db.flush()
+    return transaction_row, out_row, in_row
 
 
 def _checkpoint(db, wallet, *, fully_backfilled: bool = True):
@@ -329,6 +440,118 @@ class RobinhoodChainWalletMaterializationTests(unittest.TestCase):
         self.assertAlmostEqual(unified["fee"], 0.000004759227966)
         self.assertEqual(unified["actual_input_asset"], "ETH")
         self.assertEqual(unified["actual_output_asset"], "TEST")
+        self.assertTrue(unified["external_history"])
+
+    def test_registered_erc20_to_registered_erc20_is_materializable(self):
+        engine, db = _session()
+        self.addCleanup(engine.dispose)
+        self.addCleanup(db.close)
+        wallet = _wallet(db)
+        _erc20_to_erc20_swap_events(db, wallet)
+        _checkpoint(db, wallet)
+        db.commit()
+
+        preview = materialize_mod.preview_robinhood_chain_wallet_materialization(
+            db,
+            wallet_address_id=wallet.id,
+        )
+
+        self.assertTrue(preview["ok"])
+        self.assertEqual(preview["summary"]["external_swap_ready"], 1)
+        self.assertEqual(preview["summary"]["external_asset_pairs"], {"QHOLE-USDG": 1})
+        self.assertEqual(len(preview["candidates"]), 1)
+        self.assertEqual(preview["candidates"][0]["transaction_hash"], TOKEN_TO_TOKEN_TX_HASH.lower())
+        self.assertEqual(preview["candidates"][0]["symbol"], "QHOLE-USDG")
+        candidate = materialize_mod._classification_snapshot(db, wallet)["candidates"][0]
+        self.assertEqual(candidate["symbol"], "QHOLE-USDG")
+        self.assertEqual(candidate["input_asset"], "USDG")
+        self.assertEqual(candidate["input_amount"], "1")
+        self.assertEqual(candidate["input_decimals"], 6)
+        self.assertEqual(candidate["output_asset"], "QHOLE")
+        self.assertEqual(candidate["output_amount"], "17287.732342527412055645")
+        self.assertEqual(candidate["output_decimals"], 18)
+        self.assertEqual(candidate["network_fee_wei"], "32897760000")
+        self.assertEqual(candidate["evidence_summary"]["swap_class"], "erc20_to_erc20")
+        self.assertEqual(candidate["evidence_summary"]["input_registry_id"], 8)
+
+    def test_erc20_to_erc20_requires_both_economic_legs_registered(self):
+        for input_registered, output_registered in ((False, True), (True, False)):
+            with self.subTest(input_registered=input_registered, output_registered=output_registered):
+                engine, db = _session()
+                try:
+                    wallet = _wallet(db)
+                    _erc20_to_erc20_swap_events(
+                        db,
+                        wallet,
+                        input_registered=input_registered,
+                        output_registered=output_registered,
+                    )
+                    _checkpoint(db, wallet)
+                    db.commit()
+
+                    preview = materialize_mod.preview_robinhood_chain_wallet_materialization(
+                        db,
+                        wallet_address_id=wallet.id,
+                    )
+                    self.assertEqual(preview["summary"]["external_swap_ready"], 0)
+                    self.assertEqual(preview["summary"]["quarantined_groups"], 1)
+                finally:
+                    db.close()
+                    engine.dispose()
+
+    def test_erc20_to_erc20_materialization_is_idempotent(self):
+        engine, db = _session()
+        self.addCleanup(engine.dispose)
+        self.addCleanup(db.close)
+        wallet = _wallet(db)
+        _erc20_to_erc20_swap_events(db, wallet)
+        _checkpoint(db, wallet)
+        db.commit()
+
+        first = materialize_mod.materialize_robinhood_chain_wallet_history(
+            db,
+            wallet_address_id=wallet.id,
+        )
+        db.commit()
+        second = materialize_mod.materialize_robinhood_chain_wallet_history(
+            db,
+            wallet_address_id=wallet.id,
+        )
+        db.commit()
+
+        self.assertEqual(first["created_external_swaps"], 1)
+        self.assertEqual(second["created_external_swaps"], 0)
+        self.assertEqual(second["unchanged_external_swaps"], 1)
+        self.assertEqual(db.query(RobinhoodChainExternalSwap).count(), 1)
+
+    def test_erc20_to_erc20_unified_all_orders_row_uses_observed_assets(self):
+        engine, db = _session()
+        self.addCleanup(engine.dispose)
+        self.addCleanup(db.close)
+        wallet = _wallet(db)
+        _erc20_to_erc20_swap_events(db, wallet)
+        _checkpoint(db, wallet)
+        db.commit()
+
+        result = materialize_mod.materialize_robinhood_chain_wallet_history(
+            db,
+            wallet_address_id=wallet.id,
+        )
+        db.commit()
+        self.assertEqual(result["created_external_swaps"], 1)
+
+        row = db.query(RobinhoodChainExternalSwap).one()
+        unified = _to_unified_robinhood_chain_external_swap(row)
+        self.assertEqual(unified["venue"], "robinhood_chain")
+        self.assertEqual(unified["symbol"], "QHOLE-USDG")
+        self.assertEqual(unified["side"], "buy")
+        self.assertEqual(unified["actual_input_asset"], "USDG")
+        self.assertEqual(unified["actual_input_amount"], "1")
+        self.assertEqual(unified["actual_output_asset"], "QHOLE")
+        self.assertEqual(unified["actual_output_amount"], "17287.732342527412055645")
+        self.assertAlmostEqual(unified["filled_qty"], 17287.732342527412055645)
+        self.assertAlmostEqual(unified["avg_fill_price"], 1.0 / 17287.732342527412055645)
+        self.assertAlmostEqual(unified["fee"], 0.00000003289776)
         self.assertTrue(unified["external_history"])
 
     def test_external_swap_lot_sync_creates_missing_basis_buy_lot_once(self):

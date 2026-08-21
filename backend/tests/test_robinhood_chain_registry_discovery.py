@@ -12,7 +12,9 @@ from app.models import (
     RobinhoodChainPairCapability,
     RobinhoodChainPairObjective,
     RobinhoodChainRegistryVerification,
+    RobinhoodChainWalletEvent,
     TokenRegistry,
+    WalletAddress,
 )
 from app.services.robinhood_chain_execution_discovery import RobinhoodChainExecutionDiscoveryService
 from app.services.robinhood_chain_registry_discovery import (
@@ -89,6 +91,48 @@ class _FakeRpcClient:
             if selector == "0x313ce567":
                 return {"ok": True, "result": _abi_uint(int(item["decimals"]))}
         return {"ok": False, "error": {"message": f"unsupported fake RPC method: {method}"}}
+
+    async def get_erc20_balance(
+        self,
+        owner_address: str,
+        contract_address: str,
+        decimals: int,
+        *,
+        block_tag: str = "latest",
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        self.calls.append(
+            (
+                "erc20_balance",
+                [
+                    str(owner_address),
+                    str(contract_address),
+                    int(decimals),
+                    str(block_tag),
+                    bool(force_refresh),
+                ],
+            )
+        )
+        item = self.metadata.get(str(contract_address).lower())
+        if not item:
+            return {"ok": False, "error": "missing fake metadata"}
+        atomic = int(item.get("balance_atomic") or 0)
+        scale = Decimal(10) ** int(decimals)
+        balance = Decimal(atomic) / scale
+        balance_text = format(balance, "f")
+        if "." in balance_text:
+            balance_text = balance_text.rstrip("0").rstrip(".")
+        if not balance_text:
+            balance_text = "0"
+        return {
+            "ok": True,
+            "owner_address": str(owner_address),
+            "contract_address": str(contract_address),
+            "decimals": int(decimals),
+            "balance_atomic": str(atomic),
+            "balance_token": balance_text,
+            "read_only": True,
+        }
 
 
 class _FakeDiscoveryService:
@@ -241,6 +285,8 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.engine = create_engine("sqlite+pysqlite:///:memory:")
         for table in (
+            WalletAddress.__table__,
+            RobinhoodChainWalletEvent.__table__,
             TokenRegistry.__table__,
             RobinhoodChainRegistryVerification.__table__,
             RobinhoodChainPairObjective.__table__,
@@ -298,6 +344,61 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 {"source": price_source, "id": int(row.id)},
             )
             self.db.commit()
+        return row
+
+    def _wallet(self, address: str = "0x" + "aa" * 20) -> WalletAddress:
+        row = WalletAddress(
+            asset="ALL",
+            network="robinhood_chain",
+            wallet_id="robinhood_chain",
+            address=address,
+            owner_scope="user",
+        )
+        self.db.add(row)
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    def _wallet_event(
+        self,
+        wallet: WalletAddress,
+        *,
+        contract: str,
+        symbol: str,
+        decimals: int,
+        event_key: str,
+        amount_atomic: str = "1",
+        registered: bool = False,
+        registry_id: int | None = None,
+    ) -> RobinhoodChainWalletEvent:
+        row = RobinhoodChainWalletEvent(
+            wallet_address_id=str(wallet.id),
+            chain_id=4663,
+            event_key=event_key,
+            transaction_hash="0x" + event_key[-1:] * 64,
+            event_type="erc20_transfer",
+            status="ok",
+            classification="erc20_transfer",
+            direction="in",
+            asset=symbol,
+            amount_atomic=str(amount_atomic),
+            decimals=int(decimals),
+            fee_wei="0",
+            contract_address=contract.lower(),
+            registry_id=registry_id,
+            registered=bool(registered),
+            source="blockscout_v2",
+            raw={
+                "provider_raw": {
+                    "provider_symbol": symbol,
+                    "provider_decimals": int(decimals),
+                    "token_name": f"{symbol} Token",
+                }
+            },
+        )
+        self.db.add(row)
+        self.db.commit()
+        self.db.refresh(row)
         return row
 
     def _mark_verified(self, row: TokenRegistry) -> None:
@@ -1273,6 +1374,141 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     def test_probe_amount_normalization_preserves_integer_trailing_zero(self) -> None:
         self.assertEqual(_parse_probe_amount("10", 6), "10")
         self.assertEqual(_parse_probe_amount("10.5000", 6), "10.5")
+
+    async def test_unregistered_wallet_asset_positive_balance_is_register_ready(self) -> None:
+        wallet = self._wallet()
+        contract = "0x" + "91" * 20
+        self._wallet_event(
+            wallet,
+            contract=contract,
+            symbol="FORGE",
+            decimals=18,
+            event_key="event-forge-1",
+            amount_atomic="123000000000000000000",
+        )
+        self.fake_rpc.metadata[contract.lower()] = {
+            "code": True,
+            "symbol": "FORGE",
+            "name": "Forge Token",
+            "decimals": 18,
+            "balance_atomic": 123000000000000000000,
+        }
+
+        result = await self.service.unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            limit=50,
+            positive_only=True,
+            force_refresh=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["blockchain_read_only"])
+        self.assertFalse(result["will_mutate"])
+        self.assertEqual(len(result["items"]), 1)
+        item = result["items"][0]
+        self.assertEqual(item["contract_address"], contract.lower())
+        self.assertEqual(item["symbol"], "FORGE")
+        self.assertEqual(item["decimals"], 18)
+        self.assertEqual(item["balance_atomic"], "123000000000000000000")
+        self.assertEqual(item["balance_token"], "123")
+        self.assertTrue(item["positive_balance"])
+        self.assertTrue(item["ready_to_register"])
+        self.assertEqual(item["metadata_status"], "ready")
+        self.assertFalse(item["symbol_conflict"])
+
+    async def test_unregistered_wallet_asset_excludes_current_registered_contract(self) -> None:
+        wallet = self._wallet()
+        contract = "0x" + "92" * 20
+        self._wallet_event(
+            wallet,
+            contract=contract,
+            symbol="KNOWN",
+            decimals=6,
+            event_key="event-known-2",
+            amount_atomic="1000000",
+            registered=False,
+        )
+        self._token("KNOWN", contract, 6)
+
+        result = await self.service.unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=False,
+        )
+
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["observed_unregistered_contracts"], 0)
+
+    async def test_unregistered_wallet_asset_zero_balance_filter(self) -> None:
+        wallet = self._wallet()
+        contract = "0x" + "93" * 20
+        self._wallet_event(
+            wallet,
+            contract=contract,
+            symbol="ZERO",
+            decimals=6,
+            event_key="event-zero-3",
+            amount_atomic="1000000",
+        )
+        self.fake_rpc.metadata[contract.lower()] = {
+            "code": True,
+            "symbol": "ZERO",
+            "name": "Zero Token",
+            "decimals": 6,
+            "balance_atomic": 0,
+        }
+
+        positive = await self.service.unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=True,
+        )
+        all_items = await self.service.unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=False,
+        )
+
+        self.assertEqual(positive["items"], [])
+        self.assertEqual(len(all_items["items"]), 1)
+        self.assertFalse(all_items["items"][0]["positive_balance"])
+        self.assertFalse(all_items["items"][0]["ready_to_register"])
+        self.assertEqual(all_items["items"][0]["metadata_status"], "zero_balance")
+
+    async def test_unregistered_wallet_asset_symbol_collision_is_quarantined_from_direct_add(self) -> None:
+        wallet = self._wallet()
+        registered = self._token("DUP", "0x" + "94" * 20, 18)
+        contract = "0x" + "95" * 20
+        self._wallet_event(
+            wallet,
+            contract=contract,
+            symbol="DUP",
+            decimals=18,
+            event_key="event-dup-4",
+            amount_atomic="5000000000000000000",
+        )
+        self.fake_rpc.metadata[contract.lower()] = {
+            "code": True,
+            "symbol": "DUP",
+            "name": "Duplicate Symbol Token",
+            "decimals": 18,
+            "balance_atomic": 5000000000000000000,
+        }
+
+        result = await self.service.unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=True,
+        )
+
+        self.assertEqual(len(result["items"]), 1)
+        item = result["items"][0]
+        self.assertTrue(item["positive_balance"])
+        self.assertTrue(item["symbol_conflict"])
+        self.assertFalse(item["ready_to_register"])
+        self.assertEqual(item["metadata_status"], "symbol_conflict")
+        self.assertEqual(item["conflicting_registry_ids"], [int(registered.id)])
 
     def test_extra_registry_asset_is_not_automatically_added_as_objective(self) -> None:
         self._token("EXTRA", "0x" + "e0" * 20, 18)

@@ -287,27 +287,26 @@ def _make_registry() -> Dict[str, VenueSpec]:
             supports_markets=False,   # DEX metrics will get a dedicated source adapter later
         ),
 
-        # NEW: Solana on-chain DEX (reads first; trading wired later)
+        # Legacy/internal Solana compatibility venue. User-facing Solana trading is canonicalized to solana_jupiter.
         "solana_dex": VenueSpec(
             key="solana_dex",
             display_name="Solana DEX",
             enabled=_always_enabled,
             adapter_factory=solana_dex_factory,
-            supports_trading=False,   # flip to True once swap execution is wired end-to-end
+            supports_trading=False,   # legacy identity only; do not enable as a second live-submit venue
             supports_balances=True,
-            supports_orderbook=False, # not via your centralized orderbook path initially
-            supports_markets=False,   # add later if we want /api/market/markets integration
+            supports_orderbook=False, # compatibility reads remain available through the Solana subsystem
+            supports_markets=False,
         ),
 
-        # NEW: Solana Jupiter (DEX execution venue; initially mirrors Solana DEX read capabilities)
-        # NOTE: We intentionally keep orderbook/trading disabled until the Jupiter quote + sign/send
-        # + ack/reconcile plumbing is wired, so selecting this venue cannot break existing widgets.
+        # Canonical user-facing Solana Jupiter execution venue.
+        # Quote + wallet-sign + execute/ack paths are wired; generic DRY_RUN / ARMED / LIVE_VENUES gates still apply.
         "solana_jupiter": VenueSpec(
             key="solana_jupiter",
             display_name="Solana-Jupiter",
             enabled=_always_enabled,
             adapter_factory=solana_dex_factory,
-            supports_trading=False,
+            supports_trading=True,
             supports_balances=True,
             supports_orderbook=False,
             supports_markets=False,

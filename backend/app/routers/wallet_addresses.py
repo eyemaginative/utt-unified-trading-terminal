@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import httpx
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -1423,23 +1423,53 @@ async def wallet_balances_latest(
 ):
     # Keep the newest snapshot for each wallet-address + asset identity. One
     # account-level address may emit ETH and multiple registered ERC-20 rows.
-    stmt = (
-        select(WalletAddressSnapshot, WalletAddress)
+    # Rank the complete filtered snapshot history first, then apply the API
+    # limit to current balance identities. A raw-history limit here can evict a
+    # valid last-known-good balance merely because unrelated snapshots are newer.
+    snapshot_asset_identity = func.upper(
+        func.coalesce(WalletAddressSnapshot.asset, WalletAddress.asset)
+    )
+    ranked_stmt = (
+        select(
+            WalletAddressSnapshot.id.label("snapshot_id"),
+            func.row_number().over(
+                partition_by=(
+                    WalletAddressSnapshot.wallet_address_id,
+                    snapshot_asset_identity,
+                ),
+                order_by=(
+                    WalletAddressSnapshot.fetched_at.desc(),
+                    WalletAddressSnapshot.id.desc(),
+                ),
+            ).label("snapshot_rank"),
+        )
         .join(WalletAddress, WalletAddress.id == WalletAddressSnapshot.wallet_address_id)
     )
     if network:
         normalized_network = str(network or "").strip().lower()
-        stmt = stmt.where(
+        ranked_stmt = ranked_stmt.where(
             or_(
                 WalletAddress.network == normalized_network,
                 WalletAddressSnapshot.network == normalized_network,
             )
         )
     if wallet_id:
-        stmt = stmt.where(WalletAddress.wallet_id == str(wallet_id or "").strip())
+        ranked_stmt = ranked_stmt.where(WalletAddress.wallet_id == str(wallet_id or "").strip())
     if owner_scope:
-        stmt = stmt.where(WalletAddress.owner_scope == str(owner_scope or "").strip())
-    stmt = stmt.order_by(WalletAddressSnapshot.fetched_at.desc()).limit(limit)
+        ranked_stmt = ranked_stmt.where(WalletAddress.owner_scope == str(owner_scope or "").strip())
+
+    ranked = ranked_stmt.subquery()
+    stmt = (
+        select(WalletAddressSnapshot, WalletAddress)
+        .join(WalletAddress, WalletAddress.id == WalletAddressSnapshot.wallet_address_id)
+        .join(ranked, ranked.c.snapshot_id == WalletAddressSnapshot.id)
+        .where(ranked.c.snapshot_rank == 1)
+        .order_by(
+            WalletAddressSnapshot.fetched_at.desc(),
+            WalletAddressSnapshot.id.desc(),
+        )
+        .limit(limit)
+    )
     rows = db.execute(stmt).all()
 
     latest: Dict[Tuple[str, str], Tuple[WalletAddressSnapshot, WalletAddress]] = {}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import unittest
 from pathlib import Path
 from datetime import datetime
@@ -256,6 +257,19 @@ class _FakeRpcClient:
             raise AssertionError(f"address mismatch: {actual} != {expected}")
 
 
+class _FakePendingReceiptRpcClient(_FakeRpcClient):
+    async def rpc_read(self, method, params, *, cache_namespace=None, force_refresh=False):
+        tx_hash = str(params[0]).lower() if params else ""
+        if method == "eth_getTransactionReceipt" and tx_hash == SWAP_HASH.lower():
+            return {"ok": True, "result": None}
+        return await super().rpc_read(
+            method,
+            params,
+            cache_namespace=cache_namespace,
+            force_refresh=force_refresh,
+        )
+
+
 class RobinhoodChainGenericCloseoutTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
@@ -277,6 +291,7 @@ class RobinhoodChainGenericCloseoutTests(unittest.TestCase):
     def _prepared_lifecycle(self, *, include_capability_economics: bool = True):
         capability_token = "capability-" + ("a" * 64)
         capability = {
+            "chain_id": 4663,
             "wallet_address": WALLET,
             "symbol": "INDEX-USDG",
             "side": "buy",
@@ -292,6 +307,10 @@ class RobinhoodChainGenericCloseoutTests(unittest.TestCase):
             "minimum_received_atomic": "76979561996418272888",
             "requested_amount": "1",
             "approval_tx_hash": APPROVAL_HASH,
+            "transaction_from": WALLET,
+            "transaction_to": ROUTER,
+            "transaction_value_wei": "0",
+            "calldata_sha256": hashlib.sha256(bytes.fromhex(self.rpc.swap_calldata[2:])).hexdigest(),
         }
         if not include_capability_economics:
             for key in (
@@ -453,6 +472,204 @@ class RobinhoodChainGenericCloseoutTests(unittest.TestCase):
         self.assertTrue(final.route["generic_wallet_lifecycle"]["historical_preflight_available"])
         self.assertEqual(final.expected_output_amount, "77.75713332971542716")
         self.assertEqual(final.minimum_output_amount, "76.979561996418272888")
+
+    def test_expired_receipt_capability_uses_durable_submission_and_reconciles_idempotently(self) -> None:
+        row, _, capability_token, capability = self._prepared_lifecycle()
+        execution_id = str(row.id)
+        rh_router._record_generic_wallet_swap_submission(
+            self.db,
+            execution_id=execution_id,
+            tx_hash=SWAP_HASH,
+            capability_token=capability_token,
+            capability=capability,
+        )
+        self.db.commit()
+
+        def _decode(token, *, now_epoch=None, allow_expired_for_bound_receipt=False):
+            self.assertEqual(token, capability_token)
+            if allow_expired_for_bound_receipt is not True:
+                raise ValueError("wallet_swap_capability_expired")
+            return dict(capability)
+
+        request = rh_router.RobinhoodChainWalletSwapReceiptRequest(
+            capability=capability_token,
+            tx_hash=SWAP_HASH,
+            execution_id=execution_id,
+        )
+        with (
+            patch.object(rh_router, "decode_wallet_swap_capability", side_effect=_decode),
+            patch.object(rh_router, "_resolve_robinhood_chain_execution_taker", return_value=WALLET),
+            patch.object(rh_router, "get_robinhood_chain_registry_discovery_service", return_value=_FakeRegistryService()),
+            patch.object(rh_router, "get_robinhood_chain_client", return_value=self.rpc),
+        ):
+            first = asyncio.run(
+                rh_router.robinhood_chain_wallet_swap_receipt(
+                    request,
+                    self.db,
+                )
+            )
+            second = asyncio.run(
+                rh_router.robinhood_chain_wallet_swap_receipt(
+                    request,
+                    self.db,
+                )
+            )
+
+        self.assertTrue(first["confirmed"])
+        self.assertTrue(first["expired_capability_recovery"])
+        self.assertEqual(
+            first["receipt_authority_source"],
+            "durable_execution_bound_expired_capability",
+        )
+        self.assertFalse(first["new_wallet_request_authorized"])
+        self.assertTrue(second["confirmed"])
+        self.assertTrue(second["expired_capability_recovery"])
+        self.assertEqual(self.db.query(RobinhoodChainSwapExecution).count(), 1)
+        final = self.db.get(RobinhoodChainSwapExecution, execution_id)
+        self.assertEqual(final.status, "confirmed")
+        self.assertEqual(final.swap_tx_hash.lower(), SWAP_HASH.lower())
+
+    def test_expired_receipt_capability_requires_previously_bound_transaction_hash(self) -> None:
+        row, _, capability_token, capability = self._prepared_lifecycle()
+        execution_id = str(row.id)
+
+        def _decode(token, *, now_epoch=None, allow_expired_for_bound_receipt=False):
+            self.assertEqual(token, capability_token)
+            if allow_expired_for_bound_receipt is not True:
+                raise ValueError("wallet_swap_capability_expired")
+            return dict(capability)
+
+        request = rh_router.RobinhoodChainWalletSwapReceiptRequest(
+            capability=capability_token,
+            tx_hash=SWAP_HASH,
+            execution_id=execution_id,
+        )
+        with patch.object(rh_router, "decode_wallet_swap_capability", side_effect=_decode):
+            with self.assertRaises(rh_router.HTTPException) as ctx:
+                asyncio.run(
+                    rh_router.robinhood_chain_wallet_swap_receipt(
+                        request,
+                        self.db,
+                    )
+                )
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(
+            ctx.exception.detail["error"],
+            "wallet_swap_expired_capability_hash_not_owned",
+        )
+        current = self.db.get(RobinhoodChainSwapExecution, execution_id)
+        self.assertEqual(current.status, "swap_prepared")
+        self.assertIsNone(current.swap_tx_hash)
+
+    def test_sync_load_reconciles_confirmed_pending_durable_swap_without_receipt_capability(self) -> None:
+        row, _, capability_token, capability = self._prepared_lifecycle()
+        execution_id = str(row.id)
+        rh_router._record_generic_wallet_swap_submission(
+            self.db,
+            execution_id=execution_id,
+            tx_hash=SWAP_HASH,
+            capability_token=capability_token,
+            capability=capability,
+        )
+        self.db.commit()
+
+        with (
+            patch.object(rh_router, "_resolve_robinhood_chain_execution_taker", return_value=WALLET),
+            patch.object(rh_router, "get_robinhood_chain_registry_discovery_service", return_value=_FakeRegistryService()),
+            patch.object(rh_router, "get_robinhood_chain_client", return_value=self.rpc),
+        ):
+            first = asyncio.run(
+                rh_router._reconcile_pending_generic_wallet_swaps_for_sync_load(
+                    self.db,
+                    limit=50,
+                )
+            )
+            self.db.commit()
+            second = asyncio.run(
+                rh_router._reconcile_pending_generic_wallet_swaps_for_sync_load(
+                    self.db,
+                    limit=50,
+                )
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["candidate_count"], 1)
+        self.assertEqual(first["confirmed"], 1)
+        self.assertEqual(first["still_pending"], 0)
+        self.assertEqual(first["error_count"], 0)
+        self.assertTrue(first["order_mutation"])
+        self.assertTrue(first["database_mutation"])
+        self.assertFalse(first["wallet_request"])
+        self.assertFalse(first["signing"])
+        self.assertFalse(first["broadcast"])
+        self.assertFalse(first["automatic_retry"])
+        self.assertFalse(first["automatic_second_transaction"])
+        final = self.db.get(RobinhoodChainSwapExecution, execution_id)
+        self.assertEqual(final.status, "confirmed")
+        self.assertEqual(final.swap_status, "confirmed")
+        self.assertEqual(
+            final.route["execution_reconciliation"]["source"],
+            "wallet_sync_incremental_receipt",
+        )
+        unified = _to_unified_robinhood_chain_swap_execution(final)
+        self.assertEqual(unified["status"], "confirmed")
+        self.assertTrue(unified["execution_reconciled"])
+        self.assertEqual(second["candidate_count"], 0)
+        self.assertEqual(second["confirmed"], 0)
+        self.assertFalse(second["database_mutation"])
+
+    def test_sync_load_receipt_scan_leaves_unconfirmed_submission_pending(self) -> None:
+        row, _, capability_token, capability = self._prepared_lifecycle()
+        execution_id = str(row.id)
+        rh_router._record_generic_wallet_swap_submission(
+            self.db,
+            execution_id=execution_id,
+            tx_hash=SWAP_HASH,
+            capability_token=capability_token,
+            capability=capability,
+        )
+        self.db.commit()
+
+        pending_rpc = _FakePendingReceiptRpcClient()
+        with patch.object(rh_router, "get_robinhood_chain_client", return_value=pending_rpc):
+            result = asyncio.run(
+                rh_router._reconcile_pending_generic_wallet_swaps_for_sync_load(
+                    self.db,
+                    limit=50,
+                )
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["candidate_count"], 1)
+        self.assertEqual(result["still_pending"], 1)
+        self.assertEqual(result["confirmed"], 0)
+        self.assertEqual(result["error_count"], 0)
+        self.assertFalse(result["order_mutation"])
+        self.assertFalse(result["database_mutation"])
+        current = self.db.get(RobinhoodChainSwapExecution, execution_id)
+        self.assertEqual(current.status, "swap_pending")
+        self.assertEqual(current.swap_tx_hash.lower(), SWAP_HASH.lower())
+
+    def test_wallet_sync_incremental_route_invokes_durable_receipt_reconciliation(self) -> None:
+        router_source = Path(rh_router.__file__).read_text(encoding="utf-8")
+        start = router_source.index('@router.post("/wallet-sync/incremental")')
+        end = router_source.index('@router.get("/registry-discovery/status")', start)
+        block = router_source[start:end]
+
+        self.assertIn(
+            "await _reconcile_pending_generic_wallet_swaps_for_sync_load(",
+            block,
+        )
+        self.assertIn(
+            'result["utt_swap_receipt_reconciliation"] = receipt_reconciliation',
+            block,
+        )
+        self.assertIn(
+            'result["all_orders_visibility_mutation"]',
+            block,
+        )
+        self.assertIn('result["wallet_request"] = False', block)
+        self.assertIn('result["automatic_second_transaction"] = False', block)
 
     def test_prepared_lifecycle_uses_validated_handoff_economics_when_capability_omits_duplicates(self) -> None:
         row, created, _capability_token, capability = self._prepared_lifecycle(

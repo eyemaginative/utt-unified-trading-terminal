@@ -2,7 +2,7 @@
 
 UTT (Unified Trading Terminal) is a local-first, multi-venue crypto trading terminal built with **FastAPI** on the backend and **React** on the frontend. It is designed to unify centralized exchange (CEX) workflows and selected decentralized exchange (DEX) flows under a single operator-focused interface.
 
-> **Current documented baseline:** this README is prepared for the cumulative publication following published baseline `977a6396a9215a80c6ba98663a50398613114b4d`. It retains the previously published Counterparty / UniSat, SEC-VAULT.1, Cexius, generic Order Details, managed Arbitrage, Solana, Hydration, Market Metrics, and Spread / Bridge capabilities and adds the accepted generic Robinhood Chain execution, historical/incremental wallet-ingestion, external-swap materialization, All Orders Sync+Load orchestration, known-UTT/external idempotency, and ERC-20 USD balance-pricing work. Cexius market orders, Cexius Cancel All, automated arbitrage execution, and generic Robinhood Chain Cost Basis / Cost Avg reconstruction are not implied by the current scope.
+> **Documentation state — August 20, 2026:** this README documents the cumulative development state prepared for publication after published baseline `52f6f5cd95854e87ac3cfe7790b0c997ed8dd026`. It retains the previously published Counterparty / UniSat, SEC-VAULT.1, Cexius, generic Order Details, managed Arbitrage, Solana, Hydration, Market Metrics, Spread / Bridge, Robinhood Chain execution/ingestion, and test-hygiene work, and adds the accepted Robinhood Chain quote/reconciliation improvements, Solana-Jupiter venue consolidation, All Venues portfolio/self-custody corrections, long-running wallet-snapshot retention fix, and Cexius tax-evidence presentation described below. Extended Robinhood Chain cold-pair quote reliability observation remains ongoing; publishing the accepted code does not relax any wallet, signing, slippage, approval, or broadcast safety boundary.
 
 At a high level, UTT provides one place to:
 
@@ -22,6 +22,63 @@ At a high level, UTT provides one place to:
 - manage Token Registry rows, Hydration Route Registry rows, wallet addresses, venue API keys, and local operator preferences
 - inspect a managed read-only Arbitrage window with best bid/ask, spread, per-venue top-of-book rows, manual refresh, and bounded auto-refresh
 - integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
+
+---
+
+## What changed in the August 2026 cumulative update
+
+This publication interval contains a large set of accepted changes completed after published baseline `52f6f5cd95854e87ac3cfe7790b0c997ed8dd026`. The points below are a release-oriented summary; the later venue and feature sections provide the operator detail.
+
+### Robinhood Chain
+
+- Improved synthetic Order Book construction so bid/ask sampling uses matched quote notional and avoids crossed synthetic books caused by mismatched directional notionals.
+- Preserved high-precision Order Ticket prices instead of incorrectly quantizing displayed prices to quote-asset amount decimals.
+- Added registry-driven discovered-token balance handling and broader Token Registry-backed pair selection.
+- Improved registered ERC-20 balance pricing with bounded caching and deterministic read-only price sources.
+- Added historical and incremental Robinhood Chain wallet-evidence ingestion, checkpointing, known-UTT lifecycle reuse, and high-confidence external-swap materialization.
+- Wired the same incremental Robinhood Chain ingestion/materialization path into **All Orders → Sync+Load**.
+- Added durable receipt recovery so an already-submitted transaction can be reconciled after a short-lived preparation capability expires without requiring another wallet transaction.
+- Strengthened exact-once ownership so a known UTT transaction does not also become an external `RHCHAINEXT` order, duplicate journal, or duplicate lot.
+- Improved receipt reconciliation, execution-owner recovery, and repeat Sync+Load idempotency.
+- Added bounded fresh-quote recovery and longer lifecycle-preflight budgets for transient provider `404 / No quotes available` responses while keeping the requested slippage authoritative.
+- Preserved the rule that passive reads, quote recovery, lifecycle restoration, registry discovery, and Sync+Load do **not** open MetaMask.
+- Preserved finite ERC-20 approvals, separate approval/swap wallet requests, no unlimited approval, no automatic second transaction, no automatic retry after transaction authority has advanced, and no backend signing/broadcast.
+
+### Solana / Jupiter
+
+- `solana_jupiter` is now the canonical user-facing Solana execution venue.
+- Legacy `solana_dex` remains in the backend as an internal/compatibility identity and API namespace so historical records and existing routes continue to work.
+- User-facing venue selection and Venue Manager behavior consolidate on Solana-Jupiter rather than showing duplicate Solana venues.
+- Jupiter live-gating and venue-order refresh behavior were aligned with the canonical venue identity.
+- Existing Jupiter, Raydium, wallet-manager, token-registry, and historical `solana_dex` compatibility paths are preserved.
+
+### All Venues, portfolio balances, and self-custody
+
+- Fixed the **All Venues** sentinel so aggregate mode remains `ALL` instead of being normalized into an invalid concrete venue `all`.
+- All Venues no longer sends unsupported `venue=all` balance requests or mounts Order Book / Order Ticket as if `all` were a tradable venue.
+- Header Total Portfolio and All Venues portfolio totals were reconciled to the same displayed aggregate behavior.
+- Self-custody balances are included in All Venues when eligible cached Wallet Address snapshots exist.
+- Same-address Counterparty/native BTC duplication is removed in All Venues: the self-custody BTC identity is canonical when the matching self-custody snapshot is present.
+- Independent self-custody BTC addresses remain separately represented; Counterparty protocol assets remain represented; standalone Counterparty views remain available.
+- Fixed the diagnosed `GLOBAL_LIMIT_EVICTION_CONFIRMED` long-running snapshot bug in `/api/wallet_addresses/balances/latest`: the backend now selects the newest snapshot per `(wallet_address_id, asset)` **before** applying the final result limit.
+- An unchanged but still-valid BTC snapshot can therefore remain visible without forcing another BlockCypher/Blockchair request merely to keep its portfolio row alive.
+- The accepted fallback remains conservative: when a matching self-custody BTC snapshot is not available, same-address Counterparty BTC may remain visible rather than silently erasing the holding.
+
+### Cexius
+
+- Refined Cexius realized-tax presentation for filled SELLs whose FIFO quantity consumption is valid but whose consumed deposit lots contain unavailable cost basis.
+- In that state, **Tax** displays `I/E` rather than a fabricated number, and **net-a/tx** remains equal to Net because no tax deduction can be truthfully computed.
+- Order Details uses the same semantic state and explains that cost basis is unavailable rather than incorrectly reporting valid quantity inventory as insufficient.
+- The existing true `insufficient_inventory` path remains separate and intact.
+- Complete Cexius rows with sufficient basis evidence retain their normal numeric behavior.
+- Cexius market orders, Cancel All, withdrawals, deposit-address mutation, and automatic retry remain intentionally unavailable.
+
+### Validation and operational hardening
+
+- Continued strict separation of passive reads from Ledger/FIFO mutation.
+- Continued database hygiene checks around focused regression runs.
+- Preserved background Ledger/lot refresh behavior while auditing exact-once results instead of disabling the background process.
+- Validation workflows avoid generated executable Python helpers under the Windows TEMP directory after antivirus heuristic detection; repository tests, `python -c` syntax checks, and PowerShell-native read-only API checks are preferred.
 
 ---
 
@@ -144,6 +201,40 @@ UTTT bridge execution and basis-transfer mutation remain intentionally separated
 
 ---
 
+## Venue and source coverage
+
+The table below is the most complete high-level map of the current terminal. **Runtime configuration, current adapter capability flags, credential state, registry state, and backend safety gates remain authoritative** when a particular environment differs from this summary.
+
+| Venue / source | Canonical key | Type | Markets / book | Balances | Orders / history | Live mutation model | Wallet / auth model |
+|---|---|---|---|---|---|---|---|
+| Coinbase | `coinbase` | CEX | Integrated market discovery + orderbook | Integrated | Unified order workflow | Live-gated where adapter supports | Venue API credential |
+| Crypto.com Exchange | `cryptocom` | CEX | Integrated instruments + book | Integrated | Unified order workflow | Live-gated where adapter supports | Venue API credential |
+| Cexius | `cexius` | CEX | Public catalog, rules, direct-symbol orderbook | Total / Available / Hold | Paginated venue snapshots + All Orders | **Limit BUY/SELL + selected cancel only** | Profile-vault Bearer token |
+| Dex-Trade | `dex_trade` | CEX | Integrated | Integrated | Unified order workflow | Live-gated where adapter supports | Venue API credential |
+| Gemini | `gemini` | CEX | Integrated | Integrated | Unified order workflow | Live-gated where adapter supports | Venue API credential |
+| Kraken | `kraken` | CEX | Integrated | Integrated | Unified order workflow | Live-gated where adapter supports | Venue API credential |
+| OKX | `okx` | CEX | Instruments + orderbook + rules | Integrated | Venue orders, fills diagnostics, All Orders | Live-gated submit + selected cancel | API key / secret / passphrase |
+| Robinhood Crypto brokerage | `robinhood` | Brokerage / CEX-style adapter | Pricing/orderbook context; catalog behavior differs | Integrated with fast hold overlay | Unified order workflow | Live-gated where configured | Robinhood adapter credentials |
+| Robinhood Chain | `robinhood_chain` | EVM DEX / chain workflow | Registry-backed provider quotes + synthetic books | Native ETH + registered ERC-20 | UTT lifecycle + external materialization + All Orders | Explicit finite approval + swap stages | MetaMask-compatible browser wallet; backend never signs |
+| Counterparty / Bitcoin | `counterparty` | Bitcoin metaprotocol | Dispensers + protocol orders | BTC + protocol-asset context | Confirmed purchases may reflect in All Orders | Explicit compose → UniSat sign → separate broadcast confirmation | UniSat; backend never signs |
+| Solana-Jupiter | `solana_jupiter` | Solana DEX | Jupiter route/book context | Solana wallet/token balances | Swap/limit-style records + venue refresh | Browser-wallet signing under live gates | Solana wallet extension |
+| Solana legacy compatibility | `solana_dex` | Internal / compatibility | Historical/API compatibility | Compatibility balance paths | Historical compatibility | **Not the canonical user-facing venue** | Same Solana infrastructure |
+| Raydium routing | under Solana flow | Solana DEX route | Raydium route/pool context | Through Solana wallet state | Supported swap materialization paths | Wallet-signed | Solana wallet extension |
+| Polkadot / Hydration | `polkadot_hydration` | Substrate DEX | Manual XYK, confirmed Router, synthetic context | Hydration wallet/balance tooling | `swap_orders` + All Orders | Wallet-signed guarded routes | Polkadot/Substrate wallet |
+| Self-custody Wallet Addresses | `self_custody` grouping | Portfolio / custody source | Not a trading venue | Cached on-chain balances | Chain-specific history / ingest where supported | No generic trading authority | User-controlled addresses / external wallets |
+| Derived / global market data | `Derived` / global context | Market-data source | CoinGecko/derived metrics | Not custody | Not order authority | None | No trading credential |
+
+### Important identity distinctions
+
+- **Robinhood** and **Robinhood Chain** are different venues. `robinhood` is the brokerage/CEX-style adapter; `robinhood_chain` is the EVM chain workflow.
+- **Solana-Jupiter** is the canonical user-facing Solana execution venue. `solana_dex` is retained for internal/historical compatibility and existing `/api/solana_dex/...` routes.
+- **Raydium** is a Solana route/provider context, not a second generic CEX account.
+- **Counterparty** is a Bitcoin metaprotocol workflow. It is not a normal CEX and does not give the backend a Bitcoin signing key.
+- **Self-custody** is a portfolio/custody source, not a tradable venue.
+- **All Venues** is an aggregate portfolio state, not a venue. Trading widgets are intentionally suppressed while All Venues is selected.
+
+---
+
 ## Major capabilities
 
 ### Centralized exchange workflow
@@ -164,6 +255,105 @@ Current functionality in the codebase includes:
 - Robinhood balance hold handling using a fast open-order overlay so balance refresh is not blocked by full order-history scans
 - OKX read-only diagnostics, balances, orderbooks, rules, venue orders, fills diagnostics, basis previews, live-gated submit, and live-gated cancel
 - auth, profile, local session, database backup, 2FA, and API-key management flows
+
+
+#### Coinbase — `coinbase`
+
+Coinbase is a first-class CEX adapter in the generic venue registry. It uses the shared terminal rather than a Coinbase-only screen.
+
+Practical UTT coverage includes:
+
+- venue selection and market/symbol discovery through the common market layer
+- public orderbook context in the Order Book widget
+- private account balances in Balances and All Venues
+- Order Ticket participation behind the shared live-routing gates
+- local/venue order normalization into the unified order workflow
+- ownership/source participation in portfolio and Market Cap / Volume context
+- local accounting/basis presentation when corresponding ledger and lot evidence exists
+
+Coinbase remains an independent FIFO/account scope. UTT does not pool Coinbase inventory with another exchange or self-custody wallet merely because the asset symbol is the same.
+
+#### Crypto.com Exchange — `cryptocom`
+
+Crypto.com Exchange is integrated through its REST adapter and is normalized into the same terminal contract as the other CEX venues. Effective private/live availability depends on a usable credential bundle.
+
+Practical UTT coverage includes:
+
+- instrument/market discovery through the common venue selector
+- public book context
+- private balances with unified Total / Available / Hold presentation where source data permits
+- live-gated Order Ticket routing through the adapter
+- venue-order and All Orders reflection
+- All Venues aggregation and market-metric ownership/source classification
+- venue-isolated basis/FIFO context when accounting evidence is available
+
+Crypto.com is treated as its own custody/accounting scope; its lots are not universal inventory for another venue.
+
+#### Dex-Trade — `dex_trade`
+
+Dex-Trade is a guarded CEX adapter with market, orderbook, balance, and trading capability.
+
+Practical UTT coverage includes:
+
+- market and symbol selection
+- Order Book context
+- private balance retrieval
+- Order Ticket submit paths subject to backend live gates
+- venue-order refresh and unified All Orders visibility
+- All Venues portfolio aggregation
+- Market Cap / Volume ownership/source context
+- venue-scoped accounting/basis display where local evidence exists
+
+Dex-Trade credential/configuration readiness is authoritative for whether private or live-gated functions are available.
+
+#### Gemini — `gemini`
+
+Gemini is a first-class CEX adapter with market, orderbook, balance, and trading capabilities exposed through the generic venue registry.
+
+Practical UTT coverage includes:
+
+- market discovery and venue-aware symbol selection
+- public orderbook reads
+- private balances
+- shared Order Ticket routing behind live controls
+- venue-order synchronization and All Orders normalization
+- All Venues portfolio participation
+- Market Cap / Volume ownership/source context
+- isolated local basis/FIFO presentation rather than cross-venue pooling
+
+The terminal keeps Gemini-specific transport details behind the adapter so the operator workflow remains consistent with Coinbase, Kraken, Crypto.com, Dex-Trade, OKX, Cexius, and Robinhood where their capabilities overlap.
+
+#### Kraken — `kraken`
+
+Kraken is a first-class CEX adapter with market, orderbook, balance, and trading capability through the generic venue registry.
+
+Practical UTT coverage includes:
+
+- market/symbol discovery
+- public Order Book context
+- private balance retrieval and portfolio aggregation
+- live-gated Order Ticket routing
+- venue-order refresh and unified All Orders display
+- Market Cap / Volume ownership/source classification
+- venue-scoped cost-basis/FIFO context when local accounting evidence is available
+
+Kraken holdings remain a separate inventory scope from Robinhood, Coinbase, OKX, self-custody, and every other venue.
+
+#### Robinhood Crypto brokerage — `robinhood`
+
+The Robinhood brokerage adapter is separate from Robinhood Chain. It participates in centralized-exchange-style balance and order workflows, while its generic market-catalog behavior differs from a conventional CEX.
+
+Practical UTT coverage includes:
+
+- brokerage balance retrieval
+- a fast open-order hold overlay so Available / Hold can reflect reserved funds without blocking on full paginated order history
+- Order Book / pricing context through the supported Robinhood market path
+- shared Order Ticket behavior behind the common safety gates
+- venue-order synchronization and All Orders normalization
+- All Venues portfolio participation and market-metric ownership/source context
+- Robinhood-only FIFO/accounting scope, explicitly separate from `robinhood_chain`
+
+The full venue-order history workflow remains distinct from the fast balance-hold overlay. A Robinhood brokerage asset and the same ticker on Robinhood Chain are not interchangeable custody or basis identities.
 
 #### OKX integration
 
@@ -197,7 +387,7 @@ Current Cexius capabilities include:
 - profile-vault Bearer-token authentication with explicit Read and Trade scope metadata and no credential environment fallback
 - normalized balances with distinct `Total`, `Available`, and `Hold` semantics
 - bounded pagination for complete open-order retrieval, duplicate suppression, repeated-page protection, and coherent open / filled / canceled persistence
-- unified All Orders visibility, including truthful `I/E` display when a filled disposal has insufficient venue-scoped inventory and `—` for canceled-order tax
+- unified All Orders visibility, including truthful `I/E` when tax evidence is unavailable because of true quantity insufficiency **or** applied FIFO quantity with missing consumed-lot cost basis, while canceled-order tax remains `—`
 - API-authoritative quantity precision, price precision, minimum quantity, and minimum notional handling, including the observed Cexius `trading_amount_precision`, `trading_price_precision`, `trading_min_amount`, and minimum-order-value fields
 - selected single-order cancellation through the shared confirmation and `cancel_by_ref` path
 - non-mutating cancellation simulation while disarmed or in dry-run mode; simulated actions do not rewrite local rows as canceled
@@ -207,7 +397,7 @@ Current Cexius capabilities include:
 
 Cexius live routing remains explicitly guarded. A visible Order Ticket is not enough to submit or cancel an order. Live mutation requires `DRY_RUN=false`, `ARMED=true`, `LIVE_VENUES` to include `cexius`, a matching enabled venue capability, and a Profile-vault credential declared for both Read and Trade. The implementation intentionally does not enable market orders, Cancel All, withdrawals, deposit-address generation, or automatic retry.
 
-A zero-fill open order is not execution evidence and is excluded from ledger/FIFO processing. Existing filled rows may correctly show `I/E` when Cexius-scoped inventory is unavailable; basis and tax values are not fabricated. Organic-fill revalidation remains an operational follow-up rather than a claim that every historical fill has complete local basis.
+A zero-fill open order is not execution evidence and is excluded from ledger/FIFO processing. Existing filled SELLs may correctly show `I/E` when tax evidence cannot be computed truthfully. That includes true `insufficient_inventory`, but it also includes the distinct accepted state where FIFO quantity consumption is applied successfully while one or more consumed Cexius deposit lots have unavailable cost basis. In the latter state, `net-a/tx` remains equal to Net and Order Details explains the missing-basis condition. Basis and tax values are never fabricated.
 
 ### Counterparty / UniSat workflow
 
@@ -277,6 +467,11 @@ Current Robinhood Chain capabilities include:
 - All Orders `Sync+Load` integration with the same incremental scanner/materializer path
 - direction-correct All Orders normalization, exact canonical venue identity, and pre-pagination canceled/rejected filtering
 - deterministic ERC-20 USD balance pricing with bounded caching and read-only quote fallback
+- synthetic-book sampling with matched quote notional to avoid artificial crossed books
+- high-precision Order Ticket price display independent of quote-asset amount precision
+- bounded fresh-quote recovery for transient provider `404 / No quotes available` responses while preserving requested slippage
+- durable receipt reconciliation for already-submitted transactions even after short-lived preparation capability expiry
+- exact-once known-UTT ownership so wallet scanning does not duplicate a UTT lifecycle as `RHCHAINEXT`
 
 Current accepted execution scope is **registry-driven but still explicitly gated**:
 
@@ -310,6 +505,20 @@ Robinhood Chain safety boundaries include:
 ### Solana DEX workflow
 
 UTT also includes Solana DEX-specific functionality so on-chain trading can live inside the same interface.
+
+The canonical user-facing Solana execution venue is now:
+
+```text
+solana_jupiter
+```
+
+The legacy/internal identity:
+
+```text
+solana_dex
+```
+
+remains for historical records, compatibility checks, and existing `/api/solana_dex/...` backend namespaces. It should not appear as a duplicate user-facing venue alongside Solana-Jupiter.
 
 Current architecture in this repository includes support for:
 
@@ -589,7 +798,20 @@ The backend is the source of truth for trading-side behavior, while the frontend
 The exact state of each venue may evolve over time, but the repository currently includes work across:
 
 - Coinbase
+  - common market and symbol discovery
+  - public Order Book integration
+  - private balance retrieval and All Venues aggregation
+  - live-gated Order Ticket participation
+  - venue-order / All Orders normalization
+  - Market Cap / Volume ownership/source context
+  - independent venue-scoped accounting/FIFO context
 - Crypto.com Exchange
+  - REST instrument/market discovery and public book context
+  - private balances normalized into shared balance fields
+  - live-gated Order Ticket routing
+  - venue-order / All Orders reflection
+  - All Venues and Market Cap / Volume source participation
+  - independent venue-scoped accounting/FIFO context
 - Cexius
   - public market catalog, rules, ticker, trades, candles, fees, and direct-symbol orderbooks
   - Profile-vault Bearer-token authentication with Read / Trade scope checks and no env credential fallback
@@ -599,12 +821,30 @@ The exact state of each venue may evolve over time, but the repository currently
   - limit BUY / SELL submission with API-authoritative precision and minimums
   - manually editable Quantity / Limit / Total, optional Auto-calc, explicit confirmation, and one-request/no-retry behavior
   - generic read-only terminal-order Details windows
-  - insufficient-inventory `I/E` presentation without fabricated basis or tax
+  - tax-evidence `I/E` presentation that distinguishes true insufficient quantity inventory from applied FIFO quantity with missing consumed-lot basis, without fabricating basis or tax
   - market orders, Cancel All, withdrawals, and deposit-address generation intentionally disabled
 
 - Dex-Trade
+  - market/symbol selection and Order Book context
+  - private balances
+  - live-gated Order Ticket routing
+  - venue-order refresh and All Orders visibility
+  - All Venues and market-metric source participation
+  - independent venue-scoped accounting/FIFO context
 - Gemini
+  - market discovery and public orderbook reads
+  - private balances
+  - live-gated Order Ticket routing
+  - venue-order synchronization and All Orders normalization
+  - All Venues and Market Cap / Volume source participation
+  - independent venue-scoped accounting/FIFO context
 - Kraken
+  - market/symbol discovery and public Order Book context
+  - private balances and portfolio aggregation
+  - live-gated Order Ticket routing
+  - venue-order refresh and All Orders display
+  - Market Cap / Volume source participation
+  - independent venue-scoped accounting/FIFO context
 - OKX
   - public instruments and orderbook
   - private balances
@@ -617,6 +857,12 @@ The exact state of each venue may evolve over time, but the repository currently
   - live-gated cancel from All Orders
   - Market Cap / Volume source filtering
 - Robinhood Crypto brokerage adapter
+  - brokerage balances with fast open-order hold overlay
+  - supported Order Book / pricing context
+  - shared live-gated Order Ticket path
+  - venue-order refresh and All Orders normalization
+  - All Venues and market-metric source participation
+  - inventory/accounting scope separate from Robinhood Chain
 - Robinhood Chain
   - chain ID 4663 RPC diagnostics and bounded EVM reads
   - MetaMask linkage by explicit operator action
@@ -780,6 +1026,33 @@ total gain percentage
 ```
 
 Cost-basis and gain fields are read-only display/enrichment fields unless an explicit ledger or FIFO apply workflow is invoked elsewhere. Balance windows should not mutate FIFO lots merely by opening, refreshing, sorting, or filtering.
+
+#### All Venues aggregation and self-custody
+
+**All Venues** is an aggregate portfolio mode, not a tradable venue. Its canonical UI state is `ALL`.
+
+When All Venues is active:
+
+- balance sources are aggregated without sending an invalid backend `venue=all` request
+- Order Book and Order Ticket are not mounted as though `all` were a real trading venue
+- source/group rows can be expanded beneath an asset
+- AppHeader Total Portfolio and the All Venues portfolio total use the same aggregate source set
+- self-custody Wallet Address balances can participate when a latest cached snapshot exists
+- returning to a concrete venue restores the normal trading widgets
+
+For native BTC, same-address self-custody and Counterparty funding identities are deduplicated conservatively:
+
+```text
+matching self_custody BTC snapshot present
+→ self_custody is canonical
+→ same-address Counterparty BTC suppressed
+
+matching self_custody snapshot absent
+→ Counterparty BTC may remain as a fallback
+→ do not silently erase the holding
+```
+
+The Wallet Address latest-balance endpoint now selects the newest snapshot for each `(wallet_address_id, asset)` before applying the final result limit. This prevents a still-valid, unchanged self-custody balance from disappearing merely because thousands of newer snapshots for unrelated identities were written later.
 
 ### 3) Orders, All Orders, and order refresh
 
@@ -1782,7 +2055,7 @@ UTT intentionally omits unsupported time-in-force, post-only, and client-order-I
 
 Only the selected open order can be canceled. Cancel All remains absent. Dry-run or disarmed cancellation reports a simulation without changing authoritative local lifecycle state.
 
-A resting zero-fill order affects Available and Hold but does not create an execution, fee, ledger row, FIFO consumption, basis mutation, or realized tax. When a historical filled disposal cannot be matched to Cexius-scoped inventory, UTT reports `I/E` rather than inventing basis or tax.
+A resting zero-fill order affects Available and Hold but does not create an execution, fee, ledger row, FIFO consumption, basis mutation, or realized tax. For filled SELLs, UTT distinguishes quantity inventory from cost-basis evidence. True `insufficient_inventory` can make tax unavailable, but an applied FIFO SELL can also have valid consumed quantity and known proceeds while one or more consumed deposit lots have unavailable basis. In either unavailable-tax-evidence case, UTT reports `I/E` instead of inventing tax; for the applied/missing-basis case, `net-a/tx` remains equal to Net.
 
 ## Counterparty / UniSat notes
 
@@ -1931,6 +2204,10 @@ Price availability does not imply that historical USD basis is complete. Cost Ba
 ## Solana DEX notes
 
 The Solana side of UTT is designed to fit into the same terminal as the CEX workflows rather than being a separate application.
+
+### Canonical venue identity
+
+`solana_jupiter` is the canonical user-facing venue for current Solana/Jupiter execution and venue-order workflows. `solana_dex` remains an internal/historical compatibility identity so existing local records and `/api/solana_dex/...` route namespaces continue to resolve. Raydium remains a route/provider option inside the Solana workflow rather than a duplicate generic venue row.
 
 ### Current flow areas in the codebase
 
@@ -2156,6 +2433,8 @@ The repository includes token-registry-related backend and frontend work. This s
 
 There is also wallet-address handling in the backend, which supports broader local wallet and workflow integration. Cached wallet-address snapshots can contribute to AppHeader portfolio totals, so self-custody balances can be represented without requiring the balances table to be opened first.
 
+For latest-balance reads, UTT ranks snapshots by `(wallet_address_id, snapshot asset)` and selects the newest identity **before** applying the endpoint result limit. This prevents long-running snapshot history from globally evicting an older but still-current self-custody identity. The correction changes query semantics rather than increasing explorer polling frequency.
+
 Hydration wallet-history ingestion extends this local wallet tooling by caching indexed wallet transactions, materializing them into local deposits and withdrawals, and linking them to the missing-basis, FIFO lot, and bridge transfer-record workflows without requiring live secrets or runtime database files to be committed.
 
 ---
@@ -2223,6 +2502,19 @@ In general:
 ---
 
 ## Troubleshooting
+
+### All Venues or self-custody BTC looks wrong
+
+Check:
+
+- the Wallet Addresses latest-balance API returns the expected self-custody identities
+- the intended self-custody Wallet Address rows are enabled and in the expected owner scope
+- the Balances tab has been manually refreshed if background refresh is intentionally disabled for that tab
+- the AppHeader/background portfolio refresh is not being confused with the Balances-tab refresh setting
+
+Current code selects the latest snapshot per `(wallet_address_id, asset)` before applying the endpoint result limit. An old-but-current BTC snapshot should therefore no longer disappear simply because the historical snapshot table grows.
+
+If Counterparty BTC appears in All Venues for an address that should be represented by self-custody, verify that the matching self-custody snapshot is actually present. Counterparty is intentionally retained as a fallback when no matching self-custody snapshot is available.
 
 ### Frontend starts but cannot reach backend
 
@@ -2588,7 +2880,22 @@ one confirmed live action sends one request and is not retried automatically
 zero-fill rows do not enter execution accounting
 ```
 
-If a filled disposal shows `I/E`, inspect Cexius-scoped inventory and transfer-in basis before treating it as a calculation defect. `I/E` means insufficient inventory; UTT does not borrow lots from another venue or invent basis.
+If a filled Cexius SELL shows `I/E`, open Order Details and distinguish the two accounting states:
+
+```text
+A. realized_status = applied
+   consumed quantity = valid
+   proceeds = known
+   one or more consumed-lot bases = unavailable
+   → Tax = I/E
+   → net-a/tx = Net
+
+B. true insufficient_inventory
+   → Tax evidence unavailable
+   → inventory error remains explicit
+```
+
+`I/E` therefore means **tax evidence is unavailable**, not automatically that quantity inventory is insufficient. UTT does not borrow lots from another venue and does not invent missing basis or tax.
 
 ### OKX Order Ticket, live submit, or cancel does not work
 
@@ -2708,6 +3015,7 @@ The repository includes many execution and accounting surfaces, but several boun
 - UTT does not treat local panic disable as venue-side credential revocation.
 - UTT does not require withdrawal permission for OKX or Cexius order testing.
 - UTT does not enable Cexius market orders, Cancel All, withdrawals, deposit-address generation, or automatic order retry.
+- Cexius explicit `SOL-USDT` All Orders Symbol filtering remains a separate queued UI defect (`CEX-SYMFILTER.SOL.1`); leaving the Symbol field blank preserves row visibility until that correction is accepted.
 - UTT does not treat a Cexius zero-fill resting order as an executed ledger event.
 - UTT does not execute arbitrage from the managed Arbitrage snapshot window.
 - UTT does not auto-apply FIFO merely because a venue fill exists.
@@ -2723,7 +3031,7 @@ The repository includes many execution and accounting surfaces, but several boun
 - Robinhood Chain selected generic Token Registry-backed execution remains capability-gated; token registration, synthetic-book visibility, or quoteability alone does not imply live authority.
 - Market Cap / Volume windows are discovery and monitoring tools, not order execution tools.
 - Robinhood Chain ERC-20 USD pricing is accepted, but generic Robinhood Chain Cost Basis / Cost Avg reconstruction remains follow-up work; missing historical basis must not be fabricated.
-- Some Robinhood Chain synthetic books may display crossed directional snapshots; crossed-book diagnosis/correction remains a follow-up while raw provider evidence is preserved.
+- Robinhood Chain synthetic-book matched-notional/non-crossing correction is accepted; extended cold-pair quote reliability observation remains a follow-up without relaxing transaction safety.
 
 
 ---
@@ -2789,7 +3097,7 @@ UTT is an actively evolving trading terminal codebase with current accepted work
 - SEC-VAULT.1 owner-scoped encrypted credential storage, explicit vault ownership, active/disabled lifecycle metadata, metadata-only inventory, scope declarations, and panic-disable containment
 - Counterparty / UniSat mainnet integration, balances, collectibles, market context, dispenser / order modes, unsigned compose review, explicit PSBT signing, separately gated broadcast, All Orders reflection, and BTC accounting previews
 - Robinhood Chain chain-ID-4663 integration, MetaMask linkage, Token Registry identity, selected generic exact-input execution, finite approval and fresh swap-only preflight, receipt reconciliation, historical/incremental wallet scanning, known-UTT reuse, external MetaMask/DEX swap materialization, All Orders Sync+Load, deterministic ERC-20 USD balance pricing, and idempotent downstream accounting
-- Cexius public/authenticated REST integration, normalized balances and rules, complete order histories, fast orderbooks, selected cancellation, limit BUY / SELL submission, truthful dry-run simulation, and insufficient-inventory presentation
+- Cexius public/authenticated REST integration, normalized balances and rules, complete order histories, fast orderbooks, selected cancellation, limit BUY / SELL submission, truthful dry-run simulation, and explicit unavailable-tax-evidence presentation that preserves the distinction between true inventory insufficiency and applied quantity with missing basis
 - generic read-only Order Details windows with transaction metadata, draggable/resizable top-layer presentation, persistent geometry, and Reset controls
 - managed Arbitrage snapshot window with canonical WindowManager routing, no duplicate popover, best bid/ask and spread display, manual/auto refresh, request coalescing, and privacy handoff
 - OKX balances, orderbooks, rules, fills diagnostics, fill basis preview, live-gated submit, live-gated cancel, and Market Cap / Volume source filtering
@@ -2801,9 +3109,13 @@ UTT is an actively evolving trading terminal codebase with current accepted work
 - Spread / Bridge transfer-record planning, canonical supply context, and read-only basis/apply previews
 - missing-basis lots, transfer-link previews, explicit-only FIFO lot impact, and LP / Omnipool special handling
 - registry, scanner, Market Cap, Volume, Arbitrage, and Spread / Bridge tool windows
-- wallet-address and self-custody portfolio visibility
+- wallet-address and self-custody portfolio visibility, including All Venues same-address Counterparty/native-BTC dedupe and latest-per-wallet+asset snapshot retention before final result limiting
+- All Venues `ALL` sentinel handling, aggregate-only widget behavior, and reconciled header/table portfolio totals
+- Solana-Jupiter canonical user-facing venue consolidation with retained `solana_dex` historical/API compatibility
+- Robinhood Chain matched-notional synthetic-book correction, high-precision Order Ticket pricing, durable receipt recovery, bounded quote recovery, and exact-once known-UTT vs external-wallet materialization
+- Cexius applied-missing-basis `I/E` tax presentation with `net-a/tx = Net` and distinct true-insufficient-inventory handling
 - unified order and ledger workflows
 
-Current deliberate boundaries remain: Cexius market orders, Cancel All, withdrawals, deposit-address generation, and automatic retry are disabled; the Arbitrage window is monitoring-only; Robinhood Chain registration/quoteability does not bypass execution authority; generic Robinhood Chain Cost Basis / Cost Avg reconstruction and crossed synthetic-book remediation remain follow-up work; and organic Cexius fill-accounting revalidation remains an operational follow-up rather than a publication blocker.
+Current deliberate boundaries remain: Cexius market orders, Cancel All, withdrawals, deposit-address generation, and automatic retry are disabled; the Arbitrage window is monitoring-only; Robinhood Chain registration/quoteability does not bypass execution authority; generic Robinhood Chain Cost Basis / Cost Avg reconstruction and extended cold-pair quote reliability observation remain follow-up work; and Cexius rows with incomplete historical basis remain explicitly marked rather than receiving fabricated tax values.
 
 Expect active iteration rather than a frozen, final product. Robinhood Chain generic selected-pair execution should be read as capability-gated exact-input support under the accepted finite-approval/fresh-preflight safety model, not as universal authorization for every registry pair or direction.

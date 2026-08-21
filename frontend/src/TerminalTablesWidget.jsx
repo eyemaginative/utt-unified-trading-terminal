@@ -812,6 +812,7 @@ function classifyStatusKind(statusLower, bucketMaybeLower) {
       balancesColSpan,
       loadingBalances,
       doRefreshBalances,
+      onRegisterRobinhoodChainCandidate,
       hideBalancesView,
       setHideBalancesView,
       hideZeroBalances,
@@ -4257,9 +4258,18 @@ async function refreshSolanaOnchainBalances() {
     const asset = String(b?.asset || "").trim();
     const venRow = String(b?.venue || "").trim();
     const market = normalizeMarketSymbolMaybe(inferBalanceMarketSymbol(b));
+    const isUnregisteredRobinhoodToken = Boolean(
+      isRobinhoodChainBalanceRow(b) &&
+      (
+        b?.unregistered_token === true ||
+        String(b?.registry_status || "").trim().toLowerCase() === "unregistered"
+      )
+    );
 
     // Only allow clicking if we have a plausible market symbol (contains a dash) and an onPickMarket handler.
+    // Unregistered RH Chain candidates are identity-review rows, not trade-navigation rows.
     const clickable =
+      !isUnregisteredRobinhoodToken &&
       !hideTableDataGlobal &&
       typeof onPickMarket === "function" &&
       !!market &&
@@ -4349,8 +4359,80 @@ async function refreshSolanaOnchainBalances() {
                 RH-EVM
               </span>
             ) : null}
+            {isUnregisteredRobinhoodToken && !hideTableDataGlobal ? (
+              <span
+                title={`Detected wallet token is not in Token Registry. Status: ${String(b?.candidate_metadata_status || "unregistered")}`}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  border: "1px solid rgba(251,191,36,0.75)",
+                  borderRadius: 999,
+                  padding: "1px 6px",
+                  fontSize: 9,
+                  fontWeight: 900,
+                  letterSpacing: "0.06em",
+                  color: "#fcd34d",
+                  background: "rgba(120,53,15,0.18)",
+                  textDecoration: "none",
+                }}
+              >
+                UNREGISTERED
+              </span>
+            ) : null}
           </span>
           {showMint ? <span style={{ fontSize: 11, opacity: 0.7 }}>{mintShort2}</span> : null}
+          {isUnregisteredRobinhoodToken && !hideTableDataGlobal ? (
+            <>
+              <span
+                style={{ fontSize: 10, opacity: 0.72, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}
+                title={String(b?.contract_address || "")}
+              >
+                {String(b?.contract_address || "")
+                  ? `${String(b.contract_address).slice(0, 10)}…${String(b.contract_address).slice(-8)}`
+                  : "contract unavailable"}
+              </span>
+              <button
+                type="button"
+                data-no-drag="1"
+                disabled={
+                  b?.candidate_ready_to_register !== true ||
+                  typeof onRegisterRobinhoodChainCandidate !== "function"
+                }
+                title={
+                  b?.candidate_ready_to_register === true
+                    ? "Review and add this exact Robinhood Chain contract to Token Registry"
+                    : `Direct add unavailable: ${String(b?.candidate_metadata_status || "identity not verified")}`
+                }
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (
+                    b?.candidate_ready_to_register !== true ||
+                    typeof onRegisterRobinhoodChainCandidate !== "function"
+                  ) {
+                    return;
+                  }
+                  Promise.resolve(onRegisterRobinhoodChainCandidate(b)).catch((err) => {
+                    console.warn("Robinhood Chain candidate registration failed:", err);
+                  });
+                }}
+                style={{
+                  alignSelf: "flex-start",
+                  marginTop: 2,
+                  padding: "2px 7px",
+                  borderRadius: 6,
+                  border: "1px solid rgba(251,191,36,0.55)",
+                  background: "rgba(120,53,15,0.16)",
+                  color: "#fcd34d",
+                  cursor: b?.candidate_ready_to_register === true ? "pointer" : "not-allowed",
+                  fontSize: 10,
+                  fontWeight: 800,
+                  opacity: b?.candidate_ready_to_register === true ? 1 : 0.55,
+                }}
+              >
+                {b?.candidate_ready_to_register === true ? "Add to Registry" : "Review required"}
+              </button>
+            </>
+          ) : null}
         </div>
       </td>
     );
@@ -5434,6 +5516,59 @@ function hasAppliedRealizedBasisGap(o) {
     return Number.isFinite(Number(value));
   });
 }
+
+function hasInsufficientInventoryRealization(o) {
+  if (!o || typeof o !== "object") return false;
+
+  const candidates = [
+    o.realized_error,
+    o.realizedError,
+    o.impact_error,
+    o.impactError,
+    o?.impact?.error,
+    o?.impact?.reason,
+    o?.journal_impact?.error,
+    o?.journal_impact?.reason,
+  ];
+
+  return candidates.some((value) => {
+    const s = String(value || "").trim().toLowerCase();
+    if (!s) return false;
+    return s === "insufficient_inventory" ||
+      (s.includes("insufficient") && s.includes("inventory"));
+  });
+}
+
+function hasCexiusAppliedMissingBasisTaxEvidence(o) {
+  if (!o || typeof o !== "object") return false;
+  if (String(o?.venue || "").trim().toLowerCase() !== "cexius") return false;
+  if (!isFilledSellOrder(o)) return false;
+  if (!hasAppliedRealizedBasisGap(o)) return false;
+  if (hasInsufficientInventoryRealization(o)) return false;
+
+  const errorCandidates = [
+    o.realized_error,
+    o.realizedError,
+    o.impact_error,
+    o.impactError,
+    o?.impact?.error,
+    o?.impact?.reason,
+    o?.journal_impact?.error,
+    o?.journal_impact?.reason,
+  ];
+  if (errorCandidates.some((value) => String(value || "").trim())) return false;
+
+  const proceedsCandidates = [
+    o.realized_proceeds_usd,
+    o.realizedProceedsUsd,
+    o.proceeds_usd,
+    o.proceedsUsd,
+  ];
+  return proceedsCandidates.some((value) => {
+    if (value === null || value === undefined || value === "") return false;
+    return Number.isFinite(Number(value));
+  });
+}
 function formatAllOrdersTimeCompact(value) {
     if (value === null || value === undefined || value === "") return "—";
     try {
@@ -5572,12 +5707,16 @@ const isUsdQuote = isUsdQuotedSymbol(symForTax);
 
 const gainUsd = pickOrderGainUsdMaybe(o);
 const realizedBasisGap = hasAppliedRealizedBasisGap(o);
+const isInventoryError = hasInsufficientInventoryRealization(o);
+const isCexiusMissingBasisTaxEvidence = hasCexiusAppliedMissingBasisTaxEvidence(o);
+const isTaxEvidenceUnavailable = isInventoryError || isCexiusMissingBasisTaxEvidence;
 
 const shouldFallbackTax =
   !isRobinhoodChainExecutionRow &&
   !!aoTaxWithholdEnabled &&
   backendTax === null &&
   !realizedBasisGap &&
+  !isTaxEvidenceUnavailable &&
   isUsdQuote &&
   isFilledSellOrder(o) &&
   net !== null &&
@@ -5598,11 +5737,23 @@ const rate = Number(aoTaxCombinedPct) / 100;
 const fallbackTax =
   taxableBase !== null && Number.isFinite(rate) && rate > 0 ? Math.max(0, Number(taxableBase) * rate) : null;
 
-// Use backend tax if present, otherwise fallback tax if applicable, otherwise 0 for net-a/tx math.
-const taxUsed = backendTax !== null ? backendTax : fallbackTax !== null ? fallbackTax : 0;
+// Use backend/fallback tax when known. When Cexius tax evidence is unavailable
+// (true inventory failure or applied FIFO with missing cost basis), preserve Net
+// without fabricating a tax deduction.
+const taxUsed = isTaxEvidenceUnavailable
+  ? 0
+  : backendTax !== null
+    ? backendTax
+    : fallbackTax !== null
+      ? fallbackTax
+      : 0;
 
 const netAfterTax =
-  isRobinhoodChainExecutionRow || realizedBasisGap || net === null || net === undefined
+  isRobinhoodChainExecutionRow ||
+  (realizedBasisGap && !isTaxEvidenceUnavailable) ||
+  net === null ||
+  net === undefined ||
+  !Number.isFinite(Number(net))
     ? null
     : Number(net) - Number(taxUsed);
 const bucket = orderBucket(o);
@@ -6028,34 +6179,41 @@ if (col === COLS.side) return <td style={td}>{hideTableDataGlobal ? "•••�
     }
     // Tax (backend if present; else Mode A fallback on USD FILLED SELL when eligible)
     if (col === COLS.tax) {
-      const isInventoryError =
-        String(o?.realized_status || "").trim().toLowerCase() === "unapplied" &&
-        String(o?.realized_error || "").trim().toLowerCase() === "insufficient_inventory";
-      const displayTax = isRobinhoodChainExecutionRow || realizedBasisGap
+      const displayTax = isTaxEvidenceUnavailable || isRobinhoodChainExecutionRow || realizedBasisGap
         ? null
         : backendTax !== null
           ? backendTax
           : fallbackTax;
-      const displayText =
-        displayTax === null
-          ? (isInventoryError ? "I/E" : "—")
+      const displayText = isTaxEvidenceUnavailable
+        ? "I/E"
+        : displayTax === null
+          ? "—"
           : fmtMoney?.(displayTax);
       return (
         <td
           style={td}
           title={
-            realizedBasisGap && displayTax === null
-              ? "Cost basis missing; realized tax cannot be computed"
-              : isInventoryError && displayTax === null
-                ? "Insufficient inventory"
-                : undefined
+            isInventoryError
+              ? "Insufficient inventory"
+              : isCexiusMissingBasisTaxEvidence
+                ? "Cost basis is unavailable for one or more consumed Cexius FIFO lots; tax cannot be calculated."
+                : realizedBasisGap && displayTax === null
+                  ? "Cost basis missing; realized tax cannot be computed"
+                  : undefined
           }
         >
           {maskMaybe?.(displayText)}
         </td>
       );
     }
-    if (col === COLS.netAfterTax) return <td style={td}>{maskMaybe?.(netAfterTax === null ? "—" : fmtMoney?.(netAfterTax))}</td>;
+    if (col === COLS.netAfterTax) {
+      const netAfterTaxTitle = isInventoryError && netAfterTax !== null
+        ? "Tax unavailable due to insufficient inventory; showing Net without a fabricated tax deduction."
+        : isCexiusMissingBasisTaxEvidence && netAfterTax !== null
+          ? "Cost basis is unavailable for one or more consumed Cexius FIFO lots; showing Net without a fabricated tax deduction."
+          : undefined;
+      return <td style={td} title={netAfterTaxTitle}>{maskMaybe?.(netAfterTax === null ? "—" : fmtMoney?.(netAfterTax))}</td>;
+    }
     if (col === COLS.fee) {
       const feeText = fee === null
         ? "—"
@@ -7636,7 +7794,7 @@ function renderFillToasts() {
                           {hideTableDataGlobal ? "" : `${(b.__balanceGroupChildren || []).length} source${(b.__balanceGroupChildren || []).length === 1 ? "" : "s"}`}
                         </span>
                       </td>
-                    ) : isGroupedChild ? (
+                    ) : isGroupedChild && !b?.unregistered_token ? (
                       <td style={{ ...sx.td, paddingLeft: 22, opacity: 0.92 }}>
                         {hideTableDataGlobal ? "••••" : b.asset || "—"}
                       </td>
@@ -9125,12 +9283,16 @@ function renderFillToasts() {
     const backendTax = pickOrderTaxUsdMaybe(o);
     const gainUsd = pickOrderGainUsdMaybe(o);
     const realizedBasisGap = hasAppliedRealizedBasisGap(o);
+    const isInventoryError = hasInsufficientInventoryRealization(o);
+    const isCexiusMissingBasisTaxEvidence = hasCexiusAppliedMissingBasisTaxEvidence(o);
+    const isTaxEvidenceUnavailable = isInventoryError || isCexiusMissingBasisTaxEvidence;
     const symbolForTax = pickOrderSymbolStr(o);
     const shouldFallbackTax =
       !isCanceled &&
       !!aoTaxWithholdEnabled &&
       backendTax === null &&
       !realizedBasisGap &&
+      !isTaxEvidenceUnavailable &&
       isUsdQuotedSymbol(symbolForTax) &&
       isFilledSellOrder(o) &&
       net !== null &&
@@ -9151,11 +9313,7 @@ function renderFillToasts() {
         ? Math.max(0, Number(taxableBase) * taxRate)
         : null;
 
-    const isInventoryError =
-      String(o?.realized_status || "").trim().toLowerCase() === "unapplied" &&
-      String(o?.realized_error || "").trim().toLowerCase() === "insufficient_inventory";
-
-    const taxValue = isCanceled || realizedBasisGap
+    const taxValue = isCanceled || isTaxEvidenceUnavailable || realizedBasisGap
       ? null
       : backendTax !== null
         ? backendTax
@@ -9163,15 +9321,18 @@ function renderFillToasts() {
 
     const taxText = isCanceled
       ? "—"
-      : taxValue === null
-        ? isInventoryError
-          ? "I/E"
-          : "—"
-        : fmtMoney?.(taxValue);
+      : isTaxEvidenceUnavailable
+        ? "I/E"
+        : taxValue === null
+          ? "—"
+          : fmtMoney?.(taxValue);
 
-    const taxForNet = taxValue === null ? 0 : Number(taxValue);
+    const taxForNet = isTaxEvidenceUnavailable ? 0 : taxValue === null ? 0 : Number(taxValue);
     const netAfterTax =
-      realizedBasisGap || net === null || net === undefined || !Number.isFinite(Number(net))
+      (realizedBasisGap && !isTaxEvidenceUnavailable) ||
+      net === null ||
+      net === undefined ||
+      !Number.isFinite(Number(net))
         ? null
         : Number(net) - (Number.isFinite(taxForNet) ? taxForNet : 0);
 
@@ -9369,9 +9530,19 @@ function renderFillToasts() {
           {row("Fee", fee === null || fee === undefined ? "—" : `${fmtFee?.(fee)}${feeAsset ? ` ${feeAsset}` : ""}`)}
           {row("Net", formatMoneyValue(net))}
           {row("Tax", taxText, {
-            title: isInventoryError && taxValue === null ? "Insufficient inventory" : undefined,
+            title: isInventoryError
+              ? "Insufficient inventory"
+              : isCexiusMissingBasisTaxEvidence
+                ? "Cost basis is unavailable for one or more consumed Cexius FIFO lots; tax cannot be calculated."
+                : undefined,
           })}
-          {row("Net after tax", netAfterTax === null ? "—" : formatMoneyValue(netAfterTax))}
+          {row("Net after tax", netAfterTax === null ? "—" : formatMoneyValue(netAfterTax), {
+            title: isInventoryError && netAfterTax !== null
+              ? "Tax unavailable due to insufficient inventory; showing Net without a fabricated tax deduction."
+              : isCexiusMissingBasisTaxEvidence && netAfterTax !== null
+                ? "Cost basis is unavailable for one or more consumed Cexius FIFO lots; showing Net without a fabricated tax deduction."
+                : undefined,
+          })}
 
           <div style={sectionTitle}>Lifecycle</div>
           {row("Status", status)}
@@ -9391,7 +9562,13 @@ function renderFillToasts() {
           {row("Realized fee (USD)", formatMoneyValue(o?.realized_fee_usd))}
           {row("Realized P&L (USD)", formatMoneyValue(o?.realized_pnl_usd))}
           {row("Realized error", o?.realized_error)}
-          {row("Tax / inventory state", taxText)}
+          {row("Tax / inventory state", taxText, {
+            title: isInventoryError
+              ? "Insufficient inventory"
+              : isCexiusMissingBasisTaxEvidence
+                ? "Applied Cexius FIFO quantity is valid, but one or more consumed lots have unavailable cost basis; tax cannot be calculated."
+                : undefined,
+          })}
 
           <div style={sectionTitle}>Related data</div>
           <div style={detailRow}>

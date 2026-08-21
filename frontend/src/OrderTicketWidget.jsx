@@ -80,6 +80,10 @@ const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
 const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
 const ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT = "utt:robinhood-chain-orderbook-pick";
 const ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT = "utt:robinhood-chain-selected-pair-registered";
+const ROBINHOOD_CHAIN_INTERACTIVE_QUOTE_PRIORITY_EVENT = "utt:robinhood-chain-interactive-quote-priority";
+const ROBINHOOD_CHAIN_INDICATIVE_TIMEOUT_MS = 60000;
+const ROBINHOOD_CHAIN_FIRM_PLAN_TIMEOUT_MS = 120000;
+const ROBINHOOD_CHAIN_LIFECYCLE_PREFLIGHT_TIMEOUT_MS = 120000;
 const ROBINHOOD_CHAIN_NETWORK = Object.freeze({
   chainIdHex: "0x1237",
   chainIdDecimal: 4663,
@@ -3325,6 +3329,33 @@ const LS_OT_AUTOCALC_AUTHORITY = "utt_ot_autocalc_authority_v1";
 // Safe environment helpers (prevents “blank UI” from storage/window issues)
 // ─────────────────────────────────────────────────────────────
 const HAS_WINDOW = typeof window !== "undefined";
+
+function beginRobinhoodChainInteractiveProviderPriority(symbol, source) {
+  if (!HAS_WINDOW) return () => {};
+  const normalizedSymbol = normalizeRobinhoodChainQuoteSymbol(symbol);
+  if (!normalizedSymbol) return () => {};
+  let released = false;
+  const notify = (active) => {
+    try {
+      window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_INTERACTIVE_QUOTE_PRIORITY_EVENT, {
+        detail: {
+          active: active === true,
+          symbol: normalizedSymbol,
+          source: String(source || "order_ticket_lifecycle"),
+        },
+      }));
+    } catch {
+      // Order Book can still refresh manually if the event bridge is unavailable.
+    }
+  };
+  notify(true);
+  return () => {
+    if (released) return;
+    released = true;
+    notify(false);
+  };
+}
+
 function lsGet(key, fallback = null) {
   try {
     if (typeof localStorage === "undefined") return fallback;
@@ -6501,9 +6532,9 @@ export default function OrderTicketWidget({
   useEffect(() => {
     if (limitEditingRef.current) return;
 
-    // DEX / Counterparty preview venues: do not CEX-normalize the user-entered limit.
-    // Counterparty BTC/XCP prices can be tiny; stale generic rules can otherwise round them to 0.
-    if (isDexSwapVenue || isCounterpartyVenue) return;
+    // DEX / Counterparty / Robinhood Chain preview venues: do not CEX-normalize the user-entered limit.
+    // Counterparty BTC/XCP and Robinhood Chain ratio prices can be tiny; generic venue rules can otherwise truncate them.
+    if (isDexSwapVenue || isCounterpartyVenue || isRobinhoodChainVenue) return;
 
     const lp = String(limitPrice ?? "");
     if (!lp) return;
@@ -6517,7 +6548,7 @@ export default function OrderTicketWidget({
       setLimitPrice(normalized);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rules, side, limitPrice, isDexSwapVenue, isCounterpartyVenue]);
+  }, [rules, side, limitPrice, isDexSwapVenue, isCounterpartyVenue, isRobinhoodChainVenue]);
 
   // ─────────────────────────────────────────────────────────────
   // Effective min qty (gated to Crypto.com only)
@@ -8662,6 +8693,52 @@ export default function OrderTicketWidget({
     robinhoodChainAutoPlanKey,
   ]);
 
+  const robinhoodChainInteractiveQuotePriorityActive = Boolean(
+    isRobinhoodChainVenue && (
+      robinhoodChainQuoteLoading ||
+      robinhoodChainFirmPlanLoading ||
+      ["quote_queued", "quoting", "plan_queued", "planning"].includes(robinhoodChainAutoPreparationPhase) ||
+      (
+        robinhoodChainAutoQuoteEligible &&
+        !robinhoodChainAutoQuoteCurrent &&
+        robinhoodChainAutoQuoteAttemptKeyRef.current !== robinhoodChainAutoQuoteKey
+      ) ||
+      (
+        robinhoodChainAutoQuoteCurrent &&
+        !robinhoodChainAutoPlanCurrent &&
+        canBuildRobinhoodChainFirmPlan
+      )
+    )
+  );
+
+  // RH-QUOTE.PIPELINE.1B: announce read-only interactive quote/plan priority so
+  // the synthetic Order Book can defer its automatic provider work. This is a
+  // UI scheduling signal only; it grants no wallet, signing, or broadcast authority.
+  useEffect(() => {
+    if (!isRobinhoodChainVenue) return undefined;
+    const symbol = normalizeRobinhoodChainQuoteSymbol(otSymbol);
+    if (!symbol) return undefined;
+
+    const notifyPriority = (active) => {
+      try {
+        window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_INTERACTIVE_QUOTE_PRIORITY_EVENT, {
+          detail: {
+            active: active === true,
+            symbol,
+            source: "order_ticket",
+          },
+        }));
+      } catch {
+        // Order Book can still refresh manually if the event bridge is unavailable.
+      }
+    };
+
+    notifyPriority(robinhoodChainInteractiveQuotePriorityActive);
+    return () => {
+      if (robinhoodChainInteractiveQuotePriorityActive) notifyPriority(false);
+    };
+  }, [isRobinhoodChainVenue, otSymbol, robinhoodChainInteractiveQuotePriorityActive]);
+
   const robinhoodChainAutoPreparationStatus = useMemo(() => {
     if (!isRobinhoodChainVenue) return null;
 
@@ -10486,7 +10563,7 @@ async function submitLimitOrder() {
           taker_address: robinhoodChainReviewTakerAddress || null,
           force_refresh: !!forceRefresh,
         },
-        { apiBase, timeout_ms: 30000 }
+        { apiBase, timeout_ms: ROBINHOOD_CHAIN_INDICATIVE_TIMEOUT_MS }
       );
       if (
         robinhoodChainQuoteReqRef.current !== reqId ||
@@ -10604,7 +10681,7 @@ async function submitLimitOrder() {
           slippage_bps: Number(robinhoodChainSlippageBps),
           taker_address: robinhoodChainReviewTakerAddress,
         },
-        { apiBase, timeout_ms: 30000 }
+        { apiBase, timeout_ms: ROBINHOOD_CHAIN_FIRM_PLAN_TIMEOUT_MS }
       );
       if (
         robinhoodChainFirmPlanReqRef.current !== reqId ||
@@ -10659,6 +10736,10 @@ async function submitLimitOrder() {
     setRobinhoodChainWalletRejectionReviewed(false);
     setRobinhoodChainWalletRejectionAttempted(false);
     setRobinhoodChainWalletRejectionResult(null);
+    const releaseProviderPriority = beginRobinhoodChainInteractiveProviderPriority(
+      otSymbol,
+      "wallet_rejection_prepare"
+    );
     try {
       const data = await prepareRobinhoodChainWalletRejection(
         {
@@ -10668,7 +10749,7 @@ async function submitLimitOrder() {
           slippage_bps: Number(robinhoodChainSlippageBps),
           taker_address: robinhoodChainConnectedAddress,
         },
-        { apiBase, timeout_ms: 60000 }
+        { apiBase, timeout_ms: ROBINHOOD_CHAIN_LIFECYCLE_PREFLIGHT_TIMEOUT_MS }
       );
       if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       if (
@@ -10696,6 +10777,7 @@ async function submitLimitOrder() {
       setRobinhoodChainWalletRejectionError(msg);
       onToast?.({ kind: "warn", msg });
     } finally {
+      releaseProviderPriority();
       setRobinhoodChainWalletRejectionBusy(false);
     }
   }
@@ -10880,6 +10962,10 @@ async function submitLimitOrder() {
     setRobinhoodChainWalletApprovalPrepared(null);
     setRobinhoodChainWalletApprovalAttempted(false);
     setRobinhoodChainWalletApprovalResult(null);
+    const releaseProviderPriority = beginRobinhoodChainInteractiveProviderPriority(
+      otSymbol,
+      "wallet_approval_prepare"
+    );
     try {
       const data = await prepareRobinhoodChainWalletApproval(
         {
@@ -10889,7 +10975,7 @@ async function submitLimitOrder() {
           slippage_bps: Number(robinhoodChainSlippageBps),
           taker_address: robinhoodChainConnectedAddress,
         },
-        { apiBase, timeout_ms: 60000 }
+        { apiBase, timeout_ms: ROBINHOOD_CHAIN_LIFECYCLE_PREFLIGHT_TIMEOUT_MS }
       );
       if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       if (
@@ -10915,6 +11001,7 @@ async function submitLimitOrder() {
       setRobinhoodChainWalletApprovalError(msg);
       onToast?.({ kind: "warn", msg });
     } finally {
+      releaseProviderPriority();
       setRobinhoodChainWalletApprovalBusy(false);
     }
   }
@@ -11067,6 +11154,10 @@ async function submitLimitOrder() {
     setRobinhoodChainWalletSwapPrepared(null);
     setRobinhoodChainWalletSwapAttempted(false);
     setRobinhoodChainWalletSwapResult(null);
+    const releaseProviderPriority = beginRobinhoodChainInteractiveProviderPriority(
+      otSymbol,
+      "wallet_swap_prepare"
+    );
     try {
       const data = await prepareRobinhoodChainWalletSwap(
         {
@@ -11079,7 +11170,7 @@ async function submitLimitOrder() {
             robinhoodChainWalletApprovalResult?.transaction_hash || robinhoodChainWalletApprovalResult?.tx_hash
           ) || undefined,
         },
-        { apiBase, timeout_ms: 60000 }
+        { apiBase, timeout_ms: ROBINHOOD_CHAIN_LIFECYCLE_PREFLIGHT_TIMEOUT_MS }
       );
       if (!robinhoodChainReviewContextIsCurrent(reviewContextVersion)) return;
       if (
@@ -11111,6 +11202,7 @@ async function submitLimitOrder() {
       setRobinhoodChainWalletSwapError(msg);
       onToast?.({ kind: "warn", msg });
     } finally {
+      releaseProviderPriority();
       setRobinhoodChainWalletSwapBusy(false);
     }
   }

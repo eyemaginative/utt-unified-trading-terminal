@@ -31,12 +31,18 @@ _MAX_PROVIDER_ERROR_TEXT = 1200
 _MAX_UINT256 = (1 << 256) - 1
 _APPROVE_SELECTOR = "0x095ea7b3"
 _BOOK_MULTIPLIERS = (Decimal("0.25"), Decimal("0.5"), Decimal("1"), Decimal("2"), Decimal("4"))
+_BOOK_MIN_QUOTE_INPUT_ATOMIC = 1000
+_BOOK_MIN_QUOTE_OUTPUT_ATOMIC = 100
 _WALLET_APPROVAL_CAPABILITY_VERSION = "r5c5d2f2_wallet_approval_v1"
 _WALLET_APPROVAL_RECEIPT_TTL_SECONDS = 30 * 60
 _WALLET_APPROVAL_CAPABILITY_DOMAIN = b"UTT:R5C.5D.2F.2:wallet-approval-capability:v1"
 _WALLET_SWAP_CAPABILITY_VERSION = "r5c5d2f3_wallet_swap_v1"
 _WALLET_SWAP_RECEIPT_TTL_SECONDS = 30 * 60
 _WALLET_SWAP_CAPABILITY_DOMAIN = b"UTT:R5C.5D.2F.3:wallet-swap-capability:v1"
+_FIRM_QUOTE_RETRY_POLICY = "interactive_firm_plan_quote_v2"
+_FIRM_QUOTE_MAX_ATTEMPTS = 3
+_FIRM_QUOTE_RETRY_DELAYS_S = (0.75, 1.5)
+_FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S = (5.0, 15.0)
 
 
 def _utc_iso() -> str:
@@ -93,6 +99,28 @@ def _scaled_display_amount(value: Any, multiplier: Decimal, decimals: int) -> st
     if atomic <= 0:
         atomic = 1
     return _decimal_text(Decimal(atomic) / (Decimal(10) ** places))
+
+
+def _synthetic_book_quote_seed(
+    quote_token: Dict[str, Any],
+    quote_to_base_capability: Dict[str, Any],
+) -> Tuple[str, str]:
+    places = max(0, min(int(quote_token.get("decimals") or 0), 18))
+    stable_source = str(quote_token.get("external_price_source") or "").strip().lower()
+    stable_price_id = str(quote_token.get("external_price_id") or "").strip().lower()
+    if stable_source == "stable" or stable_price_id == "stable":
+        seed = Decimal("1")
+        seed_source = "token_registry_stable_quote"
+    else:
+        seed = _decimal(quote_to_base_capability.get("probe_amount"), field="probe_amount")
+        seed_source = "quote_direction_capability"
+
+    scale = Decimal(10) ** places
+    seed_atomic = int(seed * scale)
+    smallest_multiplier = min(_BOOK_MULTIPLIERS)
+    minimum_seed_atomic = int(Decimal(_BOOK_MIN_QUOTE_INPUT_ATOMIC) / smallest_multiplier)
+    seed_atomic = max(seed_atomic, minimum_seed_atomic)
+    return _decimal_text(Decimal(seed_atomic) / scale), seed_source
 
 
 def _normalize_evm_quantity(
@@ -816,7 +844,18 @@ def create_wallet_swap_capability(
     }
 
 
-def decode_wallet_swap_capability(token: str, *, now_epoch: Optional[int] = None) -> Dict[str, Any]:
+def decode_wallet_swap_capability(
+    token: str,
+    *,
+    now_epoch: Optional[int] = None,
+    allow_expired_for_bound_receipt: bool = False,
+) -> Dict[str, Any]:
+    """Verify and decode one signed swap capability.
+
+    Expiry remains mandatory for every normal caller. The single recovery
+    exception is post-broadcast receipt verification after a durable execution
+    has already bound the exact signed capability and transaction hash.
+    """
     text = str(token or "").strip()
     parts = text.split(".")
     if len(parts) != 2:
@@ -835,7 +874,7 @@ def decode_wallet_swap_capability(token: str, *, now_epoch: Optional[int] = None
         raise ValueError("wallet_swap_capability_invalid")
     now = int(time.time()) if now_epoch is None else int(now_epoch)
     expires = int(payload.get("expires_at") or 0)
-    if expires <= now:
+    if expires <= now and allow_expired_for_bound_receipt is not True:
         raise ValueError("wallet_swap_capability_expired")
     return payload
 
@@ -904,6 +943,47 @@ def _safe_provider_error(value: Any) -> Any:
             return out
     text = str(value or "").strip()
     return text[:_MAX_PROVIDER_ERROR_TEXT] if text else None
+
+
+def _firm_quote_retry_reason(result: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(result, dict) or result.get("ok") is True:
+        return None
+    error = str(result.get("error") or "").strip()
+    if error == "uniswap_quote_provider_transient_error":
+        return error
+    if error != "uniswap_quote_provider_error":
+        return None
+    try:
+        http_status = int(result.get("http_status") or 0)
+    except (TypeError, ValueError):
+        http_status = 0
+    provider_error = result.get("provider_error")
+    if http_status != 404 or not isinstance(provider_error, dict):
+        return None
+    code = str(provider_error.get("errorCode") or "").strip().lower()
+    detail = str(provider_error.get("detail") or provider_error.get("message") or "").strip().lower()
+    if code == "resourcenotfound" and detail == "no quotes available":
+        return "provider_404_no_quotes_available"
+    return None
+
+
+def _firm_quote_retry_delay_s(result: Dict[str, Any], retry_index: int) -> float:
+    retry_after = str((result or {}).get("retry_after") or "").strip()
+    if retry_after:
+        try:
+            parsed = float(retry_after)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        if parsed > 0:
+            return max(0.25, min(parsed, 3.0))
+    retry_reason = _firm_quote_retry_reason(result)
+    delays = (
+        _FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S
+        if retry_reason == "provider_404_no_quotes_available"
+        else _FIRM_QUOTE_RETRY_DELAYS_S
+    )
+    index = max(0, min(int(retry_index), len(delays) - 1))
+    return float(delays[index])
 
 
 def _normalize_token(token: Dict[str, Any]) -> Dict[str, Any]:
@@ -1104,6 +1184,10 @@ class RobinhoodChainUniswapQuoteService:
             "wallet_connection_requested": False,
             "signing_enabled": False,
             "broadcast_enabled": False,
+            "interactive_firm_quote_retry_policy": _FIRM_QUOTE_RETRY_POLICY,
+            "interactive_firm_quote_max_attempts": _FIRM_QUOTE_MAX_ATTEMPTS,
+            "interactive_firm_quote_transient_retry_delays_s": list(_FIRM_QUOTE_RETRY_DELAYS_S),
+            "interactive_firm_quote_no_quotes_retry_delays_s": list(_FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S),
             "last_good_at": self._last_good_at,
             "last_error": self._last_error,
             "read_only": True,
@@ -1527,16 +1611,15 @@ class RobinhoodChainUniswapQuoteService:
                     input_asset=from_symbol,
                     output_asset=to_symbol,
                 )
+
         levels = max(1, min(int(depth), len(_BOOK_MULTIPLIERS)))
-        bid_seed = str(base_to_quote_capability.get("probe_amount") or "").strip()
-        ask_seed = str(quote_to_base_capability.get("probe_amount") or "").strip()
         try:
-            bid_amounts = [
-                _scaled_display_amount(bid_seed, multiplier, int(base_identity["decimals"]))
-                for multiplier in _BOOK_MULTIPLIERS[:levels]
-            ]
-            ask_amounts = [
-                _scaled_display_amount(ask_seed, multiplier, int(quote_identity["decimals"]))
+            quote_seed, quote_seed_source = _synthetic_book_quote_seed(
+                quote_token,
+                quote_to_base_capability,
+            )
+            quote_amounts = [
+                _scaled_display_amount(quote_seed, multiplier, int(quote_identity["decimals"]))
                 for multiplier in _BOOK_MULTIPLIERS[:levels]
             ]
         except ValueError as exc:
@@ -1545,72 +1628,146 @@ class RobinhoodChainUniswapQuoteService:
         bids: List[Dict[str, Any]] = []
         asks: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
-        for amount in bid_amounts:
-            quote = await self.quote(
-                symbol=normalized_symbol,
-                side="sell",
-                amount_mode="exact_input",
-                requested_amount=amount,
-                slippage_bps=50,
-                swapper_address=taker_address,
-                input_token=base_token,
-                output_token=quote_token,
-                confirm_quote=True,
+
+        for pair_index, quote_amount in enumerate(quote_amounts, start=1):
+            quote_input_atomic, _ = _display_to_atomic(
+                quote_amount,
+                int(quote_identity["decimals"]),
             )
-            if quote.get("ok"):
-                bids.append({
-                    "price": quote.get("price_quote_per_base"),
-                    "size": quote.get("input_amount"),
-                    "base_quantity": quote.get("input_amount"),
-                    "quote_quantity": quote.get("output_amount"),
-                    "input_asset": base_identity["symbol"],
-                    "input_amount": quote.get("input_amount"),
-                    "output_asset": quote_identity["symbol"],
-                    "output_amount": quote.get("output_amount"),
-                    "minimum_received": quote.get("minimum_received"),
-                    "route_sources": [f"UNISWAP_{item}" for item in (quote.get("route_protocols") or [])],
-                    "provider": UNISWAP_PROVIDER,
-                    "synthetic": True,
-                    "resting_order": False,
-                    "fetched_at": quote.get("fetched_at"),
+            if int(quote_input_atomic) < _BOOK_MIN_QUOTE_INPUT_ATOMIC:
+                errors.append({
+                    "side": "pair",
+                    "pair_index": pair_index,
+                    "sample_quote_notional": quote_amount,
+                    "error": "synthetic_orderbook_quote_notional_below_precision_floor",
+                    "quote_input_atomic": quote_input_atomic,
+                    "minimum_quote_input_atomic": _BOOK_MIN_QUOTE_INPUT_ATOMIC,
                 })
-            else:
-                errors.append({"side": "bid", "sample_input_amount": amount, "error": quote.get("error")})
-        for amount in ask_amounts:
-            quote = await self.quote(
+                continue
+
+            ask_quote = await self.quote(
                 symbol=normalized_symbol,
                 side="buy",
                 amount_mode="exact_input",
-                requested_amount=amount,
+                requested_amount=quote_amount,
                 slippage_bps=50,
                 swapper_address=taker_address,
                 input_token=quote_token,
                 output_token=base_token,
                 confirm_quote=True,
             )
-            if quote.get("ok"):
-                asks.append({
-                    "price": quote.get("price_quote_per_base"),
-                    "size": quote.get("output_amount"),
-                    "base_quantity": quote.get("output_amount"),
-                    "quote_quantity": quote.get("input_amount"),
-                    "input_asset": quote_identity["symbol"],
-                    "input_amount": quote.get("input_amount"),
-                    "output_asset": base_identity["symbol"],
-                    "output_amount": quote.get("output_amount"),
-                    "minimum_received": quote.get("minimum_received"),
-                    "route_sources": [f"UNISWAP_{item}" for item in (quote.get("route_protocols") or [])],
-                    "provider": UNISWAP_PROVIDER,
-                    "synthetic": True,
-                    "resting_order": False,
-                    "fetched_at": quote.get("fetched_at"),
+            if not ask_quote.get("ok"):
+                errors.append({
+                    "side": "ask",
+                    "pair_index": pair_index,
+                    "sample_quote_notional": quote_amount,
+                    "sample_input_amount": quote_amount,
+                    "error": ask_quote.get("error"),
                 })
-            else:
-                errors.append({"side": "ask", "sample_input_amount": amount, "error": quote.get("error")})
+                continue
+
+            paired_base_amount = str(ask_quote.get("output_amount") or "").strip()
+            try:
+                _display_to_atomic(paired_base_amount, int(base_identity["decimals"]))
+            except ValueError:
+                errors.append({
+                    "side": "pair",
+                    "pair_index": pair_index,
+                    "sample_quote_notional": quote_amount,
+                    "error": "synthetic_orderbook_invalid_paired_base_amount",
+                })
+                continue
+
+            bid_quote = await self.quote(
+                symbol=normalized_symbol,
+                side="sell",
+                amount_mode="exact_input",
+                requested_amount=paired_base_amount,
+                slippage_bps=50,
+                swapper_address=taker_address,
+                input_token=base_token,
+                output_token=quote_token,
+                confirm_quote=True,
+            )
+            if not bid_quote.get("ok"):
+                errors.append({
+                    "side": "bid",
+                    "pair_index": pair_index,
+                    "sample_quote_notional": quote_amount,
+                    "sample_input_amount": paired_base_amount,
+                    "error": bid_quote.get("error"),
+                })
+                continue
+
+            bid_output_atomic = str(bid_quote.get("output_amount_atomic") or "").strip()
+            if not bid_output_atomic.isdigit() or int(bid_output_atomic) < _BOOK_MIN_QUOTE_OUTPUT_ATOMIC:
+                errors.append({
+                    "side": "pair",
+                    "pair_index": pair_index,
+                    "sample_quote_notional": quote_amount,
+                    "sample_input_amount": paired_base_amount,
+                    "error": "synthetic_orderbook_quote_output_below_precision_floor",
+                    "quote_output_atomic": bid_output_atomic or None,
+                    "minimum_quote_output_atomic": _BOOK_MIN_QUOTE_OUTPUT_ATOMIC,
+                })
+                continue
+
+            route_sources: List[str] = []
+            for item in [*(ask_quote.get("route_protocols") or []), *(bid_quote.get("route_protocols") or [])]:
+                source = f"UNISWAP_{item}"
+                if source not in route_sources:
+                    route_sources.append(source)
+
+            common = {
+                "pair_index": pair_index,
+                "sample_quote_notional": quote_amount,
+                "paired_base_amount": paired_base_amount,
+                "sampling_policy": "quote_notional_matched_v1",
+                "route_sources": route_sources,
+                "provider": UNISWAP_PROVIDER,
+                "synthetic": True,
+                "resting_order": False,
+            }
+            asks.append({
+                **common,
+                "side": "ask",
+                "price": ask_quote.get("price_quote_per_base"),
+                "size": ask_quote.get("output_amount"),
+                "base_quantity": ask_quote.get("output_amount"),
+                "quote_quantity": ask_quote.get("input_amount"),
+                "input_asset": quote_identity["symbol"],
+                "input_amount": ask_quote.get("input_amount"),
+                "output_asset": base_identity["symbol"],
+                "output_amount": ask_quote.get("output_amount"),
+                "minimum_received": ask_quote.get("minimum_received"),
+                "sample_input_amount": quote_amount,
+                "provider_request_id": ask_quote.get("request_id"),
+                "paired_provider_request_id": bid_quote.get("request_id"),
+                "fetched_at": ask_quote.get("fetched_at"),
+            })
+            bids.append({
+                **common,
+                "side": "bid",
+                "price": bid_quote.get("price_quote_per_base"),
+                "size": bid_quote.get("input_amount"),
+                "base_quantity": bid_quote.get("input_amount"),
+                "quote_quantity": bid_quote.get("output_amount"),
+                "input_asset": base_identity["symbol"],
+                "input_amount": bid_quote.get("input_amount"),
+                "output_asset": quote_identity["symbol"],
+                "output_amount": bid_quote.get("output_amount"),
+                "minimum_received": bid_quote.get("minimum_received"),
+                "sample_input_amount": paired_base_amount,
+                "provider_request_id": bid_quote.get("request_id"),
+                "paired_provider_request_id": ask_quote.get("request_id"),
+                "fetched_at": bid_quote.get("fetched_at"),
+            })
+
         bids.sort(key=lambda item: Decimal(str(item.get("price") or "0")), reverse=True)
         asks.sort(key=lambda item: Decimal(str(item.get("price") or "0")))
         best_bid = Decimal(str(bids[0]["price"])) if bids else None
         best_ask = Decimal(str(asks[0]["price"])) if asks else None
+        crossed = bool(best_bid is not None and best_ask is not None and best_bid >= best_ask)
         spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
         midpoint = (best_ask + best_bid) / Decimal(2) if spread is not None else None
         spread_bps = spread / midpoint * Decimal(10000) if midpoint and midpoint > 0 else None
@@ -1638,12 +1795,13 @@ class RobinhoodChainUniswapQuoteService:
             "identity_source": "token_registry",
             "capability_source": "database",
             "depth_requested": int(depth),
-            "depth_returned": min(len(bids), len(asks)),
+            "depth_returned": len(bids),
             "max_depth": len(_BOOK_MULTIPLIERS),
             "bids": bids,
             "asks": asks,
             "best_bid": _decimal_text(best_bid) if best_bid is not None else None,
             "best_ask": _decimal_text(best_ask) if best_ask is not None else None,
+            "crossed": crossed,
             "spread": _decimal_text(spread) if spread is not None else None,
             "spread_bps": _decimal_text(spread_bps) if spread_bps is not None else None,
             "midpoint": _decimal_text(midpoint) if midpoint is not None else None,
@@ -1656,7 +1814,13 @@ class RobinhoodChainUniswapQuoteService:
             "sizeDecimals": max(0, min(18, int(base_identity["decimals"]))),
             "cached": False,
             "fetched_at": max([str(row.get("fetched_at") or "") for row in [*bids, *asks]] or [""]) or None,
-            "snapshot_source": "uniswap_api_database_capability_samples",
+            "snapshot_source": "uniswap_api_quote_notional_matched_samples",
+            "sampling_policy": "quote_notional_matched_v1",
+            "quote_probe_seed": quote_seed,
+            "quote_probe_seed_source": quote_seed_source,
+            "minimum_quote_input_atomic": _BOOK_MIN_QUOTE_INPUT_ATOMIC,
+            "minimum_quote_output_atomic": _BOOK_MIN_QUOTE_OUTPUT_ATOMIC,
+            "paired_level_count": len(bids),
             "stale": False,
             "synthetic": True,
             "resting_order": False,
@@ -1686,21 +1850,74 @@ class RobinhoodChainUniswapQuoteService:
         credential = self._credential_record()
         if not self._credential_usable(credential):
             return _failure("uniswap_quote_not_configured", symbol=symbol)
-        quote_result = await self.quote(
-            symbol=symbol,
-            side=side,
-            amount_mode=amount_mode,
-            requested_amount=requested_amount,
-            slippage_bps=slippage_bps,
-            swapper_address=swapper_address,
-            input_token=input_token,
-            output_token=output_token,
-            confirm_quote=True,
-            _include_provider_response=True,
-        )
-        raw_response = quote_result.pop("_provider_response", None)
-        if quote_result.get("ok") is not True or not isinstance(raw_response, dict):
-            return quote_result
+        quote_attempts = 0
+        quote_retry_reasons: List[str] = []
+        raw_response: Optional[Dict[str, Any]] = None
+        while quote_attempts < _FIRM_QUOTE_MAX_ATTEMPTS:
+            quote_attempts += 1
+            quote_result = await self.quote(
+                symbol=symbol,
+                side=side,
+                amount_mode=amount_mode,
+                requested_amount=requested_amount,
+                slippage_bps=slippage_bps,
+                swapper_address=swapper_address,
+                input_token=input_token,
+                output_token=output_token,
+                confirm_quote=True,
+                _include_provider_response=True,
+            )
+            raw_candidate = quote_result.pop("_provider_response", None)
+            if quote_result.get("ok") is True and isinstance(raw_candidate, dict):
+                raw_response = raw_candidate
+                quote_result.update(
+                    {
+                        "provider_quote_retry_policy": _FIRM_QUOTE_RETRY_POLICY,
+                        "provider_quote_attempts": quote_attempts,
+                        "provider_quote_retries": quote_attempts - 1,
+                        "provider_quote_recovery_applied": quote_attempts > 1,
+                        "provider_quote_retry_reasons": list(quote_retry_reasons),
+                    }
+                )
+                break
+
+            retry_reason = _firm_quote_retry_reason(quote_result)
+            if retry_reason:
+                quote_retry_reasons.append(retry_reason)
+            if retry_reason is None or quote_attempts >= _FIRM_QUOTE_MAX_ATTEMPTS:
+                quote_result.update(
+                    {
+                        "provider_quote_retry_policy": _FIRM_QUOTE_RETRY_POLICY,
+                        "provider_quote_attempts": quote_attempts,
+                        "provider_quote_retries": max(0, quote_attempts - 1),
+                        "provider_quote_recovery_applied": False,
+                        "provider_quote_retry_reasons": list(quote_retry_reasons),
+                        "automatic_retry": False,
+                        "automatic_second_transaction": False,
+                    }
+                )
+                return quote_result
+
+            await asyncio.sleep(
+                _firm_quote_retry_delay_s(
+                    quote_result,
+                    quote_attempts - 1,
+                )
+            )
+
+        if raw_response is None:
+            return _failure(
+                "uniswap_firm_plan_quote_missing",
+                symbol=symbol,
+                provider_contacted=True,
+                provider_quote_retry_policy=_FIRM_QUOTE_RETRY_POLICY,
+                provider_quote_attempts=quote_attempts,
+                provider_quote_retries=max(0, quote_attempts - 1),
+                provider_quote_recovery_applied=False,
+                provider_quote_retry_reasons=list(quote_retry_reasons),
+                automatic_retry=False,
+                automatic_second_transaction=False,
+            )
         raw_quote = raw_response.get("quote") if isinstance(raw_response.get("quote"), dict) else None
         if raw_quote is None:
             return _failure("uniswap_firm_plan_quote_missing", symbol=symbol, provider_contacted=True)

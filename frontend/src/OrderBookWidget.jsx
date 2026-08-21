@@ -19,6 +19,9 @@ const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
 const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
 const ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT = "utt:robinhood-chain-orderbook-pick";
 const ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT = "utt:robinhood-chain-selected-pair-registered";
+const ROBINHOOD_CHAIN_INTERACTIVE_QUOTE_PRIORITY_EVENT = "utt:robinhood-chain-interactive-quote-priority";
+const ROBINHOOD_CHAIN_AUTO_PRIORITY_RELEASE_MS = 250;
+const ROBINHOOD_CHAIN_AUTO_INITIAL_DELAY_MS = 1000;
 const MARKET_METRICS_BROWSER_CACHE_KEY = "utt.market_metrics.summary.v10";
 const MARKET_METRICS_BROWSER_CACHE_EVENT = "utt:market-metrics-summary-v10";
 const ORDERBOOK_QUOTE_USD_STALE_MS = 15 * 60 * 1000;
@@ -871,6 +874,11 @@ export default function OrderBookWidget({
 
   const inFlightRef = useRef(false);
   const abortRef = useRef(null);
+  const requestKindRef = useRef("");
+  const robinhoodChainInteractivePriorityRef = useRef({ active: false, symbol: "" });
+  const robinhoodChainDeferredAutoRefreshRef = useRef(false);
+  const robinhoodChainAutoInitialPendingRef = useRef(false);
+  const robinhoodChainPriorityReleaseTimerRef = useRef(null);
 
   // NEW: error gating to stop hammering known-bad pairs
   const pairNotFoundRef = useRef(false);
@@ -1966,6 +1974,7 @@ function clampBox(next) {
 
     if (inFlightRef.current) return;
     inFlightRef.current = true;
+    requestKindRef.current = opts.auto === true ? "auto" : "manual";
 
     try {
       setObLoading(true);
@@ -2386,13 +2395,82 @@ function clampBox(next) {
     } finally {
       setObLoading(false);
       inFlightRef.current = false;
+      requestKindRef.current = "";
     }
   }
+
+  const fetchOrderBookRef = useRef(null);
+  fetchOrderBookRef.current = fetchOrderBook;
 
   useEffect(() => {
     if (!obLoading && !obError) snapToCenterAnchors();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asksSorted.length, bidsSorted.length]);
+
+  // RH-QUOTE.PIPELINE.1B: let interactive Order Ticket quote/plan work own the
+  // single Uniswap provider slot before background synthetic-book auto refresh.
+  // Manual Order Book Refresh remains operator-controlled and is never suppressed.
+  useEffect(() => {
+    const normalizePrioritySymbol = (value) => String(value || "").trim().toUpperCase().replace(/[\\/_]/g, "-");
+    const currentVenue = String(effectiveVenue || "").trim().toLowerCase();
+    const currentSymbol = normalizePrioritySymbol(obSymbol);
+    if (!isRobinhoodChainVenueKey(currentVenue) || !currentSymbol) return undefined;
+
+    const clearReleaseTimer = () => {
+      if (robinhoodChainPriorityReleaseTimerRef.current !== null) {
+        window.clearTimeout(robinhoodChainPriorityReleaseTimerRef.current);
+        robinhoodChainPriorityReleaseTimerRef.current = null;
+      }
+    };
+
+    const onInteractivePriority = (event) => {
+      const detail = event?.detail && typeof event.detail === "object" ? event.detail : {};
+      const eventSymbol = normalizePrioritySymbol(detail?.symbol);
+      if (eventSymbol && eventSymbol !== currentSymbol) return;
+
+      const active = detail?.active === true;
+      robinhoodChainInteractivePriorityRef.current = { active, symbol: eventSymbol || currentSymbol };
+
+      if (active) {
+        clearReleaseTimer();
+        robinhoodChainDeferredAutoRefreshRef.current = true;
+        if (requestKindRef.current === "auto") {
+          try {
+            if (abortRef.current) abortRef.current.abort();
+          } catch {
+            // The in-flight auto book request can finish/cancel naturally.
+          }
+        }
+        return;
+      }
+
+      if (!robinhoodChainDeferredAutoRefreshRef.current || !obAutoRefresh) return;
+      if (robinhoodChainAutoInitialPendingRef.current) return;
+      robinhoodChainDeferredAutoRefreshRef.current = false;
+      clearReleaseTimer();
+      robinhoodChainPriorityReleaseTimerRef.current = window.setTimeout(() => {
+        robinhoodChainPriorityReleaseTimerRef.current = null;
+        const priority = robinhoodChainInteractivePriorityRef.current || {};
+        const prioritySymbol = normalizePrioritySymbol(priority?.symbol);
+        if (priority?.active === true && (!prioritySymbol || prioritySymbol === currentSymbol)) {
+          robinhoodChainDeferredAutoRefreshRef.current = true;
+          return;
+        }
+        if (document.hidden) {
+          robinhoodChainDeferredAutoRefreshRef.current = true;
+          return;
+        }
+        const fetchCurrent = fetchOrderBookRef.current;
+        if (typeof fetchCurrent === "function") void fetchCurrent({ auto: true });
+      }, ROBINHOOD_CHAIN_AUTO_PRIORITY_RELEASE_MS);
+    };
+
+    window.addEventListener(ROBINHOOD_CHAIN_INTERACTIVE_QUOTE_PRIORITY_EVENT, onInteractivePriority);
+    return () => {
+      window.removeEventListener(ROBINHOOD_CHAIN_INTERACTIVE_QUOTE_PRIORITY_EVENT, onInteractivePriority);
+      clearReleaseTimer();
+    };
+  }, [effectiveVenue, obSymbol, obAutoRefresh]);
 
   // Auto-refresh:
   // - Debounce the initial fetch (prevents cascades when venue/symbol is switching)
@@ -2408,23 +2486,40 @@ function clampBox(next) {
     const ms = sec * 1000;
 
     let cancelled = false;
+    const isRobinhoodChain = isRobinhoodChainVenueKey(v);
+    const prioritySymbol = String(sym || "").trim().toUpperCase().replace(/[\\/_]/g, "-");
+    const autoRefreshBlockedByInteractivePriority = () => {
+      if (!isRobinhoodChain) return false;
+      const priority = robinhoodChainInteractivePriorityRef.current || {};
+      const activeSymbol = String(priority?.symbol || "").trim().toUpperCase().replace(/[\\/_]/g, "-");
+      return priority?.active === true && (!activeSymbol || activeSymbol === prioritySymbol);
+    };
+    const runAutomaticRefresh = () => {
+      if (cancelled || document.hidden) return;
+      if (autoRefreshBlockedByInteractivePriority()) {
+        robinhoodChainDeferredAutoRefreshRef.current = true;
+        return;
+      }
+      robinhoodChainDeferredAutoRefreshRef.current = false;
+      void fetchOrderBook({ auto: true });
+    };
 
-    const initial = setTimeout(() => {
-      if (cancelled) return;
-      if (document.hidden) return;
-      void fetchOrderBook();
-    }, 300);
+    if (isRobinhoodChain) robinhoodChainAutoInitialPendingRef.current = true;
+    const initial = setTimeout(
+      () => {
+        if (isRobinhoodChain) robinhoodChainAutoInitialPendingRef.current = false;
+        runAutomaticRefresh();
+      },
+      isRobinhoodChain ? ROBINHOOD_CHAIN_AUTO_INITIAL_DELAY_MS : 300
+    );
 
-    const t = setInterval(() => {
-      if (cancelled) return;
-      if (document.hidden) return;
-      void fetchOrderBook();
-    }, ms);
+    const t = setInterval(runAutomaticRefresh, ms);
 
     return () => {
       cancelled = true;
       clearTimeout(initial);
       clearInterval(t);
+      if (isRobinhoodChain) robinhoodChainAutoInitialPendingRef.current = false;
       try {
         if (abortRef.current) abortRef.current.abort();
       } catch {

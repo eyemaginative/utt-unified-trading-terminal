@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import re
 import uuid
@@ -20,7 +21,9 @@ from ..models import (
     RobinhoodChainPairObjective,
     RobinhoodChainRegistryVerification,
     RobinhoodChainSwapExecution,
+    RobinhoodChainWalletEvent,
     TokenRegistry,
+    WalletAddress,
 )
 from .evm_rpc import decode_abi_uint256, get_robinhood_chain_client, validate_evm_address
 from .robinhood_chain_execution_discovery import (
@@ -709,6 +712,382 @@ class RobinhoodChainRegistryDiscoveryService:
             identity["verification"] = verification
             out.append(identity)
         return out
+
+    def _unregistered_wallet_row(
+        self,
+        db: Session,
+        wallet_address_id: Optional[str],
+    ) -> WalletAddress:
+        requested_id = str(wallet_address_id or "").strip()
+        if requested_id:
+            row = (
+                db.query(WalletAddress)
+                .filter(WalletAddress.id == requested_id)
+                .first()
+            )
+            rows = [row] if row is not None else []
+        else:
+            rows = (
+                db.query(WalletAddress)
+                .filter(
+                    WalletAddress.network == ROBINHOOD_CHAIN,
+                    WalletAddress.wallet_id == ROBINHOOD_CHAIN,
+                )
+                .order_by(WalletAddress.created_at.desc())
+                .all()
+            )
+
+        for row in rows:
+            if row is None:
+                continue
+            if str(row.network or "").strip().lower() != ROBINHOOD_CHAIN:
+                continue
+            if str(row.wallet_id or "").strip().lower() != ROBINHOOD_CHAIN:
+                continue
+            if str(row.asset or "").strip().upper() not in {"ALL", "*"}:
+                continue
+            try:
+                validate_evm_address(str(row.address or "").strip())
+            except Exception:
+                continue
+            return row
+
+        if requested_id:
+            raise ValueError("robinhood_chain_wallet_address_not_found_or_not_all_scope")
+        raise ValueError("robinhood_chain_wallet_address_all_scope_not_found")
+
+    async def unregistered_wallet_assets(
+        self,
+        db: Session,
+        *,
+        wallet_address_id: Optional[str] = None,
+        limit: int = 50,
+        positive_only: bool = True,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Discover wallet-observed ERC-20 contracts absent from Token Registry.
+
+        Candidate discovery is read-only. Historical wallet evidence provides the
+        contract inventory, while current chain code/metadata/balance reads decide
+        whether a candidate is safe to offer for explicit user registration.
+        """
+
+        safe_limit = max(1, min(100, int(limit or 50)))
+        wallet = self._unregistered_wallet_row(db, wallet_address_id)
+        owner = validate_evm_address(str(wallet.address or "").strip())
+
+        chain = await self.rpc_client.verify_expected_chain(force_refresh=force_refresh)
+        if not chain.get("ok"):
+            raise ValueError("robinhood_chain_candidate_chain_id_mismatch_or_unavailable")
+
+        registry_rows = (
+            db.query(TokenRegistry)
+            .filter(TokenRegistry.chain == ROBINHOOD_CHAIN)
+            .all()
+        )
+        registered_contracts: Dict[str, TokenRegistry] = {}
+        registered_by_symbol: Dict[str, List[TokenRegistry]] = {}
+        for row in registry_rows:
+            symbol = str(row.symbol or "").strip().upper()
+            if symbol:
+                registered_by_symbol.setdefault(symbol, []).append(row)
+            address = str(row.address or "").strip()
+            if not address:
+                continue
+            try:
+                normalized = validate_evm_address(address).lower()
+            except Exception:
+                continue
+            registered_contracts[normalized] = row
+
+        event_rows = (
+            db.query(RobinhoodChainWalletEvent)
+            .filter(
+                RobinhoodChainWalletEvent.wallet_address_id == str(wallet.id),
+                RobinhoodChainWalletEvent.chain_id == ROBINHOOD_CHAIN_ID,
+                RobinhoodChainWalletEvent.event_type == "erc20_transfer",
+                RobinhoodChainWalletEvent.contract_address.isnot(None),
+            )
+            .order_by(
+                RobinhoodChainWalletEvent.tx_time.desc(),
+                RobinhoodChainWalletEvent.updated_at.desc(),
+            )
+            .limit(10000)
+            .all()
+        )
+
+        observed: Dict[str, Dict[str, Any]] = {}
+        for event in event_rows:
+            raw_contract = str(event.contract_address or "").strip()
+            try:
+                contract = validate_evm_address(raw_contract).lower()
+            except Exception:
+                continue
+            if contract in registered_contracts:
+                continue
+
+            raw = event.raw if isinstance(event.raw, dict) else {}
+            provider_raw = raw.get("provider_raw") if isinstance(raw.get("provider_raw"), dict) else {}
+            provider_symbol = str(
+                provider_raw.get("provider_symbol")
+                or event.asset
+                or ""
+            ).strip().upper()
+            provider_name = str(provider_raw.get("token_name") or "").strip() or None
+            provider_decimals = provider_raw.get("provider_decimals")
+            try:
+                provider_decimals = int(provider_decimals) if provider_decimals is not None else None
+            except Exception:
+                provider_decimals = None
+
+            seen_at = event.tx_time or event.updated_at or event.created_at
+            item = observed.get(contract)
+            if item is None:
+                item = {
+                    "contract_address": contract,
+                    "provider_symbol": provider_symbol or None,
+                    "provider_name": provider_name,
+                    "provider_decimals": provider_decimals,
+                    "last_seen_at": seen_at,
+                    "event_count": 0,
+                }
+                observed[contract] = item
+            item["event_count"] = int(item.get("event_count") or 0) + 1
+            current_seen = item.get("last_seen_at")
+            if seen_at is not None and (current_seen is None or seen_at > current_seen):
+                item["last_seen_at"] = seen_at
+                if provider_symbol:
+                    item["provider_symbol"] = provider_symbol
+                if provider_name:
+                    item["provider_name"] = provider_name
+                if provider_decimals is not None:
+                    item["provider_decimals"] = provider_decimals
+
+        ordered = sorted(
+            observed.values(),
+            key=lambda item: item.get("last_seen_at") or datetime.min,
+            reverse=True,
+        )
+        inspect_limit = min(100, max(safe_limit * 4, safe_limit))
+        ordered = ordered[:inspect_limit]
+        semaphore = asyncio.Semaphore(6)
+
+        async def _inspect(item: Dict[str, Any]) -> Dict[str, Any]:
+            contract = str(item["contract_address"])
+            async with semaphore:
+                try:
+                    code_result = await self.rpc_client.rpc_read(
+                        "eth_getCode",
+                        [contract, "latest"],
+                        cache_namespace=f"rh_unregistered_code:{contract}",
+                        force_refresh=force_refresh,
+                    )
+                    raw_code = str(code_result.get("result") or "").strip()
+                    code_present = bool(
+                        code_result.get("ok")
+                        and raw_code not in {"", "0x", "0x0"}
+                    )
+
+                    async def _call(selector: str, namespace: str) -> Dict[str, Any]:
+                        return await self.rpc_client.rpc_read(
+                            "eth_call",
+                            [{"to": contract, "data": selector}, "latest"],
+                            cache_namespace=f"rh_unregistered_{namespace}:{contract}",
+                            force_refresh=force_refresh,
+                        )
+
+                    symbol_result, name_result, decimals_result = await asyncio.gather(
+                        _call(_ERC20_SYMBOL_SELECTOR, "symbol"),
+                        _call(_ERC20_NAME_SELECTOR, "name"),
+                        _call(_ERC20_DECIMALS_SELECTOR, "decimals"),
+                    )
+                    onchain_symbol = (
+                        _decode_abi_string(symbol_result.get("result"))
+                        if symbol_result.get("ok")
+                        else None
+                    )
+                    onchain_symbol = str(onchain_symbol or "").strip().upper() or None
+                    onchain_name = (
+                        _decode_abi_string(name_result.get("result"))
+                        if name_result.get("ok")
+                        else None
+                    )
+                    onchain_name = str(onchain_name or "").strip() or None
+
+                    onchain_decimals: Optional[int] = None
+                    if decimals_result.get("ok"):
+                        try:
+                            decoded_decimals = int(decode_abi_uint256(decimals_result.get("result")))
+                            if 0 <= decoded_decimals <= 18:
+                                onchain_decimals = decoded_decimals
+                        except Exception:
+                            onchain_decimals = None
+
+                    balance_result: Dict[str, Any] = {
+                        "ok": False,
+                        "error": "erc20_metadata_unavailable",
+                    }
+                    if onchain_decimals is not None:
+                        balance_result = await self.rpc_client.get_erc20_balance(
+                            owner,
+                            contract,
+                            onchain_decimals,
+                            force_refresh=force_refresh,
+                        )
+
+                    balance_atomic = str(balance_result.get("balance_atomic") or "0")
+                    try:
+                        positive_balance = bool(
+                            balance_result.get("ok")
+                            and int(balance_atomic) > 0
+                        )
+                    except Exception:
+                        positive_balance = False
+
+                    conflicting_rows: List[TokenRegistry] = []
+                    if onchain_symbol:
+                        for registry_row in registered_by_symbol.get(onchain_symbol, []):
+                            registry_address = str(registry_row.address or "").strip()
+                            if not registry_address:
+                                conflicting_rows.append(registry_row)
+                                continue
+                            try:
+                                if validate_evm_address(registry_address).lower() != contract:
+                                    conflicting_rows.append(registry_row)
+                            except Exception:
+                                conflicting_rows.append(registry_row)
+
+                    symbol_conflict = bool(conflicting_rows)
+                    ready_to_register = bool(
+                        code_present
+                        and onchain_symbol
+                        and onchain_decimals is not None
+                        and balance_result.get("ok")
+                        and positive_balance
+                        and not symbol_conflict
+                    )
+
+                    if not code_present:
+                        metadata_status = "contract_code_missing"
+                    elif onchain_symbol is None or onchain_decimals is None:
+                        metadata_status = "metadata_unavailable"
+                    elif not balance_result.get("ok"):
+                        metadata_status = "balance_unavailable"
+                    elif symbol_conflict:
+                        metadata_status = "symbol_conflict"
+                    elif not positive_balance:
+                        metadata_status = "zero_balance"
+                    else:
+                        metadata_status = "ready"
+
+                    return {
+                        "chain": ROBINHOOD_CHAIN,
+                        "chain_id": ROBINHOOD_CHAIN_ID,
+                        "wallet_address_id": str(wallet.id),
+                        "wallet_address": owner,
+                        "registry_status": "unregistered",
+                        "contract_address": contract,
+                        "symbol": onchain_symbol or item.get("provider_symbol"),
+                        "onchain_symbol": onchain_symbol,
+                        "name": onchain_name or item.get("provider_name"),
+                        "onchain_name": onchain_name,
+                        "decimals": onchain_decimals,
+                        "provider_symbol": item.get("provider_symbol"),
+                        "provider_name": item.get("provider_name"),
+                        "provider_decimals": item.get("provider_decimals"),
+                        "balance_atomic": balance_atomic if balance_result.get("ok") else None,
+                        "balance_token": balance_result.get("balance_token"),
+                        "positive_balance": positive_balance,
+                        "code_present": code_present,
+                        "metadata_status": metadata_status,
+                        "symbol_conflict": symbol_conflict,
+                        "conflicting_registry_ids": [
+                            int(row.id)
+                            for row in conflicting_rows
+                            if getattr(row, "id", None) is not None
+                        ],
+                        "ready_to_register": ready_to_register,
+                        "last_seen_at": iso_or_none(item.get("last_seen_at")),
+                        "event_count": int(item.get("event_count") or 0),
+                        "read_only": True,
+                        "will_mutate": False,
+                        "wallet_request": False,
+                        "signing": False,
+                        "broadcast": False,
+                    }
+                except Exception as exc:
+                    return {
+                        "chain": ROBINHOOD_CHAIN,
+                        "chain_id": ROBINHOOD_CHAIN_ID,
+                        "wallet_address_id": str(wallet.id),
+                        "wallet_address": owner,
+                        "registry_status": "unregistered",
+                        "contract_address": contract,
+                        "symbol": item.get("provider_symbol"),
+                        "onchain_symbol": None,
+                        "name": item.get("provider_name"),
+                        "onchain_name": None,
+                        "decimals": None,
+                        "provider_symbol": item.get("provider_symbol"),
+                        "provider_name": item.get("provider_name"),
+                        "provider_decimals": item.get("provider_decimals"),
+                        "balance_atomic": None,
+                        "balance_token": None,
+                        "positive_balance": False,
+                        "code_present": None,
+                        "metadata_status": "rpc_error",
+                        "symbol_conflict": False,
+                        "conflicting_registry_ids": [],
+                        "ready_to_register": False,
+                        "candidate_error": _clean_text(exc, 500),
+                        "last_seen_at": iso_or_none(item.get("last_seen_at")),
+                        "event_count": int(item.get("event_count") or 0),
+                        "read_only": True,
+                        "will_mutate": False,
+                        "wallet_request": False,
+                        "signing": False,
+                        "broadcast": False,
+                    }
+
+        inspected = await asyncio.gather(*[_inspect(item) for item in ordered])
+        if positive_only:
+            inspected = [
+                item for item in inspected
+                if item.get("positive_balance") is True
+            ]
+
+        inspected.sort(
+            key=lambda item: str(item.get("last_seen_at") or ""),
+            reverse=True,
+        )
+        inspected.sort(
+            key=lambda item: (
+                0 if item.get("positive_balance") is True else 1,
+                0 if item.get("ready_to_register") is True else 1,
+            )
+        )
+        items = inspected[:safe_limit]
+
+        return {
+            "ok": True,
+            "tranche": "RH-REGDISC.BAL.1B",
+            "wallet_address_id": str(wallet.id),
+            "wallet_address": owner,
+            "items": items,
+            "count": len(items),
+            "observed_unregistered_contracts": len(observed),
+            "inspected_contracts": len(ordered),
+            "positive_only": bool(positive_only),
+            "blockchain_read_only": True,
+            "token_registry_mutation": False,
+            "ledger_mutation": False,
+            "fifo_mutation": False,
+            "basis_mutation": False,
+            "wallet_request": False,
+            "signing": False,
+            "broadcast": False,
+            "will_mutate": False,
+        }
 
     async def verify_asset(
         self,

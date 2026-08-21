@@ -1506,6 +1506,372 @@ def _record_generic_wallet_swap_submission(
     return row, True
 
 
+def _decode_generic_wallet_swap_receipt_capability(
+    db: Session,
+    *,
+    capability_token: str,
+    execution_id: Optional[str],
+    tx_hash: str,
+) -> Tuple[Dict[str, Any], bool]:
+    """Decode receipt authority without extending pre-broadcast send authority.
+
+    Fresh capabilities follow the original strict TTL path. An expired
+    capability is accepted only when its exact signed token and transaction
+    hash are already bound to the durable RH-ORDER.MISS.1B execution owner.
+    """
+    try:
+        return decode_wallet_swap_capability(capability_token), False
+    except ValueError as exc:
+        if str(exc) != "wallet_swap_capability_expired":
+            raise
+
+    execution_key = str(execution_id or "").strip()
+    if not execution_key:
+        raise ValueError("wallet_swap_expired_capability_execution_id_required")
+
+    row = db.get(RobinhoodChainSwapExecution, execution_key)
+    if row is None:
+        raise ValueError("wallet_swap_expired_capability_execution_not_found")
+
+    normalized_tx_hash = validate_transaction_hash(tx_hash).lower()
+    route = row.route if isinstance(row.route, dict) else {}
+    durable = route.get("generic_wallet_lifecycle") if isinstance(route.get("generic_wallet_lifecycle"), dict) else {}
+    if durable.get("version") != "RH-ORDER.MISS.1B" or durable.get("durable_before_wallet_request") is not True:
+        raise ValueError("wallet_swap_expired_capability_execution_not_durable")
+
+    capability_sha = _generic_wallet_swap_sha256_text(capability_token)
+    if str(durable.get("swap_capability_sha256") or "") != capability_sha:
+        raise ValueError("wallet_swap_expired_capability_capability_mismatch")
+
+    if str(row.swap_tx_hash or "").strip().lower() != normalized_tx_hash:
+        raise ValueError("wallet_swap_expired_capability_hash_not_owned")
+
+    lifecycle = route.get("execution_lifecycle") if isinstance(route.get("execution_lifecycle"), dict) else {}
+    swap_lifecycle = lifecycle.get("swap") if isinstance(lifecycle.get("swap"), dict) else {}
+    reconciliation = route.get("execution_reconciliation") if isinstance(route.get("execution_reconciliation"), dict) else {}
+    row_status = str(row.status or "").strip().lower()
+    if row_status == "swap_pending":
+        if (
+            swap_lifecycle.get("submission_recorded") is not True
+            or str(swap_lifecycle.get("tx_hash") or "").strip().lower() != normalized_tx_hash
+        ):
+            raise ValueError("wallet_swap_expired_capability_submission_not_recorded")
+    elif row_status == "confirmed":
+        if (
+            reconciliation.get("reconciled") is not True
+            or str(reconciliation.get("swap_tx_hash") or "").strip().lower() != normalized_tx_hash
+        ):
+            raise ValueError("wallet_swap_expired_capability_confirmation_not_owned")
+    elif row_status == "swap_reverted":
+        if str(swap_lifecycle.get("tx_hash") or "").strip().lower() != normalized_tx_hash:
+            raise ValueError("wallet_swap_expired_capability_revert_not_owned")
+    else:
+        raise ValueError("wallet_swap_expired_capability_execution_state_invalid")
+
+    capability = decode_wallet_swap_capability(
+        capability_token,
+        allow_expired_for_bound_receipt=True,
+    )
+
+    plan_checks = (
+        (int(row.chain_id or 0), int(capability.get("chain_id") or 0)),
+        (str(row.wallet_address or "").strip().lower(), str(capability.get("wallet_address") or "").strip().lower()),
+        (str(row.symbol or "").strip().upper(), str(capability.get("symbol") or "").strip().upper()),
+        (str(row.side or "").strip().lower(), str(capability.get("side") or "").strip().lower()),
+        (str(row.from_asset or "").strip().upper(), str(capability.get("input_asset") or "").strip().upper()),
+        (str(row.to_asset or "").strip().upper(), str(capability.get("output_asset") or "").strip().upper()),
+        (str(row.exact_input_amount_atomic or ""), str(capability.get("input_amount_atomic") or "")),
+        (str(row.minimum_output_amount_atomic or ""), str(capability.get("minimum_received_atomic") or "")),
+        (str(row.swap_transaction_to or "").strip().lower(), str(capability.get("transaction_to") or "").strip().lower()),
+        (str(row.swap_transaction_value_wei or "0"), str(capability.get("transaction_value_wei") or "0")),
+        (str(row.swap_calldata_sha256 or "").strip().lower(), str(capability.get("calldata_sha256") or "").strip().lower()),
+    )
+    if any(actual != expected for actual, expected in plan_checks):
+        raise ValueError("wallet_swap_expired_capability_durable_plan_mismatch")
+
+    return capability, True
+
+
+async def _reconcile_pending_generic_wallet_swaps_for_sync_load(
+    db: Session,
+    *,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Best-effort receipt reconciliation for durable submitted UTT swaps.
+
+    All Orders Sync+Load already invokes the Robinhood Chain incremental wallet
+    path.  Known UTT lifecycle hashes are deliberately excluded from external
+    wallet materialization, so a submitted generic UTT swap must be reconciled
+    through its durable RobinhoodChainSwapExecution owner instead.
+
+    This scanner never prepares, signs, broadcasts, retries, or creates a second
+    wallet request. It only inspects rows that already own a submitted tx hash.
+    """
+    bounded_limit = max(1, min(int(limit or 50), 100))
+    rows = (
+        db.query(RobinhoodChainSwapExecution)
+        .filter(
+            RobinhoodChainSwapExecution.status == "swap_pending",
+            RobinhoodChainSwapExecution.swap_tx_hash.is_not(None),
+        )
+        .order_by(RobinhoodChainSwapExecution.updated_at.asc())
+        .limit(bounded_limit)
+        .all()
+    )
+
+    result: Dict[str, Any] = {
+        "ok": True,
+        "tranche": "RH-RECEIPT.EXPIRY.1B",
+        "source": "wallet_sync_incremental",
+        "candidate_count": len(rows),
+        "inspected": 0,
+        "still_pending": 0,
+        "confirmed": 0,
+        "reverted": 0,
+        "skipped_not_durable": 0,
+        "errors": [],
+        "order_mutation": False,
+        "database_mutation": False,
+        "wallet_request": False,
+        "signing": False,
+        "broadcast": False,
+        "automatic_retry": False,
+        "automatic_second_transaction": False,
+    }
+    if not rows:
+        return result
+
+    rpc = get_robinhood_chain_client()
+    try:
+        chain = await rpc.verify_expected_chain(force_refresh=True)
+    except Exception as exc:
+        result["ok"] = False
+        result["errors"].append({
+            "error": "wallet_sync_receipt_chain_read_failed",
+            "message": str(exc),
+        })
+        return result
+    if chain.get("ok") is not True or chain.get("chain_id_matches") is not True:
+        result["ok"] = False
+        result["errors"].append({
+            "error": "wallet_sync_receipt_chain_mismatch",
+        })
+        return result
+
+    for row in rows:
+        result["inspected"] += 1
+        execution_id = str(row.id)
+        tx_hash_text = str(row.swap_tx_hash or "").strip()
+        try:
+            tx_hash = validate_transaction_hash(tx_hash_text).lower()
+        except ValueError as exc:
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": str(exc),
+            })
+            continue
+
+        route = row.route if isinstance(row.route, dict) else {}
+        durable = route.get("generic_wallet_lifecycle") if isinstance(route.get("generic_wallet_lifecycle"), dict) else {}
+        lifecycle = route.get("execution_lifecycle") if isinstance(route.get("execution_lifecycle"), dict) else {}
+        swap_lifecycle = lifecycle.get("swap") if isinstance(lifecycle.get("swap"), dict) else {}
+        if durable.get("version") != "RH-ORDER.MISS.1B" or durable.get("durable_before_wallet_request") is not True:
+            result["skipped_not_durable"] += 1
+            continue
+        if (
+            swap_lifecycle.get("submission_recorded") is not True
+            or str(swap_lifecycle.get("tx_hash") or "").strip().lower() != tx_hash
+        ):
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_receipt_submission_not_recorded",
+            })
+            continue
+
+        try:
+            receipt_record = await rpc.rpc_read(
+                "eth_getTransactionReceipt",
+                [tx_hash],
+                cache_namespace=None,
+                force_refresh=True,
+            )
+        except Exception as exc:
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_receipt_read_failed",
+                "message": str(exc),
+            })
+            continue
+        if receipt_record.get("ok") is not True:
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_receipt_read_failed",
+            })
+            continue
+        receipt = receipt_record.get("result")
+        if receipt is None:
+            result["still_pending"] += 1
+            continue
+        if not isinstance(receipt, dict):
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_receipt_invalid",
+            })
+            continue
+
+        try:
+            receipt_status = _decode_robinhood_chain_rpc_quantity(
+                receipt.get("status"),
+                field="wallet_sync_receipt_status",
+            )
+        except Exception as exc:
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_receipt_status_invalid",
+                "message": str(exc),
+            })
+            continue
+
+        try:
+            tx_record = await rpc.rpc_read(
+                "eth_getTransactionByHash",
+                [tx_hash],
+                cache_namespace=None,
+                force_refresh=True,
+            )
+        except Exception as exc:
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_transaction_read_failed",
+                "message": str(exc),
+            })
+            continue
+        transaction = tx_record.get("result") if tx_record.get("ok") is True else None
+        if not isinstance(transaction, dict):
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_transaction_read_failed",
+            })
+            continue
+
+        durable_transaction = {
+            "transaction_from": str(row.wallet_address or ""),
+            "transaction_to": str(row.swap_transaction_to or ""),
+            "transaction_value_wei": str(row.swap_transaction_value_wei or "0"),
+            "calldata_sha256": str(row.swap_calldata_sha256 or ""),
+        }
+        try:
+            validate_wallet_swap_transaction(
+                durable_transaction,
+                tx_hash=tx_hash,
+                transaction=transaction,
+            )
+        except ValueError as exc:
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_durable_transaction_mismatch",
+                "message": str(exc),
+            })
+            continue
+
+        if receipt_status == 0:
+            try:
+                block_number = (
+                    _decode_robinhood_chain_rpc_quantity(
+                        receipt.get("blockNumber"),
+                        field="wallet_sync_reverted_block_number",
+                    )
+                    if receipt.get("blockNumber") is not None
+                    else None
+                )
+                gas_used = (
+                    _decode_robinhood_chain_rpc_quantity(
+                        receipt.get("gasUsed"),
+                        field="wallet_sync_reverted_gas_used",
+                    )
+                    if receipt.get("gasUsed") is not None
+                    else None
+                )
+                effective_gas_price = (
+                    _decode_robinhood_chain_rpc_quantity(
+                        receipt.get("effectiveGasPrice"),
+                        field="wallet_sync_reverted_effective_gas_price",
+                    )
+                    if receipt.get("effectiveGasPrice") is not None
+                    else None
+                )
+                with db.begin_nested():
+                    changed = _mark_generic_wallet_swap_reverted(
+                        db,
+                        execution_id=execution_id,
+                        tx_hash=tx_hash,
+                        block_number=block_number,
+                        gas_used=gas_used,
+                        effective_gas_price=effective_gas_price,
+                    )
+                if changed:
+                    result["reverted"] += 1
+                    result["database_mutation"] = True
+                else:
+                    result["reverted"] += 1
+            except Exception as exc:
+                result["errors"].append({
+                    "execution_id": execution_id,
+                    "error": "wallet_sync_revert_reconciliation_failed",
+                    "message": str(getattr(exc, "detail", None) or exc),
+                })
+            continue
+
+        if receipt_status != 1:
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_receipt_status_invalid",
+                "receipt_status": receipt_status,
+            })
+            continue
+
+        try:
+            with db.begin_nested():
+                reconciliation = await _persist_generic_wallet_swap_reconciliation(
+                    db,
+                    tx_hash=tx_hash,
+                    symbol=str(row.symbol or ""),
+                    side=str(row.side or ""),
+                    requested_amount=str(row.exact_input_amount or ""),
+                    quoted_output_amount=str(row.expected_output_amount or ""),
+                    minimum_received=str(row.minimum_output_amount or ""),
+                    approval_tx_hash=str(row.approval_tx_hash or "").strip() or None,
+                    source="wallet_sync_incremental_receipt",
+                    historical_preflight_available=(
+                        durable.get("historical_preflight_available") is not False
+                    ),
+                )
+            if reconciliation.get("ok") is True:
+                result["confirmed"] += 1
+                result["order_mutation"] = bool(
+                    result["order_mutation"]
+                    or reconciliation.get("order_mutation")
+                )
+                result["database_mutation"] = bool(
+                    result["database_mutation"]
+                    or reconciliation.get("database_mutation")
+                )
+            else:
+                result["errors"].append({
+                    "execution_id": execution_id,
+                    "error": "wallet_sync_receipt_reconciliation_not_ok",
+                })
+        except Exception as exc:
+            result["errors"].append({
+                "execution_id": execution_id,
+                "error": "wallet_sync_receipt_reconciliation_failed",
+                "message": str(getattr(exc, "detail", None) or exc),
+            })
+
+    result["error_count"] = len(result["errors"])
+    return result
+
+
 def _mark_generic_wallet_swap_reverted(
     db: Session,
     *,
@@ -3186,6 +3552,34 @@ async def robinhood_chain_wallet_sync_incremental(
                 else 502
             )
             raise HTTPException(status_code=status_code, detail=result)
+
+        # RH-RECEIPT.EXPIRY.1B: All Orders Sync+Load must not depend on the
+        # Order Ticket's short-lived receipt capability.  Reconcile already
+        # submitted durable UTT lifecycle owners from their persisted tx hash.
+        # This never prepares/signs/broadcasts or creates a second wallet request.
+        receipt_reconciliation = await _reconcile_pending_generic_wallet_swaps_for_sync_load(
+            db,
+            limit=50,
+        )
+        result = dict(result)
+        result["utt_swap_receipt_reconciliation"] = receipt_reconciliation
+        result["orders_table_mutation"] = bool(
+            result.get("orders_table_mutation")
+            or receipt_reconciliation.get("order_mutation")
+        )
+        result["all_orders_visibility_mutation"] = bool(
+            result.get("all_orders_visibility_mutation")
+            or receipt_reconciliation.get("order_mutation")
+        )
+        result["database_mutation"] = bool(
+            result.get("database_mutation")
+            or receipt_reconciliation.get("database_mutation")
+        )
+        result["wallet_request"] = False
+        result["signing"] = False
+        result["broadcast"] = False
+        result["automatic_retry"] = False
+        result["automatic_second_transaction"] = False
         db.commit()
         return result
     except HTTPException:
@@ -3225,6 +3619,42 @@ async def robinhood_chain_registry_discovery_assets(
         "blockchain_read_only": True,
         "execution_enabled": False,
     }
+
+
+@router.get("/registry-discovery/unregistered-wallet-assets")
+async def robinhood_chain_registry_discovery_unregistered_wallet_assets(
+    wallet_address_id: Optional[str] = Query(
+        None,
+        description="Optional saved ALL / robinhood_chain Wallet Addresses row ID.",
+    ),
+    limit: int = Query(50, ge=1, le=100),
+    positive_only: bool = Query(
+        True,
+        description="When true, return only contracts with a positive current wallet balance.",
+    ),
+    force_refresh: bool = Query(
+        False,
+        description="Bypass bounded RPC read caches for code, metadata, and balance reads.",
+    ),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(
+            status_code=503,
+            detail="Robinhood Chain configuration is not effective for chain ID 4663",
+        )
+    try:
+        return await get_robinhood_chain_registry_discovery_service().unregistered_wallet_assets(
+            db,
+            wallet_address_id=wallet_address_id,
+            limit=int(limit),
+            positive_only=bool(positive_only),
+            force_refresh=bool(force_refresh),
+        )
+    except ValueError as exc:
+        error = str(exc)
+        status_code = 404 if "not_found" in error else 409
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
 
 
 @router.post("/registry-discovery/assets/{token_registry_id}/verify")
@@ -4686,16 +5116,21 @@ async def robinhood_chain_wallet_swap_receipt(
 ) -> Dict[str, Any]:
     """Verify one submitted swap transaction and persist receipt-verified order reconciliation only."""
     try:
-        capability = decode_wallet_swap_capability(request.capability)
-    except ValueError as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
-
-    try:
         tx_hash = validate_transaction_hash(request.tx_hash)
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    try:
+        capability, expired_capability_recovery = _decode_generic_wallet_swap_receipt_capability(
+            db,
+            capability_token=request.capability,
+            execution_id=request.execution_id,
+            tx_hash=tx_hash,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
     saved_wallet = _resolve_robinhood_chain_execution_taker(db, str(capability.get("wallet_address") or ""))
     if saved_wallet.lower() != str(capability.get("wallet_address") or "").lower():
@@ -4763,6 +5198,13 @@ async def robinhood_chain_wallet_swap_receipt(
             "swap_only": True,
             "approval_request_authorized": False,
             "automatic_second_transaction": False,
+            "receipt_authority_source": (
+                "durable_execution_bound_expired_capability"
+                if expired_capability_recovery
+                else "fresh_signed_capability"
+            ),
+            "expired_capability_recovery": bool(expired_capability_recovery),
+            "new_wallet_request_authorized": False,
             "database_mutation": bool(submission_changed),
         }
     try:
@@ -4799,6 +5241,13 @@ async def robinhood_chain_wallet_swap_receipt(
             "swap_only": True,
             "approval_request_authorized": False,
             "automatic_second_transaction": False,
+            "receipt_authority_source": (
+                "durable_execution_bound_expired_capability"
+                if expired_capability_recovery
+                else "fresh_signed_capability"
+            ),
+            "expired_capability_recovery": bool(expired_capability_recovery),
+            "new_wallet_request_authorized": False,
             "database_mutation": bool(submission_changed),
         }
 
@@ -4836,6 +5285,13 @@ async def robinhood_chain_wallet_swap_receipt(
             "effective_gas_price_wei": str(effective_gas_price) if effective_gas_price is not None else None,
             "network_fee_wei": str(network_fee_wei) if network_fee_wei is not None else None,
             "automatic_second_transaction": False,
+            "receipt_authority_source": (
+                "durable_execution_bound_expired_capability"
+                if expired_capability_recovery
+                else "fresh_signed_capability"
+            ),
+            "expired_capability_recovery": bool(expired_capability_recovery),
+            "new_wallet_request_authorized": False,
             "database_mutation": bool(submission_changed or reverted_changed),
         }
     if receipt_status != 1:
@@ -4893,6 +5349,13 @@ async def robinhood_chain_wallet_swap_receipt(
         "swap_request_authorized": True,
         "automatic_retry": False,
         "automatic_second_transaction": False,
+        "receipt_authority_source": (
+            "durable_execution_bound_expired_capability"
+            if expired_capability_recovery
+            else "fresh_signed_capability"
+        ),
+        "expired_capability_recovery": bool(expired_capability_recovery),
+        "new_wallet_request_authorized": False,
         "reconciliation": reconciliation_result,
         "reconciliation_error": reconciliation_error,
         "order_mutation": bool(reconciliation_result and reconciliation_result.get("order_mutation")),

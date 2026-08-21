@@ -161,7 +161,7 @@ def _candidate_external_swap(
     db: Session,
     rows: Sequence[RobinhoodChainWalletEvent],
 ) -> Optional[Dict[str, Any]]:
-    """Return a high-confidence external ETH->registered ERC-20 swap candidate.
+    """Return a high-confidence external ETH/ERC-20 -> registered ERC-20 swap candidate.
 
     Asset identity is event-type aware:
       - top-level transaction + asset ETH is native ETH; contract_address is
@@ -180,6 +180,125 @@ def _candidate_external_swap(
 
     out_row = outgoing[0]
     in_row = incoming[0]
+
+    # Registered ERC-20 -> registered ERC-20 swaps are materializable only
+    # when both economic legs resolve exactly through the current Token
+    # Registry and one top-level transaction row supplies call/fee metadata.
+    # Zero-value asset-less contract-call rows are metadata, not economic legs.
+    if _norm(out_row.event_type) == "erc20_transfer":
+        if _norm(in_row.event_type) != "erc20_transfer":
+            return None
+        if out_row.registered is not True or out_row.registry_id is None:
+            return None
+        if in_row.registered is not True or in_row.registry_id is None:
+            return None
+        if not str(out_row.contract_address or "").strip():
+            return None
+        if not str(in_row.contract_address or "").strip():
+            return None
+        if out_row.decimals is None or in_row.decimals is None:
+            return None
+
+        input_registry = (
+            db.query(TokenRegistry)
+            .filter(TokenRegistry.id == int(out_row.registry_id))
+            .first()
+        )
+        output_registry = (
+            db.query(TokenRegistry)
+            .filter(TokenRegistry.id == int(in_row.registry_id))
+            .first()
+        )
+        if input_registry is None or output_registry is None:
+            return None
+        if _norm(input_registry.chain) != _NETWORK or _norm(output_registry.chain) != _NETWORK:
+            return None
+        if _norm(input_registry.address) != _norm(out_row.contract_address):
+            return None
+        if _norm(output_registry.address) != _norm(in_row.contract_address):
+            return None
+
+        input_asset = _asset(input_registry.symbol)
+        output_asset = _asset(output_registry.symbol)
+        if not input_asset or not output_asset:
+            return None
+        if input_asset == "ETH" or output_asset == "ETH" or input_asset == output_asset:
+            return None
+        if input_asset != _asset(out_row.asset) or output_asset != _asset(in_row.asset):
+            return None
+        try:
+            input_decimals = int(input_registry.decimals)
+            output_decimals = int(output_registry.decimals)
+        except Exception:
+            return None
+        if input_decimals != int(out_row.decimals) or output_decimals != int(in_row.decimals):
+            return None
+
+        transaction_rows = [row for row in rows if _norm(row.event_type) == "transaction"]
+        if len(transaction_rows) != 1:
+            return None
+        transaction_row = transaction_rows[0]
+        if _norm(transaction_row.direction) != "out":
+            return None
+        if _positive_atomic(transaction_row) != 0:
+            return None
+        if not str(transaction_row.contract_address or "").strip():
+            return None
+
+        input_amount = _decimal_text_from_atomic(out_row.amount_atomic, input_decimals)
+        output_amount = _decimal_text_from_atomic(in_row.amount_atomic, output_decimals)
+        network_fee = _fee_text(transaction_row.fee_wei)
+        if input_amount is None or output_amount is None or network_fee is None:
+            return None
+        try:
+            if Decimal(input_amount) <= 0 or Decimal(output_amount) <= 0:
+                return None
+        except Exception:
+            return None
+
+        tx_hash = _norm(out_row.transaction_hash or in_row.transaction_hash or transaction_row.transaction_hash)
+        if not tx_hash:
+            return None
+
+        block_values = [int(row.block_number) for row in rows if row.block_number is not None]
+        tx_times = [row.tx_time for row in rows if row.tx_time is not None]
+        fee_wei = str(transaction_row.fee_wei or "0")
+
+        return {
+            "transaction_hash": tx_hash,
+            "symbol": f"{output_asset}-{input_asset}",
+            "side": "buy",
+            "status": "confirmed",
+            "input_asset": input_asset,
+            "input_amount_atomic": str(out_row.amount_atomic or "0"),
+            "input_amount": input_amount,
+            "input_decimals": input_decimals,
+            "output_asset": output_asset,
+            "output_registry_id": int(output_registry.id),
+            "output_amount_atomic": str(in_row.amount_atomic or "0"),
+            "output_amount": output_amount,
+            "output_decimals": output_decimals,
+            "network_fee_asset": "ETH",
+            "network_fee_wei": fee_wei,
+            "network_fee": network_fee,
+            "block_number": max(block_values) if block_values else None,
+            "tx_time": min(tx_times) if tx_times else None,
+            "source": "wallet_history_external",
+            "evidence_summary": {
+                "version": _MATERIALIZATION_VERSION,
+                "event_count": len(rows),
+                "swap_class": "erc20_to_erc20",
+                "input_event_type": _norm(out_row.event_type),
+                "output_event_type": _norm(in_row.event_type),
+                "input_direction": _norm(out_row.direction),
+                "output_direction": _norm(in_row.direction),
+                "input_registered": True,
+                "input_registry_id": int(input_registry.id),
+                "output_registered": True,
+                "call_target_present": bool(transaction_row.contract_address),
+                "network_fee_separate": True,
+            },
+        }
 
     if _norm(out_row.event_type) != "transaction":
         return None
@@ -427,6 +546,7 @@ def preview_robinhood_chain_wallet_materialization(
         "tranche": "RH-WALLET.INGEST.1D-R1",
         "wallet_address_id": str(wallet.id),
         "summary": snapshot["summary"],
+        "candidates": list(snapshot["candidates"]),
         "read_only": True,
         "will_mutate": False,
         "safety": {

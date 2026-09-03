@@ -836,7 +836,7 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         ticket_source = (repo_root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
 
         handler_start = ticket_source.index("  async function addSelectedRobinhoodChainPair() {")
-        handler_end = ticket_source.index("  async function readRobinhoodChainWalletState", handler_start)
+        handler_end = ticket_source.index("  // RH-CATALOG.SELECT.1B-R2: synchronize registration initiated by the Order Book", handler_start)
         handler = ticket_source[handler_start:handler_end]
 
         self.assertIn("addRobinhoodChainSelectedPair(", handler)
@@ -865,7 +865,7 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(event_name, orderbook_source)
 
         ticket_listener_start = ticket_source.index("  // RH-CATALOG.SELECT.1B-R2: synchronize registration initiated by the Order Book")
-        ticket_listener_end = ticket_source.index("  async function readRobinhoodChainWalletState", ticket_listener_start)
+        ticket_listener_end = ticket_source.index("  const robinhoodChainEvmWalletOptionsKey = useMemo(", ticket_listener_start)
         ticket_listener = ticket_source[ticket_listener_start:ticket_listener_end]
         self.assertIn("setRobinhoodChainMarkets(items);", ticket_listener)
         self.assertIn("robinhoodChainExecutionAuthorityReqRef.current += 1;", ticket_listener)

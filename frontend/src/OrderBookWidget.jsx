@@ -19,6 +19,8 @@ const COUNTERPARTY_ORDERBOOK_PICK_EVENT = "utt:counterparty-orderbook-pick";
 const COUNTERPARTY_EXECUTION_MODE_EVENT = "utt:counterparty-execution-mode";
 const ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT = "utt:robinhood-chain-orderbook-pick";
 const ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT = "utt:robinhood-chain-selected-pair-registered";
+const ROBINHOOD_CHAIN_EXACT_MARKET_SELECTION_EVENT = "utt:robinhood-chain-exact-market-selection";
+const ROBINHOOD_CHAIN_MARKET_CAPABILITY_REFRESHED_EVENT = "utt:robinhood-chain-market-capability-refreshed";
 const ROBINHOOD_CHAIN_INTERACTIVE_QUOTE_PRIORITY_EVENT = "utt:robinhood-chain-interactive-quote-priority";
 const ROBINHOOD_CHAIN_AUTO_PRIORITY_RELEASE_MS = 250;
 const ROBINHOOD_CHAIN_AUTO_INITIAL_DELAY_MS = 1000;
@@ -37,6 +39,16 @@ const USD_VALUE_QUOTES = new Set([
 function safeNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function robinhoodChainExactIdentityLabel(asset) {
+  const id = Number(asset?.registry_id);
+  const symbol = String(asset?.symbol || "?").trim().toUpperCase();
+  const address = String(asset?.registry_contract_address || asset?.contract_address || asset?.address || "").trim();
+  const contract = address
+    ? `${address.slice(0, 8)}…${address.slice(-6)}`
+    : "native";
+  return `#${Number.isInteger(id) ? id : "?"} · ${symbol} · ${contract}`;
 }
 
 function counterpartyRetryAfterMs(rawValue, nowMs = Date.now()) {
@@ -381,6 +393,21 @@ function robinhoodChainPairParts(symbol) {
   const parts = raw.split("-").map((item) => item.trim()).filter(Boolean);
   if (parts.length !== 2) return { base: "", quote: "", symbol: raw };
   return { base: parts[0], quote: parts[1], symbol: `${parts[0]}-${parts[1]}` };
+}
+
+function robinhoodChainOrderbookSnapshotKey(market, symbol, depth) {
+  const parts = robinhoodChainPairParts(symbol || market?.symbol);
+  const objectiveId = String(market?.id || "").trim();
+  const baseRegistryId = Number(market?.base?.registry_id);
+  const quoteRegistryId = Number(market?.quote?.registry_id);
+  const exactIdentity = objectiveId || (
+    Number.isInteger(baseRegistryId) && baseRegistryId > 0 &&
+    Number.isInteger(quoteRegistryId) && quoteRegistryId > 0
+      ? `${baseRegistryId}:${quoteRegistryId}`
+      : ""
+  );
+  if (!parts.symbol || !exactIdentity) return "";
+  return `robinhood_chain|${parts.symbol}|${exactIdentity}|${Math.max(1, Math.min(5, Number(depth) || 5))}`;
 }
 
 function robinhoodChainRegistryIdentityVerified(identity) {
@@ -813,6 +840,9 @@ export default function OrderBookWidget({
   const [robinhoodChainPairRegistrationBusy, setRobinhoodChainPairRegistrationBusy] = useState(false);
   const [robinhoodChainPairRegistrationError, setRobinhoodChainPairRegistrationError] = useState("");
   const [robinhoodChainPairRegistrationNotice, setRobinhoodChainPairRegistrationNotice] = useState("");
+  const [robinhoodChainExactSelection, setRobinhoodChainExactSelection] = useState({
+    symbol: "", objectiveId: "", baseRegistryId: null, quoteRegistryId: null,
+  });
   const robinhoodChainMarketsReqRef = useRef(0);
   const robinhoodChainRefreshSummaryRef = useRef(null);
   const [counterpartyLiquidityFilter, setCounterpartyLiquidityFilter] = useState(() => readCounterpartyLiquidityFilter());
@@ -877,8 +907,14 @@ export default function OrderBookWidget({
   const requestKindRef = useRef("");
   const robinhoodChainInteractivePriorityRef = useRef({ active: false, symbol: "" });
   const robinhoodChainDeferredAutoRefreshRef = useRef(false);
+  const robinhoodChainSelectionRefreshPendingRef = useRef("");
   const robinhoodChainAutoInitialPendingRef = useRef(false);
   const robinhoodChainPriorityReleaseTimerRef = useRef(null);
+  // RHBOOKTICKET1A: an Order Book refresh can arrive while the Robinhood Chain
+  // market catalog is still loading. Preserve that exact request and replay it
+  // once catalog loading completes instead of silently dropping it until the
+  // next long auto-refresh interval or requiring another operator click.
+  const robinhoodChainCatalogDeferredRefreshRef = useRef(null);
 
   // NEW: error gating to stop hammering known-bad pairs
   const pairNotFoundRef = useRef(false);
@@ -889,6 +925,7 @@ export default function OrderBookWidget({
   const [counterpartyResilience, setCounterpartyResilience] = useState(null);
   const [cooldownClock, setCooldownClock] = useState(() => Date.now());
   const counterpartyLastGoodRef = useRef(new Map());
+  const robinhoodChainLastGoodRef = useRef(new Map());
 
   const [inlineMode, setInlineMode] = useState(true);
 
@@ -1035,25 +1072,99 @@ export default function OrderBookWidget({
   const isPolkadotDexVenue = useMemo(() => isPolkadotHydrationVenueKey(effectiveVenue), [effectiveVenue]);
   const isCounterpartyVenue = useMemo(() => isCounterpartyVenueKey(effectiveVenue), [effectiveVenue]);
   const isRobinhoodChainVenue = useMemo(() => isRobinhoodChainVenueKey(effectiveVenue), [effectiveVenue]);
-  const selectedRobinhoodChainMarket = useMemo(() => {
-    const wanted = robinhoodChainPairParts(obSymbol).symbol;
-    return (robinhoodChainMarkets || []).find((item) => (
-      robinhoodChainPairParts(item?.symbol).symbol === wanted
-    )) || null;
-  }, [robinhoodChainMarkets, obSymbol]);
-
   const robinhoodChainSelectedPair = robinhoodChainPairParts(obSymbol);
-  const robinhoodChainRegistryAssetBySymbol = useMemo(() => {
+  const robinhoodChainConfiguredMarketMatches = useMemo(() => {
+    const wanted = robinhoodChainSelectedPair.symbol;
+    if (!wanted) return [];
+    return (robinhoodChainMarkets || []).filter((item) => (
+      robinhoodChainPairParts(item?.symbol).symbol === wanted
+    ));
+  }, [robinhoodChainMarkets, robinhoodChainSelectedPair.symbol]);
+
+  const robinhoodChainRegistryAssetsBySymbol = useMemo(() => {
     const out = {};
     for (const asset of robinhoodChainRegistryAssets || []) {
       if (!asset || typeof asset !== "object" || asset?.identity_error || asset?.registry_id === null || asset?.registry_id === undefined) continue;
       const symbol = String(asset?.symbol || "").trim().toUpperCase();
-      if (symbol && !out[symbol]) out[symbol] = asset;
+      if (!symbol) continue;
+      if (!out[symbol]) out[symbol] = [];
+      out[symbol].push(asset);
+    }
+    for (const values of Object.values(out)) {
+      values.sort((a, b) => Number(a?.registry_id || 0) - Number(b?.registry_id || 0));
     }
     return out;
   }, [robinhoodChainRegistryAssets]);
-  const robinhoodChainRegistryBaseIdentity = robinhoodChainRegistryAssetBySymbol[robinhoodChainSelectedPair.base] || null;
-  const robinhoodChainRegistryQuoteIdentity = robinhoodChainRegistryAssetBySymbol[robinhoodChainSelectedPair.quote] || null;
+  const robinhoodChainUniqueRegistryAssetBySymbol = useMemo(() => {
+    const out = {};
+    for (const [symbol, matches] of Object.entries(robinhoodChainRegistryAssetsBySymbol)) {
+      if (Array.isArray(matches) && matches.length === 1) out[symbol] = matches[0];
+    }
+    return out;
+  }, [robinhoodChainRegistryAssetsBySymbol]);
+
+  const robinhoodChainExactSelectionCurrent = robinhoodChainExactSelection?.symbol === robinhoodChainSelectedPair.symbol
+    ? robinhoodChainExactSelection
+    : { symbol: robinhoodChainSelectedPair.symbol, objectiveId: "", baseRegistryId: null, quoteRegistryId: null };
+  const robinhoodChainExplicitBaseRegistryId = Number(robinhoodChainExactSelectionCurrent?.baseRegistryId);
+  const robinhoodChainExplicitQuoteRegistryId = Number(robinhoodChainExactSelectionCurrent?.quoteRegistryId);
+  const robinhoodChainHasExplicitRegistryPair = Number.isInteger(robinhoodChainExplicitBaseRegistryId) && robinhoodChainExplicitBaseRegistryId > 0
+    && Number.isInteger(robinhoodChainExplicitQuoteRegistryId) && robinhoodChainExplicitQuoteRegistryId > 0;
+
+  const selectedRobinhoodChainMarket = useMemo(() => {
+    const objectiveId = String(robinhoodChainExactSelectionCurrent?.objectiveId || "").trim();
+    if (objectiveId) {
+      const exact = robinhoodChainConfiguredMarketMatches.find((item) => String(item?.id || "").trim() === objectiveId) || null;
+      if (exact) return exact;
+    }
+    if (robinhoodChainHasExplicitRegistryPair) {
+      return robinhoodChainConfiguredMarketMatches.find((item) => (
+        Number(item?.base?.registry_id) === robinhoodChainExplicitBaseRegistryId
+        && Number(item?.quote?.registry_id) === robinhoodChainExplicitQuoteRegistryId
+      )) || null;
+    }
+    return robinhoodChainConfiguredMarketMatches.length === 1 ? robinhoodChainConfiguredMarketMatches[0] : null;
+  }, [
+    robinhoodChainConfiguredMarketMatches,
+    robinhoodChainExactSelectionCurrent?.objectiveId,
+    robinhoodChainHasExplicitRegistryPair,
+    robinhoodChainExplicitBaseRegistryId,
+    robinhoodChainExplicitQuoteRegistryId,
+  ]);
+
+  const robinhoodChainBaseRegistryCandidates = robinhoodChainRegistryAssetsBySymbol[robinhoodChainSelectedPair.base] || [];
+  const robinhoodChainQuoteRegistryCandidates = robinhoodChainRegistryAssetsBySymbol[robinhoodChainSelectedPair.quote] || [];
+  const robinhoodChainExplicitBaseIdentity = Number.isInteger(robinhoodChainExplicitBaseRegistryId)
+    ? robinhoodChainBaseRegistryCandidates.find((item) => Number(item?.registry_id) === robinhoodChainExplicitBaseRegistryId) || null
+    : null;
+  const robinhoodChainExplicitQuoteIdentity = Number.isInteger(robinhoodChainExplicitQuoteRegistryId)
+    ? robinhoodChainQuoteRegistryCandidates.find((item) => Number(item?.registry_id) === robinhoodChainExplicitQuoteRegistryId) || null
+    : null;
+  const robinhoodChainRegistryBaseIdentity = selectedRobinhoodChainMarket?.base?.registry_id
+    ? selectedRobinhoodChainMarket.base
+    : robinhoodChainExplicitBaseIdentity || robinhoodChainUniqueRegistryAssetBySymbol[robinhoodChainSelectedPair.base] || null;
+  const robinhoodChainRegistryQuoteIdentity = selectedRobinhoodChainMarket?.quote?.registry_id
+    ? selectedRobinhoodChainMarket.quote
+    : robinhoodChainExplicitQuoteIdentity || robinhoodChainUniqueRegistryAssetBySymbol[robinhoodChainSelectedPair.quote] || null;
+  const robinhoodChainConfiguredMarketAmbiguous = Boolean(
+    isRobinhoodChainVenue && robinhoodChainConfiguredMarketMatches.length > 1 && !selectedRobinhoodChainMarket
+  );
+  const robinhoodChainRegistryPairAmbiguous = Boolean(
+    isRobinhoodChainVenue &&
+    !selectedRobinhoodChainMarket &&
+    (
+      (robinhoodChainBaseRegistryCandidates.length > 1 && !robinhoodChainExplicitBaseIdentity) ||
+      (robinhoodChainQuoteRegistryCandidates.length > 1 && !robinhoodChainExplicitQuoteIdentity)
+    )
+  );
+  const robinhoodChainExactSelectorVisible = Boolean(
+    isRobinhoodChainVenue && (
+      robinhoodChainConfiguredMarketMatches.length > 1 ||
+      robinhoodChainBaseRegistryCandidates.length > 1 ||
+      robinhoodChainQuoteRegistryCandidates.length > 1 ||
+      robinhoodChainHasExplicitRegistryPair
+    )
+  );
   const robinhoodChainRegistryPairResolved = Boolean(
     robinhoodChainSelectedPair.base &&
     robinhoodChainSelectedPair.quote &&
@@ -1076,8 +1187,73 @@ export default function OrderBookWidget({
   const robinhoodChainPairNotConfigured = Boolean(
     isRobinhoodChainVenue &&
     robinhoodChainRegistryPairReady &&
-    !selectedRobinhoodChainMarket
+    !selectedRobinhoodChainMarket &&
+    !robinhoodChainConfiguredMarketAmbiguous &&
+    !robinhoodChainRegistryPairAmbiguous
   );
+
+  function publishRobinhoodChainExactSelection(nextSelection, source = "order_book") {
+    const next = {
+      symbol: robinhoodChainSelectedPair.symbol,
+      objectiveId: String(nextSelection?.objectiveId || "").trim(),
+      baseRegistryId: Number(nextSelection?.baseRegistryId) || null,
+      quoteRegistryId: Number(nextSelection?.quoteRegistryId) || null,
+    };
+    setRobinhoodChainExactSelection(next);
+    try {
+      window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_EXACT_MARKET_SELECTION_EVENT, {
+        detail: { source, ...next },
+      }));
+    } catch {
+      // Peer widget can safely fall back to symbol-only fail-closed behavior.
+    }
+  }
+
+  function chooseRobinhoodChainRegistryIdentity(role, rawRegistryId) {
+    const picked = Number(rawRegistryId);
+    const currentBase = Number(robinhoodChainRegistryBaseIdentity?.registry_id);
+    const currentQuote = Number(robinhoodChainRegistryQuoteIdentity?.registry_id);
+    const baseRegistryId = role === "base" ? picked : currentBase;
+    const quoteRegistryId = role === "quote" ? picked : currentQuote;
+    const exact = robinhoodChainConfiguredMarketMatches.find((item) => (
+      Number(item?.base?.registry_id) === baseRegistryId && Number(item?.quote?.registry_id) === quoteRegistryId
+    )) || null;
+    publishRobinhoodChainExactSelection({
+      objectiveId: exact?.id || "",
+      baseRegistryId,
+      quoteRegistryId,
+    });
+    setRobinhoodChainPairRegistrationError("");
+    setRobinhoodChainPairRegistrationNotice("");
+    setObError(null);
+  }
+
+  useEffect(() => {
+    setRobinhoodChainExactSelection((current) => (
+      current?.symbol === robinhoodChainSelectedPair.symbol
+        ? current
+        : { symbol: robinhoodChainSelectedPair.symbol, objectiveId: "", baseRegistryId: null, quoteRegistryId: null }
+    ));
+  }, [robinhoodChainSelectedPair.symbol]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const onExactSelection = (event) => {
+      const detail = event?.detail && typeof event.detail === "object" ? event.detail : {};
+      if (String(detail?.source || "") === "order_book") return;
+      if (robinhoodChainPairParts(detail?.symbol).symbol !== robinhoodChainSelectedPair.symbol) return;
+      setRobinhoodChainExactSelection({
+        symbol: robinhoodChainSelectedPair.symbol,
+        objectiveId: String(detail?.objectiveId || "").trim(),
+        baseRegistryId: Number(detail?.baseRegistryId) || null,
+        quoteRegistryId: Number(detail?.quoteRegistryId) || null,
+      });
+      setObError(null);
+    };
+    window.addEventListener(ROBINHOOD_CHAIN_EXACT_MARKET_SELECTION_EVENT, onExactSelection);
+    return () => window.removeEventListener(ROBINHOOD_CHAIN_EXACT_MARKET_SELECTION_EVENT, onExactSelection);
+  }, [robinhoodChainSelectedPair.symbol]);
+
 
   useEffect(() => {
     setRobinhoodChainPairRegistrationError("");
@@ -1086,9 +1262,11 @@ export default function OrderBookWidget({
 
   function robinhoodChainMarketForSymbol(value) {
     const wanted = robinhoodChainPairParts(value).symbol;
-    return (robinhoodChainMarkets || []).find((item) => (
+    if (wanted && wanted === robinhoodChainSelectedPair.symbol) return selectedRobinhoodChainMarket;
+    const matches = (robinhoodChainMarkets || []).filter((item) => (
       robinhoodChainPairParts(item?.symbol).symbol === wanted
-    )) || null;
+    ));
+    return matches.length === 1 ? matches[0] : null;
   }
 
   useEffect(() => {
@@ -1123,7 +1301,9 @@ export default function OrderBookWidget({
 
       } catch (error) {
         if (cancelled || String(error?.name || "") === "AbortError") return;
-        setRobinhoodChainMarkets([]);
+        // RHBOOKTICKET1: transport/provider failure is not authoritative market absence.
+        // Retain the last successful catalog so a transient read cannot downgrade the
+        // selected exact objective to "not present in database".
         setRobinhoodChainMarketsError(String(error?.message || error || "Robinhood Chain market catalog failed."));
       } finally {
         if (!cancelled && robinhoodChainMarketsReqRef.current === reqId) {
@@ -1160,7 +1340,7 @@ export default function OrderBookWidget({
         setRobinhoodChainRegistryAssets(Array.isArray(payload?.items) ? payload.items : []);
       } catch (error) {
         if (cancelled) return;
-        setRobinhoodChainRegistryAssets([]);
+        // Retain the last successful exact Registry identities on transient read failure.
         setRobinhoodChainRegistryAssetsError(String(error?.message || error || "Robinhood Chain registry assets failed."));
       } finally {
         if (!cancelled) setRobinhoodChainRegistryAssetsLoading(false);
@@ -1225,13 +1405,21 @@ export default function OrderBookWidget({
         throw new Error(refreshed?.error || "Selected pair was saved, but the market catalog refresh failed.");
       }
       const items = Array.isArray(refreshed?.items) ? refreshed.items : [];
+      const objectiveId = String(result?.objective?.id || "").trim();
       const configured = items.find((market) => (
-        robinhoodChainPairParts(market?.symbol).symbol === robinhoodChainSelectedPair.symbol
+        String(market?.id || "").trim() === objectiveId
+        && Number(market?.base?.registry_id) === baseRegistryId
+        && Number(market?.quote?.registry_id) === quoteRegistryId
       ));
       if (!configured) {
-        throw new Error("Selected pair was saved, but it is not present in the refreshed market catalog.");
+        throw new Error("Selected pair was saved, but its exact objective ID is not present in the refreshed market catalog.");
       }
       setRobinhoodChainMarkets(items);
+      publishRobinhoodChainExactSelection({
+        objectiveId: configured.id,
+        baseRegistryId,
+        quoteRegistryId,
+      });
       setObError(null);
       try {
         window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_SELECTED_PAIR_REGISTERED_EVENT, {
@@ -1239,6 +1427,9 @@ export default function OrderBookWidget({
             source: "order_book",
             symbol: robinhoodChainSelectedPair.symbol,
             markets: items,
+            objectiveId: configured.id,
+            baseRegistryId,
+            quoteRegistryId,
             idempotent: result?.idempotent === true,
           },
         }));
@@ -1266,12 +1457,20 @@ export default function OrderBookWidget({
       if (String(detail?.source || "") === "order_book") return;
       const eventSymbol = robinhoodChainPairParts(detail?.symbol).symbol;
       const items = Array.isArray(detail?.markets) ? detail.markets : [];
+      const objectiveId = String(detail?.objectiveId || "").trim();
+      const baseRegistryId = Number(detail?.baseRegistryId);
+      const quoteRegistryId = Number(detail?.quoteRegistryId);
       const configured = items.find((market) => (
-        robinhoodChainPairParts(market?.symbol).symbol === robinhoodChainSelectedPair.symbol
+        String(market?.id || "").trim() === objectiveId
+        && Number(market?.base?.registry_id) === baseRegistryId
+        && Number(market?.quote?.registry_id) === quoteRegistryId
       ));
       if (!isRobinhoodChainVenue || !eventSymbol || eventSymbol !== robinhoodChainSelectedPair.symbol || !configured) return;
 
       setRobinhoodChainMarkets(items);
+      setRobinhoodChainExactSelection({
+        symbol: eventSymbol, objectiveId, baseRegistryId, quoteRegistryId,
+      });
       setObError(null);
       setRobinhoodChainPairRegistrationError("");
       setRobinhoodChainPairRegistrationNotice(
@@ -1928,16 +2127,30 @@ function clampBox(next) {
 
     let robinhoodChainMarket = null;
     if (isRobinhoodChainVenueKey(v)) {
-      if (robinhoodChainMarketsLoading) return;
+      if (robinhoodChainMarketsLoading) {
+        const pending = robinhoodChainCatalogDeferredRefreshRef.current || {};
+        const force = pending?.force === true || opts.force === true;
+        robinhoodChainCatalogDeferredRefreshRef.current = {
+          symbol: robinhoodChainPairParts(sym).symbol,
+          force,
+          auto: force ? false : opts.auto === true,
+          selection: pending?.selection === true || opts.selection === true,
+        };
+        return;
+      }
       robinhoodChainMarket = robinhoodChainMarketForSymbol(sym);
       if (!robinhoodChainMarket) {
         setObAsks([]);
         setObBids([]);
         setOrderBookMeta(null);
         setObError(
-          robinhoodChainPairNotConfigured
-            ? "REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED. Use Add Selected Pair before Refresh."
-            : robinhoodChainRegistryAssetsError || robinhoodChainMarketsError || "This market is not present in the Robinhood Chain database catalog."
+          robinhoodChainConfiguredMarketAmbiguous
+            ? "AMBIGUOUS CONFIGURED MARKET · multiple exact Robinhood Chain pair objectives share this display symbol. Choose the exact Registry IDs before refreshing."
+            : robinhoodChainRegistryPairAmbiguous
+              ? "AMBIGUOUS REGISTRY SYMBOL · multiple Robinhood Chain contracts share this ticker. Choose exact Registry IDs; symbol-only pair creation is blocked."
+            : robinhoodChainPairNotConfigured
+              ? "REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED. Use Add Selected Pair before Refresh."
+              : robinhoodChainRegistryAssetsError || robinhoodChainMarketsError || "This market is not present in the Robinhood Chain database catalog."
         );
         return;
       }
@@ -1974,7 +2187,7 @@ function clampBox(next) {
 
     if (inFlightRef.current) return;
     inFlightRef.current = true;
-    requestKindRef.current = opts.auto === true ? "auto" : "manual";
+    requestKindRef.current = opts.selection === true ? "selection" : opts.auto === true ? "auto" : "manual";
 
     try {
       setObLoading(true);
@@ -2001,7 +2214,11 @@ function clampBox(next) {
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ confirm_refresh: true, force_refresh: true }),
+            body: JSON.stringify({
+              confirm_refresh: true,
+              force_refresh: true,
+              objective_id: String(robinhoodChainMarket?.id || "").trim() || null,
+            }),
             signal: ac.signal,
             cache: "no-store",
           }
@@ -2032,13 +2249,38 @@ function clampBox(next) {
         setRobinhoodChainMarkets((current) => {
           const items = Array.isArray(current) ? current : [];
           let replaced = false;
+          const refreshedId = String(refreshedMarket?.id || "").trim();
           const next = items.map((item) => {
-            if (robinhoodChainPairParts(item?.symbol).symbol !== refreshedSymbol) return item;
+            if (String(item?.id || "").trim() !== refreshedId) return item;
             replaced = true;
             return refreshedMarket;
           });
           return replaced ? next : [...next, refreshedMarket];
         });
+        try {
+          const refreshedObjectiveId = String(refreshedMarket?.id || "").trim();
+          const refreshedBaseRegistryId = Number(refreshedMarket?.base?.registry_id);
+          const refreshedQuoteRegistryId = Number(refreshedMarket?.quote?.registry_id);
+          if (
+            refreshedSymbol &&
+            refreshedObjectiveId &&
+            Number.isInteger(refreshedBaseRegistryId) && refreshedBaseRegistryId > 0 &&
+            Number.isInteger(refreshedQuoteRegistryId) && refreshedQuoteRegistryId > 0
+          ) {
+            window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_MARKET_CAPABILITY_REFRESHED_EVENT, {
+              detail: {
+                source: "order_book",
+                symbol: refreshedSymbol,
+                objectiveId: refreshedObjectiveId,
+                baseRegistryId: refreshedBaseRegistryId,
+                quoteRegistryId: refreshedQuoteRegistryId,
+                market: refreshedMarket,
+              },
+            }));
+          }
+        } catch {
+          // Order Ticket can recover from its next catalog read; Book state is already current.
+        }
         robinhoodChainMarket = refreshedMarket;
         if (refreshedMarket?.orderbook_enabled !== true) {
           showRobinhoodChainUnavailableMarket(refreshedMarket, refreshSummary);
@@ -2075,9 +2317,13 @@ function clampBox(next) {
       const counterpartyOrderbookUrl = `${apiBase}/api/counterparty/orderbook?symbol=${encodeURIComponent(counterpartySymbol)}&depth=${encodeURIComponent(
         String(depth)
       )}&open_only=true${forceQ}&_ts=${Date.now()}`;
+      const robinhoodChainObjectiveId = String(robinhoodChainMarket?.id || "").trim();
+      const robinhoodChainObjectiveQ = robinhoodChainObjectiveId
+        ? `&objective_id=${encodeURIComponent(robinhoodChainObjectiveId)}`
+        : "";
       const robinhoodChainOrderbookUrl = `${apiBase}/api/robinhood_chain/orderbook?symbol=${encodeURIComponent(sym)}&depth=${encodeURIComponent(
         String(Math.min(depth, 5))
-      )}&force_refresh=${opts.force ? "true" : "false"}&_ts=${Date.now()}`;
+      )}&force_refresh=${opts.force ? "true" : "false"}${robinhoodChainObjectiveQ}&_ts=${Date.now()}`;
 
       if (isPolkadotHydration) {
         const sr = await fetch(hydrationStatusUrl, { signal: ac.signal, cache: "no-store" });
@@ -2321,6 +2567,24 @@ function clampBox(next) {
       setObAsks(nextAsks);
       setObBids(nextBids);
 
+      if (isRobinhoodChainVenueKey(usedVenue) && (nextAsks.length || nextBids.length)) {
+        const cacheKey = robinhoodChainOrderbookSnapshotKey(robinhoodChainMarket, sym, depth);
+        if (cacheKey) {
+          const cache = robinhoodChainLastGoodRef.current;
+          if (cache.size >= 20 && !cache.has(cacheKey)) {
+            const oldestKey = cache.keys().next().value;
+            if (oldestKey) cache.delete(oldestKey);
+          }
+          cache.set(cacheKey, {
+            asks: nextAsks,
+            bids: nextBids,
+            meta: nextMeta,
+            activeRouter: usedRouter,
+            ts: Date.now(),
+          });
+        }
+      }
+
       if (counterpartyRequest) {
         const cache = counterpartyLastGoodRef.current;
         if (cache.size >= 20 && !cache.has(counterpartyCacheKey)) {
@@ -2373,18 +2637,39 @@ function clampBox(next) {
         return;
       }
 
-      setObAsks([]);
-      setObBids([]);
-      setOrderBookMeta(null);
-      setHydrationLiquidityWarning(null);
-
-      setObActiveRouter(null);
       const raw = requestTimedOut
         ? (isRobinhoodChainVenueKey(v)
             ? "Robinhood Chain synthetic quote sampling timed out after 30s. Retry once after the provider backoff window."
             : "Hydration orderbook request timed out after 45s. The backend may still be probing slow quote samples; try Refresh once, then test depth=1 from PowerShell if this repeats.")
         : (e?.message || "Failed to load order book");
       const pretty = formatOrderBookError(raw, venueLabel || effectiveVenue);
+
+      if (isRobinhoodChainVenueKey(v)) {
+        const cacheKey = robinhoodChainOrderbookSnapshotKey(robinhoodChainMarket, sym, depth);
+        const cached = cacheKey ? robinhoodChainLastGoodRef.current.get(cacheKey) || null : null;
+        if (cached) {
+          setObAsks(cached.asks || []);
+          setObBids(cached.bids || []);
+          setOrderBookMeta({
+            ...(cached.meta || {}),
+            stale: true,
+            snapshotSource: "frontend_last_good",
+            staleReason: pretty,
+          });
+          setObActiveRouter(cached.activeRouter || null);
+          setHydrationLiquidityWarning(null);
+          setObError(`STALE LAST-GOOD BOOK · ${pretty}`);
+          snapToCenterAnchors();
+          return;
+        }
+      }
+
+      setObAsks([]);
+      setObBids([]);
+      setOrderBookMeta(null);
+      setHydrationLiquidityWarning(null);
+
+      setObActiveRouter(null);
       setObError(pretty);
 
       // If we detected a "pair not found", stop auto-refresh hammering until symbol/venue changes or user forces refresh
@@ -2433,35 +2718,51 @@ function clampBox(next) {
 
       if (active) {
         clearReleaseTimer();
-        robinhoodChainDeferredAutoRefreshRef.current = true;
-        if (requestKindRef.current === "auto") {
+        if (requestKindRef.current === "selection") {
+          robinhoodChainSelectionRefreshPendingRef.current = currentSymbol;
+        } else {
+          robinhoodChainDeferredAutoRefreshRef.current = true;
+        }
+        if (["auto", "selection"].includes(requestKindRef.current)) {
           try {
             if (abortRef.current) abortRef.current.abort();
           } catch {
-            // The in-flight auto book request can finish/cancel naturally.
+            // The in-flight automatic book request can finish/cancel naturally.
           }
         }
         return;
       }
 
-      if (!robinhoodChainDeferredAutoRefreshRef.current || !obAutoRefresh) return;
-      if (robinhoodChainAutoInitialPendingRef.current) return;
-      robinhoodChainDeferredAutoRefreshRef.current = false;
+      const selectionPending = robinhoodChainSelectionRefreshPendingRef.current === currentSymbol;
+      const recurringAutoPending = robinhoodChainDeferredAutoRefreshRef.current && obAutoRefresh;
+      if (!selectionPending && !recurringAutoPending) return;
+      if (robinhoodChainAutoInitialPendingRef.current && !selectionPending) return;
       clearReleaseTimer();
       robinhoodChainPriorityReleaseTimerRef.current = window.setTimeout(() => {
         robinhoodChainPriorityReleaseTimerRef.current = null;
         const priority = robinhoodChainInteractivePriorityRef.current || {};
         const prioritySymbol = normalizePrioritySymbol(priority?.symbol);
         if (priority?.active === true && (!prioritySymbol || prioritySymbol === currentSymbol)) {
-          robinhoodChainDeferredAutoRefreshRef.current = true;
+          if (selectionPending) robinhoodChainSelectionRefreshPendingRef.current = currentSymbol;
+          if (recurringAutoPending) robinhoodChainDeferredAutoRefreshRef.current = true;
           return;
         }
         if (document.hidden) {
-          robinhoodChainDeferredAutoRefreshRef.current = true;
+          if (selectionPending) robinhoodChainSelectionRefreshPendingRef.current = currentSymbol;
+          if (recurringAutoPending) robinhoodChainDeferredAutoRefreshRef.current = true;
           return;
         }
         const fetchCurrent = fetchOrderBookRef.current;
-        if (typeof fetchCurrent === "function") void fetchCurrent({ auto: true });
+        if (typeof fetchCurrent !== "function") return;
+        if (selectionPending) {
+          robinhoodChainSelectionRefreshPendingRef.current = "";
+          void fetchCurrent({ auto: true, selection: true });
+          return;
+        }
+        if (recurringAutoPending) {
+          robinhoodChainDeferredAutoRefreshRef.current = false;
+          void fetchCurrent({ auto: true });
+        }
       }, ROBINHOOD_CHAIN_AUTO_PRIORITY_RELEASE_MS);
     };
 
@@ -2472,8 +2773,102 @@ function clampBox(next) {
     };
   }, [effectiveVenue, obSymbol, obAutoRefresh]);
 
+  // RHBOOKTICKET1A: replay exactly one Book request that was deferred because
+  // the Robinhood Chain market catalog was still loading. Manual force refresh
+  // remains operator-controlled; automatic work still yields to Ticket priority.
+  useEffect(() => {
+    const venue = String(effectiveVenue || "").trim().toLowerCase();
+    if (!isRobinhoodChainVenueKey(venue) || robinhoodChainMarketsLoading) return undefined;
+
+    const pending = robinhoodChainCatalogDeferredRefreshRef.current;
+    if (!pending) return undefined;
+
+    const currentSymbol = robinhoodChainPairParts(obSymbol).symbol;
+    if (!currentSymbol || pending?.symbol !== currentSymbol) {
+      robinhoodChainCatalogDeferredRefreshRef.current = null;
+      return undefined;
+    }
+
+    robinhoodChainCatalogDeferredRefreshRef.current = null;
+    const timer = window.setTimeout(() => {
+      if (pending?.auto === true) {
+        const priority = robinhoodChainInteractivePriorityRef.current || {};
+        const prioritySymbol = robinhoodChainPairParts(priority?.symbol).symbol;
+        if (document.hidden || (priority?.active === true && (!prioritySymbol || prioritySymbol === currentSymbol))) {
+          if (pending?.selection === true) {
+            robinhoodChainSelectionRefreshPendingRef.current = currentSymbol;
+          } else {
+            robinhoodChainDeferredAutoRefreshRef.current = true;
+          }
+          return;
+        }
+      }
+
+      const fetchCurrent = fetchOrderBookRef.current;
+      if (typeof fetchCurrent === "function") {
+        void fetchCurrent({
+          force: pending?.force === true,
+          auto: pending?.auto === true,
+          selection: pending?.selection === true,
+        });
+      }
+    }, ROBINHOOD_CHAIN_AUTO_PRIORITY_RELEASE_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [robinhoodChainMarketsLoading, effectiveVenue, obSymbol]);
+
+  // RHBOOKTICKET1B: selecting a committed Robinhood Chain market performs
+  // exactly one bounded synthetic-book load even when recurring Auto is OFF.
+  // Auto OFF therefore means "no interval", not "leave a selected market blank".
+  // This automatic selection fetch still yields to Ticket interactive priority.
+  useEffect(() => {
+    const venue = String(effectiveVenue || "").trim().toLowerCase();
+    const currentSymbol = robinhoodChainPairParts(obSymbol).symbol;
+    if (!isRobinhoodChainVenueKey(venue) || !currentSymbol) return undefined;
+
+    let cancelled = false;
+    robinhoodChainSelectionRefreshPendingRef.current = "";
+    robinhoodChainAutoInitialPendingRef.current = true;
+
+    const timer = window.setTimeout(() => {
+      robinhoodChainAutoInitialPendingRef.current = false;
+      if (cancelled) return;
+
+      const priority = robinhoodChainInteractivePriorityRef.current || {};
+      const prioritySymbol = robinhoodChainPairParts(priority?.symbol).symbol;
+      if (
+        document.hidden ||
+        (priority?.active === true && (!prioritySymbol || prioritySymbol === currentSymbol))
+      ) {
+        robinhoodChainSelectionRefreshPendingRef.current = currentSymbol;
+        return;
+      }
+
+      const fetchCurrent = fetchOrderBookRef.current;
+      if (typeof fetchCurrent === "function") {
+        void fetchCurrent({ auto: true, selection: true });
+      }
+    }, ROBINHOOD_CHAIN_AUTO_INITIAL_DELAY_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      robinhoodChainAutoInitialPendingRef.current = false;
+      if (robinhoodChainSelectionRefreshPendingRef.current === currentSymbol) {
+        robinhoodChainSelectionRefreshPendingRef.current = "";
+      }
+      try {
+        if (abortRef.current) abortRef.current.abort();
+      } catch {
+        // A superseded selected-market request can finish/cancel naturally.
+      }
+    };
+  }, [effectiveVenue, obSymbol]);
+
   // Auto-refresh:
-  // - Debounce the initial fetch (prevents cascades when venue/symbol is switching)
+  // - Robinhood Chain selected-market initial load is owned by RHBOOKTICKET1B above.
+  // - Recurring Auto remains optional and preserves the configured interval.
+  // - Non-Robinhood venues keep their existing debounced initial fetch.
   // - Do NOT refresh on draft typing (only committed obSymbol)
   useEffect(() => {
     if (!obAutoRefresh) return;
@@ -2504,22 +2899,16 @@ function clampBox(next) {
       void fetchOrderBook({ auto: true });
     };
 
-    if (isRobinhoodChain) robinhoodChainAutoInitialPendingRef.current = true;
-    const initial = setTimeout(
-      () => {
-        if (isRobinhoodChain) robinhoodChainAutoInitialPendingRef.current = false;
-        runAutomaticRefresh();
-      },
-      isRobinhoodChain ? ROBINHOOD_CHAIN_AUTO_INITIAL_DELAY_MS : 300
-    );
+    const initial = isRobinhoodChain
+      ? null
+      : setTimeout(runAutomaticRefresh, 300);
 
     const t = setInterval(runAutomaticRefresh, ms);
 
     return () => {
       cancelled = true;
-      clearTimeout(initial);
+      if (initial !== null) clearTimeout(initial);
       clearInterval(t);
-      if (isRobinhoodChain) robinhoodChainAutoInitialPendingRef.current = false;
       try {
         if (abortRef.current) abortRef.current.abort();
       } catch {
@@ -3140,13 +3529,17 @@ function clampBox(next) {
           </button>
 
           <button
-            style={{ ...btnCompact(), ...((obLoading || counterpartyCooldownActive || robinhoodChainPairNotConfigured) ? styles.buttonDisabled : {}) }}
-            disabled={obLoading || counterpartyCooldownActive || robinhoodChainPairNotConfigured}
+            style={{ ...btnCompact(), ...((obLoading || counterpartyCooldownActive || robinhoodChainPairNotConfigured || robinhoodChainConfiguredMarketAmbiguous || robinhoodChainRegistryPairAmbiguous) ? styles.buttonDisabled : {}) }}
+            disabled={obLoading || counterpartyCooldownActive || robinhoodChainPairNotConfigured || robinhoodChainConfiguredMarketAmbiguous || robinhoodChainRegistryPairAmbiguous}
             title={counterpartyCooldownActive
               ? `Counterparty cooldown active. Refresh available in ${counterpartyCooldownLabel}.`
-              : robinhoodChainPairNotConfigured
-                ? "Add Selected Pair first. Pair registration is provider-free; Refresh remains a separate explicit action."
-                : isRobinhoodChainVenue
+              : robinhoodChainConfiguredMarketAmbiguous
+                ? "Multiple configured exact objectives share this display symbol. Choose exact Registry IDs before Refresh."
+                : robinhoodChainRegistryPairAmbiguous
+                  ? "Multiple Token Registry contracts share one selected ticker. Configure an exact-ID market before Refresh."
+                  : robinhoodChainPairNotConfigured
+                  ? "Add Selected Pair first. Pair registration is provider-free; Refresh remains a separate explicit action."
+                  : isRobinhoodChainVenue
                   ? "Explicitly refresh only the selected Robinhood Chain pair. A blocked pair may perform two bounded read-only exact-input provider probes; no wallet request, signing, transaction construction, or execution promotion occurs."
                   : "Refresh OrderBook"}
             onClick={() => refreshSelectedMarket(true)}
@@ -3189,7 +3582,7 @@ function clampBox(next) {
                     {" "}• <b>SYNTH</b>
                     {" "}• <b>QUOTE ONLY</b>
                     {" "}• <b>NOT RESTING</b>
-                    {" "}• {orderBookMeta?.cached ? <b>CACHED</b> : orderBookMeta?.cacheMixed ? <b>MIXED CACHE</b> : <b>FRESH</b>}
+                    {" "}• {orderBookMeta?.stale ? <b>STALE</b> : orderBookMeta?.cached ? <b>CACHED</b> : orderBookMeta?.cacheMixed ? <b>MIXED CACHE</b> : <b>FRESH</b>}
                     {Array.isArray(orderBookMeta?.sources) && orderBookMeta.sources.length ? <> • Route <b>{orderBookMeta.sources.join(", ")}</b></> : null}
                     {Number(orderBookMeta?.warningCount || 0) > 0 ? <> • Warnings <b>{Number(orderBookMeta.warningCount)}</b></> : null}
                     {orderBookMeta?.spreadBps !== null && orderBookMeta?.spreadBps !== undefined ? <> • Spread <b>{Number(orderBookMeta.spreadBps).toFixed(2)} bps</b></> : null}
@@ -3352,7 +3745,7 @@ function clampBox(next) {
         ) : null}
 
 
-        {(robinhoodChainPairVerificationBlocked || robinhoodChainPairNotConfigured || robinhoodChainPairRegistrationBusy || robinhoodChainPairRegistrationError || robinhoodChainPairRegistrationNotice) && (
+        {(robinhoodChainExactSelectorVisible || robinhoodChainConfiguredMarketAmbiguous || robinhoodChainRegistryPairAmbiguous || robinhoodChainPairVerificationBlocked || robinhoodChainPairNotConfigured || robinhoodChainPairRegistrationBusy || robinhoodChainPairRegistrationError || robinhoodChainPairRegistrationNotice) && (
           <div
             data-rh-catalog-select="selected-pair-registration"
             data-provider-contacted="false"
@@ -3361,12 +3754,12 @@ function clampBox(next) {
               marginTop: 6,
               padding: 8,
               borderRadius: 8,
-              border: robinhoodChainPairRegistrationError || robinhoodChainPairVerificationBlocked
+              border: robinhoodChainPairRegistrationError || robinhoodChainConfiguredMarketAmbiguous || robinhoodChainRegistryPairAmbiguous || robinhoodChainPairVerificationBlocked
                 ? "1px solid rgba(251, 113, 133, 0.52)"
                 : robinhoodChainPairNotConfigured
                   ? "1px solid rgba(250, 204, 21, 0.48)"
                   : "1px solid rgba(74, 222, 128, 0.42)",
-              background: robinhoodChainPairRegistrationError || robinhoodChainPairVerificationBlocked
+              background: robinhoodChainPairRegistrationError || robinhoodChainConfiguredMarketAmbiguous || robinhoodChainRegistryPairAmbiguous || robinhoodChainPairVerificationBlocked
                 ? "rgba(69, 10, 10, 0.22)"
                 : robinhoodChainPairNotConfigured
                   ? "rgba(66, 48, 4, 0.22)"
@@ -3376,12 +3769,16 @@ function clampBox(next) {
             }}
           >
             <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
-              <b style={{ color: robinhoodChainPairVerificationBlocked ? "#fecdd3" : robinhoodChainPairNotConfigured ? "#fde68a" : "#bbf7d0", letterSpacing: 0.35 }}>
-                {robinhoodChainPairVerificationBlocked
-                  ? "CANONICAL TOKEN VERIFICATION REQUIRED"
-                  : robinhoodChainPairNotConfigured
-                    ? "VERIFIED REGISTRY ASSETS · PAIR NOT CONFIGURED"
-                    : "SELECTED PAIR REGISTRATION"}
+              <b style={{ color: robinhoodChainConfiguredMarketAmbiguous || robinhoodChainRegistryPairAmbiguous || robinhoodChainPairVerificationBlocked ? "#fecdd3" : robinhoodChainPairNotConfigured ? "#fde68a" : "#bbf7d0", letterSpacing: 0.35 }}>
+                {robinhoodChainConfiguredMarketAmbiguous
+                  ? "AMBIGUOUS CONFIGURED MARKET"
+                  : robinhoodChainRegistryPairAmbiguous
+                    ? "EXACT TOKEN IDENTITY REQUIRED"
+                  : robinhoodChainPairVerificationBlocked
+                    ? "CANONICAL TOKEN VERIFICATION REQUIRED"
+                    : robinhoodChainPairNotConfigured
+                      ? "VERIFIED REGISTRY ASSETS · PAIR NOT CONFIGURED"
+                      : "SELECTED PAIR REGISTRATION"}
               </b>
               {robinhoodChainPairNotConfigured && (
                 <button
@@ -3395,6 +3792,60 @@ function clampBox(next) {
                 </button>
               )}
             </div>
+            {robinhoodChainExactSelectorVisible && (
+              <div style={{ marginTop: 7, display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }} data-rh-exact-market-selector="true">
+                <span style={{ color: "#cbd5e1", fontWeight: 800 }}>Exact identity</span>
+                {robinhoodChainBaseRegistryCandidates.length > 1 ? (
+                  <label style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+                    <span>{robinhoodChainSelectedPair.base}</span>
+                    <select
+                      value={String(robinhoodChainRegistryBaseIdentity?.registry_id || "")}
+                      onChange={(event) => chooseRobinhoodChainRegistryIdentity("base", event.target.value)}
+                      style={{ background: "#0b1220", color: "#e2e8f0", border: "1px solid rgba(148,163,184,0.35)", borderRadius: 6, padding: "3px 5px", fontSize: 10 }}
+                    >
+                      <option value="">Choose exact token…</option>
+                      {robinhoodChainBaseRegistryCandidates.map((asset) => (
+                        <option key={`rh-ob-base-${asset.registry_id}`} value={String(asset.registry_id)}>
+                          {robinhoodChainExactIdentityLabel(asset)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+                {robinhoodChainQuoteRegistryCandidates.length > 1 ? (
+                  <label style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+                    <span>{robinhoodChainSelectedPair.quote}</span>
+                    <select
+                      value={String(robinhoodChainRegistryQuoteIdentity?.registry_id || "")}
+                      onChange={(event) => chooseRobinhoodChainRegistryIdentity("quote", event.target.value)}
+                      style={{ background: "#0b1220", color: "#e2e8f0", border: "1px solid rgba(148,163,184,0.35)", borderRadius: 6, padding: "3px 5px", fontSize: 10 }}
+                    >
+                      <option value="">Choose exact token…</option>
+                      {robinhoodChainQuoteRegistryCandidates.map((asset) => (
+                        <option key={`rh-ob-quote-${asset.registry_id}`} value={String(asset.registry_id)}>
+                          {robinhoodChainExactIdentityLabel(asset)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+                {selectedRobinhoodChainMarket?.id ? (
+                  <span style={{ color: "#bbf7d0" }}>Objective {String(selectedRobinhoodChainMarket.id).slice(0, 8)}… · base #{selectedRobinhoodChainMarket?.base?.registry_id} · quote #{selectedRobinhoodChainMarket?.quote?.registry_id}</span>
+                ) : robinhoodChainRegistryPairResolved ? (
+                  <span style={{ color: "#fde68a" }}>Exact pair #{robinhoodChainRegistryBaseIdentity?.registry_id} → #{robinhoodChainRegistryQuoteIdentity?.registry_id} is not configured yet.</span>
+                ) : null}
+              </div>
+            )}
+            {robinhoodChainConfiguredMarketAmbiguous && (
+              <div style={{ marginTop: 4, color: "#fecdd3" }}>
+                Multiple configured objectives share {robinhoodChainSelectedPair.symbol}. Symbol-only selection is blocked; choose the exact Registry identity above.
+              </div>
+            )}
+            {robinhoodChainRegistryPairAmbiguous && (
+              <div style={{ marginTop: 4, color: "#fecdd3" }}>
+                Symbol-only pair resolution is blocked because at least one ticker maps to multiple Robinhood Chain contracts. Choose the intended exact contract/Registry ID above.
+              </div>
+            )}
             {robinhoodChainPairVerificationBlocked && (
               <div style={{ marginTop: 4, color: "#fecdd3" }}>
                 Pair enrollment is blocked until both Token Registry identities are canonically verified. {robinhoodChainSelectedPair.base}: {robinhoodChainRegistryBaseVerified ? "VERIFIED" : String(robinhoodChainRegistryBaseIdentity?.verification?.canonical_status || "NOT VERIFIED").replaceAll("_", " ").toUpperCase()} · {robinhoodChainSelectedPair.quote}: {robinhoodChainRegistryQuoteVerified ? "VERIFIED" : String(robinhoodChainRegistryQuoteIdentity?.verification?.canonical_status || "NOT VERIFIED").replaceAll("_", " ").toUpperCase()}. Use Token Registry → Verify on-chain first.

@@ -4253,6 +4253,25 @@ async function refreshSolanaOnchainBalances() {
     );
   }
 
+  function robinhoodChainBalanceIdentityTooltip(b) {
+    if (!isRobinhoodChainBalanceRow(b)) return "";
+    const registryId = b?.registry_id ?? b?.registryId ?? null;
+    const contract = String(b?.contract_address ?? b?.contractAddress ?? "").trim();
+    const fetchedAt = String(b?.fetched_at ?? b?.captured_at ?? b?.created_at ?? "").trim();
+    const usdSource = String(b?.usd_source_symbol || b?.usd_source || "—").trim() || "—";
+    const lines = ["Robinhood Chain mainnet 4663 · Wallet Addresses · read only"];
+    if (registryId !== null && registryId !== undefined && String(registryId).trim()) {
+      lines.push(`Registry ID: ${registryId}`);
+    } else if (String(b?.asset || "").trim().toUpperCase() === "ETH") {
+      lines.push("Registry identity: native asset");
+    }
+    lines.push(`Contract: ${contract || "Native / none"}`);
+    if (b?.registry_venue) lines.push(`Registry scope: ${String(b.registry_venue)}`);
+    if (fetchedAt) lines.push(`Snapshot: ${fetchedAt}`);
+    lines.push(`USD source: ${usdSource}`);
+    return lines.join("\n");
+  }
+
   // NEW (Balances-only): clickable asset cell that routes to inferred market symbol
   function renderBalanceAssetCell(b) {
     const asset = String(b?.asset || "").trim();
@@ -4287,10 +4306,11 @@ async function refreshSolanaOnchainBalances() {
     // Venue hint: if viewing All venues, use the row venue; otherwise use current venue selection.
     const venueMaybe = venue === ALL_VENUES_VALUE ? venRow || "" : String(venue || "").trim();
 
-    const title = clickable ? `Pick market: ${market}${venueMaybe ? ` (${venueMaybe})` : ""}` : undefined;
-
     const assetUpper = String(asset || "").trim().toUpperCase();
     const isRobinhoodChain = isRobinhoodChainBalanceRow(b);
+    const identityTooltip = isRobinhoodChain ? robinhoodChainBalanceIdentityTooltip(b) : "";
+    const pickTitle = clickable ? `Pick market: ${market}${venueMaybe ? ` (${venueMaybe})` : ""}` : "";
+    const title = [pickTitle, identityTooltip].filter(Boolean).join("\n") || undefined;
 
     return (
       <td
@@ -4341,7 +4361,7 @@ async function refreshSolanaOnchainBalances() {
             {display}
             {isRobinhoodChain && !hideTableDataGlobal ? (
               <span
-                title="Robinhood Chain mainnet 4663 · Wallet Addresses · read only"
+                title={identityTooltip || "Robinhood Chain mainnet 4663 · Wallet Addresses · read only"}
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
@@ -7795,7 +7815,10 @@ function renderFillToasts() {
                         </span>
                       </td>
                     ) : isGroupedChild && !b?.unregistered_token ? (
-                      <td style={{ ...sx.td, paddingLeft: 22, opacity: 0.92 }}>
+                      <td
+                        style={{ ...sx.td, paddingLeft: 22, opacity: 0.92 }}
+                        title={hideTableDataGlobal ? "" : robinhoodChainBalanceIdentityTooltip(b)}
+                      >
                         {hideTableDataGlobal ? "••••" : b.asset || "—"}
                       </td>
                     ) : (
@@ -7852,6 +7875,7 @@ function renderFillToasts() {
                         isRobinhoodChainBalanceRow(b) ? `Network: robinhood_chain` : "",
                         isRobinhoodChainBalanceRow(b) ? `Source: ${String(b.source_type || "Wallet Addresses / Robinhood Chain RPC")}` : "",
                         isRobinhoodChainBalanceRow(b) ? `Price status: ${String(b.price_status || (b.px_usd == null ? "unpriced" : "priced"))}` : "",
+                        isRobinhoodChainBalanceRow(b) && b.registry_id != null ? `Registry ID: ${String(b.registry_id)}` : "",
                         isRobinhoodChainBalanceRow(b) && b.contract_address ? `Contract: ${String(b.contract_address)}` : "",
                       ].filter(Boolean).join("\n")}
                     >

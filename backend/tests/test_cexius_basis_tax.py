@@ -138,10 +138,18 @@ class CexiusBasisTaxTests(unittest.TestCase):
         text = widget.read_text(encoding="utf-8")
         self.assertIn('new Set(["USD", "USDC", "USDT", "USDG"])', text)
         self.assertIn("function hasAppliedRealizedBasisGap", text)
+        self.assertIn("function hasCexiusAppliedMissingBasisTaxEvidence", text)
+        self.assertIn("isTaxEvidenceUnavailable = isInventoryError || isCexiusMissingBasisTaxEvidence", text)
         self.assertIn("!realizedBasisGap", text)
-        self.assertIn("isRobinhoodChainExecutionRow || realizedBasisGap", text)
-        self.assertIn("isCanceled || realizedBasisGap", text)
+        self.assertIn("!isTaxEvidenceUnavailable", text)
+        self.assertIn("isTaxEvidenceUnavailable || isRobinhoodChainExecutionRow || realizedBasisGap", text)
+        self.assertIn("isCanceled || isTaxEvidenceUnavailable || realizedBasisGap", text)
+        self.assertIn("(realizedBasisGap && !isTaxEvidenceUnavailable)", text)
         self.assertIn('"Cost basis missing; realized tax cannot be computed"', text)
+        self.assertIn(
+            '"Cost basis is unavailable for one or more consumed Cexius FIFO lots; tax cannot be calculated."',
+            text,
+        )
 
 
 if __name__ == "__main__":

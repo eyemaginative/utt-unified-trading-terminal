@@ -704,6 +704,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
   const [robinhoodUnregisteredCandidates, setRobinhoodUnregisteredCandidates] = useState([]);
   const [robinhoodUnregisteredLoading, setRobinhoodUnregisteredLoading] = useState(false);
   const [robinhoodUnregisteredError, setRobinhoodUnregisteredError] = useState("");
+  const [robinhoodUnregisteredCachedScanAt, setRobinhoodUnregisteredCachedScanAt] = useState(null);
   const [robinhoodCandidateSavingContract, setRobinhoodCandidateSavingContract] = useState("");
   const [suggestions, setSuggestions] = useState([]);
   const [dismissed, setDismissed] = useState(() => new Set());
@@ -775,10 +776,27 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
   }, [robinhoodDiscoveryAssets]);
 
   const robinhoodDiscoveryBySymbol = useMemo(() => {
-    const out = {};
+    const buckets = {};
     for (const asset of robinhoodDiscoveryAssets || []) {
       const symbol = String(asset?.symbol || "").trim().toUpperCase();
-      if (symbol && !out[symbol]) out[symbol] = asset;
+      if (!symbol) continue;
+      if (!buckets[symbol]) buckets[symbol] = [];
+      buckets[symbol].push(asset);
+    }
+    const out = {};
+    for (const [symbol, matches] of Object.entries(buckets)) {
+      if (matches.length === 1) {
+        out[symbol] = matches[0];
+      } else {
+        out[symbol] = {
+          symbol,
+          identity_error: "ambiguous_robinhood_chain_registry_symbol",
+          ambiguous: true,
+          registry_ids: matches
+            .map((asset) => Number(asset?.registry_id))
+            .filter((id) => Number.isInteger(id) && id > 0),
+        };
+      }
     }
     return out;
   }, [robinhoodDiscoveryAssets]);
@@ -916,11 +934,12 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
     }
   }, [API_BASE, chain]);
 
-  const loadRobinhoodUnregisteredCandidates = useCallback(async ({ forceRefresh = false, showLoading = true } = {}) => {
+  const loadRobinhoodUnregisteredCandidates = useCallback(async ({ showLoading = true } = {}) => {
     if (!isRobinhoodChain(chain)) {
       setRobinhoodUnregisteredCandidates([]);
       setRobinhoodUnregisteredLoading(false);
       setRobinhoodUnregisteredError("");
+      setRobinhoodUnregisteredCachedScanAt(null);
       return [];
     }
     if (showLoading) setRobinhoodUnregisteredLoading(true);
@@ -929,7 +948,6 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
       const qs = new URLSearchParams({
         limit: "50",
         positive_only: "true",
-        force_refresh: forceRefresh ? "true" : "false",
       });
       const r = await fetch(
         `${API_BASE}/api/robinhood_chain/registry-discovery/unregistered-wallet-assets?${qs.toString()}`,
@@ -939,6 +957,7 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
       if (!r.ok) throw new Error(j?.detail ? JSON.stringify(j.detail) : `HTTP ${r.status}`);
       const arr = Array.isArray(j?.items) ? j.items : [];
       setRobinhoodUnregisteredCandidates(arr);
+      setRobinhoodUnregisteredCachedScanAt(j?.cached_wallet_scan_at || null);
       return arr;
     } catch (e) {
       const message = String(e?.message || e);
@@ -949,6 +968,41 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
       if (showLoading) setRobinhoodUnregisteredLoading(false);
     }
   }, [API_BASE, chain]);
+
+  const scanRobinhoodUnregisteredCandidates = useCallback(async () => {
+    if (!isRobinhoodChain(chain) || robinhoodUnregisteredLoading) return [];
+    setRobinhoodUnregisteredLoading(true);
+    setRobinhoodUnregisteredError("");
+    try {
+      const r = await fetch(
+        `${API_BASE}/api/robinhood_chain/registry-discovery/unregistered-wallet-assets/scan`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({
+            limit: 50,
+            positive_only: true,
+            force_refresh: true,
+            confirm_scan: true,
+          }),
+        }
+      );
+      const j = await r.json().catch(() => null);
+      if (!r.ok || j?.ok === false) {
+        throw new Error(j?.detail ? JSON.stringify(j.detail) : (j?.error || `HTTP ${r.status}`));
+      }
+      const arr = Array.isArray(j?.items) ? j.items : [];
+      setRobinhoodUnregisteredCandidates(arr);
+      setRobinhoodUnregisteredCachedScanAt(j?.cached_wallet_scan_at || null);
+      return arr;
+    } catch (e) {
+      setRobinhoodUnregisteredError(String(e?.message || e));
+      return [];
+    } finally {
+      setRobinhoodUnregisteredLoading(false);
+    }
+  }, [API_BASE, chain, robinhoodUnregisteredLoading]);
+
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1037,17 +1091,10 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
     return () => window.removeEventListener("focus", onFocus);
   }, [loadSuggestions]);
 
-  // RH-REGDISC.BAL.1B-R1: do not rescan Robinhood Chain on every window focus.
-  // Automatic candidate refresh follows the terminal's existing Background / Every
-  // cadence; manual Scan wallet remains the explicit force-refresh path.
-  useEffect(() => {
-    if (!isRobinhoodChain(chain) || !backgroundRefreshEnabled) return undefined;
-    const seconds = Math.max(30, Number(backgroundRefreshSeconds) || 600);
-    const timer = window.setInterval(() => {
-      loadRobinhoodUnregisteredCandidates({ forceRefresh: false, showLoading: false });
-    }, seconds * 1000);
-    return () => window.clearInterval(timer);
-  }, [chain, backgroundRefreshEnabled, backgroundRefreshSeconds, loadRobinhoodUnregisteredCandidates]);
+  // RH-REGDISC.MANUALCACHE.1: unknown-token discovery is intentionally
+  // operator-triggered only. Background / Every / focus may reload other UI data,
+  // but they never invoke the wallet-scan endpoint.
+
 
   const useSuggestion = useCallback((sug) => {
     setSymbol(String(sug?.symbol || "").trim());
@@ -1176,11 +1223,9 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
         }
       }
 
-      // Registration + canonical verification are the Add operation. Remove only
-      // that contract locally and let the normal terminal Background refresh (or
-      // explicit Scan wallet / Balances Refresh) perform the next wallet-wide scan.
-      // This avoids blocking the selected Add on a 50-contract rescan and avoids
-      // making every candidate appear to be Saving.
+      // Registration + canonical verification are the Add operation. The backend
+      // reconciles only this exact contract from the persisted candidate cache; the
+      // local removal mirrors that result without triggering another wallet scan.
       setRobinhoodUnregisteredCandidates((prev) =>
         (prev || []).filter((item) =>
           String(item?.contract_address || "").trim().toLowerCase() !== contractKey
@@ -1345,18 +1390,27 @@ export default function TokenRegistryWindow({ apiBase = "", onClose, backgroundR
   );
 
   const testResolve = useCallback(
-    async (sym) => {
-      const a = String(sym || "").trim();
+    async (tokenOrSymbol) => {
+      const suppliedRow = tokenOrSymbol && typeof tokenOrSymbol === "object" ? tokenOrSymbol : null;
+      const a = String(suppliedRow?.symbol || tokenOrSymbol || "").trim();
       if (!a) return;
       setErr(null);
       try {
         const c = String(chain || "").trim().toLowerCase();
         if (c === "robinhood_chain") {
-          const row = (items || []).find(
-            (item) => String(item?.symbol || "").trim().toUpperCase() === a.toUpperCase()
-          );
+          let row = suppliedRow;
           if (!row) {
-            throw new Error(`No Robinhood Chain registry row returned for ${a.toUpperCase()}.`);
+            const matches = (items || []).filter(
+              (item) => String(item?.symbol || "").trim().toUpperCase() === a.toUpperCase()
+            );
+            if (matches.length !== 1) {
+              throw new Error(
+                matches.length > 1
+                  ? `${a.toUpperCase()} resolves to multiple Robinhood Chain Token Registry contracts. Verify an exact row instead of using symbol-only resolution.`
+                  : `No Robinhood Chain registry row returned for ${a.toUpperCase()}.`
+              );
+            }
+            row = matches[0];
           }
           const validation = validateTokenIdentityInput(
             c,
@@ -1453,6 +1507,10 @@ This performed read-only Robinhood Chain RPC verification and persisted local ve
     const quoteDiscovery = robinhoodDiscoveryBySymbol[quote] || null;
     if (!baseSymbol || !quote || baseSymbol === quote) {
       setErr("Choose two different Robinhood Chain assets for review.");
+      return;
+    }
+    if (quoteDiscovery?.ambiguous === true) {
+      setErr(`${quote} resolves to multiple Robinhood Chain Token Registry contracts. Open a configured exact-ID market instead of using symbol-only pair creation.`);
       return;
     }
     if (!robinhoodDiscoveryVerified(discovery) || !robinhoodDiscoveryVerified(quoteDiscovery)) {
@@ -1879,22 +1937,27 @@ This performed read-only Robinhood Chain RPC verification and persisted local ve
               type="button"
               style={btnStyle}
               disabled={robinhoodUnregisteredLoading}
-              onClick={() => loadRobinhoodUnregisteredCandidates({ forceRefresh: true })}
+              onClick={scanRobinhoodUnregisteredCandidates}
             >
               {robinhoodUnregisteredLoading ? "Scanning…" : "Scan wallet"}
             </button>
           </div>
           <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
-            Read-only candidates come from persisted wallet ERC-20 history, exact contract identity, on-chain metadata, and current <code style={codeStyle}>balanceOf</code>. Nothing is auto-registered. Automatic scans follow the main UI Background refresh {backgroundRefreshEnabled ? `(every ${Math.max(30, Number(backgroundRefreshSeconds) || 600)} sec)` : "(currently off)"}; <strong>Scan wallet</strong> forces an immediate refresh.
+            Cached candidates are loaded from the local database only. <strong>Scan wallet</strong> is the only action that inspects persisted wallet ERC-20 evidence, reads on-chain metadata/current <code style={codeStyle}>balanceOf</code>, and refreshes the candidate cache. Background / Every and window focus never scan unknown contracts.
+          </div>
+          <div style={{ fontSize: 11, opacity: 0.68, marginBottom: 8 }}>
+            Cached wallet scan: {robinhoodUnregisteredCachedScanAt
+              ? new Date(robinhoodUnregisteredCachedScanAt).toLocaleString()
+              : "Never — click Scan wallet to populate the persistent cache."}
           </div>
           {robinhoodUnregisteredError ? (
             <div style={{ marginBottom: 8, color: "#fde68a", fontSize: 12 }}>
-              Candidate scan unavailable: {robinhoodUnregisteredError}
+              Candidate cache unavailable: {robinhoodUnregisteredError}
             </div>
           ) : null}
           {!robinhoodUnregisteredLoading && visibleRobinhoodUnregisteredCandidates.length === 0 ? (
             <div style={{ fontSize: 12, opacity: 0.72 }}>
-              No positive unregistered Robinhood Chain token balances detected from current persisted wallet history.
+              No positive unregistered Robinhood Chain candidates are present in the last explicit wallet-scan cache.
             </div>
           ) : null}
           {visibleRobinhoodUnregisteredCandidates.length ? (
@@ -2598,7 +2661,7 @@ This performed read-only Robinhood Chain RPC verification and persisted local ve
                               {robinhoodDiscoveryLoading ? "VERIFY STATUS…" : robinhoodVerified ? "ON-CHAIN VERIFIED" : robinhoodVerificationStatus}
                             </span>
                           )}
-                          <button type="button" style={btnStyle} onClick={() => testResolve(row.symbol)}>
+                          <button type="button" style={btnStyle} onClick={() => testResolve(row)}>
                             {chain === "counterparty" ? "Test price" : (isRobinhoodChain(chain) ? "Verify on-chain" : "Test resolve")}
                           </button>
                           {robinhoodReviewBaseEligible && robinhoodVerified && robinhoodEthVerified && (

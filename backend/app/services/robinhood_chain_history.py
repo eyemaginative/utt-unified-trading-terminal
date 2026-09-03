@@ -571,9 +571,27 @@ class RobinhoodChainHistoryService:
         self._backoff_until_monotonic = 0.0
         self._backoff_until_utc: Optional[datetime] = None
 
+    def _credential_record(self) -> Optional[Dict[str, Any]]:
+        try:
+            raw = settings.robinhood_chain_blockscout_api_credential()
+        except Exception:
+            return None
+        return dict(raw) if isinstance(raw, dict) else None
+
     def status(self) -> Dict[str, Any]:
+        credential = self._credential_record()
+        api_key_configured = bool(str((credential or {}).get("api_key") or "").strip())
+        api_base_configured = bool(
+            self.api_base.startswith("https://") or self.api_base.startswith("http://")
+        )
+        pro_api = self.api_base.startswith("https://api.blockscout.com/")
         return {
-            "configured": bool(self.api_base.startswith("https://") or self.api_base.startswith("http://")),
+            "configured": bool(api_base_configured and (not pro_api or api_key_configured)),
+            "api_base_configured": api_base_configured,
+            "api_key_configured": api_key_configured,
+            "credential_source": (credential or {}).get("source"),
+            "credential_venue": (credential or {}).get("venue"),
+            "pro_api": pro_api,
             "timeout_s": self.timeout_s,
             "cache_ttl_s": self.cache_ttl_s,
             "error_backoff_s": self.error_backoff_s,
@@ -652,13 +670,20 @@ class RobinhoodChainHistoryService:
     ) -> Dict[str, Any]:
         url = f"{self.api_base}/{path.lstrip('/')}"
         effective_timeout_s = self.timeout_s if timeout_s is None else max(2.0, min(30.0, float(timeout_s)))
+        credential = self._credential_record()
+        api_key = str((credential or {}).get("api_key") or "").strip()
+        if self.api_base.startswith("https://api.blockscout.com/") and not api_key:
+            raise RuntimeError("Robinhood Chain Blockscout Pro API key is not configured")
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "UTT-Robinhood-Chain-History/8.0",
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         async with self._semaphore:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(effective_timeout_s),
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "UTT-Robinhood-Chain-History/8.0",
-                },
+                headers=headers,
                 transport=self.transport,
             ) as client:
                 response = await client.get(url, params=params or {})

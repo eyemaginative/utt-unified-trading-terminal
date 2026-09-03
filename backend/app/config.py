@@ -203,7 +203,7 @@ class Settings(BaseSettings):
 
     # RH-CHAIN.8: bounded, display-only Blockscout transaction history.
     robinhood_chain_explorer_api_base: Optional[str] = Field(
-        default="https://robinhoodchain.blockscout.com/api/v2",
+        default="https://api.blockscout.com/4663/api/v2",
         alias="ROBINHOOD_CHAIN_EXPLORER_API_BASE",
     )
     robinhood_chain_history_timeout_s: float = Field(
@@ -828,6 +828,29 @@ class Settings(BaseSettings):
             return None
         return (token, secret)
 
+    def robinhood_chain_blockscout_api_credential(self) -> Optional[dict]:
+        """Return the backend-only Blockscout Pro API key from the encrypted vault.
+
+        Canonical Profile -> API Keys row:
+          - venue='blockscout'
+          - api_key='<Blockscout Pro API key>'
+          - api_secret/passphrase blank
+
+        No environment API-key fallback is accepted, and callers must never
+        serialize the key into HTTP responses, logs, or request URLs.
+        """
+        bundle = self._vault_latest_bundle("blockscout")
+        if not bundle:
+            return None
+        api_key = str(bundle.get("api_key") or "").strip()
+        if not api_key:
+            return None
+        return {
+            "api_key": api_key,
+            "source": "profile_vault",
+            "venue": "blockscout",
+        }
+
     def robinhood_chain_zerox_api_credential(self) -> Optional[dict]:
         """Return the backend-only 0x provider credential from the encrypted vault.
 
@@ -1037,10 +1060,17 @@ class Settings(BaseSettings):
         return value or None
 
     def robinhood_chain_effective_explorer_api_base(self) -> str:
-        """Return the fixed Blockscout API base used by display-only history reads."""
+        """Return the fixed Blockscout API base used by display-only history reads.
+
+        Normalize the retired Robinhood Chain per-instance REST base to the
+        chain-scoped Blockscout Pro API so an older private .env override cannot
+        silently keep wallet ingestion on the Cloudflare-challenged legacy path.
+        """
         value = str(getattr(self, "robinhood_chain_explorer_api_base", None) or "").strip().rstrip("/")
         if not value.startswith(("https://", "http://")):
             return ""
+        if value.lower() == "https://robinhoodchain.blockscout.com/api/v2":
+            return "https://api.blockscout.com/4663/api/v2"
         return value
 
     def robinhood_chain_effective_swap_provider(self) -> str:

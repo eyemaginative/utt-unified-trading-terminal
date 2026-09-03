@@ -19,6 +19,8 @@ from ..models import (
     RobinhoodChainExecution,
     RobinhoodChainPairCapability,
     RobinhoodChainPairObjective,
+    RobinhoodChainRegistryCandidate,
+    RobinhoodChainRegistryCandidateScan,
     RobinhoodChainRegistryVerification,
     RobinhoodChainSwapExecution,
     RobinhoodChainWalletEvent,
@@ -36,6 +38,7 @@ from .robinhood_chain_registry_authority import (
     RobinhoodChainRegistryAuthorityError,
     effective_native_row,
     effective_row_by_symbol,
+    require_token_registry_contract_identity_schema,
     identity_fields_from_row,
     resolve_robinhood_chain_execution_authority,
     select_effective_registry_rows,
@@ -617,6 +620,34 @@ class RobinhoodChainRegistryDiscoveryService:
         self._verified_identity_required(db, int(row.id))
         return self.token_identity(db, row)
 
+    def resolve_verified_token_by_id(self, db: Session, token_registry_id: int) -> Dict[str, Any]:
+        """Resolve one exact verified Robinhood Chain identity by Token Registry row ID."""
+        row = self._registry_row_by_id(db, int(token_registry_id))
+        self._verified_identity_required(db, int(row.id))
+        return self.token_identity(db, row)
+
+    def resolve_verified_token_by_contract(self, db: Session, contract_address: str) -> Dict[str, Any]:
+        """Resolve one exact verified ERC-20 identity by normalized contract address."""
+        contract = validate_evm_address(str(contract_address or "").strip()).lower()
+        matches: List[TokenRegistry] = []
+        for row in self.registry_rows(db):
+            try:
+                identity = self.token_identity(db, row)
+            except Exception:
+                continue
+            if bool(identity.get("native")):
+                continue
+            current = str(identity.get("registry_contract_address") or "").strip().lower()
+            if current == contract:
+                matches.append(row)
+        if not matches:
+            raise ValueError("robinhood_chain_registry_token_not_found")
+        if len(matches) > 1:
+            raise ValueError("ambiguous_robinhood_chain_contract_registry_identity")
+        row = matches[0]
+        self._verified_identity_required(db, int(row.id))
+        return self.token_identity(db, row)
+
     def native_identity(self, db: Session) -> Dict[str, Any]:
         try:
             row = effective_native_row(db, venue=ROBINHOOD_CHAIN_VENUE)
@@ -756,7 +787,184 @@ class RobinhoodChainRegistryDiscoveryService:
             raise ValueError("robinhood_chain_wallet_address_not_found_or_not_all_scope")
         raise ValueError("robinhood_chain_wallet_address_all_scope_not_found")
 
-    async def unregistered_wallet_assets(
+    @staticmethod
+    def _candidate_cache_schema_exists(db: Session) -> bool:
+        bind = db.get_bind()
+        dialect = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+        if dialect != "sqlite":
+            return True
+        required = {
+            "robinhood_chain_registry_candidates",
+            "robinhood_chain_registry_candidate_scans",
+        }
+        rows = db.execute(
+            text(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                      'robinhood_chain_registry_candidates',
+                      'robinhood_chain_registry_candidate_scans'
+                  )
+                """
+            )
+        ).all()
+        return {str(row[0] or "") for row in rows} == required
+
+    def _ensure_candidate_cache_schema(self, db: Session) -> None:
+        require_token_registry_contract_identity_schema(db)
+        RobinhoodChainRegistryCandidate.__table__.create(
+            bind=db.get_bind(),
+            checkfirst=True,
+        )
+        RobinhoodChainRegistryCandidateScan.__table__.create(
+            bind=db.get_bind(),
+            checkfirst=True,
+        )
+        db.commit()
+
+    @staticmethod
+    def _cached_candidate_dict(row: RobinhoodChainRegistryCandidate) -> Dict[str, Any]:
+        item = copy.deepcopy(row.candidate) if isinstance(row.candidate, dict) else {}
+        item["wallet_address_id"] = str(row.wallet_address_id)
+        item["chain_id"] = int(row.chain_id)
+        item["contract_address"] = str(row.contract_address or "").strip().lower()
+        item["cached"] = True
+        item["cached_scan_at"] = iso_or_none(row.scanned_at)
+        item["candidate_cache_mutation"] = False
+        item["database_mutation"] = False
+        item["will_mutate"] = False
+        return item
+
+    def cached_unregistered_wallet_assets(
+        self,
+        db: Session,
+        *,
+        wallet_address_id: Optional[str] = None,
+        limit: int = 50,
+        positive_only: bool = True,
+    ) -> Dict[str, Any]:
+        """Return persisted candidate rows without RPC/provider/wallet scanning."""
+        safe_limit = max(1, min(100, int(limit or 50)))
+        wallet = self._unregistered_wallet_row(db, wallet_address_id)
+        owner = validate_evm_address(str(wallet.address or "").strip())
+
+        if not self._candidate_cache_schema_exists(db):
+            return {
+                "ok": True,
+                "tranche": "RH-REGDISC.MANUALCACHE.1",
+                "wallet_address_id": str(wallet.id),
+                "wallet_address": owner,
+                "items": [],
+                "count": 0,
+                "cached_wallet_scan_at": None,
+                "cache_present": False,
+                "scan_required": True,
+                "discovery_mode": "persistent_cache_read",
+                "rpc_contacted": False,
+                "provider_contacted": False,
+                "wallet_scan_performed": False,
+                "blockchain_read_only": True,
+                "token_registry_mutation": False,
+                "candidate_cache_mutation": False,
+                "database_mutation": False,
+                "ledger_mutation": False,
+                "fifo_mutation": False,
+                "basis_mutation": False,
+                "wallet_request": False,
+                "signing": False,
+                "broadcast": False,
+                "will_mutate": False,
+            }
+
+        registered_rows = (
+            db.query(TokenRegistry)
+            .filter(TokenRegistry.chain == ROBINHOOD_CHAIN)
+            .all()
+        )
+        registered_contracts = set()
+        for registry_row in registered_rows or []:
+            address = str(registry_row.address or "").strip()
+            if not address:
+                continue
+            try:
+                registered_contracts.add(validate_evm_address(address).lower())
+            except Exception:
+                continue
+
+        rows = (
+            db.query(RobinhoodChainRegistryCandidate)
+            .filter(
+                RobinhoodChainRegistryCandidate.wallet_address_id == str(wallet.id),
+                RobinhoodChainRegistryCandidate.chain_id == ROBINHOOD_CHAIN_ID,
+            )
+            .order_by(
+                RobinhoodChainRegistryCandidate.scanned_at.desc(),
+                RobinhoodChainRegistryCandidate.updated_at.desc(),
+            )
+            .all()
+        )
+        visible_rows = [
+            row for row in rows
+            if str(row.contract_address or "").strip().lower() not in registered_contracts
+        ]
+        items = [self._cached_candidate_dict(row) for row in visible_rows]
+        if positive_only:
+            items = [item for item in items if item.get("positive_balance") is True]
+        # Keep cached presentation ordering byte-for-byte equivalent in semantics
+        # to the explicit scan response: positive/ready candidates first, then
+        # newest wallet evidence first within each priority bucket. Stable sorts
+        # intentionally mirror scan_unregistered_wallet_assets() below so applying
+        # the same limit cannot select a different subset after reload.
+        items.sort(
+            key=lambda item: str(item.get("last_seen_at") or ""),
+            reverse=True,
+        )
+        items.sort(
+            key=lambda item: (
+                0 if item.get("positive_balance") is True else 1,
+                0 if item.get("ready_to_register") is True else 1,
+            )
+        )
+        items = items[:safe_limit]
+        scan_state = (
+            db.query(RobinhoodChainRegistryCandidateScan)
+            .filter(
+                RobinhoodChainRegistryCandidateScan.wallet_address_id == str(wallet.id),
+                RobinhoodChainRegistryCandidateScan.chain_id == ROBINHOOD_CHAIN_ID,
+            )
+            .first()
+        )
+        scan_at = scan_state.scanned_at if scan_state is not None else None
+        return {
+            "ok": True,
+            "tranche": "RH-REGDISC.MANUALCACHE.1",
+            "wallet_address_id": str(wallet.id),
+            "wallet_address": owner,
+            "items": items,
+            "count": len(items),
+            "cached_wallet_scan_at": iso_or_none(scan_at),
+            "cache_present": scan_state is not None,
+            "scan_required": scan_state is None,
+            "discovery_mode": "persistent_cache_read",
+            "rpc_contacted": False,
+            "provider_contacted": False,
+            "wallet_scan_performed": False,
+            "blockchain_read_only": True,
+            "token_registry_mutation": False,
+            "candidate_cache_mutation": False,
+            "database_mutation": False,
+            "ledger_mutation": False,
+            "fifo_mutation": False,
+            "basis_mutation": False,
+            "wallet_request": False,
+            "signing": False,
+            "broadcast": False,
+            "will_mutate": False,
+        }
+
+    async def scan_unregistered_wallet_assets(
         self,
         db: Session,
         *,
@@ -765,13 +973,15 @@ class RobinhoodChainRegistryDiscoveryService:
         positive_only: bool = True,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        """Discover wallet-observed ERC-20 contracts absent from Token Registry.
+        """Explicitly scan one saved wallet and transactionally refresh its cache.
 
-        Candidate discovery is read-only. Historical wallet evidence provides the
-        contract inventory, while current chain code/metadata/balance reads decide
-        whether a candidate is safe to offer for explicit user registration.
+        This is the only method that performs unknown-contract chain inspection.
+        Historical wallet evidence provides the contract inventory; bounded RPC
+        metadata/balance reads produce candidates that are persisted only after the
+        full scan completes successfully.
         """
 
+        self._ensure_candidate_cache_schema(db)
         safe_limit = max(1, min(100, int(limit or 50)))
         wallet = self._unregistered_wallet_row(db, wallet_address_id)
         owner = validate_evm_address(str(wallet.address or "").strip())
@@ -786,11 +996,7 @@ class RobinhoodChainRegistryDiscoveryService:
             .all()
         )
         registered_contracts: Dict[str, TokenRegistry] = {}
-        registered_by_symbol: Dict[str, List[TokenRegistry]] = {}
         for row in registry_rows:
-            symbol = str(row.symbol or "").strip().upper()
-            if symbol:
-                registered_by_symbol.setdefault(symbol, []).append(row)
             address = str(row.address or "").strip()
             if not address:
                 continue
@@ -944,27 +1150,24 @@ class RobinhoodChainRegistryDiscoveryService:
                     except Exception:
                         positive_balance = False
 
-                    conflicting_rows: List[TokenRegistry] = []
+                    same_symbol_rows: List[TokenRegistry] = []
                     if onchain_symbol:
-                        for registry_row in registered_by_symbol.get(onchain_symbol, []):
-                            registry_address = str(registry_row.address or "").strip()
-                            if not registry_address:
-                                conflicting_rows.append(registry_row)
-                                continue
-                            try:
-                                if validate_evm_address(registry_address).lower() != contract:
-                                    conflicting_rows.append(registry_row)
-                            except Exception:
-                                conflicting_rows.append(registry_row)
+                        same_symbol_rows = [
+                            registry_row
+                            for registry_row in registry_rows
+                            if str(registry_row.symbol or "").strip().upper() == onchain_symbol
+                        ]
 
-                    symbol_conflict = bool(conflicting_rows)
+                    # Symbols are display/search metadata, not ERC-20 identity. A
+                    # different contract using an existing symbol remains eligible
+                    # for registration and is surfaced with informational same-symbol IDs.
+                    symbol_conflict = False
                     ready_to_register = bool(
                         code_present
                         and onchain_symbol
                         and onchain_decimals is not None
                         and balance_result.get("ok")
                         and positive_balance
-                        and not symbol_conflict
                     )
 
                     if not code_present:
@@ -973,8 +1176,6 @@ class RobinhoodChainRegistryDiscoveryService:
                         metadata_status = "metadata_unavailable"
                     elif not balance_result.get("ok"):
                         metadata_status = "balance_unavailable"
-                    elif symbol_conflict:
-                        metadata_status = "symbol_conflict"
                     elif not positive_balance:
                         metadata_status = "zero_balance"
                     else:
@@ -1001,9 +1202,10 @@ class RobinhoodChainRegistryDiscoveryService:
                         "code_present": code_present,
                         "metadata_status": metadata_status,
                         "symbol_conflict": symbol_conflict,
-                        "conflicting_registry_ids": [
+                        "conflicting_registry_ids": [],
+                        "same_symbol_registry_ids": [
                             int(row.id)
-                            for row in conflicting_rows
+                            for row in same_symbol_rows
                             if getattr(row, "id", None) is not None
                         ],
                         "ready_to_register": ready_to_register,
@@ -1038,6 +1240,7 @@ class RobinhoodChainRegistryDiscoveryService:
                         "metadata_status": "rpc_error",
                         "symbol_conflict": False,
                         "conflicting_registry_ids": [],
+                        "same_symbol_registry_ids": [],
                         "ready_to_register": False,
                         "candidate_error": _clean_text(exc, 500),
                         "last_seen_at": iso_or_none(item.get("last_seen_at")),
@@ -1050,27 +1253,92 @@ class RobinhoodChainRegistryDiscoveryService:
                     }
 
         inspected = await asyncio.gather(*[_inspect(item) for item in ordered])
+        scanned_at = utc_now()
+
+        # Persist only after the complete inspection succeeds. Delete + insert are
+        # one transaction so any persistence failure rolls back to the prior stale
+        # cache instead of leaving a partial scan.
+        try:
+            (
+                db.query(RobinhoodChainRegistryCandidate)
+                .filter(
+                    RobinhoodChainRegistryCandidate.wallet_address_id == str(wallet.id),
+                    RobinhoodChainRegistryCandidate.chain_id == ROBINHOOD_CHAIN_ID,
+                )
+                .delete(synchronize_session=False)
+            )
+            for item in inspected:
+                contract = validate_evm_address(str(item.get("contract_address") or "").strip()).lower()
+                cached_payload = copy.deepcopy(item)
+                cached_payload["cached"] = True
+                cached_payload["cached_scan_at"] = iso_or_none(scanned_at)
+                cached_payload["candidate_cache_mutation"] = False
+                cached_payload["database_mutation"] = False
+                cached_payload["will_mutate"] = False
+                db.add(
+                    RobinhoodChainRegistryCandidate(
+                        wallet_address_id=str(wallet.id),
+                        chain_id=ROBINHOOD_CHAIN_ID,
+                        contract_address=contract,
+                        candidate=cached_payload,
+                        scanned_at=scanned_at,
+                        updated_at=scanned_at,
+                    )
+                )
+            scan_state = (
+                db.query(RobinhoodChainRegistryCandidateScan)
+                .filter(
+                    RobinhoodChainRegistryCandidateScan.wallet_address_id == str(wallet.id),
+                    RobinhoodChainRegistryCandidateScan.chain_id == ROBINHOOD_CHAIN_ID,
+                )
+                .first()
+            )
+            if scan_state is None:
+                scan_state = RobinhoodChainRegistryCandidateScan(
+                    wallet_address_id=str(wallet.id),
+                    chain_id=ROBINHOOD_CHAIN_ID,
+                    scanned_at=scanned_at,
+                    candidate_count=len(inspected),
+                    updated_at=scanned_at,
+                )
+                db.add(scan_state)
+            else:
+                scan_state.scanned_at = scanned_at
+                scan_state.candidate_count = len(inspected)
+                scan_state.updated_at = scanned_at
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+        visible = inspected
         if positive_only:
-            inspected = [
-                item for item in inspected
+            visible = [
+                item for item in visible
                 if item.get("positive_balance") is True
             ]
 
-        inspected.sort(
+        visible.sort(
             key=lambda item: str(item.get("last_seen_at") or ""),
             reverse=True,
         )
-        inspected.sort(
+        visible.sort(
             key=lambda item: (
                 0 if item.get("positive_balance") is True else 1,
                 0 if item.get("ready_to_register") is True else 1,
             )
         )
-        items = inspected[:safe_limit]
+        items = visible[:safe_limit]
+        for item in items:
+            item["cached"] = True
+            item["cached_scan_at"] = iso_or_none(scanned_at)
+            item["candidate_cache_mutation"] = True
+            item["database_mutation"] = True
+            item["will_mutate"] = True
 
         return {
             "ok": True,
-            "tranche": "RH-REGDISC.BAL.1B",
+            "tranche": "RH-REGDISC.MANUALCACHE.1",
             "wallet_address_id": str(wallet.id),
             "wallet_address": owner,
             "items": items,
@@ -1078,15 +1346,24 @@ class RobinhoodChainRegistryDiscoveryService:
             "observed_unregistered_contracts": len(observed),
             "inspected_contracts": len(ordered),
             "positive_only": bool(positive_only),
+            "cached_wallet_scan_at": iso_or_none(scanned_at),
+            "cache_present": True,
+            "scan_required": False,
+            "discovery_mode": "explicit_wallet_scan",
+            "rpc_contacted": True,
+            "provider_contacted": False,
+            "wallet_scan_performed": True,
             "blockchain_read_only": True,
             "token_registry_mutation": False,
+            "candidate_cache_mutation": True,
+            "database_mutation": True,
             "ledger_mutation": False,
             "fifo_mutation": False,
             "basis_mutation": False,
             "wallet_request": False,
             "signing": False,
             "broadcast": False,
-            "will_mutate": False,
+            "will_mutate": True,
         }
 
     async def verify_asset(
@@ -1224,6 +1501,21 @@ class RobinhoodChainRegistryDiscoveryService:
             "will_mutate_chain": False,
         }
 
+    def _identity_with_verification(self, db: Session, row: TokenRegistry) -> Dict[str, Any]:
+        identity = self.token_identity(db, row)
+        verification_row = self._verification_row(db, int(row.id))
+        verification = self._verification_dict(verification_row)
+        if (
+            verification is not None
+            and str(verification.get("canonical_status") or "").strip().lower() == "verified"
+            and not self._verification_matches_current_registry_identity(verification_row, identity)
+        ):
+            verification["canonical_status"] = "registry_changed_since_verification"
+            verification["registry_match"] = False
+            verification["verification_error"] = "registry_changed_since_verification"
+        identity["verification"] = verification
+        return identity
+
     def _objective_row(self, db: Session, objective_id: str) -> RobinhoodChainPairObjective:
         row = (
             db.query(RobinhoodChainPairObjective)
@@ -1259,8 +1551,12 @@ class RobinhoodChainRegistryDiscoveryService:
             "enabled": bool(row.enabled),
             "review_only": bool(row.review_only),
             "notes": row.notes,
-            "base": self.token_identity(db, base_row),
-            "quote": self.token_identity(db, quote_row),
+            # Configured markets are exact Token Registry ID authorities. Include the
+            # verification state for those exact IDs so Order Book / Order Ticket do
+            # not fall back to symbol-only verification or treat a verified pair as
+            # unverified merely because objective token_identity() is metadata-only.
+            "base": self._identity_with_verification(db, base_row),
+            "quote": self._identity_with_verification(db, quote_row),
             "capabilities": [self._capability_dict(db, item) for item in capabilities],
             "created_at": iso_or_none(row.created_at),
             "updated_at": iso_or_none(row.updated_at),
@@ -1274,42 +1570,90 @@ class RobinhoodChainRegistryDiscoveryService:
         )
         return [self._objective_dict(db, row) for row in rows]
 
-    def objective_by_symbol(
+    def _enabled_objective_rows_by_symbol(
         self,
         db: Session,
         symbol: str,
-    ) -> Dict[str, Any]:
+    ) -> List[RobinhoodChainPairObjective]:
         normalized = _normalize_market_symbol(symbol)
-        row = (
+        return (
             db.query(RobinhoodChainPairObjective)
             .filter(
                 RobinhoodChainPairObjective.symbol == normalized,
                 RobinhoodChainPairObjective.enabled.is_(True),
             )
-            .first()
+            .order_by(RobinhoodChainPairObjective.id.asc())
+            .all()
         )
-        if row is None:
+
+    def _enabled_objective_row_by_symbol(
+        self,
+        db: Session,
+        symbol: str,
+    ) -> RobinhoodChainPairObjective:
+        rows = self._enabled_objective_rows_by_symbol(db, symbol)
+        if not rows:
             raise ValueError("robinhood_chain_pair_objective_not_found")
+        if len(rows) > 1:
+            raise ValueError("robinhood_chain_pair_objective_symbol_ambiguous")
+        return rows[0]
+
+    def objective_by_id(
+        self,
+        db: Session,
+        objective_id: str,
+        *,
+        expected_symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        row = self._objective_row(db, objective_id)
+        if not bool(row.enabled):
+            raise ValueError("robinhood_chain_pair_objective_disabled")
+        if expected_symbol is not None:
+            normalized = _normalize_market_symbol(expected_symbol)
+            if str(row.symbol or "").strip().upper() != normalized:
+                raise ValueError("robinhood_chain_pair_objective_symbol_mismatch")
         return self._objective_dict(db, row)
 
-    def market_by_symbol(
+    def objective_by_symbol(
         self,
         db: Session,
         symbol: str,
     ) -> Dict[str, Any]:
-        """Return one enabled market with derived provider/order-book state."""
-        normalized = _normalize_market_symbol(symbol)
+        return self._objective_dict(db, self._enabled_objective_row_by_symbol(db, symbol))
+
+    def market_by_objective_id(
+        self,
+        db: Session,
+        objective_id: str,
+        *,
+        expected_symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        objective = self.objective_by_id(db, objective_id, expected_symbol=expected_symbol)
+        objective_key = str(objective.get("id") or "").strip()
         market = next(
             (
                 item
                 for item in self.market_catalog(db)
-                if str(item.get("symbol") or "").strip().upper() == normalized
+                if str(item.get("id") or "").strip() == objective_key
             ),
             None,
         )
         if market is None:
             raise ValueError("robinhood_chain_pair_objective_not_found")
         return market
+
+    def market_by_symbol(
+        self,
+        db: Session,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        """Return one unambiguous enabled market with derived provider/order-book state."""
+        objective = self.objective_by_symbol(db, symbol)
+        return self.market_by_objective_id(
+            db,
+            str(objective.get("id") or ""),
+            expected_symbol=str(objective.get("symbol") or symbol),
+        )
 
     @staticmethod
     def _market_indicative_state(capabilities: List[Dict[str, Any]]) -> str:
@@ -2017,6 +2361,7 @@ class RobinhoodChainRegistryDiscoveryService:
         taker_address: str,
         force_refresh: bool,
         confirm_refresh: bool,
+        objective_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Refresh provider-scoped exact-input evidence for one selected market.
 
@@ -2030,16 +2375,14 @@ class RobinhoodChainRegistryDiscoveryService:
 
         schema_compatibility = _ensure_provider_scoped_capability_schema(db)
         normalized_symbol = _normalize_market_symbol(symbol)
-        objective = (
-            db.query(RobinhoodChainPairObjective)
-            .filter(
-                RobinhoodChainPairObjective.symbol == normalized_symbol,
-                RobinhoodChainPairObjective.enabled.is_(True),
-            )
-            .first()
-        )
-        if objective is None:
-            raise ValueError("robinhood_chain_pair_objective_not_found")
+        if str(objective_id or "").strip():
+            objective = self._objective_row(db, str(objective_id).strip())
+            if not bool(objective.enabled):
+                raise ValueError("robinhood_chain_pair_objective_disabled")
+            if str(objective.symbol or "").strip().upper() != normalized_symbol:
+                raise ValueError("robinhood_chain_pair_objective_symbol_mismatch")
+        else:
+            objective = self._enabled_objective_row_by_symbol(db, normalized_symbol)
         if str(objective.mechanism or "").strip().lower() != MECHANISM_SWAP:
             raise ValueError("selected_market_refresh_requires_swap_objective")
 
@@ -2367,16 +2710,7 @@ class RobinhoodChainRegistryDiscoveryService:
             raise ValueError(f"{error_prefix}_preparation_target_locked")
 
         taker = validate_evm_address(taker_address)
-        objective = (
-            db.query(RobinhoodChainPairObjective)
-            .filter(
-                RobinhoodChainPairObjective.symbol == normalized_symbol,
-                RobinhoodChainPairObjective.enabled.is_(True),
-            )
-            .first()
-        )
-        if objective is None:
-            raise ValueError("robinhood_chain_pair_objective_not_found")
+        objective = self._enabled_objective_row_by_symbol(db, normalized_symbol)
         if str(objective.mechanism or "").strip().lower() != MECHANISM_SWAP:
             raise ValueError(f"{error_prefix}_swap_mechanism_required")
 
@@ -2434,6 +2768,7 @@ class RobinhoodChainRegistryDiscoveryService:
             authority = resolve_robinhood_chain_execution_authority(
                 db,
                 symbol=normalized_symbol,
+                objective_id=str(objective.id),
                 side=normalized_side,
                 amount_mode=normalized_mode,
                 provider=PROVIDER_ZEROX,
@@ -2556,6 +2891,7 @@ class RobinhoodChainRegistryDiscoveryService:
         authority = resolve_robinhood_chain_execution_authority(
             db,
             symbol=normalized_symbol,
+            objective_id=str(objective.id),
             side=normalized_side,
             amount_mode=normalized_mode,
             provider=PROVIDER_ZEROX,
@@ -2618,16 +2954,7 @@ class RobinhoodChainRegistryDiscoveryService:
         ):
             raise ValueError("r5c5a_live_authorization_target_locked")
 
-        objective = (
-            db.query(RobinhoodChainPairObjective)
-            .filter(
-                RobinhoodChainPairObjective.symbol == normalized_symbol,
-                RobinhoodChainPairObjective.enabled.is_(True),
-            )
-            .first()
-        )
-        if objective is None:
-            raise ValueError("robinhood_chain_pair_objective_not_found")
+        objective = self._enabled_objective_row_by_symbol(db, normalized_symbol)
         base_row, quote_row = self._objective_tokens(db, objective)
         base_identity = self.token_identity(db, base_row)
         quote_identity = self.token_identity(db, quote_row)
@@ -2691,7 +3018,7 @@ class RobinhoodChainRegistryDiscoveryService:
             and str(existing.get("wallet_address") or "").strip().lower() == authorized_wallet
         ):
             authority = resolve_robinhood_chain_execution_authority(
-                db, symbol=normalized_symbol, side=normalized_side,
+                db, symbol=normalized_symbol, objective_id=str(objective.id), side=normalized_side,
                 amount_mode=normalized_mode, provider=normalized_provider,
                 require_execution=True,
             )
@@ -2746,7 +3073,7 @@ class RobinhoodChainRegistryDiscoveryService:
         db.add(capability)
         db.flush()
         authority = resolve_robinhood_chain_execution_authority(
-            db, symbol=normalized_symbol, side=normalized_side,
+            db, symbol=normalized_symbol, objective_id=str(objective.id), side=normalized_side,
             amount_mode=normalized_mode, provider=normalized_provider,
             require_execution=True,
         )
@@ -2812,16 +3139,7 @@ class RobinhoodChainRegistryDiscoveryService:
         ):
             raise ValueError("r5c5b_live_authorization_target_locked")
 
-        objective = (
-            db.query(RobinhoodChainPairObjective)
-            .filter(
-                RobinhoodChainPairObjective.symbol == normalized_symbol,
-                RobinhoodChainPairObjective.enabled.is_(True),
-            )
-            .first()
-        )
-        if objective is None:
-            raise ValueError("robinhood_chain_pair_objective_not_found")
+        objective = self._enabled_objective_row_by_symbol(db, normalized_symbol)
         base_row, quote_row = self._objective_tokens(db, objective)
         base_identity = self.token_identity(db, base_row)
         quote_identity = self.token_identity(db, quote_row)
@@ -2885,7 +3203,7 @@ class RobinhoodChainRegistryDiscoveryService:
             and str(existing.get("wallet_address") or "").strip().lower() == authorized_wallet
         ):
             authority = resolve_robinhood_chain_execution_authority(
-                db, symbol=normalized_symbol, side=normalized_side,
+                db, symbol=normalized_symbol, objective_id=str(objective.id), side=normalized_side,
                 amount_mode=normalized_mode, provider=normalized_provider,
                 require_execution=True,
             )
@@ -2940,7 +3258,7 @@ class RobinhoodChainRegistryDiscoveryService:
         db.add(capability)
         db.flush()
         authority = resolve_robinhood_chain_execution_authority(
-            db, symbol=normalized_symbol, side=normalized_side,
+            db, symbol=normalized_symbol, objective_id=str(objective.id), side=normalized_side,
             amount_mode=normalized_mode, provider=normalized_provider,
             require_execution=True,
         )

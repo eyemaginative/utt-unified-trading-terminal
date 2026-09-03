@@ -514,6 +514,153 @@ def _swap_gate() -> Dict[str, Any]:
     }
 
 
+_GENERIC_READ_ONLY_RECONCILIATION_SOURCES = frozenset({
+    "wallet_swap_receipt",
+    "wallet_sync_incremental_receipt",
+    "explicit_confirmed_backfill",
+    "rh_order_miss_1b_orphan_recovery",
+})
+
+
+def _generic_read_only_restore_evidence(
+    row: RobinhoodChainSwapExecution,
+) -> Optional[Dict[str, Any]]:
+    """Recognize durable generic-wallet rows without extending execution authority."""
+    direction = _direction_key(side=row.side, from_asset=row.from_asset, to_asset=row.to_asset)
+    if direction in ROBINHOOD_CHAIN_SWAP_APPROVAL_DIRECTIONS:
+        return None
+
+    route = _route_copy(row)
+    durable = route.get("generic_wallet_lifecycle")
+    if isinstance(durable, dict):
+        capability_sha = str(durable.get("swap_capability_sha256") or "").strip().lower()
+        if (
+            durable.get("version") == "RH-ORDER.MISS.1B"
+            and durable.get("durable_before_wallet_request") is True
+            and _SHA256_RE.fullmatch(capability_sha)
+        ):
+            return {
+                "kind": "generic_wallet_lifecycle",
+                "version": "RH-ORDER.MISS.1B",
+                "source": "durable_pre_wallet_request",
+            }
+
+    reconciliation = route.get("execution_reconciliation")
+    if isinstance(reconciliation, dict):
+        source = str(reconciliation.get("source") or "").strip().lower()
+        if (
+            reconciliation.get("reconciled") is True
+            and source in _GENERIC_READ_ONLY_RECONCILIATION_SOURCES
+        ):
+            return {
+                "kind": "execution_reconciliation",
+                "version": str(reconciliation.get("version") or "").strip() or None,
+                "source": source,
+            }
+    return None
+
+
+def _validate_generic_read_only_row(
+    row: RobinhoodChainSwapExecution,
+) -> Dict[str, Any]:
+    """Validate only identity needed to restore a generic lifecycle read-only."""
+    if int(row.chain_id or 0) != EXPECTED_CHAIN_ID:
+        raise ValueError("robinhood_chain_swap_chain_mismatch")
+
+    direction = _direction_key(side=row.side, from_asset=row.from_asset, to_asset=row.to_asset)
+    side, from_asset, to_asset = direction
+    if side not in {"buy", "sell"} or not from_asset or not to_asset or from_asset == to_asset:
+        raise ValueError("robinhood_chain_swap_direction_mismatch")
+    if direction in ROBINHOOD_CHAIN_SWAP_APPROVAL_DIRECTIONS:
+        raise ValueError("robinhood_chain_swap_generic_restore_legacy_direction")
+    if str(row.symbol or "").strip().upper() != _direction_symbol(direction):
+        raise ValueError("robinhood_chain_swap_symbol_mismatch")
+    if str(row.amount_mode or "").strip().lower() != ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE:
+        raise ValueError("robinhood_chain_swap_amount_mode_mismatch")
+
+    validate_evm_address(row.wallet_address)
+    validate_evm_address(row.from_contract_address)
+    validate_evm_address(row.to_contract_address)
+    try:
+        from_decimals = int(row.from_decimals)
+        to_decimals = int(row.to_decimals)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("robinhood_chain_swap_token_identity_mismatch") from exc
+    if not 0 <= from_decimals <= 255 or not 0 <= to_decimals <= 255:
+        raise ValueError("robinhood_chain_swap_token_identity_mismatch")
+
+    input_atomic = str(row.exact_input_amount_atomic or "").strip()
+    if not input_atomic.isdigit() or int(input_atomic) <= 0:
+        raise ValueError("invalid_robinhood_chain_swap_input_amount")
+
+    evidence = _generic_read_only_restore_evidence(row)
+    if evidence is None:
+        raise ValueError("robinhood_chain_swap_direction_mismatch")
+    if evidence.get("kind") == "execution_reconciliation":
+        validate_transaction_hash(row.swap_tx_hash)
+    return evidence
+
+
+def _generic_read_only_payload(
+    row: RobinhoodChainSwapExecution,
+    evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Serialize a generic lifecycle with every transaction path deliberately removed."""
+    execution = serialize_swap_execution(row)
+    execution.update({
+        "tranche": "RH-SWAP.RESTORE.GENERIC.1",
+        "approval_execution_enabled": False,
+        "swap_stage_enabled": False,
+        "swap_execution_enabled": False,
+        "approval_only": False,
+        "swap_stage_locked_reason": "Generic lifecycle restoration is read-only.",
+        "automatic_second_transaction": False,
+        "signing_enabled": False,
+        "broadcast_enabled": False,
+        "review_only": True,
+        "will_mutate": False,
+        "generic_read_only_restore": True,
+        "generic_read_only_evidence": dict(evidence),
+    })
+    allowance = dict(execution.get("allowance") or {})
+    spender = str(allowance.get("spender") or "").strip().lower()
+    allowance["spender_allowlisted"] = spender in ROBINHOOD_CHAIN_ALLOWANCE_HOLDER_ALLOWLIST
+    execution["allowance"] = allowance
+    swap = dict(execution.get("swap") or {})
+    swap["route"] = {
+        "generic_read_only_restore": True,
+        "evidence_kind": evidence.get("kind"),
+        "source": evidence.get("source"),
+    }
+    execution["swap"] = swap
+
+    gate = {
+        **_swap_gate(),
+        "send_enabled": False,
+        "execution_enabled": False,
+        "wallet_connection_requested": False,
+        "signing_enabled": False,
+        "broadcast_enabled": False,
+        "generic_read_only_restore": True,
+        "review_only": True,
+        "will_mutate": False,
+    }
+    return {
+        "ok": True,
+        "execution": execution,
+        "approval_transaction_plan": None,
+        "unsigned_transaction_plan": None,
+        "send_gate": dict(gate),
+        "review_gate": dict(gate),
+        "read_only": True,
+        "will_mutate": False,
+        "wallet_connection_requested": False,
+        "signing_enabled": False,
+        "broadcast_enabled": False,
+        "generic_read_only_restore": True,
+    }
+
+
 def _validate_row(row: RobinhoodChainSwapExecution) -> None:
     if int(row.chain_id or 0) != EXPECTED_CHAIN_ID:
         raise ValueError("robinhood_chain_swap_chain_mismatch")
@@ -727,7 +874,18 @@ class RobinhoodChainSwapExecutionService:
         return row
 
     def get(self, db: Session, execution_id: str) -> Dict[str, Any]:
-        row = self._get(db, execution_id)
+        row = db.get(RobinhoodChainSwapExecution, str(execution_id or "").strip())
+        if row is None:
+            raise KeyError("robinhood_chain_swap_execution_not_found")
+
+        direction = _direction_key(side=row.side, from_asset=row.from_asset, to_asset=row.to_asset)
+        if direction not in ROBINHOOD_CHAIN_SWAP_APPROVAL_DIRECTIONS:
+            generic_evidence = _generic_read_only_restore_evidence(row)
+            if generic_evidence is not None:
+                validated_evidence = _validate_generic_read_only_row(row)
+                return _generic_read_only_payload(row, validated_evidence)
+
+        _validate_row(row)
         return {
             "ok": True,
             "execution": serialize_swap_execution(row),

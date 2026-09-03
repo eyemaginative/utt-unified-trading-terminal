@@ -11,6 +11,8 @@ from sqlalchemy import (
     Integer,
     Boolean,
     JSON,
+    func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -273,7 +275,24 @@ class TokenRegistry(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
     __table_args__ = (
-        UniqueConstraint("chain", "venue", "symbol", name="uq_token_registry_chain_venue_symbol"),
+        # Robinhood Chain ERC-20 identity is chain + normalized contract, not symbol.
+        # The partial expression index permits multiple blank-address/native rows for
+        # other chains while preventing case-only duplicate RH contracts. Native RH
+        # ambiguity remains guarded explicitly by registry authority.
+        Index(
+            "uq_token_registry_rh_chain_contract_norm",
+            "chain",
+            func.lower(func.trim(address)),
+            unique=True,
+            sqlite_where=text(
+                "LOWER(TRIM(chain)) = 'robinhood_chain' "
+                "AND address IS NOT NULL AND TRIM(address) <> ''"
+            ),
+            postgresql_where=text(
+                "LOWER(TRIM(chain)) = 'robinhood_chain' "
+                "AND address IS NOT NULL AND TRIM(address) <> ''"
+            ),
+        ),
         Index("ix_token_registry_chain_symbol", "chain", "symbol"),
         Index("ix_token_registry_chain_venue", "chain", "venue"),
         Index("ix_token_registry_chain_address", "chain", "address"),
@@ -458,6 +477,82 @@ class WalletAddress(Base):
     __table_args__ = (
         UniqueConstraint("owner_scope", "network", "address", name="uq_wallet_addr_scope_network_address"),
         Index("ix_wallet_addresses_asset_network", "asset", "network"),
+    )
+
+
+class RobinhoodChainRegistryCandidate(Base):
+    """Persisted manual wallet-scan candidate keyed by exact contract identity.
+
+    This cache is deliberately operationally independent from background refresh
+    cadence. It is refreshed only by the explicit Robinhood Chain Scan wallet
+    action and can be read repeatedly without RPC/provider work.
+    """
+
+    __tablename__ = "robinhood_chain_registry_candidates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    wallet_address_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("wallet_addresses.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663, index=True)
+    contract_address: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
+    candidate: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    scanned_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+    wallet_address: Mapped["WalletAddress"] = relationship("WalletAddress")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "wallet_address_id",
+            "chain_id",
+            "contract_address",
+            name="uq_rh_registry_candidate_wallet_chain_contract",
+        ),
+        Index(
+            "ix_rh_registry_candidate_wallet_scan",
+            "wallet_address_id",
+            "chain_id",
+            "scanned_at",
+        ),
+    )
+
+
+class RobinhoodChainRegistryCandidateScan(Base):
+    """Persistent scan watermark for one Robinhood Chain wallet candidate cache."""
+
+    __tablename__ = "robinhood_chain_registry_candidate_scans"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    wallet_address_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("wallet_addresses.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False, default=4663, index=True)
+    scanned_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+    wallet_address: Mapped["WalletAddress"] = relationship("WalletAddress")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "wallet_address_id",
+            "chain_id",
+            name="uq_rh_registry_candidate_scan_wallet_chain",
+        ),
+        Index(
+            "ix_rh_registry_candidate_scan_time",
+            "chain_id",
+            "scanned_at",
+        ),
     )
 
 

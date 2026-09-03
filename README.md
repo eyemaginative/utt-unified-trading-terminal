@@ -2,7 +2,7 @@
 
 UTT (Unified Trading Terminal) is a local-first, multi-venue crypto trading terminal built with **FastAPI** on the backend and **React** on the frontend. It is designed to unify centralized exchange (CEX) workflows and selected decentralized exchange (DEX) flows under a single operator-focused interface.
 
-> **Documentation state — August 20, 2026:** this README documents the cumulative development state prepared for publication after published baseline `52f6f5cd95854e87ac3cfe7790b0c997ed8dd026`. It retains the previously published Counterparty / UniSat, SEC-VAULT.1, Cexius, generic Order Details, managed Arbitrage, Solana, Hydration, Market Metrics, Spread / Bridge, Robinhood Chain execution/ingestion, and test-hygiene work, and adds the accepted Robinhood Chain quote/reconciliation improvements, Solana-Jupiter venue consolidation, All Venues portfolio/self-custody corrections, long-running wallet-snapshot retention fix, and Cexius tax-evidence presentation described below. Extended Robinhood Chain cold-pair quote reliability observation remains ongoing; publishing the accepted code does not relax any wallet, signing, slippage, approval, or broadcast safety boundary.
+> **Documentation state — September 3, 2026:** this README documents the cumulative development state prepared for publication after published baseline `81d8d3b58512fffd9cc87bf32e5fdd414255c5d9`. It retains the previously published Counterparty / UniSat, SEC-VAULT.1, Cexius, managed Arbitrage, Solana / Jupiter, Hydration, Market Metrics, Spread / Bridge, All Venues / self-custody, and Robinhood Chain execution / ingestion work, and adds the accepted Robinhood Chain exact-identity Registry authority, multi-provider quote context, generic lifecycle / All Orders reconciliation, Order Book / Order Ticket state isolation, focused post-confirmation balance refresh, and event-loop latency isolation described below. The current Robinhood Chain discovery / quote cap policy remains configuration- and capability-driven in this publication; migration of those caps to per-user Profile controls backed by the database is the next planned tranche. Publishing this checkpoint does not relax wallet matching, finite approvals, slippage, signing, broadcast, provider-concurrency, or transaction-authority safety boundaries.
 
 At a high level, UTT provides one place to:
 
@@ -12,7 +12,7 @@ At a high level, UTT provides one place to:
 - submit and track CEX orders, cancel supported venue orders, and monitor venue-native order snapshots
 - trade through supported live-gated CEX adapters such as Coinbase, Crypto.com, Cexius, Dex-Trade, Gemini, Kraken, Robinhood, and OKX where configured
 - use Counterparty / UniSat workflows for Bitcoin-metaprotocol assets, collectibles, orderbook context, unsigned compose review, explicit PSBT signing, and separately gated broadcast
-- use Robinhood Chain for registry-backed EVM balances, 0x and provider-scoped read-only indicative quote discovery, Token Registry-driven selected-pair registration, synthetic books, bounded exact-input planning, controlled browser-wallet execution, receipt reconciliation, historical/incremental wallet ingestion, external-swap materialization, All Orders Sync+Load, and deterministic ERC-20 USD balance pricing
+- use Robinhood Chain for registry-backed EVM balances, exact Token Registry / pair-objective identity, 0x, Uniswap API, and Uniswap v3 RPC read-only indicative quote context, synthetic books, bounded exact-input planning, controlled browser-wallet execution, receipt reconciliation, historical/incremental wallet ingestion, external-swap materialization, All Orders Sync+Load, and deterministic ERC-20 USD balance pricing
 - submit and track Solana swaps / limit-style flows and confirmed Hydration manual-route swaps
 - monitor scanners, discovery tools, Ordinals / Counterparty collectibles, wallet activity, market-cap data, volume data, and self-custody balances
 - filter Market Cap and Volume windows by All / Owned / Unowned and by venue/source such as Coinbase, Crypto.com, Dex-Trade, Gemini, Hydration, Kraken, OKX, Robinhood, self-custody, Solana, and Solana-Jupiter
@@ -24,6 +24,47 @@ At a high level, UTT provides one place to:
 - integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
 
 ---
+
+## What changed in the September 3, 2026 cumulative update
+
+This publication interval contains the accepted work completed after published baseline `81d8d3b58512fffd9cc87bf32e5fdd414255c5d9`. The summary below is release-oriented; existing venue sections remain the detailed operator reference.
+
+### Robinhood Chain exact identity, Registry authority, and quote context
+
+- Pair objectives bind exact Token Registry row identities rather than relying on ticker text alone. Current authority requests preserve `objective_id` when available; legacy symbol fallback is accepted only when it resolves uniquely and the expected contracts still match.
+- Registry discovery and indicative quote context support provider-scoped 0x, Uniswap API, and Uniswap v3 RPC paths while keeping provider concurrency bounded. Read-only capability discovery does not itself authorize a wallet transaction.
+- Exact-market ambiguity continues to fail closed. Duplicate symbols are not permission to choose a token heuristically.
+- Current discovery safeguards still include capability-level probe ceilings and the config-backed `ROBINHOOD_CHAIN_DISCOVERY_MAX_SELL_USD` policy. The current setting defaults to `5` USD and is validated with a `25` USD ceiling. These values remain a known operator limitation in this publication and are scheduled to move to per-user **Profile** controls persisted in the database in the next tranche.
+- A `discovery_amount_exceeds_cap` response means the current request crossed one of those discovery-policy ceilings; it is not evidence by itself of insufficient wallet balance, missing liquidity, or a failed on-chain transaction.
+- Wallet execution remains separately gated by the saved-wallet match, chain identity, current execution authority, exact spend, slippage/minimum output, finite allowance, explicit browser-wallet confirmation, and receipt reconciliation.
+
+### Generic lifecycle, receipt reconciliation, and All Orders ownership
+
+- Generic Robinhood Chain swap lifecycles now persist durable pair-objective / Registry provenance so later receipt reconciliation does not depend on reinterpreting a ticker or on the provider string stored by an older lifecycle.
+- Legacy lifecycle recovery prefers durable objective identity and otherwise permits only unique symbol resolution with contract verification; ambiguous or mismatched identities fail closed.
+- Confirmed receipts reconcile against the existing UTT execution owner and do not create a second external `RHCHAINEXT` representation for the same transaction.
+- Repeated receipt refresh and **All Orders → Sync+Load** remain idempotent, including confirmed pending durable swaps recovered without another wallet transaction.
+- Confirmed terminal lifecycle history remains available in All Orders but is not restored into active Order Ticket execution controls.
+- Successful receipt handling performs the focused Robinhood Chain balance refresh and All Orders refresh automatically after confirmation; the manual Refresh control remains available but is not required for the accepted post-confirmation path.
+
+### Order Book / Order Ticket state isolation
+
+- Robinhood Chain synthetic books retain exact-market last-good data across transient transport failures instead of destructively clearing the selected book.
+- Book state is keyed by exact market identity, and superseded selected-market requests are aborted so stale responses cannot overwrite the active market.
+- With Auto disabled, the selected market still receives one bounded initial book load; recurring automatic refresh remains separately disabled.
+- Market changes and explicit Buy / Sell changes clear unrelated economic intent, while an intentional book-row pick preserves the row-derived price / amount state for that exact market.
+- Route state distinguishes in-flight resolution from a settled unsupported route so the Ticket does not present a premature permanent block while capability resolution is still running.
+- Focused Robinhood Chain balance refresh requests only the native gas asset plus the selected base / quote identities rather than sweeping the full wallet for every confirmation.
+
+### Robinhood Chain read-path latency isolation
+
+- The latest Robinhood Chain balance-snapshot read keeps its ranked exact-identity snapshot and basis semantics, but its synchronous database work now runs outside the async event loop.
+- Registry Markets keeps the same catalog semantics while its synchronous catalog work also runs through the Starlette worker-pool boundary.
+- The repair does not increase provider concurrency, does not increase frontend timeouts, does not enable automatic Ticket quote / plan polling, and does not change wallet, signing, approval, or broadcast behavior.
+- Static acceptance completed with the direct Robinhood Chain regression green at `377/377`.
+- In isolated live acceptance, canary blocking dropped from `6/6` balance rounds, `5/6` Registry rounds, and `6/6` combined rounds to `0/6` for all three.
+- In the repeated browser hard-load witness, correlated multi-endpoint `>=5 s` stalls dropped from `13/15` rounds to `0/15`, the balance snapshot stayed within the existing `15 s` frontend budget in all `15/15` samples, and all `90/90` read-only requests completed successfully.
+- The balance snapshot can still be locally expensive during artificial hard-load pressure. That remaining query cost is tracked separately as an optional performance optimization; it no longer starves unrelated async status traffic.
 
 ## What changed in the August 2026 cumulative update
 
@@ -1791,11 +1832,18 @@ ROBINHOOD_CHAIN_EXPLORER_API_BASE=https://robinhoodchain.blockscout.com/api/v2
 ROBINHOOD_CHAIN_SWAP_PROVIDER=0x
 ROBINHOOD_CHAIN_ZEROX_API_BASE=https://api.0x.org
 
+# Optional read-only Uniswap quote-provider settings.
+# Keep the Uniswap API key in Profile -> API Keys as venue uniswap_api;
+# there is no environment API-key fallback.
+ROBINHOOD_CHAIN_UNISWAP_API_BASE=https://trade-api.gateway.uniswap.org/v1
+ROBINHOOD_CHAIN_UNISWAP_QUOTE_TIMEOUT_S=15
+ROBINHOOD_CHAIN_UNISWAP_QUOTE_MAX_CONCURRENT=1
+
 # Keep live execution off unless intentionally performing a bounded test.
 ROBINHOOD_CHAIN_LIVE_EXECUTION_ENABLED=0
 ```
 
-Store the 0x API key through **Profile → API Keys** using venue `zerox`. Do not put the key in the README, source files, or tracked env files.
+Store the 0x API key through **Profile → API Keys** using venue `zerox`. Store the Uniswap quote API key through **Profile → API Keys** using venue `uniswap_api`; the current Uniswap quote path does not accept an environment API-key fallback. Do not put either key in the README, source files, or tracked env files.
 
 Enabling `ROBINHOOD_CHAIN_LIVE_EXECUTION_ENABLED=1` is not sufficient by itself. Live execution also requires the global trading gates, an accepted registry capability, a matching saved wallet, a fresh provider plan, an explicit database authority, and explicit browser-wallet confirmation for each transaction stage.
 
@@ -2138,6 +2186,8 @@ execution status
 
 A quote or discoverable token does not automatically become an executable pair.
 
+Exact-market identity is objective-first. When an exact pair-objective ID is available, the current Order Ticket / API authority handoff preserves it. Legacy symbol-only recovery is allowed only when the symbol resolves uniquely and the expected Registry contracts still match; zero or multiple matches fail closed.
+
 ### Wallet and transaction model
 
 Passive chain operations use backend RPC reads. Signing remains in the browser wallet.
@@ -2171,6 +2221,8 @@ Some Robinhood Chain RPC endpoints serve transactions and receipts but do not re
 - one approval submission and one swap submission
 
 Historical balances that are available but disagree still fail closed. The fallback is not permission to ignore a real mismatch.
+
+For durable generic lifecycles, receipt reconciliation is tied to the saved UTT execution owner and exact objective / Registry provenance rather than requiring the lifecycle's historical quote-provider string to remain the current execution-authority provider. This keeps old confirmed transactions reconcilable without weakening exact identity or creating a second external-swap owner.
 
 ### Current execution boundary
 
@@ -2615,6 +2667,8 @@ Check:
 - the selected pair has a matching registry objective and directional capability
 
 Passive balance, history, quote, and lifecycle reads should not request MetaMask.
+
+If the Order Ticket reports `discovery_amount_exceeds_cap`, the request crossed a current discovery-policy ceiling. In this publication those ceilings are still configuration / capability driven; `ROBINHOOD_CHAIN_DISCOVERY_MAX_SELL_USD` defaults to `5` USD and is validated with a `25` USD maximum, while individual capabilities may also carry a `max_probe_amount`. This error is not by itself a wallet-balance or liquidity verdict. Migration of these caps to per-user **Profile** settings persisted in the database is the next planned Robinhood Chain tranche.
 
 ### Robinhood Chain approval or swap is blocked
 

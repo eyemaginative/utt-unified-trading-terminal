@@ -79,6 +79,33 @@ class _FakeRegistryService:
             return dict(market["quote"])
         raise ValueError("unexpected token")
 
+    def resolve_verified_token_by_id(self, db, token_registry_id: int):
+        registry_id = int(token_registry_id)
+        market = self.market_by_symbol(db, "INDEX-USDG")
+        if registry_id == int(market["base"]["registry_id"]):
+            return dict(market["base"])
+        if registry_id == int(market["quote"]["registry_id"]):
+            return dict(market["quote"])
+        raise ValueError("unexpected token registry id")
+
+    def objective_by_symbol(self, db, symbol: str):
+        market = self.market_by_symbol(db, symbol)
+        return {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "symbol": "INDEX-USDG",
+            "mechanism": "swap",
+            "base": dict(market["base"]),
+            "quote": dict(market["quote"]),
+        }
+
+    def objective_by_id(self, db, objective_id: str, *, expected_symbol=None):
+        objective = self.objective_by_symbol(db, expected_symbol or "INDEX-USDG")
+        if str(objective_id) != str(objective["id"]):
+            raise ValueError("unexpected objective id")
+        if expected_symbol is not None and str(expected_symbol).upper() != str(objective["symbol"]).upper():
+            raise ValueError("unexpected objective symbol")
+        return objective
+
 
 
 class _FakeNativeRegistryService:
@@ -98,6 +125,16 @@ class _FakeNativeRegistryService:
                 "decimals": 18,
                 "native": True,
             },
+        }
+
+    def objective_by_symbol(self, db, symbol: str):
+        market = self.market_by_symbol(db, symbol)
+        return {
+            "id": "00000000-0000-0000-0000-000000000002",
+            "symbol": "INDEX-ETH",
+            "mechanism": "swap",
+            "base": dict(market["base"]),
+            "quote": dict(market["quote"]),
         }
 
 
@@ -164,6 +201,16 @@ class _FakeNativeOutputRegistryService:
                 "decimals": 18,
                 "native": True,
             },
+        }
+
+    def objective_by_symbol(self, db, symbol: str):
+        market = self.market_by_symbol(db, symbol)
+        return {
+            "id": "00000000-0000-0000-0000-000000000003",
+            "symbol": "INDEX-ETH",
+            "mechanism": "swap",
+            "base": dict(market["base"]),
+            "quote": dict(market["quote"]),
         }
 
 
@@ -691,18 +738,21 @@ class RobinhoodChainGenericCloseoutTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[2]
         ticket_path = repo_root / "frontend" / "src" / "OrderTicketWidget.jsx"
         ticket_text = ticket_path.read_text(encoding="utf-8")
-        start = ticket_text.index("async function refreshRobinhoodChainSuccessfulSwapReceipt()")
-        end = ticket_text.index("async function sendRobinhoodChainSuccessfulSwapRequest()", start)
+        start = ticket_text.index("async function applyRobinhoodChainSuccessfulSwapReceipt(")
+        end = ticket_text.index("function startRobinhoodChainSuccessfulSwapReceiptWatcher(", start)
         receipt_block = ticket_text[start:end]
 
         self.assertIn(
-            "await refreshRobinhoodChainTicketBalancesAfterConfirmation({",
+            "ticketBalanceRefresh = await refreshRobinhoodChainTicketBalancesAfterConfirmation({",
             receipt_block,
         )
-        self.assertIn('source: "generic_wallet_swap_receipt"', receipt_block)
+        self.assertIn(
+            'source: automatic ? "generic_wallet_swap_receipt_auto" : "generic_wallet_swap_receipt"',
+            receipt_block,
+        )
         self.assertIn("order_ticket_balance_refresh: ticketBalanceRefresh", receipt_block)
         self.assertIn(
-            "Order Ticket balances were refreshed automatically",
+            "balances and All Orders were refreshed automatically",
             receipt_block,
         )
 

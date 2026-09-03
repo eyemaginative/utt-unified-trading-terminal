@@ -12,10 +12,13 @@ from sqlalchemy import text
 from ..db import get_db
 from ..models import TokenRegistry
 from ..services.robinhood_chain_registry_authority import (
+    ASSET_KIND_ERC20,
     ASSET_KIND_NATIVE,
     ROBINHOOD_CHAIN,
     RobinhoodChainRegistryAuthorityError,
+    assert_erc20_contract_write_unambiguous,
     assert_native_write_unambiguous,
+    require_token_registry_contract_identity_schema,
     normalize_identity_input,
     row_asset_kind,
 )
@@ -65,6 +68,19 @@ def _token_identity_error(error: str, message: str, **context: Any) -> None:
     }
     detail.update(context)
     raise HTTPException(status_code=422, detail=detail)
+
+
+def _require_contract_identity_schema(db: Session) -> None:
+    try:
+        require_token_registry_contract_identity_schema(db)
+    except RobinhoodChainRegistryAuthorityError as exc:
+        detail: Dict[str, Any] = {
+            "error": exc.code,
+            "message": exc.message,
+            "chain": ROBINHOOD_CHAIN,
+        }
+        detail.update(exc.context)
+        raise HTTPException(status_code=503, detail=detail) from exc
 
 
 def _validate_chain_token_identity(
@@ -226,6 +242,51 @@ def _update_external_price_meta(
     db.commit()
 
 
+def _reconcile_robinhood_chain_candidate_cache(
+    db: Session,
+    *,
+    chain: str,
+    address: Optional[str],
+) -> int:
+    if _norm_chain(chain) != ROBINHOOD_CHAIN or not str(address or "").strip():
+        return 0
+    try:
+        table_exists = bool(
+            db.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name = 'robinhood_chain_registry_candidates'
+                    """
+                )
+            ).scalar_one()
+        )
+    except Exception:
+        return 0
+    if not table_exists:
+        return 0
+
+    normalized = str(address or "").strip().lower()
+    try:
+        result = db.execute(
+            text(
+                """
+                DELETE FROM robinhood_chain_registry_candidates
+                WHERE chain_id = 4663
+                  AND LOWER(TRIM(contract_address)) = :contract
+                """
+            ),
+            {"contract": normalized},
+        )
+        db.commit()
+        return max(0, int(result.rowcount or 0))
+    except Exception:
+        db.rollback()
+        return 0
+
+
 class TokenRegistryCreate(BaseModel):
     chain: str = Field(default="solana")
     venue: Optional[str] = Field(default=None, description="Optional venue override (e.g. coinbase); omit for global mapping")
@@ -279,6 +340,7 @@ def list_tokens(
     c = _norm_chain(chain)
     v = _norm_venue(venue)
     _ensure_token_registry_price_columns(db)
+    _require_contract_identity_schema(db)
 
     q = db.query(TokenRegistry).filter(TokenRegistry.chain == c)
 
@@ -304,13 +366,7 @@ def create_token(req: TokenRegistryCreate, db: Session = Depends(get_db)) -> Dic
     external_price_source = _norm_external_price_source(req.external_price_source)
     external_price_id = _clean_optional_str(req.external_price_id)
     _ensure_token_registry_price_columns(db)
-
-    # Upsert-ish behavior: if a row exists for (chain, venue, symbol), update it.
-    row = (
-        db.query(TokenRegistry)
-        .filter(TokenRegistry.chain == c, TokenRegistry.venue.is_(v) if v is None else TokenRegistry.venue == v, TokenRegistry.symbol == s)
-        .first()
-    )
+    _require_contract_identity_schema(db)
 
     a, d, asset_kind = _validate_chain_token_identity(
         chain=c,
@@ -319,6 +375,36 @@ def create_token(req: TokenRegistryCreate, db: Session = Depends(get_db)) -> Dic
         decimals=req.decimals,
         asset_kind=req.asset_kind,
     )
+
+    row: Optional[TokenRegistry]
+    if c == ROBINHOOD_CHAIN and asset_kind == ASSET_KIND_ERC20:
+        normalized_contract = str(a or "").strip().lower()
+        row = (
+            db.query(TokenRegistry)
+            .filter(
+                TokenRegistry.chain == c,
+                text("LOWER(TRIM(address)) = :normalized_contract"),
+            )
+            .params(normalized_contract=normalized_contract)
+            .first()
+        )
+        if row is None:
+            try:
+                assert_erc20_contract_write_unambiguous(db, address=normalized_contract)
+            except RobinhoodChainRegistryAuthorityError as exc:
+                _token_identity_error(exc.code, exc.message, **exc.context)
+    else:
+        # Preserve the established symbol-scoped upsert behavior outside RH ERC-20.
+        row = (
+            db.query(TokenRegistry)
+            .filter(
+                TokenRegistry.chain == c,
+                TokenRegistry.venue.is_(v) if v is None else TokenRegistry.venue == v,
+                TokenRegistry.symbol == s,
+            )
+            .first()
+        )
+
     _assert_native_write_allowed(
         db,
         chain=c,
@@ -332,6 +418,11 @@ def create_token(req: TokenRegistryCreate, db: Session = Depends(get_db)) -> Dic
         row = TokenRegistry(chain=c, venue=v, symbol=s, address=a, decimals=d, label=label)
         db.add(row)
     else:
+        # RH ERC-20 is exact-contract authoritative, so symbol/venue are mutable
+        # metadata on that identity rather than an upsert key.
+        if c == ROBINHOOD_CHAIN and asset_kind == ASSET_KIND_ERC20:
+            row.venue = v
+            row.symbol = s
         row.address = a
         row.decimals = d
         row.label = label
@@ -345,13 +436,23 @@ def create_token(req: TokenRegistryCreate, db: Session = Depends(get_db)) -> Dic
         external_price_id=external_price_id,
     )
     db.refresh(row)
+    reconciled = _reconcile_robinhood_chain_candidate_cache(
+        db,
+        chain=c,
+        address=a,
+    )
     external_meta = _external_price_meta_for_ids(db, [int(row.id)]).get(int(row.id), {})
-    return {"ok": True, "item": _row_to_dict(row, external_meta=external_meta)}
+    return {
+        "ok": True,
+        "item": _row_to_dict(row, external_meta=external_meta),
+        "candidate_cache_reconciled": int(reconciled),
+    }
 
 
 @router.put("/{token_id}")
 def update_token(token_id: int, req: TokenRegistryUpdate, db: Session = Depends(get_db)) -> Dict[str, Any]:
     _ensure_token_registry_price_columns(db)
+    _require_contract_identity_schema(db)
     row = db.query(TokenRegistry).filter(TokenRegistry.id == int(token_id)).first()
     if row is None:
         raise HTTPException(status_code=404, detail="token not found")
@@ -375,6 +476,15 @@ def update_token(token_id: int, req: TokenRegistryUpdate, db: Session = Depends(
         asset_kind=asset_kind,
         exclude_token_id=int(row.id),
     )
+    if _norm_chain(row.chain) == ROBINHOOD_CHAIN and asset_kind == ASSET_KIND_ERC20:
+        try:
+            assert_erc20_contract_write_unambiguous(
+                db,
+                address=next_address,
+                exclude_token_id=int(row.id),
+            )
+        except RobinhoodChainRegistryAuthorityError as exc:
+            _token_identity_error(exc.code, exc.message, **exc.context)
 
     row.venue = next_venue
     row.symbol = next_symbol
@@ -394,12 +504,22 @@ def update_token(token_id: int, req: TokenRegistryUpdate, db: Session = Depends(
             external_price_id=req.external_price_id,
         )
         db.refresh(row)
+    reconciled = _reconcile_robinhood_chain_candidate_cache(
+        db,
+        chain=row.chain,
+        address=row.address,
+    )
     external_meta = _external_price_meta_for_ids(db, [int(row.id)]).get(int(row.id), {})
-    return {"ok": True, "item": _row_to_dict(row, external_meta=external_meta)}
+    return {
+        "ok": True,
+        "item": _row_to_dict(row, external_meta=external_meta),
+        "candidate_cache_reconciled": int(reconciled),
+    }
 
 
 @router.delete("/{token_id}")
 def delete_token(token_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    _require_contract_identity_schema(db)
     row = db.query(TokenRegistry).filter(TokenRegistry.id == int(token_id)).first()
     if row is None:
         return {"ok": True, "deleted": 0}

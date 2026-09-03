@@ -1193,22 +1193,34 @@ async function appLoadRobinhoodChainRegistryMap({ force = false } = {}) {
     });
     const rows = appNormalizeRowsPayload(payload);
     const bySymbol = {};
+    const buckets = {};
 
-    // Global rows are accepted first; the explicit robinhood_chain venue override
-    // then replaces the same symbol deterministically.
-    const ordered = [...rows].sort((a, b) => {
-      const av = String(a?.venue || "").trim().toLowerCase() === ROBINHOOD_CHAIN_VENUE ? 1 : 0;
-      const bv = String(b?.venue || "").trim().toLowerCase() === ROBINHOOD_CHAIN_VENUE ? 1 : 0;
-      return av - bv;
-    });
-
-    for (const row of ordered) {
+    // RH ERC-20 identity is contract-qualified. Preserve same-symbol identities
+    // separately and expose a symbol-only mapping only when exactly one effective
+    // identity exists. Global + venue native rows with one blank-address identity
+    // still resolve deterministically to the venue override.
+    for (const row of rows || []) {
       const symbol = String(row?.symbol || "").trim().toUpperCase();
       if (!symbol) continue;
+      const contract = String(row?.address || "").trim().toLowerCase();
+      const identityKey = contract || "<native>";
+      if (!buckets[symbol]) buckets[symbol] = {};
+      const current = buckets[symbol][identityKey] || null;
+      const currentVenue = String(current?.venue || "").trim().toLowerCase();
+      const nextVenue = String(row?.venue || "").trim().toLowerCase();
+      if (!current || (nextVenue === ROBINHOOD_CHAIN_VENUE && currentVenue !== ROBINHOOD_CHAIN_VENUE)) {
+        buckets[symbol][identityKey] = row;
+      }
+    }
+
+    for (const [symbol, identityMap] of Object.entries(buckets)) {
+      const identities = Object.values(identityMap || {});
+      if (identities.length !== 1) continue;
+      const row = identities[0];
       bySymbol[symbol] = {
         registry_id: row?.id ?? null,
         registry_venue: String(row?.venue || "").trim().toLowerCase() || null,
-        contract_address: String(row?.address || "").trim() || null,
+        contract_address: String(row?.address || "").trim().toLowerCase() || null,
         decimals: appFiniteNumberOrNull(row?.decimals),
         label: String(row?.label || "").trim() || null,
         external_price_source: String(row?.external_price_source || "").trim().toLowerCase() || null,
@@ -1765,7 +1777,6 @@ async function appFetchRobinhoodChainUnregisteredBalanceRows(opts = {}) {
     const qs = new URLSearchParams({
       limit: String(limit),
       positive_only: "true",
-      force_refresh: opts?.force_refresh ? "true" : "false",
     });
     const walletAddressId = String(opts?.wallet_address_id || opts?.walletAddressId || "").trim();
     if (walletAddressId) qs.set("wallet_address_id", walletAddressId);
@@ -1784,7 +1795,7 @@ async function appFetchRobinhoodChainUnregisteredBalanceRows(opts = {}) {
       const walletAddress = String(item?.wallet_address || "").trim();
       return {
         venue: ROBINHOOD_CHAIN_VENUE,
-        source_type: "Wallet Addresses / Robinhood Chain discovery",
+        source_type: "Wallet Addresses / Robinhood Chain cached discovery",
         network: ROBINHOOD_CHAIN_VENUE,
         chain: ROBINHOOD_CHAIN_VENUE,
         wallet_id: ROBINHOOD_CHAIN_VENUE,
@@ -1821,6 +1832,7 @@ async function appFetchRobinhoodChainUnregisteredBalanceRows(opts = {}) {
         provider_symbol: item?.provider_symbol || null,
         provider_decimals: item?.provider_decimals ?? null,
         last_seen_at: item?.last_seen_at || null,
+        cached_wallet_scan_at: item?.cached_scan_at || null,
         event_count: Number(item?.event_count || 0),
         read_only: true,
         portfolio_included: false,
@@ -1871,7 +1883,20 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
         walletId.toLowerCase() === ROBINHOOD_CHAIN_VENUE ||
         network === ROBINHOOD_CHAIN_VENUE
       );
-      const registryMeta = isRobinhoodChain ? robinhoodRegistryMap?.[asset] || null : null;
+      const exactRegistryId = row?.registry_id ?? row?.registryId ?? null;
+      const exactRegistryVenue = String(row?.registry_venue ?? row?.registryVenue ?? "").trim().toLowerCase() || null;
+      const exactContractAddress = String(row?.contract_address ?? row?.contractAddress ?? "").trim().toLowerCase() || null;
+      const exactTokenDecimals = appFiniteNumberOrNull(row?.token_decimals ?? row?.tokenDecimals);
+      const symbolRegistryMeta = isRobinhoodChain ? robinhoodRegistryMap?.[asset] || null : null;
+      const registryMeta = isRobinhoodChain
+        ? {
+            ...(symbolRegistryMeta || {}),
+            registry_id: exactRegistryId ?? symbolRegistryMeta?.registry_id ?? null,
+            registry_venue: exactRegistryVenue ?? symbolRegistryMeta?.registry_venue ?? null,
+            contract_address: exactContractAddress ?? symbolRegistryMeta?.contract_address ?? null,
+            decimals: exactTokenDecimals ?? symbolRegistryMeta?.decimals ?? null,
+          }
+        : null;
       const usdSource = isRobinhoodChain
         ? appRobinhoodChainUsdSourceLabel(registryMeta, px, row?.usd_source)
         : (px !== null ? `${asset}-USD` : (totalUsd !== null ? "snapshot" : "—"));
@@ -1898,10 +1923,10 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
         usd_source_symbol: usdSource,
         price_status: px !== null ? "priced" : "unpriced",
         price_basis: isRobinhoodChain && registryMeta ? "token_registry" : (px !== null ? "market_symbol" : null),
-        registry_id: registryMeta?.registry_id ?? null,
-        registry_venue: registryMeta?.registry_venue ?? null,
-        contract_address: registryMeta?.contract_address ?? null,
-        token_decimals: registryMeta?.decimals ?? null,
+        registry_id: exactRegistryId ?? registryMeta?.registry_id ?? null,
+        registry_venue: exactRegistryVenue ?? registryMeta?.registry_venue ?? null,
+        contract_address: exactContractAddress ?? registryMeta?.contract_address ?? null,
+        token_decimals: exactTokenDecimals ?? registryMeta?.decimals ?? null,
         read_only: isRobinhoodChain ? true : row?.read_only,
         portfolio_included: totalUsd !== null && Math.abs(qty) > 0,
         balance_status: row?.balance_status || row?.status || "snapshot",
@@ -1917,7 +1942,6 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
 
     const unregisteredRows = await appFetchRobinhoodChainUnregisteredBalanceRows({
       limit: 50,
-      force_refresh: false,
     });
     return [...snapshotRows, ...unregisteredRows];
   } catch {
@@ -1936,6 +1960,8 @@ function appPortfolioBalanceDedupKey(row) {
 
   if (network === ROBINHOOD_CHAIN_VENUE) {
     const walletAddressId = String(row?.wallet_address_id || row?.walletAddressId || "").trim().toLowerCase();
+    const contract = String(row?.contract_address || row?.contractAddress || "").trim().toLowerCase();
+    if (walletAddressId && contract) return `${network}:${walletAddressId}:${contract}`;
     if (walletAddressId) return `${network}:${walletAddressId}:${asset}`;
   }
 

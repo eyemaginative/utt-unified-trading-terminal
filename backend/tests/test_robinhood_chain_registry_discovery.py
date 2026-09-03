@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List
@@ -11,11 +12,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.models import (
     RobinhoodChainPairCapability,
     RobinhoodChainPairObjective,
+    RobinhoodChainRegistryCandidate,
+    RobinhoodChainRegistryCandidateScan,
     RobinhoodChainRegistryVerification,
     RobinhoodChainWalletEvent,
     TokenRegistry,
     WalletAddress,
 )
+from app.routers.token_registry import TokenRegistryCreate, create_token
 from app.services.robinhood_chain_execution_discovery import RobinhoodChainExecutionDiscoveryService
 from app.services.robinhood_chain_registry_discovery import (
     AMOUNT_MODE_EXACT_INPUT,
@@ -288,6 +292,8 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             WalletAddress.__table__,
             RobinhoodChainWalletEvent.__table__,
             TokenRegistry.__table__,
+            RobinhoodChainRegistryCandidate.__table__,
+            RobinhoodChainRegistryCandidateScan.__table__,
             RobinhoodChainRegistryVerification.__table__,
             RobinhoodChainPairObjective.__table__,
             RobinhoodChainPairCapability.__table__,
@@ -684,6 +690,51 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "registry_changed_since_verification",
         )
         self.assertFalse(stale_asset["verification"]["registry_match"])
+
+    def test_configured_market_payload_carries_exact_registry_verification(self) -> None:
+        base = self._token("AAA", "0x" + "6a" * 20, 18)
+        quote = self._token("BBB", "0x" + "6b" * 20, 6)
+        self._mark_verified(base)
+        self._mark_verified(quote)
+
+        created = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="exact-id verification payload",
+            confirm_create=True,
+            require_verified_registry_identities=True,
+        )
+
+        objective = created["objective"]
+        self.assertEqual(objective["base"]["registry_id"], base.id)
+        self.assertEqual(objective["quote"]["registry_id"], quote.id)
+        self.assertEqual(objective["base"]["verification"]["token_registry_id"], base.id)
+        self.assertEqual(objective["quote"]["verification"]["token_registry_id"], quote.id)
+        self.assertEqual(objective["base"]["verification"]["canonical_status"], "verified")
+        self.assertEqual(objective["quote"]["verification"]["canonical_status"], "verified")
+        self.assertTrue(objective["base"]["verification"]["registry_match"])
+        self.assertTrue(objective["quote"]["verification"]["registry_match"])
+
+        market = next(
+            item for item in self.service.market_catalog(self.db)
+            if item["id"] == objective["id"]
+        )
+        self.assertEqual(market["base"]["registry_id"], base.id)
+        self.assertEqual(market["quote"]["registry_id"], quote.id)
+        self.assertEqual(market["base"]["verification"]["canonical_status"], "verified")
+        self.assertEqual(market["quote"]["verification"]["canonical_status"], "verified")
+
+        base.address = "0x" + "6c" * 20
+        self.db.commit()
+        stale = self.service.objective_by_symbol(self.db, "AAA-BBB")
+        self.assertEqual(
+            stale["base"]["verification"]["canonical_status"],
+            "registry_changed_since_verification",
+        )
+        self.assertFalse(stale["base"]["verification"]["registry_match"])
+        self.assertEqual(stale["quote"]["verification"]["canonical_status"], "verified")
 
     def test_create_objective_is_idempotent_and_provider_free(self) -> None:
         base = self._token("AAA", "0x" + "79" * 20, 18)
@@ -1394,7 +1445,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "balance_atomic": 123000000000000000000,
         }
 
-        result = await self.service.unregistered_wallet_assets(
+        result = await self.service.scan_unregistered_wallet_assets(
             self.db,
             wallet_address_id=str(wallet.id),
             limit=50,
@@ -1404,7 +1455,9 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["blockchain_read_only"])
-        self.assertFalse(result["will_mutate"])
+        self.assertTrue(result["will_mutate"])
+        self.assertTrue(result["candidate_cache_mutation"])
+        self.assertTrue(result["database_mutation"])
         self.assertEqual(len(result["items"]), 1)
         item = result["items"][0]
         self.assertEqual(item["contract_address"], contract.lower())
@@ -1431,7 +1484,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self._token("KNOWN", contract, 6)
 
-        result = await self.service.unregistered_wallet_assets(
+        result = await self.service.scan_unregistered_wallet_assets(
             self.db,
             wallet_address_id=str(wallet.id),
             positive_only=False,
@@ -1459,12 +1512,12 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "balance_atomic": 0,
         }
 
-        positive = await self.service.unregistered_wallet_assets(
+        positive = await self.service.scan_unregistered_wallet_assets(
             self.db,
             wallet_address_id=str(wallet.id),
             positive_only=True,
         )
-        all_items = await self.service.unregistered_wallet_assets(
+        all_items = await self.service.scan_unregistered_wallet_assets(
             self.db,
             wallet_address_id=str(wallet.id),
             positive_only=False,
@@ -1476,7 +1529,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(all_items["items"][0]["ready_to_register"])
         self.assertEqual(all_items["items"][0]["metadata_status"], "zero_balance")
 
-    async def test_unregistered_wallet_asset_symbol_collision_is_quarantined_from_direct_add(self) -> None:
+    async def test_unregistered_wallet_asset_same_symbol_different_contract_is_register_ready(self) -> None:
         wallet = self._wallet()
         registered = self._token("DUP", "0x" + "94" * 20, 18)
         contract = "0x" + "95" * 20
@@ -1496,7 +1549,7 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "balance_atomic": 5000000000000000000,
         }
 
-        result = await self.service.unregistered_wallet_assets(
+        result = await self.service.scan_unregistered_wallet_assets(
             self.db,
             wallet_address_id=str(wallet.id),
             positive_only=True,
@@ -1505,10 +1558,217 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["items"]), 1)
         item = result["items"][0]
         self.assertTrue(item["positive_balance"])
-        self.assertTrue(item["symbol_conflict"])
-        self.assertFalse(item["ready_to_register"])
-        self.assertEqual(item["metadata_status"], "symbol_conflict")
-        self.assertEqual(item["conflicting_registry_ids"], [int(registered.id)])
+        self.assertFalse(item["symbol_conflict"])
+        self.assertTrue(item["ready_to_register"])
+        self.assertEqual(item["metadata_status"], "ready")
+        self.assertEqual(item["conflicting_registry_ids"], [])
+        self.assertEqual(item["same_symbol_registry_ids"], [int(registered.id)])
+
+    def test_cached_candidate_read_without_cache_tables_is_read_only(self) -> None:
+        wallet = self._wallet()
+        with self.engine.begin() as connection:
+            connection.execute(text("DROP TABLE robinhood_chain_registry_candidate_scans"))
+            connection.execute(text("DROP TABLE robinhood_chain_registry_candidates"))
+
+        self.fake_rpc.calls.clear()
+        cached = self.service.cached_unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=True,
+        )
+
+        self.assertEqual(self.fake_rpc.calls, [])
+        self.assertEqual(cached["items"], [])
+        self.assertFalse(cached["cache_present"])
+        self.assertTrue(cached["scan_required"])
+        self.assertFalse(cached["database_mutation"])
+        tables = {
+            str(row[0])
+            for row in self.db.execute(
+                text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name LIKE 'robinhood_chain_registry_candidate%'"
+                )
+            ).all()
+        }
+        self.assertEqual(tables, set())
+
+    async def test_cached_candidate_read_performs_zero_rpc_after_explicit_scan(self) -> None:
+        wallet = self._wallet()
+        contract = "0x" + "96" * 20
+        self._wallet_event(
+            wallet,
+            contract=contract,
+            symbol="CACHE",
+            decimals=6,
+            event_key="event-cache-5",
+            amount_atomic="2500000",
+        )
+        self.fake_rpc.metadata[contract.lower()] = {
+            "code": True,
+            "symbol": "CACHE",
+            "name": "Cached Token",
+            "decimals": 6,
+            "balance_atomic": 2500000,
+        }
+
+        scanned = await self.service.scan_unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=True,
+            force_refresh=True,
+        )
+        self.assertTrue(scanned["wallet_scan_performed"])
+        self.assertTrue(scanned["candidate_cache_mutation"])
+        self.assertTrue(scanned["cached_wallet_scan_at"])
+        self.assertGreater(len(self.fake_rpc.calls), 0)
+
+        self.fake_rpc.calls.clear()
+        restarted_service = RobinhoodChainRegistryDiscoveryService(
+            rpc_client=self.fake_rpc,
+            discovery_service=self.fake_discovery,
+            planning_service=self.fake_planning,
+            uniswap_service=self.fake_uniswap,
+            uniswap_v3_service=self.fake_uniswap_v3,
+        )
+        cached = restarted_service.cached_unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=True,
+        )
+        self.assertEqual(self.fake_rpc.calls, [])
+        self.assertFalse(cached["wallet_scan_performed"])
+        self.assertFalse(cached["rpc_contacted"])
+        self.assertFalse(cached["candidate_cache_mutation"])
+        self.assertEqual(cached["cached_wallet_scan_at"], scanned["cached_wallet_scan_at"])
+        self.assertEqual(len(cached["items"]), 1)
+        self.assertEqual(cached["items"][0]["contract_address"], contract.lower())
+
+    async def test_cached_candidate_limit_matches_explicit_scan_selection_order(self) -> None:
+        wallet = self._wallet()
+        base_time = datetime(2026, 8, 31, 0, 0, 0)
+
+        for idx in range(60):
+            contract = "0x" + f"{idx + 1:040x}"
+            symbol = f"ORD{idx:02d}"
+            event = self._wallet_event(
+                wallet,
+                contract=contract,
+                symbol=symbol,
+                decimals=6,
+                event_key=f"event-order-{idx:02d}",
+                amount_atomic="1000000",
+            )
+            event.tx_time = base_time + timedelta(minutes=idx)
+            self.fake_rpc.metadata[contract.lower()] = {
+                "code": True,
+                "symbol": symbol,
+                "name": f"Order Token {idx:02d}",
+                "decimals": 6,
+                "balance_atomic": 1000000,
+            }
+
+        self.db.commit()
+
+        scanned = await self.service.scan_unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            limit=50,
+            positive_only=True,
+            force_refresh=True,
+        )
+        cached = self.service.cached_unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            limit=50,
+            positive_only=True,
+        )
+
+        scanned_contracts = [
+            item["contract_address"]
+            for item in scanned["items"]
+        ]
+        cached_contracts = [
+            item["contract_address"]
+            for item in cached["items"]
+        ]
+
+        self.assertEqual(len(scanned_contracts), 50)
+        self.assertEqual(len(cached_contracts), 50)
+        self.assertEqual(cached_contracts, scanned_contracts)
+
+    async def test_registering_one_same_symbol_contract_reconciles_only_exact_cached_candidate(self) -> None:
+        wallet = self._wallet()
+        contract_a = "0x" + "97" * 20
+        contract_b = "0x" + "98" * 20
+        for idx, contract in enumerate((contract_a, contract_b), start=1):
+            self._wallet_event(
+                wallet,
+                contract=contract,
+                symbol="TWIN",
+                decimals=18,
+                event_key=f"event-twin-{idx}",
+                amount_atomic="1000000000000000000",
+            )
+            self.fake_rpc.metadata[contract.lower()] = {
+                "code": True,
+                "symbol": "TWIN",
+                "name": f"Twin Token {idx}",
+                "decimals": 18,
+                "balance_atomic": 1000000000000000000,
+            }
+
+        scanned = await self.service.scan_unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=True,
+            force_refresh=True,
+        )
+        self.assertEqual(
+            {item["contract_address"] for item in scanned["items"]},
+            {contract_a.lower(), contract_b.lower()},
+        )
+
+        created = create_token(
+            TokenRegistryCreate(
+                chain="robinhood_chain",
+                symbol="TWIN",
+                address=contract_a,
+                asset_kind="erc20",
+                decimals=18,
+                label="Twin Token A",
+            ),
+            self.db,
+        )
+        self.assertEqual(created["candidate_cache_reconciled"], 1)
+
+        self.fake_rpc.calls.clear()
+        cached = self.service.cached_unregistered_wallet_assets(
+            self.db,
+            wallet_address_id=str(wallet.id),
+            positive_only=True,
+        )
+        self.assertEqual(self.fake_rpc.calls, [])
+        self.assertEqual(len(cached["items"]), 1)
+        self.assertEqual(cached["items"][0]["contract_address"], contract_b.lower())
+        self.assertEqual(cached["items"][0]["symbol"], "TWIN")
+
+    def test_registry_window_manual_scan_is_post_only_and_background_scan_removed(self) -> None:
+        test_path = Path(__file__).resolve()
+        candidates = [
+            test_path.parents[2] / "frontend" / "src" / "features" / "registry" / "TokenRegistryWindow.jsx",
+            test_path.parents[1] / "frontend" / "src" / "features" / "registry" / "TokenRegistryWindow.jsx",
+        ]
+        frontend_path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+        source = frontend_path.read_text(encoding="utf-8")
+        self.assertIn("/registry-discovery/unregistered-wallet-assets/scan", source)
+        self.assertIn('method: "POST"', source)
+        self.assertIn("confirm_scan: true", source)
+        self.assertIn("Cached wallet scan:", source)
+        self.assertIn("onClick={() => testResolve(row)}", source)
+        self.assertNotIn("onClick={() => testResolve(row.symbol)}", source)
+        self.assertNotIn("Automatic candidate refresh follows", source)
+        self.assertNotIn("loadRobinhoodUnregisteredCandidates({ forceRefresh: false", source)
 
     def test_extra_registry_asset_is_not_automatically_added_as_objective(self) -> None:
         self._token("EXTRA", "0x" + "e0" * 20, 18)
@@ -1843,6 +2103,63 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(market["orderbook_providers"], ["uniswap_api"])
         self.assertEqual(market["preferred_orderbook_provider"], "uniswap_api")
 
+    def test_duplicate_market_symbol_fails_closed_without_exact_objective_id(self) -> None:
+        base_a = self._token("GME", "0x" + "d1" * 20, 18)
+        base_b = self._token("GME", "0x" + "d2" * 20, 18)
+        quote = self._token("USDG", "0x" + "d3" * 20, 6, price_source="stable")
+
+        objective_a = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base_a.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="exact GME A",
+            confirm_create=True,
+        )["objective"]
+        objective_b = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base_b.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="exact GME B",
+            confirm_create=True,
+        )["objective"]
+
+        with self.assertRaisesRegex(ValueError, "robinhood_chain_pair_objective_symbol_ambiguous"):
+            self.service.objective_by_symbol(self.db, "gme-usdg")
+        with self.assertRaisesRegex(ValueError, "robinhood_chain_pair_objective_symbol_ambiguous"):
+            self.service.market_by_symbol(self.db, "GME-USDG")
+
+        selected_a = self.service.objective_by_id(
+            self.db,
+            objective_a["id"],
+            expected_symbol="GME-USDG",
+        )
+        selected_b = self.service.market_by_objective_id(
+            self.db,
+            objective_b["id"],
+            expected_symbol="GME-USDG",
+        )
+
+        self.assertEqual(selected_a["base"]["registry_id"], base_a.id)
+        self.assertEqual(selected_b["base"]["registry_id"], base_b.id)
+        self.assertEqual(selected_a["quote"]["registry_id"], quote.id)
+        self.assertEqual(selected_b["quote"]["registry_id"], quote.id)
+
+    def test_exact_verified_token_lookup_survives_duplicate_symbol(self) -> None:
+        token_a = self._token("CLOCKIN", "0x" + "e1" * 20, 18)
+        token_b = self._token("CLOCKIN", "0x" + "e2" * 20, 18)
+        self._mark_verified(token_a)
+        self._mark_verified(token_b)
+
+        by_id = self.service.resolve_verified_token_by_id(self.db, token_b.id)
+        by_contract = self.service.resolve_verified_token_by_contract(self.db, str(token_a.address))
+
+        self.assertEqual(by_id["registry_id"], token_b.id)
+        self.assertEqual(by_id["registry_contract_address"], str(token_b.address).lower())
+        self.assertEqual(by_contract["registry_id"], token_a.id)
+        self.assertEqual(by_contract["registry_contract_address"], str(token_a.address).lower())
+
     def test_orderbook_route_uses_enriched_market_lookup(self) -> None:
         router_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "robinhood_chain.py"
         source = router_path.read_text(encoding="utf-8")
@@ -1851,7 +2168,11 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         orderbook_source = source[start:] if end < 0 else source[start:end]
 
         self.assertIn(
-            "market = registry_service.market_by_symbol(db, symbol)",
+            "registry_service.market_by_objective_id(db, objective_id, expected_symbol=symbol)",
+            orderbook_source,
+        )
+        self.assertIn(
+            "else registry_service.market_by_symbol(db, symbol)",
             orderbook_source,
         )
         self.assertNotIn(
@@ -2219,6 +2540,13 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         for source in (ticket_source, orderbook_source):
             self.assertIn("REGISTRY ASSETS FOUND · PAIR NOT CONFIGURED", source)
             self.assertIn("CANONICAL TOKEN VERIFICATION REQUIRED", source)
+            self.assertIn("AMBIGUOUS REGISTRY SYMBOL", source)
+            self.assertIn("EXACT TOKEN IDENTITY REQUIRED", source)
+            self.assertIn("AMBIGUOUS CONFIGURED MARKET", source)
+            self.assertIn("robinhoodChainRegistryAssetsBySymbol", source)
+            self.assertIn("robinhoodChainUniqueRegistryAssetBySymbol", source)
+            self.assertIn("robinhoodChainRegistryPairAmbiguous", source)
+            self.assertNotIn("robinhoodChainRegistryAssetBySymbol", source)
             self.assertIn("Add Selected Pair", source)
             self.assertIn("registry_verification_required", source)
             self.assertIn("registry_verified", source)
@@ -2226,6 +2554,10 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('data-execution-enabled="false"', source)
             self.assertIn("review-only", source)
             self.assertIn("separate explicit action", source)
+
+        app_source = (root / "frontend" / "src" / "App.jsx").read_text(encoding="utf-8")
+        self.assertIn("const buckets = {};", app_source)
+        self.assertIn("if (identities.length !== 1) continue;", app_source)
 
         self.assertIn("require_verified_registry_identities=True", router_source)
         self.assertIn("Verify on-chain", registry_source)
@@ -2238,6 +2570,123 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("onClick={addSelectedRobinhoodChainPairFromBook}", orderbook_source)
         self.assertIn("robinhoodChainPairNotConfigured", ticket_source)
         self.assertIn("robinhoodChainPairNotConfigured", orderbook_source)
+
+    def test_order_ticket_provider_work_is_explicit_and_recovery_is_receipt_scoped(self) -> None:
+        test_path = Path(__file__).resolve()
+        root_candidates = [
+            test_path.parents[2],
+            test_path.parents[1],
+        ]
+        root = next(
+            (
+                candidate
+                for candidate in root_candidates
+                if (candidate / "frontend" / "src" / "OrderTicketWidget.jsx").exists()
+            ),
+            root_candidates[0],
+        )
+        source = (root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
+
+        self.assertEqual(source.count("automatic: true"), 1)
+        receipt_watch_start = source.index("function startRobinhoodChainSuccessfulSwapReceiptWatcher")
+        receipt_watch_end = source.index("async function refreshRobinhoodChainSuccessfulSwapReceipt", receipt_watch_start)
+        receipt_watch_source = source[receipt_watch_start:receipt_watch_end]
+        self.assertIn("automatic: true", receipt_watch_source)
+        self.assertNotIn("requestRobinhoodChainQuote(true, { automatic: true", source)
+        self.assertNotIn("requestRobinhoodChainFirmPlan(true, { automatic: true", source)
+        self.assertIn("MANUAL PREP", source)
+        self.assertIn("Order Book owns automatic market-price discovery", source)
+        self.assertIn("Reference Px", source)
+        self.assertIn("provider quote responses are execution evidence only", source)
+        self.assertNotIn('limitSourceRef.current = "robinhood_chain_quote"', source)
+        self.assertIn("walletRecoveryResolved", source)
+        self.assertIn("reconciliationHeld", source)
+        self.assertIn("data?.submission_recorded === true", source)
+        self.assertIn("data?.new_wallet_request_authorized === false", source)
+        self.assertIn("wallet-broadcast recovery is complete", source)
+        self.assertNotIn("reconciliation is held and recovery identity remains saved", source)
+
+    def test_order_ticket_auto_receipt_watch_is_read_only_bounded_and_refreshes_views(self) -> None:
+        test_path = Path(__file__).resolve()
+        root_candidates = [
+            test_path.parents[2],
+            test_path.parents[1],
+        ]
+        root = next(
+            (
+                candidate
+                for candidate in root_candidates
+                if (candidate / "frontend" / "src" / "OrderTicketWidget.jsx").exists()
+            ),
+            root_candidates[0],
+        )
+        source = (root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
+
+        self.assertIn("ROBINHOOD_CHAIN_RECEIPT_WATCH_INITIAL_DELAY_MS = 4000", source)
+        self.assertIn("ROBINHOOD_CHAIN_RECEIPT_WATCH_INTERVAL_MS = 5000", source)
+        self.assertIn("ROBINHOOD_CHAIN_RECEIPT_WATCH_MAX_ATTEMPTS = 24", source)
+        self.assertIn("robinhoodChainWalletSwapReceiptWatchRef", source)
+        self.assertIn("startRobinhoodChainSuccessfulSwapReceiptWatcher", source)
+        self.assertIn("stopRobinhoodChainSuccessfulSwapReceiptWatcher", source)
+        self.assertIn('source: automatic ? "generic_wallet_swap_receipt_auto" : "generic_wallet_swap_receipt"', source)
+        self.assertIn("requestAllOrdersRefresh();", source)
+        self.assertNotIn("if (data?.order_mutation === true) requestAllOrdersRefresh();", source)
+        self.assertIn("automatic_receipt_watch_started", source)
+        self.assertIn("watching this exact transaction receipt read-only", source)
+        self.assertIn("no automatic second transaction can be opened", source)
+        self.assertIn("manual Refresh Swap Receipt and All Orders Sync+Load remain available", source)
+        self.assertIn("recording?.submission_recorded === true", source)
+
+        watch_start = source.index("function startRobinhoodChainSuccessfulSwapReceiptWatcher")
+        watch_end = source.index("async function refreshRobinhoodChainSuccessfulSwapReceipt", watch_start)
+        watch_source = source[watch_start:watch_end]
+        self.assertIn("refreshRobinhoodChainWalletSwapReceipt", watch_source)
+        self.assertIn("window.setTimeout", watch_source)
+        self.assertNotIn("eth_sendTransaction", watch_source)
+        self.assertNotIn("provider.request", watch_source)
+        self.assertNotIn("recordRobinhoodChainWalletSwapSubmission", watch_source)
+
+    def test_reconciliation_uses_exact_objective_identity_without_legacy_execution_provider_authority(self) -> None:
+        router_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "robinhood_chain.py"
+        source = router_path.read_text(encoding="utf-8")
+
+        helper_start = source.index("def _resolve_generic_wallet_swap_reconciliation_market")
+        helper_end = source.index("\ndef _generic_wallet_swap_calldata_evidence", helper_start)
+        helper_source = source[helper_start:helper_end]
+        self.assertIn("_generic_wallet_swap_route_objective_id", helper_source)
+        self.assertIn("registry_service.objective_by_id", helper_source)
+        self.assertIn("registry_service.objective_by_symbol", helper_source)
+        self.assertIn('identity_source = "legacy_unique_symbol"', helper_source)
+        self.assertIn("robinhood_chain_pair_objective_persisted_contract_mismatch", helper_source)
+        self.assertNotIn("_resolve_robinhood_chain_execution_authority_or_http", helper_source)
+
+        reconcile_start = source.index("async def _persist_generic_wallet_swap_reconciliation")
+        reconcile_end = source.index("\ndef _resolve_robinhood_chain_quote_taker", reconcile_start)
+        reconcile_source = source[reconcile_start:reconcile_end]
+        self.assertIn("_resolve_generic_wallet_swap_reconciliation_market", reconcile_source)
+        self.assertNotIn("historical_authority = _resolve_robinhood_chain_execution_authority_or_http", reconcile_source)
+        self.assertIn('"objective_identity_source": reconciliation_identity_source', reconcile_source)
+
+    def test_generic_prepared_lifecycle_persists_exact_pair_objective_and_registry_identity(self) -> None:
+        router_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "robinhood_chain.py"
+        source = router_path.read_text(encoding="utf-8")
+
+        prepare_start = source.index("def _persist_generic_wallet_swap_prepared_lifecycle")
+        prepare_end = source.index("\ndef _record_generic_wallet_swap_submission", prepare_start)
+        prepare_source = source[prepare_start:prepare_end]
+        self.assertIn("registry_service.objective_by_id", prepare_source)
+        self.assertIn("registry_service.objective_by_symbol", prepare_source)
+        self.assertIn('"wallet_swap_prepared_objective_identity_mismatch"', prepare_source)
+        self.assertIn('"objective_id": objective_id', prepare_source)
+        self.assertIn('"base_token_registry_id": base_registry_id', prepare_source)
+        self.assertIn('"quote_token_registry_id": quote_registry_id', prepare_source)
+        self.assertIn('"input_token_registry_id": int(input_identity.get("registry_id") or 0)', prepare_source)
+        self.assertIn('"output_token_registry_id": int(output_identity.get("registry_id") or 0)', prepare_source)
+
+        wallet_prepare_start = source.index("async def robinhood_chain_wallet_rejection_prepare")
+        wallet_prepare_end = source.index("\n@router.", wallet_prepare_start)
+        wallet_prepare_source = source[wallet_prepare_start:wallet_prepare_end]
+        self.assertIn('"objective_id": str(market.get("id") or "")', wallet_prepare_source)
 
     def test_discovery_sources_contain_no_known_token_contract_or_pair_objectives(self) -> None:
         import inspect

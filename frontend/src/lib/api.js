@@ -541,22 +541,32 @@ function requireRobinhoodChainReviewRequest(payload = {}) {
   const side = String(payload?.side || "").trim().toLowerCase();
   const amountMode = String(payload?.amount_mode || "").trim().toLowerCase();
   const requestedAmount = String(payload?.requested_amount || "").trim();
+  const objectiveId = String(payload?.objective_id || "").trim();
   if (!symbol || !["buy", "sell"].includes(side) || !["exact_input", "exact_output"].includes(amountMode) || !requestedAmount) {
     throw new Error("Robinhood Chain review requests require symbol, side, amount_mode, and requested_amount.");
   }
-  return { ...payload, symbol, side, amount_mode: amountMode, requested_amount: requestedAmount };
+  return {
+    ...payload,
+    symbol,
+    side,
+    amount_mode: amountMode,
+    requested_amount: requestedAmount,
+    objective_id: objectiveId || undefined,
+  };
 }
 
 export async function getRobinhoodChainSyntheticOrderbook({
   symbol,
+  objective_id,
   depth = 5,
   force_refresh = false,
   timeout_ms = 45000,
 } = {}) {
   const requestedSymbol = String(symbol || "").trim().toUpperCase().replace(/[\/_]/g, "-");
+  const objectiveId = String(objective_id || "").trim();
   if (!requestedSymbol) throw new Error("Robinhood Chain synthetic orderbook requires an explicit symbol.");
   const res = await http.get(`/api/robinhood_chain/orderbook`, {
-    params: cleanParams({ symbol: requestedSymbol, depth, force_refresh }),
+    params: cleanParams({ symbol: requestedSymbol, objective_id: objectiveId || undefined, depth, force_refresh }),
     timeout: timeout_ms,
   });
   return res.data;
@@ -695,10 +705,11 @@ export async function getRobinhoodChainExecutionAuthority(payload = {}, { apiBas
   const symbol = String(payload?.symbol || "").trim().toUpperCase().replace(/[\/_]/g, "-");
   const side = String(payload?.side || "").trim().toLowerCase();
   const amountMode = String(payload?.amount_mode || "exact_input").trim().toLowerCase().replace("exact_spend", "exact_input");
+  const objectiveId = String(payload?.objective_id || "").trim();
   if (!symbol || !["buy", "sell"].includes(side) || amountMode !== "exact_input") {
     throw new Error("Robinhood Chain execution authority requires symbol, buy/sell side, and exact_input mode.");
   }
-  const body = { symbol, side, amount_mode: amountMode, provider: "0x" };
+  const body = { symbol, side, amount_mode: amountMode, provider: "0x", objective_id: objectiveId || undefined };
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {
     const res = await http.post(`/api/robinhood_chain/execution-authority/resolve`, body, { timeout: timeout_ms });

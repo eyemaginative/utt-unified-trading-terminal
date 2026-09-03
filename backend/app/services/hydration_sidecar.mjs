@@ -959,10 +959,18 @@ function toBigIntString(value, field) {
   return BigInt(s);
 }
 
+function manualRoutePoolType(leg) {
+  const pool = leg?.pool;
+  if (pool && typeof pool === 'object') {
+    return String(pool.type ?? pool.value ?? pool.name ?? 'XYK').trim() || 'XYK';
+  }
+  return String(pool || 'XYK').trim() || 'XYK';
+}
+
 function manualRouteVariants(route) {
   const legs = Array.isArray(route) ? route : [];
   const normalized = legs.map((leg) => ({
-    pool: String(leg?.pool || 'XYK').trim() || 'XYK',
+    pool: manualRoutePoolType(leg),
     assetIn: Number(leg?.assetIn ?? leg?.asset_in),
     assetOut: Number(leg?.assetOut ?? leg?.asset_out),
   }));

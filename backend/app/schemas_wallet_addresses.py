@@ -120,6 +120,13 @@ class WalletAddressBalanceOut(BaseModel):
     usd_source: Optional[str] = None
     fetched_at: Optional[datetime] = None
 
+    # Exact on-chain identity for Robinhood Chain ERC-20 balance rows.
+    # Native/non-RH rows leave these fields blank.
+    registry_id: Optional[int] = None
+    registry_venue: Optional[str] = None
+    contract_address: Optional[str] = None
+    token_decimals: Optional[int] = None
+
     # Back-compat (optional)
     created_at: Optional[datetime] = None
     captured_at: Optional[datetime] = None

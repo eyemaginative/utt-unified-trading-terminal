@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -252,14 +253,20 @@ def _resolve_robinhood_chain_review_market(
     amount_mode: str,
     capability_status_field: str,
     provider: str = "0x",
+    objective_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """Resolve one database market and fail closed before provider contact."""
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
-        market = registry_service.objective_by_symbol(db, symbol)
+        market = (
+            registry_service.objective_by_id(db, objective_id, expected_symbol=symbol)
+            if str(objective_id or "").strip()
+            else registry_service.objective_by_symbol(db, symbol)
+        )
     except ValueError as exc:
+        error = str(exc)
         raise HTTPException(
-            status_code=404,
+            status_code=404 if "not_found" in error else 409,
             detail={
                 "error": str(exc),
                 "symbol": str(symbol or "").strip().upper(),
@@ -352,6 +359,9 @@ def _resolve_robinhood_chain_execution_authority_or_http(
     amount_mode: str = "exact_input",
     provider: str = "0x",
     require_execution: bool = False,
+    objective_id: Optional[str] = None,
+    expected_input_contract_address: Optional[str] = None,
+    expected_output_contract_address: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
         return resolve_robinhood_chain_execution_authority(
@@ -361,6 +371,9 @@ def _resolve_robinhood_chain_execution_authority_or_http(
             amount_mode=amount_mode,
             provider=provider,
             require_execution=require_execution,
+            objective_id=objective_id,
+            expected_input_contract_address=expected_input_contract_address,
+            expected_output_contract_address=expected_output_contract_address,
         )
     except RobinhoodChainRegistryAuthorityError as exc:
         status_code = 404 if "not_found" in exc.code else 409
@@ -392,6 +405,8 @@ def _assert_persisted_swap_execution_authority(
         amount_mode=str(execution.get("amount_mode") or "exact_input"),
         provider=str(execution.get("provider") or "0x"),
         require_execution=True,
+        expected_input_contract_address=str(execution.get("from_contract_address") or ""),
+        expected_output_contract_address=str(execution.get("to_contract_address") or ""),
     )
     if require_successful_broadcast:
         _resolve_robinhood_chain_execution_taker(
@@ -537,6 +552,17 @@ class RobinhoodChainExecutionDiscoveryRequest(BaseModel):
     force_refresh: bool = False
 
 
+class RobinhoodChainRegistryCandidateScanRequest(BaseModel):
+    wallet_address_id: Optional[str] = Field(default=None, max_length=64)
+    limit: int = Field(default=50, ge=1, le=100)
+    positive_only: bool = True
+    force_refresh: bool = True
+    confirm_scan: bool = Field(
+        default=False,
+        description="Must be true for the explicit operator-triggered wallet discovery scan.",
+    )
+
+
 class RobinhoodChainRegistryVerifyRequest(BaseModel):
     force_refresh: bool = False
     confirm_verify: bool = Field(
@@ -572,6 +598,7 @@ class RobinhoodChainPairDiscoveryRequest(BaseModel):
 
 
 class RobinhoodChainSelectedMarketRefreshRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     taker_address: Optional[str] = Field(
         default=None,
         min_length=42,
@@ -593,6 +620,7 @@ class RobinhoodChainExecutionEvidenceSyncRequest(BaseModel):
 
 
 class RobinhoodChainIndicativeQuoteRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     provider: str = Field(
         default="0x",
         min_length=1,
@@ -625,6 +653,7 @@ class RobinhoodChainIndicativeQuoteRequest(BaseModel):
 
 
 class RobinhoodChainUniswapQuoteRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     symbol: str = Field(
         min_length=1,
         max_length=32,
@@ -660,6 +689,7 @@ class RobinhoodChainUniswapQuoteRequest(BaseModel):
 
 
 class RobinhoodChainFirmQuotePlanRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     provider: str = Field(
         default="0x",
         min_length=1,
@@ -702,6 +732,7 @@ class RobinhoodChainFirmQuotePlanRequest(BaseModel):
 
 
 class RobinhoodChainWalletRejectionPrepareRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     provider: str = Field(default=UNISWAP_PROVIDER, min_length=1, max_length=16)
     symbol: str = Field(min_length=1, max_length=80)
     side: str = Field(min_length=3, max_length=4)
@@ -720,6 +751,7 @@ class RobinhoodChainWalletRejectionPrepareRequest(BaseModel):
 
 
 class RobinhoodChainWalletApprovalPrepareRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     provider: str = Field(default=UNISWAP_PROVIDER, min_length=1, max_length=16)
     symbol: str = Field(min_length=1, max_length=80)
     side: str = Field(min_length=3, max_length=4)
@@ -743,6 +775,7 @@ class RobinhoodChainWalletApprovalReceiptRequest(BaseModel):
 
 
 class RobinhoodChainWalletSwapPrepareRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     provider: str = Field(default=UNISWAP_PROVIDER, min_length=1, max_length=16)
     symbol: str = Field(min_length=1, max_length=80)
     side: str = Field(min_length=3, max_length=4)
@@ -809,6 +842,7 @@ class RobinhoodChainWalletSwapReconcileRequest(BaseModel):
 
 
 class RobinhoodChainExecutionAuthorityRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     symbol: str = Field(min_length=1, max_length=80)
     side: str = Field(min_length=3, max_length=4)
     amount_mode: str = Field(default="exact_input", min_length=1, max_length=32)
@@ -842,6 +876,7 @@ class RobinhoodChainPreparationVerificationRequest(BaseModel):
 
 
 class RobinhoodChainExecutionPrepareRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     symbol: str = Field(default=ROBINHOOD_CHAIN_EXECUTION_SYMBOL, min_length=1, max_length=32)
     side: str = Field(default=ROBINHOOD_CHAIN_EXECUTION_SIDE, min_length=3, max_length=4)
     quantity: str = Field(default=str(ROBINHOOD_CHAIN_EXECUTION_INPUT_ETH), min_length=1, max_length=80)
@@ -905,6 +940,7 @@ class RobinhoodChainBuySwapPrepareRequest(BaseModel):
 
 
 class RobinhoodChainSwapExecutionPrepareRequest(BaseModel):
+    objective_id: Optional[str] = Field(default=None, max_length=36, description="Optional exact pair-objective UUID; required when the display symbol is ambiguous.")
     symbol: str = Field(default="ETH-USDG", min_length=1, max_length=80)
     side: str = Field(default="buy", min_length=3, max_length=4)
     from_asset: str = Field(default=ROBINHOOD_CHAIN_SWAP_FROM_ASSET, min_length=1, max_length=32)
@@ -1147,6 +1183,79 @@ def _generic_wallet_swap_contract(identity: Dict[str, Any]) -> str:
     return validate_evm_address(str(identity.get("registry_contract_address") or ""))
 
 
+def _generic_wallet_swap_route_objective_id(route: Dict[str, Any]) -> str:
+    if not isinstance(route, dict):
+        return ""
+    direct = str(route.get("objective_id") or "").strip()
+    if direct:
+        return direct
+    durable = route.get("generic_wallet_lifecycle")
+    if isinstance(durable, dict):
+        nested = str(durable.get("objective_id") or "").strip()
+        if nested:
+            return nested
+    return ""
+
+
+def _resolve_generic_wallet_swap_reconciliation_market(
+    db: Session,
+    *,
+    registry_service: Any,
+    existing_row: Optional[RobinhoodChainSwapExecution],
+    symbol: str,
+    side: str,
+) -> Tuple[Dict[str, Any], str, str]:
+    """Resolve reconciliation identity without provider-specific execution authority.
+
+    New durable lifecycles carry the exact PairObjective UUID. Older rows predate
+    that field, so they may fall back only through objective_by_symbol(), whose
+    unique-only contract fails closed when duplicate enabled symbols exist. Exact
+    persisted input/output contracts are then checked against the resolved objective.
+    """
+    normalized_symbol = str(symbol or "").strip().upper().replace("/", "-").replace("_", "-")
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        raise ValueError("wallet_swap_reconcile_side_invalid")
+
+    existing_route = existing_row.route if existing_row is not None and isinstance(existing_row.route, dict) else {}
+    objective_id = _generic_wallet_swap_route_objective_id(existing_route)
+    identity_source = "durable_objective_id"
+    if objective_id:
+        market = registry_service.objective_by_id(
+            db,
+            objective_id,
+            expected_symbol=normalized_symbol,
+        )
+    else:
+        market = registry_service.objective_by_symbol(db, normalized_symbol)
+        objective_id = str(market.get("id") or "").strip()
+        if not objective_id:
+            raise ValueError("robinhood_chain_pair_objective_not_found")
+        identity_source = "legacy_unique_symbol"
+
+    base = market.get("base") if isinstance(market.get("base"), dict) else {}
+    quote = market.get("quote") if isinstance(market.get("quote"), dict) else {}
+    resolved_symbol = f"{str(base.get('symbol') or '').upper()}-{str(quote.get('symbol') or '').upper()}"
+    if normalized_symbol != resolved_symbol:
+        raise ValueError("robinhood_chain_pair_objective_symbol_mismatch")
+
+    if (
+        existing_row is not None
+        and str(existing_row.from_contract_address or "").strip()
+        and str(existing_row.to_contract_address or "").strip()
+    ):
+        input_token = quote if normalized_side == "buy" else base
+        output_token = base if normalized_side == "buy" else quote
+        persisted_input = validate_evm_address(str(existing_row.from_contract_address or "")).lower()
+        persisted_output = validate_evm_address(str(existing_row.to_contract_address or "")).lower()
+        resolved_input = _generic_wallet_swap_contract(input_token).lower()
+        resolved_output = _generic_wallet_swap_contract(output_token).lower()
+        if persisted_input != resolved_input or persisted_output != resolved_output:
+            raise ValueError("robinhood_chain_pair_objective_persisted_contract_mismatch")
+
+    return market, objective_id, identity_source
+
+
 def _generic_wallet_swap_calldata_evidence(transaction: Dict[str, Any]) -> Tuple[str, int]:
     calldata = str(transaction.get("data") or transaction.get("input") or "").strip().lower()
     if not calldata.startswith("0x") or len(calldata) <= 2 or len(calldata[2:]) % 2:
@@ -1185,8 +1294,8 @@ def _persist_generic_wallet_swap_prepared_lifecycle(
 
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
-        input_identity = registry_service.resolve_verified_token(db, str(capability.get("input_asset") or ""))
-        output_identity = registry_service.resolve_verified_token(db, str(capability.get("output_asset") or ""))
+        input_identity = registry_service.resolve_verified_token_by_id(db, int(capability.get("input_registry_id") or 0))
+        output_identity = registry_service.resolve_verified_token_by_id(db, int(capability.get("output_registry_id") or 0))
     except ValueError as exc:
         raise HTTPException(
             status_code=409,
@@ -1197,6 +1306,34 @@ def _persist_generic_wallet_swap_prepared_lifecycle(
         or int(output_identity.get("registry_id") or 0) != int(capability.get("output_registry_id") or 0)
     ):
         raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_registry_identity_changed"})
+
+    requested_objective_id = str(fresh_preflight.get("objective_id") or handoff.get("objective_id") or "").strip()
+    try:
+        objective = (
+            registry_service.objective_by_id(db, requested_objective_id, expected_symbol=symbol)
+            if requested_objective_id
+            else registry_service.objective_by_symbol(db, symbol)
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "wallet_swap_prepared_objective_identity_required", "message": str(exc)},
+        ) from exc
+    objective_id = str(objective.get("id") or "").strip()
+    objective_base = objective.get("base") if isinstance(objective.get("base"), dict) else {}
+    objective_quote = objective.get("quote") if isinstance(objective.get("quote"), dict) else {}
+    base_registry_id = int(objective_base.get("registry_id") or 0)
+    quote_registry_id = int(objective_quote.get("registry_id") or 0)
+    expected_input_registry_id = quote_registry_id if side == "buy" else base_registry_id
+    expected_output_registry_id = base_registry_id if side == "buy" else quote_registry_id
+    if (
+        not objective_id
+        or base_registry_id <= 0
+        or quote_registry_id <= 0
+        or int(input_identity.get("registry_id") or 0) != expected_input_registry_id
+        or int(output_identity.get("registry_id") or 0) != expected_output_registry_id
+    ):
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_prepared_objective_identity_mismatch"})
 
     # The signed wallet capability is an authorization/identity envelope and does
     # not duplicate every reviewed economic field.  The validated fresh handoff
@@ -1351,10 +1488,18 @@ def _persist_generic_wallet_swap_prepared_lifecycle(
     now = datetime.utcnow()
     route = {
         "provider": UNISWAP_PROVIDER,
+        "objective_id": objective_id,
+        "base_token_registry_id": base_registry_id,
+        "quote_token_registry_id": quote_registry_id,
         "generic_wallet_lifecycle": {
             "version": "RH-ORDER.MISS.1B",
             "durable_before_wallet_request": True,
             "historical_preflight_available": True,
+            "objective_id": objective_id,
+            "base_token_registry_id": base_registry_id,
+            "quote_token_registry_id": quote_registry_id,
+            "input_token_registry_id": int(input_identity.get("registry_id") or 0),
+            "output_token_registry_id": int(output_identity.get("registry_id") or 0),
             "swap_capability_sha256": capability_sha,
             "quote_id_source": "provider_preflight" if quote_id_source else "capability_sha256_identity",
             "allowance_current_model_semantics": allowance_semantics,
@@ -2093,9 +2238,22 @@ async def _persist_generic_wallet_swap_reconciliation(
     saved_wallet = _resolve_robinhood_chain_execution_taker(db, None)
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
-        market = registry_service.market_by_symbol(db, normalized_symbol)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_market_invalid", "message": str(exc)}) from exc
+        market, reconciliation_objective_id, reconciliation_identity_source = (
+            _resolve_generic_wallet_swap_reconciliation_market(
+                db,
+                registry_service=registry_service,
+                existing_row=existing_row,
+                symbol=normalized_symbol,
+                side=normalized_side,
+            )
+        )
+    except (ValueError, HTTPException) as exc:
+        if isinstance(exc, HTTPException):
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            message = str(detail.get("error") or detail.get("message") or exc.detail)
+        else:
+            message = str(exc)
+        raise HTTPException(status_code=409, detail={"error": "wallet_swap_reconcile_market_invalid", "message": message}) from exc
     base = market.get("base") if isinstance(market.get("base"), dict) else {}
     quote = market.get("quote") if isinstance(market.get("quote"), dict) else {}
     if normalized_symbol != f"{str(base.get('symbol') or '').upper()}-{str(quote.get('symbol') or '').upper()}":
@@ -2323,6 +2481,10 @@ async def _persist_generic_wallet_swap_reconciliation(
         "reconciled_at": now.isoformat(),
         "reconciliation_mode": "receipt_transfer_logs",
         "source": source,
+        "objective_id": reconciliation_objective_id,
+        "objective_identity_source": reconciliation_identity_source,
+        "base_token_registry_id": int(base.get("registry_id") or 0),
+        "quote_token_registry_id": int(quote.get("registry_id") or 0),
         "input_asset": str(input_token.get("symbol") or "").strip().upper(),
         "input_native": input_native,
         "input_amount_atomic": str(actual_input_atomic),
@@ -2356,6 +2518,9 @@ async def _persist_generic_wallet_swap_reconciliation(
     route = {
         **existing_route_base,
         "provider": UNISWAP_PROVIDER,
+        "objective_id": reconciliation_objective_id,
+        "base_token_registry_id": int(base.get("registry_id") or 0),
+        "quote_token_registry_id": int(quote.get("registry_id") or 0),
         "execution_reconciliation": reconciliation,
         "historical_preflight": {
             "available": bool(historical_preflight_available),
@@ -3630,26 +3795,52 @@ async def robinhood_chain_registry_discovery_unregistered_wallet_assets(
     limit: int = Query(50, ge=1, le=100),
     positive_only: bool = Query(
         True,
-        description="When true, return only contracts with a positive current wallet balance.",
-    ),
-    force_refresh: bool = Query(
-        False,
-        description="Bypass bounded RPC read caches for code, metadata, and balance reads.",
+        description="When true, return only cached candidates with a positive balance.",
     ),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
+    """Read the persisted candidate cache only; never perform wallet/RPC discovery."""
     if not bool(settings.robinhood_chain_effective_enabled()):
         raise HTTPException(
             status_code=503,
             detail="Robinhood Chain configuration is not effective for chain ID 4663",
         )
     try:
-        return await get_robinhood_chain_registry_discovery_service().unregistered_wallet_assets(
+        return get_robinhood_chain_registry_discovery_service().cached_unregistered_wallet_assets(
             db,
             wallet_address_id=wallet_address_id,
             limit=int(limit),
             positive_only=bool(positive_only),
-            force_refresh=bool(force_refresh),
+        )
+    except ValueError as exc:
+        error = str(exc)
+        status_code = 404 if "not_found" in error else 409
+        raise HTTPException(status_code=status_code, detail={"error": error}) from exc
+
+
+@router.post("/registry-discovery/unregistered-wallet-assets/scan")
+async def robinhood_chain_registry_discovery_scan_unregistered_wallet_assets(
+    request: RobinhoodChainRegistryCandidateScanRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Explicit operator-triggered wallet discovery and candidate-cache refresh."""
+    if request.confirm_scan is not True:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "confirm_robinhood_chain_registry_wallet_scan_required"},
+        )
+    if not bool(settings.robinhood_chain_effective_enabled()):
+        raise HTTPException(
+            status_code=503,
+            detail="Robinhood Chain configuration is not effective for chain ID 4663",
+        )
+    try:
+        return await get_robinhood_chain_registry_discovery_service().scan_unregistered_wallet_assets(
+            db,
+            wallet_address_id=request.wallet_address_id,
+            limit=int(request.limit),
+            positive_only=bool(request.positive_only),
+            force_refresh=bool(request.force_refresh),
         )
     except ValueError as exc:
         error = str(exc)
@@ -3693,10 +3884,14 @@ async def robinhood_chain_registry_discovery_markets(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     service = get_robinhood_chain_registry_discovery_service()
+    # RH-UI.STATUSLAT.1D: market_catalog() is synchronous DB/catalog work. Run
+    # it in the Starlette worker pool so a cold-load catalog read cannot block
+    # otherwise trivial async status endpoints on the Uvicorn event loop.
+    items = await run_in_threadpool(service.market_catalog, db)
     return {
         "ok": True,
         "tranche": "RH-CHAIN.10D.2-R5C.2",
-        "items": service.market_catalog(db),
+        "items": items,
         "token_identity_source": "token_registry",
         "pair_capability_source": "database",
         "hardcoded_markets": False,
@@ -3721,6 +3916,7 @@ async def robinhood_chain_registry_discovery_refresh_market(
             taker_address=taker,
             force_refresh=bool(request.force_refresh),
             confirm_refresh=bool(request.confirm_refresh),
+            objective_id=request.objective_id,
         )
     except ValueError as exc:
         db.rollback()
@@ -3975,11 +4171,16 @@ async def robinhood_chain_uniswap_quote(
 
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
-        market = registry_service.objective_by_symbol(db, request.symbol)
+        market = (
+            registry_service.objective_by_id(db, request.objective_id, expected_symbol=request.symbol)
+            if str(request.objective_id or "").strip()
+            else registry_service.objective_by_symbol(db, request.symbol)
+        )
     except ValueError as exc:
         db.rollback()
+        error = str(exc)
         raise HTTPException(
-            status_code=404,
+            status_code=404 if "not_found" in error else 409,
             detail={
                 "error": str(exc),
                 "symbol": str(request.symbol or "").strip().upper(),
@@ -4196,6 +4397,7 @@ async def robinhood_chain_indicative_quote(
         amount_mode=request.amount_mode,
         capability_status_field="indicative_status",
         provider=provider,
+        objective_id=request.objective_id,
     )
     if provider == UNISWAP_PROVIDER:
         normalized_side = str(request.side or "").strip().lower()
@@ -4294,6 +4496,7 @@ async def robinhood_chain_firm_quote_plan(
         amount_mode=request.amount_mode,
         capability_status_field="indicative_status" if provider == UNISWAP_PROVIDER else "firm_plan_status",
         provider=provider,
+        objective_id=request.objective_id,
     )
     if provider == UNISWAP_PROVIDER:
         if str(request.amount_mode or "").strip().lower() != "exact_input":
@@ -4377,6 +4580,7 @@ async def robinhood_chain_wallet_rejection_prepare(
         amount_mode="exact_input",
         capability_status_field="indicative_status",
         provider=UNISWAP_PROVIDER,
+        objective_id=request.objective_id,
     )
     normalized_side = str(request.side or "").strip().lower()
     input_token = quote if normalized_side == "buy" else base
@@ -4384,8 +4588,8 @@ async def robinhood_chain_wallet_rejection_prepare(
 
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
-        verified_input = registry_service.resolve_verified_token(db, str(input_token.get("symbol") or ""))
-        verified_output = registry_service.resolve_verified_token(db, str(output_token.get("symbol") or ""))
+        verified_input = registry_service.resolve_verified_token_by_id(db, int(input_token.get("registry_id") or 0))
+        verified_output = registry_service.resolve_verified_token_by_id(db, int(output_token.get("registry_id") or 0))
     except ValueError as exc:
         db.rollback()
         raise HTTPException(
@@ -4472,6 +4676,7 @@ async def robinhood_chain_wallet_rejection_prepare(
         "ok": True,
         "tranche": "R5C.5D.2F.1",
         "symbol": market.get("symbol") or request.symbol,
+        "objective_id": str(market.get("id") or ""),
         "side": normalized_side,
         "amount_mode": "exact_input",
         "requested_amount": str(request.requested_amount),
@@ -4521,6 +4726,7 @@ async def robinhood_chain_wallet_approval_prepare(
     reject_preflight = await robinhood_chain_wallet_rejection_prepare(
         RobinhoodChainWalletRejectionPrepareRequest(
             provider=UNISWAP_PROVIDER,
+            objective_id=request.objective_id,
             symbol=request.symbol,
             side=request.side,
             amount_mode="exact_input",
@@ -4614,7 +4820,7 @@ async def robinhood_chain_wallet_approval_receipt(
 
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
-        verified_token = registry_service.resolve_verified_token(db, str(capability.get("token_symbol") or ""))
+        verified_token = registry_service.resolve_verified_token_by_contract(db, str(capability.get("token") or ""))
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail={"error": "wallet_approval_verified_registry_identity_required", "message": str(exc)}) from exc
@@ -4807,6 +5013,7 @@ async def robinhood_chain_wallet_swap_prepare(
     fresh_preflight = await robinhood_chain_wallet_rejection_prepare(
         RobinhoodChainWalletRejectionPrepareRequest(
             provider=UNISWAP_PROVIDER,
+            objective_id=request.objective_id,
             symbol=request.symbol,
             side=request.side,
             amount_mode="exact_input",
@@ -5139,8 +5346,8 @@ async def robinhood_chain_wallet_swap_receipt(
 
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
-        verified_input = registry_service.resolve_verified_token(db, str(capability.get("input_asset") or ""))
-        verified_output = registry_service.resolve_verified_token(db, str(capability.get("output_asset") or ""))
+        verified_input = registry_service.resolve_verified_token_by_id(db, int(capability.get("input_registry_id") or 0))
+        verified_output = registry_service.resolve_verified_token_by_id(db, int(capability.get("output_registry_id") or 0))
     except ValueError as exc:
         db.rollback()
         raise HTTPException(
@@ -5381,6 +5588,7 @@ async def robinhood_chain_execution_authority_resolve(
         amount_mode=request.amount_mode,
         provider=request.provider,
         require_execution=False,
+        objective_id=request.objective_id,
     )
     db.rollback()
     return payload
@@ -5538,6 +5746,7 @@ async def robinhood_chain_execution_prepare(
         amount_mode="exact_input",
         provider="0x",
         require_execution=True,
+        objective_id=request.objective_id,
     )
     if str(authority.get("execution_adapter") or "") != "native_exact_input":
         raise HTTPException(
@@ -5730,6 +5939,7 @@ async def robinhood_chain_swap_execution_prepare(
         amount_mode=request.amount_mode,
         provider="0x",
         require_execution=True,
+        objective_id=request.objective_id,
     )
     if str(authority.get("execution_adapter") or "") != "erc20_exact_input":
         raise HTTPException(
@@ -6258,6 +6468,7 @@ async def robinhood_chain_synthetic_orderbook(
     depth: int = Query(default=5, ge=1, le=5),
     taker_address: Optional[str] = Query(default=None, min_length=42, max_length=42),
     force_refresh: bool = Query(default=False),
+    objective_id: Optional[str] = Query(default=None, max_length=36),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Return bounded synthetic bid/ask samples; these are not resting orders."""
@@ -6269,11 +6480,16 @@ async def robinhood_chain_synthetic_orderbook(
     taker = _resolve_robinhood_chain_quote_taker(db, taker_address)
     registry_service = get_robinhood_chain_registry_discovery_service()
     try:
-        market = registry_service.market_by_symbol(db, symbol)
+        market = (
+            registry_service.market_by_objective_id(db, objective_id, expected_symbol=symbol)
+            if str(objective_id or "").strip()
+            else registry_service.market_by_symbol(db, symbol)
+        )
     except ValueError as exc:
         db.rollback()
+        error = str(exc)
         raise HTTPException(
-            status_code=404,
+            status_code=404 if "not_found" in error else 409,
             detail={
                 "error": str(exc),
                 "symbol": str(symbol or "").strip().upper(),

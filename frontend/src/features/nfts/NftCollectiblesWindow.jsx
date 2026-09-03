@@ -1,11 +1,24 @@
 // frontend/src/features/nfts/NftCollectiblesWindow.jsx
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 const LS_UNISAT_ADDR_KEY = "utt_nft_unisat_address_v1";
 const LS_COUNTERPARTY_METADATA_CACHE_KEY = "utt_nft_counterparty_metadata_cache_v1";
 const COUNTERPARTY_METADATA_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const COUNTERPARTY_METADATA_CACHE_MAX_ASSETS = 500;
 const LS_NFT_WINDOW_LAYOUT_KEY = "utt_nft_collectibles_window_layout_v1";
+const NFT_TABLE_COLUMNS = [
+  { key: "preview", label: "Preview", width: 96, min: 72, max: 180 },
+  { key: "type", label: "Type", width: 150, min: 90, max: 260 },
+  { key: "name", label: "Name / Inscription #", width: 230, min: 140, max: 520 },
+  { key: "standard", label: "Standard", width: 120, min: 90, max: 220 },
+  { key: "source", label: "Source", width: 145, min: 90, max: 260 },
+  { key: "id", label: "ID", width: 170, min: 90, max: 320 },
+  { key: "location", label: "Location / UTXO", width: 190, min: 110, max: 420 },
+  { key: "value", label: "Value", width: 120, min: 80, max: 240 },
+  { key: "seen", label: "Seen", width: 160, min: 110, max: 280 },
+  { key: "actions", label: "Actions", width: 130, min: 100, max: 240 },
+];
 
 function asArray(v) {
   return Array.isArray(v) ? v : [];
@@ -15,6 +28,33 @@ function finiteNumberOrNull(v) {
   if (v === null || v === undefined || v === "") return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function defaultNftTableColumnWidths() {
+  return Object.fromEntries(NFT_TABLE_COLUMNS.map((c) => [c.key, c.width]));
+}
+
+function clampNftColumnWidth(key, value) {
+  const spec = NFT_TABLE_COLUMNS.find((c) => c.key === key) || {};
+  const n = finiteNumberOrNull(value);
+  const fallback = finiteNumberOrNull(spec.width) ?? 120;
+  const min = finiteNumberOrNull(spec.min) ?? 60;
+  const max = finiteNumberOrNull(spec.max) ?? 600;
+  return Math.max(min, Math.min(max, n === null ? fallback : n));
+}
+
+function normalizeNftTableColumnWidths(widthsMaybe) {
+  const incoming = widthsMaybe && typeof widthsMaybe === "object" ? widthsMaybe : {};
+  const out = {};
+  NFT_TABLE_COLUMNS.forEach((c) => {
+    out[c.key] = clampNftColumnWidth(c.key, incoming[c.key] ?? c.width);
+  });
+  return out;
+}
+
+function nftTableColumnTotalWidth(widthsMaybe) {
+  const widths = normalizeNftTableColumnWidths(widthsMaybe);
+  return NFT_TABLE_COLUMNS.reduce((sum, c) => sum + (finiteNumberOrNull(widths[c.key]) ?? c.width), 0);
 }
 
 function maskMiddle(v, left = 8, right = 6) {
@@ -752,24 +792,36 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
     const n = finiteNumberOrNull(initialLayoutRef.current?.detailPaneWidth);
     return n === null ? 320 : Math.max(280, Math.min(720, n));
   });
+  const [tableColumnWidths, setTableColumnWidths] = useState(() => normalizeNftTableColumnWidths(initialLayoutRef.current?.tableColumnWidths));
   const counterpartyMetadataLoadSeqRef = useRef(0);
   const counterpartyMarketLoadSeqRef = useRef(0);
   const splitLayoutRef = useRef(null);
+  const tableColumnWidthsRef = useRef(tableColumnWidths);
+
+  useEffect(() => {
+    tableColumnWidthsRef.current = normalizeNftTableColumnWidths(tableColumnWidths);
+  }, [tableColumnWidths]);
 
   useEffect(() => {
     writeNftWindowLayout({
       isFullscreen: !!isFullscreen,
       detailPaneWidth: Math.round(detailPaneWidth || 320),
+      tableColumnWidths: normalizeNftTableColumnWidths(tableColumnWidths),
     });
-  }, [isFullscreen, detailPaneWidth]);
+  }, [isFullscreen, detailPaneWidth, tableColumnWidths]);
 
   useEffect(() => {
     if (!isFullscreen) return undefined;
+    const prevOverflow = document?.body?.style?.overflow ?? "";
     const onKeyDown = (ev) => {
       if (ev.key === "Escape") setIsFullscreen(false);
     };
+    if (document?.body?.style) document.body.style.overflow = "hidden";
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      if (document?.body?.style) document.body.style.overflow = prevOverflow;
+    };
   }, [isFullscreen]);
 
   function startSplitResize(ev) {
@@ -793,6 +845,59 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
     document.body.style.userSelect = "none";
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
+  }
+
+  function startColumnResize(columnKey, ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const startX = Number(ev.clientX || 0);
+    const startWidths = normalizeNftTableColumnWidths(tableColumnWidthsRef.current);
+    const startWidth = startWidths[columnKey] || clampNftColumnWidth(columnKey, null);
+    const onMove = (moveEv) => {
+      const delta = Number(moveEv.clientX || 0) - startX;
+      const next = clampNftColumnWidth(columnKey, startWidth + delta);
+      setTableColumnWidths((prev) => ({
+        ...normalizeNftTableColumnWidths(prev),
+        [columnKey]: next,
+      }));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function renderResizableTh(column) {
+    const key = column?.key || "";
+    const width = clampNftColumnWidth(key, tableColumnWidths?.[key]);
+    return (
+      <th key={key} style={{ ...thStyle, width, minWidth: width, maxWidth: width, position: "sticky", userSelect: "none" }}>
+        <span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis" }}>{column.label}</span>
+        <span
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={`Resize ${column.label} column`}
+          onMouseDown={(ev) => startColumnResize(key, ev)}
+          onClick={(ev) => { ev.preventDefault(); ev.stopPropagation(); }}
+          title={`Drag to resize ${column.label}`}
+          style={{
+            position: "absolute",
+            top: 0,
+            right: -4,
+            width: 8,
+            height: "100%",
+            cursor: "col-resize",
+            zIndex: 4,
+          }}
+        />
+      </th>
+    );
   }
 
   useEffect(() => {
@@ -1098,8 +1203,8 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   const pageCanNext = total > 0 ? cursor + pageSize < total : items.length >= pageSize;
 
   const panelStyle = {
-    height: isFullscreen ? "calc(100vh - 16px)" : "100%",
-    minHeight: isFullscreen ? "calc(100vh - 16px)" : 420,
+    height: "100%",
+    minHeight: 420,
     display: "flex",
     flexDirection: "column",
     gap: 10,
@@ -1110,10 +1215,30 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
     border: "1px solid var(--utt-border-1, rgba(255,255,255,0.12))",
     borderRadius: 14,
     overflow: "hidden",
-    position: isFullscreen ? "fixed" : "relative",
-    inset: isFullscreen ? 8 : "auto",
-    zIndex: isFullscreen ? 1000 : "auto",
-    boxShadow: isFullscreen ? "0 24px 80px rgba(0,0,0,0.50)" : "none",
+    position: "relative",
+    boxShadow: "none",
+  };
+  const fullscreenBackdropStyle = {
+    position: "fixed",
+    inset: 0,
+    zIndex: 2147483000,
+    background: "rgba(4, 6, 10, 0.66)",
+    padding: 8,
+    boxSizing: "border-box",
+  };
+  const fullscreenShellStyle = {
+    width: "100%",
+    height: "100%",
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+    boxSizing: "border-box",
+  };
+  const fullscreenPanelStyle = {
+    ...panelStyle,
+    height: "100%",
+    minHeight: "calc(100vh - 16px)",
+    boxShadow: "0 24px 80px rgba(0,0,0,0.50)",
   };
   const cardStyle = {
     border: "1px solid var(--utt-border-1, rgba(255,255,255,0.12))",
@@ -1156,6 +1281,8 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
     fontSize: 12,
     verticalAlign: "middle",
     whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
   };
   const mutedStyle = { color: "var(--utt-muted, rgba(255,255,255,0.66))" };
 
@@ -1175,9 +1302,10 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
   const selectedCounterpartyQuotes = asArray(selectedCounterpartyMarket?.quotes);
   const selectedCounterpartyOrders = compactMarketRows(selectedCounterpartyMarket?.orders, 6);
   const selectedCounterpartyDispensers = compactMarketRows(selectedCounterpartyMarket?.dispensers, 6);
+  const tableColumnTotal = nftTableColumnTotalWidth(tableColumnWidths);
 
-  return (
-    <div style={panelStyle}>
+  const panelContent = (
+    <>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
         <div>
           <div style={{ fontSize: 18, fontWeight: 950 }}>Bitcoin Assets → NFTs / Collectibles</div>
@@ -1193,6 +1321,14 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
             title={isFullscreen ? "Return to normal window size" : "Expand this window to full screen"}
           >
             {isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          </button>
+          <button
+            type="button"
+            style={{ ...buttonStyle, padding: "5px 8px" }}
+            onClick={() => setTableColumnWidths(defaultNftTableColumnWidths())}
+            title="Reset NFT table column widths"
+          >
+            Reset columns
           </button>
           <span style={{ ...typeBadgeStyle("text"), color: providerPresent ? "#55e38c" : "#ff6b6b" }}>
             UniSat {providerPresent ? "detected" : "not detected"}
@@ -1273,19 +1409,15 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
       >
         <div style={{ ...cardStyle, padding: 0, overflow: "hidden", minHeight: 0, display: "flex", flexDirection: "column", marginRight: 5 }}>
           <div style={{ flex: "1 1 auto", minHeight: 0, overflow: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <table style={{ width: "100%", minWidth: tableColumnTotal, tableLayout: "fixed", borderCollapse: "collapse" }}>
+              <colgroup>
+                {NFT_TABLE_COLUMNS.map((column) => (
+                  <col key={column.key} style={{ width: clampNftColumnWidth(column.key, tableColumnWidths?.[column.key]) }} />
+                ))}
+              </colgroup>
               <thead>
                 <tr>
-                  <th style={thStyle}>Preview</th>
-                  <th style={thStyle}>Type</th>
-                  <th style={thStyle}>Name / Inscription #</th>
-                  <th style={thStyle}>Standard</th>
-                  <th style={thStyle}>Source</th>
-                  <th style={thStyle}>ID</th>
-                  <th style={thStyle}>Location / UTXO</th>
-                  <th style={thStyle}>Value</th>
-                  <th style={thStyle}>Seen</th>
-                  <th style={thStyle}>Actions</th>
+                  {NFT_TABLE_COLUMNS.map((column) => renderResizableTh(column))}
                 </tr>
               </thead>
               <tbody>
@@ -1448,13 +1580,49 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
                           </div>
 
                           {selectedCounterpartyQuotes.length ? (
-                            <div style={{ display: "grid", gap: 4 }}>
+                            <div style={{ display: "grid", gap: 6 }}>
                               <div style={{ fontWeight: 900 }}>Best bid / ask</div>
                               {selectedCounterpartyQuotes.slice(0, 4).map((q) => (
-                                <div key={q.quote_asset || "quote"} style={{ display: "grid", gridTemplateColumns: "70px 1fr 1fr", gap: 6, fontSize: 12 }}>
-                                  <span style={mutedStyle}>{q.quote_asset || "—"}</span>
-                                  <span>Bid {hideTableData ? "••••" : fmtMarketPrice(q.best_bid, q.quote_asset)}</span>
-                                  <span>Ask {hideTableData ? "••••" : fmtMarketPrice(q.best_ask, q.quote_asset)}</span>
+                                <div
+                                  key={q.quote_asset || "quote"}
+                                  style={{
+                                    display: "grid",
+                                    gridTemplateColumns: "72px minmax(0, 1fr) minmax(0, 1fr)",
+                                    gap: 8,
+                                    alignItems: "start",
+                                    fontSize: 12,
+                                  }}
+                                >
+                                  <span
+                                    style={{
+                                      ...mutedStyle,
+                                      fontWeight: 700,
+                                      whiteSpace: "nowrap",
+                                      overflow: "hidden",
+                                      textOverflow: "ellipsis",
+                                    }}
+                                    title={q.quote_asset || "—"}
+                                  >
+                                    {q.quote_asset || "—"}
+                                  </span>
+                                  <div style={{ minWidth: 0 }}>
+                                    <div style={{ ...mutedStyle, fontSize: 11, marginBottom: 2 }}>Bid</div>
+                                    <div
+                                      style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                                      title={hideTableData ? "hidden" : fmtMarketPrice(q.best_bid, q.quote_asset)}
+                                    >
+                                      {hideTableData ? "••••" : fmtMarketPrice(q.best_bid, q.quote_asset)}
+                                    </div>
+                                  </div>
+                                  <div style={{ minWidth: 0 }}>
+                                    <div style={{ ...mutedStyle, fontSize: 11, marginBottom: 2 }}>Ask</div>
+                                    <div
+                                      style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                                      title={hideTableData ? "hidden" : fmtMarketPrice(q.best_ask, q.quote_asset)}
+                                    >
+                                      {hideTableData ? "••••" : fmtMarketPrice(q.best_ask, q.quote_asset)}
+                                    </div>
+                                  </div>
                                 </div>
                               ))}
                             </div>
@@ -1536,6 +1704,22 @@ export default function NftCollectiblesWindow({ apiBase = "", hideTableData = fa
           {counterpartyMetadataLoading ? <div style={{ marginTop: 4, ...mutedStyle, fontSize: 11 }}>Counterparty metadata loading…</div> : null}
         </div>
       </div>
-    </div>
+
+    </>
   );
+
+  if (isFullscreen && typeof document !== "undefined") {
+    return createPortal(
+      <div style={fullscreenBackdropStyle}>
+        <div style={fullscreenShellStyle}>
+          <div style={fullscreenPanelStyle}>
+            {panelContent}
+          </div>
+        </div>
+      </div>,
+      document.body
+    );
+  }
+
+  return <div style={panelStyle}>{panelContent}</div>;
 }

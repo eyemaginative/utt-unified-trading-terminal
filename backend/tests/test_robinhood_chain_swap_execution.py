@@ -597,6 +597,51 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             confirm_prepare=True,
         )
 
+    async def make_generic_read_only_row(self, *, evidence_kind="durable"):
+        self.planning.allowance_atomic = 1_000_000
+        prepared = await self.prepare_weth()
+        row = self.db.get(RobinhoodChainSwapExecution, prepared["execution"]["id"])
+        row.symbol = "INDEX-USDG"
+        row.side = "buy"
+        row.from_asset = "USDG"
+        row.from_contract_address = ROBINHOOD_CHAIN_SWAP_USDG_CONTRACT
+        row.from_decimals = 6
+        row.from_native = False
+        row.to_asset = "INDEX"
+        row.to_contract_address = "0x" + "11" * 20
+        row.to_decimals = 18
+        row.to_native = False
+        row.amount_mode = "exact_input"
+        route = dict(row.route or {})
+        route.pop("execution_authority", None)
+        if evidence_kind == "durable":
+            route["generic_wallet_lifecycle"] = {
+                "version": "RH-ORDER.MISS.1B",
+                "durable_before_wallet_request": True,
+                "swap_capability_sha256": "12" * 32,
+            }
+            route.pop("execution_reconciliation", None)
+            row.status = "swap_prepared"
+            row.swap_status = "prepared"
+            row.swap_tx_hash = None
+        else:
+            route.pop("generic_wallet_lifecycle", None)
+            route["execution_reconciliation"] = {
+                "version": "R5C.5D.2F.4",
+                "reconciled": True,
+                "source": "rh_order_miss_1b_orphan_recovery",
+                "input_asset": "USDG",
+                "output_asset": "INDEX",
+                "swap_tx_hash": SWAP_TX_HASH,
+            }
+            row.status = "confirmed"
+            row.swap_status = "confirmed"
+            row.swap_tx_hash = SWAP_TX_HASH
+        row.route = route
+        self.db.add(row)
+        self.db.commit()
+        return row
+
     async def submitted_r5c5b_sell(self):
         prepared = await self.prepare_weth_sell(live_authorized=True)
         execution_id = prepared["execution"]["id"]
@@ -939,6 +984,69 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.db.get(RobinhoodChainSwapExecution, first_id).status,
             "confirmed",
         )
+
+    async def test_generic_durable_get_restores_read_only_without_transaction_plans(self):
+        row = await self.make_generic_read_only_row(evidence_kind="durable")
+
+        restored = self.service.get(self.db, str(row.id))
+
+        self.assertTrue(restored["ok"])
+        self.assertTrue(restored["read_only"])
+        self.assertFalse(restored["will_mutate"])
+        self.assertTrue(restored["generic_read_only_restore"])
+        self.assertIsNone(restored["approval_transaction_plan"])
+        self.assertIsNone(restored["unsigned_transaction_plan"])
+        self.assertFalse(restored["send_gate"]["send_enabled"])
+        self.assertFalse(restored["send_gate"]["execution_enabled"])
+        self.assertFalse(restored["execution"]["approval_execution_enabled"])
+        self.assertFalse(restored["execution"]["swap_stage_enabled"])
+        self.assertFalse(restored["execution"]["swap_execution_enabled"])
+        self.assertEqual(restored["execution"]["symbol"], "INDEX-USDG")
+        self.assertEqual(
+            restored["execution"]["generic_read_only_evidence"]["kind"],
+            "generic_wallet_lifecycle",
+        )
+        with self.assertRaisesRegex(ValueError, "robinhood_chain_swap_direction_mismatch"):
+            self.service._get(self.db, str(row.id))
+
+    async def test_generic_durable_latest_restores_matching_lifecycle_read_only(self):
+        row = await self.make_generic_read_only_row(evidence_kind="durable")
+        before_count = self.db.query(RobinhoodChainSwapExecution).count()
+
+        restored = self.service.latest(
+            self.db,
+            symbol="INDEX-USDG",
+            side="buy",
+            amount_mode="exact_spend",
+            wallet_address=TAKER,
+        )
+
+        self.assertTrue(restored["read_only"])
+        self.assertFalse(restored["will_mutate"])
+        self.assertEqual(restored["execution"]["id"], str(row.id))
+        self.assertEqual(restored["lookup"]["kind"], "latest_matching_lifecycle")
+        self.assertEqual(self.db.query(RobinhoodChainSwapExecution).count(), before_count)
+
+    async def test_generic_reconciled_orphan_latest_restores_without_durable_marker(self):
+        row = await self.make_generic_read_only_row(evidence_kind="reconciled")
+
+        restored = self.service.latest(
+            self.db,
+            symbol="INDEX-USDG",
+            side="buy",
+            amount_mode="exact_input",
+            wallet_address=TAKER,
+        )
+
+        self.assertTrue(restored["generic_read_only_restore"])
+        self.assertEqual(restored["execution"]["id"], str(row.id))
+        self.assertEqual(
+            restored["execution"]["generic_read_only_evidence"]["source"],
+            "rh_order_miss_1b_orphan_recovery",
+        )
+        self.assertIsNone(restored["approval_transaction_plan"])
+        self.assertIsNone(restored["unsigned_transaction_plan"])
+        self.assertFalse(restored["send_gate"]["send_enabled"])
 
     async def test_latest_matching_lifecycle_is_read_only_and_returns_newest_row(self):
         self.planning.allowance_atomic = 2_000_000

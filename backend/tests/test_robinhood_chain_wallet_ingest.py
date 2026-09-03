@@ -122,6 +122,105 @@ def _wallet(db):
 
 
 class RobinhoodChainWalletIngestTests(unittest.TestCase):
+    def test_blockscout_pro_api_uses_bearer_key_without_url_leak(self):
+        from app.services.robinhood_chain_history import RobinhoodChainHistoryService
+
+        captured = {}
+        api_key = "proapi_test_only_secret"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["authorization"] = request.headers.get("authorization")
+            return httpx.Response(
+                200,
+                json={"items": [], "next_page_params": None},
+                request=request,
+            )
+
+        service = RobinhoodChainHistoryService(
+            api_base="https://api.blockscout.com/4663/api/v2",
+            timeout_s=2.0,
+            cache_ttl_s=0.0,
+            error_backoff_s=0.0,
+            max_pages=5,
+            page_size=100,
+            max_concurrent=1,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with patch.object(
+            service,
+            "_credential_record",
+            return_value={
+                "api_key": api_key,
+                "source": "profile_vault",
+                "venue": "blockscout",
+            },
+        ):
+            payload = asyncio.run(
+                service._get_json(
+                    "addresses/0x" + "a" * 40 + "/transactions",
+                    None,
+                )
+            )
+            status = service.status()
+
+        self.assertEqual(payload, {"items": [], "next_page_params": None})
+        self.assertEqual(
+            captured["url"],
+            "https://api.blockscout.com/4663/api/v2/addresses/"
+            + "0x"
+            + "a" * 40
+            + "/transactions",
+        )
+        self.assertEqual(captured["authorization"], f"Bearer {api_key}")
+        self.assertNotIn(api_key, captured["url"])
+        self.assertTrue(status["configured"])
+        self.assertTrue(status["api_key_configured"])
+        self.assertEqual(status["credential_source"], "profile_vault")
+        self.assertEqual(status["credential_venue"], "blockscout")
+        self.assertTrue(status["pro_api"])
+        self.assertNotIn(api_key, repr(status))
+
+    def test_blockscout_pro_api_missing_key_fails_before_provider_contact(self):
+        from app.services.robinhood_chain_history import RobinhoodChainHistoryService
+
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(500, json={"message": "must not be called"}, request=request)
+
+        service = RobinhoodChainHistoryService(
+            api_base="https://api.blockscout.com/4663/api/v2",
+            timeout_s=2.0,
+            cache_ttl_s=0.0,
+            error_backoff_s=0.0,
+            max_pages=5,
+            page_size=100,
+            max_concurrent=1,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with patch.object(
+            service,
+            "_credential_record",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Blockscout Pro API key is not configured",
+            ):
+                asyncio.run(
+                    service._get_json(
+                        "addresses/0x" + "a" * 40 + "/transactions",
+                        None,
+                    )
+                )
+
+        self.assertEqual(calls, 0)
+
     def test_wallet_ingest_event_identity_and_checkpoint_are_idempotent(self):
         db = _session()
         self.addCleanup(db.close)

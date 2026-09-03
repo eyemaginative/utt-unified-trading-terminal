@@ -39,10 +39,13 @@ _WALLET_APPROVAL_CAPABILITY_DOMAIN = b"UTT:R5C.5D.2F.2:wallet-approval-capabilit
 _WALLET_SWAP_CAPABILITY_VERSION = "r5c5d2f3_wallet_swap_v1"
 _WALLET_SWAP_RECEIPT_TTL_SECONDS = 30 * 60
 _WALLET_SWAP_CAPABILITY_DOMAIN = b"UTT:R5C.5D.2F.3:wallet-swap-capability:v1"
+_INDICATIVE_QUOTE_RETRY_POLICY = "interactive_indicative_quote_v1"
+_INDICATIVE_QUOTE_PROVIDER_ATTEMPT_TIMEOUT_S = 5.0
 _FIRM_QUOTE_RETRY_POLICY = "interactive_firm_plan_quote_v2"
 _FIRM_QUOTE_MAX_ATTEMPTS = 3
+_FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS = 4
 _FIRM_QUOTE_RETRY_DELAYS_S = (0.75, 1.5)
-_FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S = (5.0, 15.0)
+_FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S = (5.0, 15.0, 20.0)
 
 
 def _utc_iso() -> str:
@@ -967,6 +970,15 @@ def _firm_quote_retry_reason(result: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _firm_quote_retry_max_attempts(result: Dict[str, Any]) -> int:
+    retry_reason = _firm_quote_retry_reason(result)
+    if retry_reason == "provider_404_no_quotes_available":
+        return _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS
+    if retry_reason is not None:
+        return _FIRM_QUOTE_MAX_ATTEMPTS
+    return 1
+
+
 def _firm_quote_retry_delay_s(result: Dict[str, Any], retry_index: int) -> float:
     retry_after = str((result or {}).get("retry_after") or "").strip()
     if retry_after:
@@ -1121,7 +1133,14 @@ class RobinhoodChainUniswapQuoteService:
         self.max_concurrent = max(1, min(int(max_concurrent), 4))
         self.credential_getter = credential_getter
         self.transport = transport
-        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        # RH-QUOTE.INTERACTIVE.PRIORITY.1B: one shared provider-capacity gate
+        # with interactive-before-background admission. Active background calls
+        # are not preempted, but queued synthetic-book calls may not take a
+        # newly available slot while an interactive quote/plan is waiting.
+        self._provider_condition = asyncio.Condition()
+        self._provider_active = 0
+        self._provider_interactive_waiters = 0
+        self._provider_background_waiters = 0
         self._last_good_at: Optional[str] = None
         self._last_error: Optional[str] = None
 
@@ -1144,6 +1163,33 @@ class RobinhoodChainUniswapQuoteService:
             and str(record.get("venue") or "").strip().lower() == UNISWAP_PROVIDER
             and int(record.get("key_version") or 0) == 1
         )
+
+    async def _acquire_provider_slot(self, *, priority: str) -> None:
+        normalized = "background" if str(priority or "").strip().lower() == "background" else "interactive"
+        background = normalized == "background"
+        async with self._provider_condition:
+            if background:
+                self._provider_background_waiters += 1
+            else:
+                self._provider_interactive_waiters += 1
+            try:
+                await self._provider_condition.wait_for(
+                    lambda: (
+                        self._provider_active < self.max_concurrent
+                        and (not background or self._provider_interactive_waiters == 0)
+                    )
+                )
+                self._provider_active += 1
+            finally:
+                if background:
+                    self._provider_background_waiters = max(0, self._provider_background_waiters - 1)
+                else:
+                    self._provider_interactive_waiters = max(0, self._provider_interactive_waiters - 1)
+
+    async def _release_provider_slot(self) -> None:
+        async with self._provider_condition:
+            self._provider_active = max(0, self._provider_active - 1)
+            self._provider_condition.notify_all()
 
     def status(self) -> Dict[str, Any]:
         credential = self._credential_record()
@@ -1184,8 +1230,22 @@ class RobinhoodChainUniswapQuoteService:
             "wallet_connection_requested": False,
             "signing_enabled": False,
             "broadcast_enabled": False,
+            "provider_priority_policy": "interactive_before_background_v1",
+            "provider_max_concurrent": self.max_concurrent,
+            "provider_active_slots": self._provider_active,
+            "provider_interactive_waiters": self._provider_interactive_waiters,
+            "provider_background_waiters": self._provider_background_waiters,
+            "interactive_indicative_quote_retry_policy": _INDICATIVE_QUOTE_RETRY_POLICY,
+            "interactive_indicative_quote_max_attempts": _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS,
+            "interactive_indicative_quote_transient_max_attempts": _FIRM_QUOTE_MAX_ATTEMPTS,
+            "interactive_indicative_quote_no_quotes_max_attempts": _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS,
+            "interactive_indicative_quote_provider_attempt_timeout_s": min(self.timeout_s, _INDICATIVE_QUOTE_PROVIDER_ATTEMPT_TIMEOUT_S),
+            "interactive_indicative_quote_transient_retry_delays_s": list(_FIRM_QUOTE_RETRY_DELAYS_S),
+            "interactive_indicative_quote_no_quotes_retry_delays_s": list(_FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S),
             "interactive_firm_quote_retry_policy": _FIRM_QUOTE_RETRY_POLICY,
-            "interactive_firm_quote_max_attempts": _FIRM_QUOTE_MAX_ATTEMPTS,
+            "interactive_firm_quote_max_attempts": _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS,
+            "interactive_firm_quote_transient_max_attempts": _FIRM_QUOTE_MAX_ATTEMPTS,
+            "interactive_firm_quote_no_quotes_max_attempts": _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS,
             "interactive_firm_quote_transient_retry_delays_s": list(_FIRM_QUOTE_RETRY_DELAYS_S),
             "interactive_firm_quote_no_quotes_retry_delays_s": list(_FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S),
             "last_good_at": self._last_good_at,
@@ -1206,10 +1266,17 @@ class RobinhoodChainUniswapQuoteService:
         output_token: Dict[str, Any],
         confirm_quote: bool,
         _include_provider_response: bool = False,
+        _retry_provider_errors: bool = True,
+        _provider_priority: str = "interactive",
     ) -> Dict[str, Any]:
         normalized_symbol = str(symbol or "").strip().upper().replace("/", "-").replace("_", "-")
         normalized_side = str(side or "").strip().lower()
         normalized_mode = str(amount_mode or "").strip().lower()
+        provider_priority = (
+            "background"
+            if str(_provider_priority or "").strip().lower() == "background"
+            else "interactive"
+        )
         if not confirm_quote:
             return _failure("uniswap_quote_confirmation_required", symbol=normalized_symbol)
         if normalized_side not in {"buy", "sell"}:
@@ -1264,241 +1331,361 @@ class RobinhoodChainUniswapQuoteService:
         }
         url = f"{self.api_base}{UNISWAP_QUOTE_PATH}"
         started = time.perf_counter()
-        async with self._semaphore:
-            try:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(self.timeout_s),
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/json",
-                        "x-api-key": str(credential.get("api_key") or ""),
-                        "x-universal-router-version": UNISWAP_ROUTER_VERSION,
-                        "x-permit2-disabled": "true",
-                        "x-erc20eth-enabled": "false",
-                        "User-Agent": "UTT-Robinhood-Chain-Uniswap-Quote/1.0",
-                    },
-                    transport=self.transport,
-                ) as client:
-                    response = await client.post(url, json=request_body)
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-                try:
-                    body = response.json()
-                except Exception:
-                    body = {"message": response.text[:_MAX_PROVIDER_ERROR_TEXT]}
+        provider_attempts = 0
+        provider_retry_reasons: List[str] = []
+        response: Optional[httpx.Response] = None
+        body: Any = None
+        last_transport_error: Optional[str] = None
+        attempt_timeout_s = max(2.0, min(self.timeout_s, _INDICATIVE_QUOTE_PROVIDER_ATTEMPT_TIMEOUT_S))
+        provider_queue_wait_ms = 0.0
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout_s),
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "x-api-key": str(credential.get("api_key") or ""),
+                    "x-universal-router-version": UNISWAP_ROUTER_VERSION,
+                    "x-permit2-disabled": "true",
+                    "x-erc20eth-enabled": "false",
+                    "User-Agent": "UTT-Robinhood-Chain-Uniswap-Quote/1.0",
+                },
+                transport=self.transport,
+            ) as client:
+                maximum_attempts = _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS if _retry_provider_errors else 1
+                while provider_attempts < maximum_attempts:
+                    provider_attempts += 1
+                    response = None
+                    body = None
+                    last_transport_error = None
+                    try:
+                        # RH-QUOTE.INTERACTIVE.PRIORITY.1B: provider capacity is
+                        # still held only while the HTTP request is in flight, but
+                        # queued interactive work is admitted before queued
+                        # synthetic-book work. Retry backoff never holds a slot.
+                        queue_started = time.perf_counter()
+                        await self._acquire_provider_slot(priority=provider_priority)
+                        provider_queue_wait_ms += (time.perf_counter() - queue_started) * 1000.0
+                        try:
+                            response = await client.post(
+                                url,
+                                json=request_body,
+                                timeout=httpx.Timeout(attempt_timeout_s),
+                            )
+                        finally:
+                            await asyncio.shield(self._release_provider_slot())
+                    except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                        last_transport_error = type(exc).__name__
+                        self._last_error = f"{last_transport_error}: {exc}"
+                        retry_probe = _failure(
+                            "uniswap_quote_provider_transient_error",
+                            symbol=normalized_symbol,
+                            provider_error=last_transport_error,
+                            provider_contacted=True,
+                        )
+                        retry_reason = _firm_quote_retry_reason(retry_probe)
+                        if retry_reason:
+                            provider_retry_reasons.append(retry_reason)
+                        if (
+                            _retry_provider_errors
+                            and retry_reason is not None
+                            and provider_attempts < _firm_quote_retry_max_attempts(retry_probe)
+                        ):
+                            await asyncio.sleep(
+                                _firm_quote_retry_delay_s(
+                                    retry_probe,
+                                    provider_attempts - 1,
+                                )
+                            )
+                            continue
+                        break
 
-                if response.status_code in {401, 403}:
-                    self._last_error = f"HTTP {response.status_code} from Uniswap API"
-                    return _failure(
-                        "uniswap_quote_authentication_failed",
-                        symbol=normalized_symbol,
-                        http_status=response.status_code,
-                        provider_error=_safe_provider_error(body),
-                        provider_contacted=True,
-                    )
-                if response.status_code == 429 or response.status_code >= 500:
-                    self._last_error = f"HTTP {response.status_code} from Uniswap API"
-                    return _failure(
-                        "uniswap_quote_provider_transient_error",
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = {"message": response.text[:_MAX_PROVIDER_ERROR_TEXT]}
+
+                    retry_probe = _failure(
+                        (
+                            "uniswap_quote_provider_transient_error"
+                            if response.status_code == 429 or response.status_code >= 500
+                            else "uniswap_quote_provider_error"
+                        ),
                         symbol=normalized_symbol,
                         http_status=response.status_code,
                         retry_after=response.headers.get("Retry-After"),
                         provider_error=_safe_provider_error(body),
                         provider_contacted=True,
                     )
-                if not response.is_success or not isinstance(body, dict):
-                    self._last_error = f"HTTP {response.status_code} from Uniswap API"
-                    return _failure(
-                        "uniswap_quote_provider_error",
-                        symbol=normalized_symbol,
-                        http_status=response.status_code,
-                        provider_error=_safe_provider_error(body),
-                        provider_contacted=True,
-                    )
+                    retry_reason = _firm_quote_retry_reason(retry_probe)
+                    if retry_reason:
+                        provider_retry_reasons.append(retry_reason)
+                    if (
+                        _retry_provider_errors
+                        and retry_reason is not None
+                        and provider_attempts < _firm_quote_retry_max_attempts(retry_probe)
+                    ):
+                        await asyncio.sleep(
+                            _firm_quote_retry_delay_s(
+                                retry_probe,
+                                provider_attempts - 1,
+                            )
+                        )
+                        continue
+                    break
 
-                prohibited = _prohibited_artifact(body)
-                if prohibited:
-                    self._last_error = f"Prohibited provider artifact: {prohibited}"
-                    return _failure(
-                        "uniswap_quote_prohibited_artifact",
-                        symbol=normalized_symbol,
-                        prohibited_artifact=prohibited,
-                        provider_contacted=True,
-                        http_status=response.status_code,
-                    )
-
-                tx_failure = body.get("txFailureReason")
-                quote_obj = body.get("quote") if isinstance(body.get("quote"), dict) else {}
-                if not tx_failure:
-                    tx_failure = quote_obj.get("txFailureReason")
-                if tx_failure:
-                    self._last_error = "Uniswap quote simulation failed"
-                    return _failure(
-                        "uniswap_quote_simulation_failed",
-                        symbol=normalized_symbol,
-                        provider_error=_safe_provider_error(tx_failure),
-                        provider_contacted=True,
-                        http_status=response.status_code,
-                    )
-
-                routing = str(body.get("routing") or "").strip().upper()
-                if routing not in _ALLOWED_ROUTING:
-                    self._last_error = f"Disallowed routing: {routing or 'missing'}"
-                    return _failure(
-                        "uniswap_quote_routing_not_allowed",
-                        symbol=normalized_symbol,
-                        routing=routing or None,
-                        provider_contacted=True,
-                        http_status=response.status_code,
-                    )
-
-                input_obj = quote_obj.get("input") if isinstance(quote_obj.get("input"), dict) else {}
-                output_obj = quote_obj.get("output") if isinstance(quote_obj.get("output"), dict) else {}
-                returned_input_token = str(input_obj.get("token") or "").strip().lower()
-                returned_output_token = str(output_obj.get("token") or "").strip().lower()
-                if returned_input_token != str(input_identity["provider_address"]).lower():
-                    return _failure(
-                        "uniswap_quote_provider_identity_mismatch",
-                        symbol=normalized_symbol,
-                        field="input.token",
-                        provider_contacted=True,
-                        http_status=response.status_code,
-                    )
-                if returned_output_token != str(output_identity["provider_address"]).lower():
-                    return _failure(
-                        "uniswap_quote_provider_identity_mismatch",
-                        symbol=normalized_symbol,
-                        field="output.token",
-                        provider_contacted=True,
-                        http_status=response.status_code,
-                    )
-
-                try:
-                    returned_input_atomic, returned_input = _atomic_to_display(
-                        input_obj.get("amount"),
-                        int(input_identity["decimals"]),
-                        field="provider_input_amount",
-                    )
-                    output_atomic, output_amount = _atomic_to_display(
-                        output_obj.get("amount"),
-                        int(output_identity["decimals"]),
-                        field="provider_output_amount",
-                    )
-                    minimum_atomic, minimum_amount = _atomic_to_display(
-                        output_obj.get("minimumAmount", output_obj.get("amount")),
-                        int(output_identity["decimals"]),
-                        field="provider_minimum_output_amount",
-                    )
-                except ValueError as exc:
-                    self._last_error = str(exc)
-                    return _failure(
-                        "uniswap_quote_invalid_response",
-                        symbol=normalized_symbol,
-                        response_error=str(exc),
-                        provider_contacted=True,
-                        http_status=response.status_code,
-                    )
-                if returned_input_atomic != input_atomic:
-                    return _failure(
-                        "uniswap_quote_provider_amount_mismatch",
-                        symbol=normalized_symbol,
-                        expected_input_atomic=input_atomic,
-                        returned_input_atomic=returned_input_atomic,
-                        provider_contacted=True,
-                        http_status=response.status_code,
-                    )
-
-                input_decimal = Decimal(returned_input)
-                output_decimal = Decimal(output_amount)
-                output_per_input = output_decimal / input_decimal
-                if normalized_side == "buy":
-                    quote_per_base = input_decimal / output_decimal
-                else:
-                    quote_per_base = output_decimal / input_decimal
-
-                protocols = _route_protocols(quote_obj.get("route"))
-                gas_estimate = quote_obj.get("gasUseEstimate")
-                gas_estimate_usd = (
-                    quote_obj.get("gasUseEstimateUSD")
-                    or quote_obj.get("classicGasUseEstimateUSD")
-                    or body.get("gasFeeUSD")
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            retry_metadata = {
+                "provider_quote_retry_policy": (
+                    _INDICATIVE_QUOTE_RETRY_POLICY if _retry_provider_errors else "none"
+                ),
+                "provider_quote_attempt_timeout_s": attempt_timeout_s,
+                "provider_quote_attempts": provider_attempts,
+                "provider_quote_retries": max(0, provider_attempts - 1),
+                "provider_quote_recovery_applied": bool(
+                    response is not None
+                    and response.is_success
+                    and provider_attempts > 1
+                ),
+                "provider_quote_retry_reasons": list(provider_retry_reasons),
+                "provider_queue_priority": provider_priority,
+                "provider_queue_wait_ms": round(provider_queue_wait_ms, 3),
+                "automatic_retry": False,
+                "automatic_second_transaction": False,
+            }
+            if response is None:
+                return _failure(
+                    "uniswap_quote_provider_transient_error" if last_transport_error else "uniswap_quote_provider_error",
+                    symbol=normalized_symbol,
+                    provider_error=last_transport_error,
+                    provider_contacted=True,
+                    **retry_metadata,
                 )
-                self._last_good_at = _utc_iso()
-                self._last_error = None
-                result = {
-                    "ok": True,
-                    "provider": UNISWAP_PROVIDER,
-                    "provider_contacted": True,
-                    "credential_source": credential.get("source"),
-                    "credential_venue": credential.get("venue"),
-                    "chain_id": UNISWAP_CHAIN_ID,
-                    "symbol": normalized_symbol,
-                    "side": normalized_side,
-                    "amount_mode": "exact_input",
-                    "routing": routing,
-                    "routing_preference": "BEST_PRICE",
-                    "route_protocols": protocols,
-                    "requested_amount": normalized_requested,
-                    "input_asset": input_identity["symbol"],
-                    "input_registry_id": input_identity["registry_id"],
-                    "input_amount": returned_input,
-                    "input_amount_atomic": returned_input_atomic,
-                    "output_asset": output_identity["symbol"],
-                    "output_registry_id": output_identity["registry_id"],
-                    "output_amount": output_amount,
-                    "output_amount_atomic": output_atomic,
-                    "minimum_received": minimum_amount,
-                    "minimum_received_atomic": minimum_atomic,
-                    "price_output_per_input": _decimal_text(output_per_input),
-                    "price_quote_per_base": _decimal_text(quote_per_base),
-                    "effective_price": _decimal_text(quote_per_base),
-                    "base_quantity": output_amount if normalized_side == "buy" else returned_input,
-                    "quote_quantity": returned_input if normalized_side == "buy" else output_amount,
-                    "slippage_bps": slippage,
-                    "slippage_percent": _decimal_text(Decimal(slippage) / Decimal(100)),
-                    "is_token_approval_applicable": bool(body.get("isTokenApprovalApplicable", True)),
-                    "gas_use_estimate": str(gas_estimate).strip() if gas_estimate is not None else None,
-                    "gas_use_estimate_usd": str(gas_estimate_usd).strip() if gas_estimate_usd is not None else None,
-                    "request_id": str(body.get("requestId") or "").strip() or None,
-                    "elapsed_ms": round(elapsed_ms, 2),
-                    "fetched_at": self._last_good_at,
-                    "read_only": True,
-                    "quote_only": True,
-                    "response_sanitized": True,
-                    "raw_provider_response_returned": False,
-                    "database_mutation": False,
-                    "will_mutate": False,
-                    "execution_authority": False,
-                    "execution_enabled": False,
-                    "wallet_connection_requested": False,
-                    "signing_enabled": False,
-                    "broadcast_enabled": False,
-                    "swap_endpoint_enabled": False,
-                    "order_endpoint_enabled": False,
-                    "transaction": None,
-                    "transaction_calldata": None,
-                    "permit_data": None,
-                    "permit_transaction": None,
-                    "encoded_order": None,
-                }
-                if _include_provider_response:
-                    result["_provider_response"] = copy.deepcopy(body)
-                return result
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-                self._last_error = f"{type(exc).__name__}: {exc}"
+
+            if response.status_code in {401, 403}:
+                self._last_error = f"HTTP {response.status_code} from Uniswap API"
+                return _failure(
+                    "uniswap_quote_authentication_failed",
+                    symbol=normalized_symbol,
+                    http_status=response.status_code,
+                    provider_error=_safe_provider_error(body),
+                    provider_contacted=True,
+                    **retry_metadata,
+                )
+            if response.status_code == 429 or response.status_code >= 500:
+                self._last_error = f"HTTP {response.status_code} from Uniswap API"
                 return _failure(
                     "uniswap_quote_provider_transient_error",
                     symbol=normalized_symbol,
-                    provider_error=type(exc).__name__,
+                    http_status=response.status_code,
+                    retry_after=response.headers.get("Retry-After"),
+                    provider_error=_safe_provider_error(body),
                     provider_contacted=True,
+                    **retry_metadata,
                 )
-            except Exception as exc:
-                self._last_error = f"{type(exc).__name__}: {exc}"
+            if not response.is_success or not isinstance(body, dict):
+                self._last_error = f"HTTP {response.status_code} from Uniswap API"
                 return _failure(
                     "uniswap_quote_provider_error",
                     symbol=normalized_symbol,
-                    provider_error=type(exc).__name__,
+                    http_status=response.status_code,
+                    provider_error=_safe_provider_error(body),
                     provider_contacted=True,
+                    **retry_metadata,
                 )
+
+            prohibited = _prohibited_artifact(body)
+            if prohibited:
+                self._last_error = f"Prohibited provider artifact: {prohibited}"
+                return _failure(
+                    "uniswap_quote_prohibited_artifact",
+                    symbol=normalized_symbol,
+                    prohibited_artifact=prohibited,
+                    provider_contacted=True,
+                    http_status=response.status_code,
+                    **retry_metadata,
+                )
+
+            tx_failure = body.get("txFailureReason")
+            quote_obj = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+            if not tx_failure:
+                tx_failure = quote_obj.get("txFailureReason")
+            if tx_failure:
+                self._last_error = "Uniswap quote simulation failed"
+                return _failure(
+                    "uniswap_quote_simulation_failed",
+                    symbol=normalized_symbol,
+                    provider_error=_safe_provider_error(tx_failure),
+                    provider_contacted=True,
+                    http_status=response.status_code,
+                    **retry_metadata,
+                )
+
+            routing = str(body.get("routing") or "").strip().upper()
+            if routing not in _ALLOWED_ROUTING:
+                self._last_error = f"Disallowed routing: {routing or 'missing'}"
+                return _failure(
+                    "uniswap_quote_routing_not_allowed",
+                    symbol=normalized_symbol,
+                    routing=routing or None,
+                    provider_contacted=True,
+                    http_status=response.status_code,
+                    **retry_metadata,
+                )
+
+            input_obj = quote_obj.get("input") if isinstance(quote_obj.get("input"), dict) else {}
+            output_obj = quote_obj.get("output") if isinstance(quote_obj.get("output"), dict) else {}
+            returned_input_token = str(input_obj.get("token") or "").strip().lower()
+            returned_output_token = str(output_obj.get("token") or "").strip().lower()
+            if returned_input_token != str(input_identity["provider_address"]).lower():
+                return _failure(
+                    "uniswap_quote_provider_identity_mismatch",
+                    symbol=normalized_symbol,
+                    field="input.token",
+                    provider_contacted=True,
+                    http_status=response.status_code,
+                    **retry_metadata,
+                )
+            if returned_output_token != str(output_identity["provider_address"]).lower():
+                return _failure(
+                    "uniswap_quote_provider_identity_mismatch",
+                    symbol=normalized_symbol,
+                    field="output.token",
+                    provider_contacted=True,
+                    http_status=response.status_code,
+                    **retry_metadata,
+                )
+
+            try:
+                returned_input_atomic, returned_input = _atomic_to_display(
+                    input_obj.get("amount"),
+                    int(input_identity["decimals"]),
+                    field="provider_input_amount",
+                )
+                output_atomic, output_amount = _atomic_to_display(
+                    output_obj.get("amount"),
+                    int(output_identity["decimals"]),
+                    field="provider_output_amount",
+                )
+                minimum_atomic, minimum_amount = _atomic_to_display(
+                    output_obj.get("minimumAmount", output_obj.get("amount")),
+                    int(output_identity["decimals"]),
+                    field="provider_minimum_output_amount",
+                )
+            except ValueError as exc:
+                self._last_error = str(exc)
+                return _failure(
+                    "uniswap_quote_invalid_response",
+                    symbol=normalized_symbol,
+                    response_error=str(exc),
+                    provider_contacted=True,
+                    http_status=response.status_code,
+                    **retry_metadata,
+                )
+            if returned_input_atomic != input_atomic:
+                return _failure(
+                    "uniswap_quote_provider_amount_mismatch",
+                    symbol=normalized_symbol,
+                    expected_input_atomic=input_atomic,
+                    returned_input_atomic=returned_input_atomic,
+                    provider_contacted=True,
+                    http_status=response.status_code,
+                    **retry_metadata,
+                )
+
+            input_decimal = Decimal(returned_input)
+            output_decimal = Decimal(output_amount)
+            output_per_input = output_decimal / input_decimal
+            if normalized_side == "buy":
+                quote_per_base = input_decimal / output_decimal
+            else:
+                quote_per_base = output_decimal / input_decimal
+
+            protocols = _route_protocols(quote_obj.get("route"))
+            gas_estimate = quote_obj.get("gasUseEstimate")
+            gas_estimate_usd = (
+                quote_obj.get("gasUseEstimateUSD")
+                or quote_obj.get("classicGasUseEstimateUSD")
+                or body.get("gasFeeUSD")
+            )
+            self._last_good_at = _utc_iso()
+            self._last_error = None
+            result = {
+                "ok": True,
+                "provider": UNISWAP_PROVIDER,
+                "provider_contacted": True,
+                "credential_source": credential.get("source"),
+                "credential_venue": credential.get("venue"),
+                "chain_id": UNISWAP_CHAIN_ID,
+                "symbol": normalized_symbol,
+                "side": normalized_side,
+                "amount_mode": "exact_input",
+                "routing": routing,
+                "routing_preference": "BEST_PRICE",
+                "route_protocols": protocols,
+                "requested_amount": normalized_requested,
+                "input_asset": input_identity["symbol"],
+                "input_registry_id": input_identity["registry_id"],
+                "input_amount": returned_input,
+                "input_amount_atomic": returned_input_atomic,
+                "output_asset": output_identity["symbol"],
+                "output_registry_id": output_identity["registry_id"],
+                "output_amount": output_amount,
+                "output_amount_atomic": output_atomic,
+                "minimum_received": minimum_amount,
+                "minimum_received_atomic": minimum_atomic,
+                "price_output_per_input": _decimal_text(output_per_input),
+                "price_quote_per_base": _decimal_text(quote_per_base),
+                "effective_price": _decimal_text(quote_per_base),
+                "base_quantity": output_amount if normalized_side == "buy" else returned_input,
+                "quote_quantity": returned_input if normalized_side == "buy" else output_amount,
+                "slippage_bps": slippage,
+                "slippage_percent": _decimal_text(Decimal(slippage) / Decimal(100)),
+                "is_token_approval_applicable": bool(body.get("isTokenApprovalApplicable", True)),
+                "gas_use_estimate": str(gas_estimate).strip() if gas_estimate is not None else None,
+                "gas_use_estimate_usd": str(gas_estimate_usd).strip() if gas_estimate_usd is not None else None,
+                "request_id": str(body.get("requestId") or "").strip() or None,
+                "elapsed_ms": round(elapsed_ms, 2),
+                "fetched_at": self._last_good_at,
+                "read_only": True,
+                "quote_only": True,
+                "response_sanitized": True,
+                "raw_provider_response_returned": False,
+                "database_mutation": False,
+                "will_mutate": False,
+                "execution_authority": False,
+                "execution_enabled": False,
+                "wallet_connection_requested": False,
+                "signing_enabled": False,
+                "broadcast_enabled": False,
+                "swap_endpoint_enabled": False,
+                "order_endpoint_enabled": False,
+                "transaction": None,
+                "transaction_calldata": None,
+                "permit_data": None,
+                "permit_transaction": None,
+                "encoded_order": None,
+            }
+            result.update(retry_metadata)
+            if _include_provider_response:
+                result["_provider_response"] = copy.deepcopy(body)
+            return result
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            return _failure(
+                "uniswap_quote_provider_transient_error",
+                symbol=normalized_symbol,
+                provider_error=type(exc).__name__,
+                provider_contacted=True,
+            )
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            return _failure(
+                "uniswap_quote_provider_error",
+                symbol=normalized_symbol,
+                provider_error=type(exc).__name__,
+                provider_contacted=True,
+            )
 
 
     def _headers(self, credential: Dict[str, Any]) -> Dict[str, str]:
@@ -1525,7 +1712,11 @@ class RobinhoodChainUniswapQuoteService:
             headers=self._headers(credential),
             transport=self.transport,
         ) as client:
-            response = await client.post(url, json=body)
+            await self._acquire_provider_slot(priority="interactive")
+            try:
+                response = await client.post(url, json=body)
+            finally:
+                await asyncio.shield(self._release_provider_slot())
         try:
             payload: Any = response.json()
         except Exception:
@@ -1655,6 +1846,8 @@ class RobinhoodChainUniswapQuoteService:
                 input_token=quote_token,
                 output_token=base_token,
                 confirm_quote=True,
+                _retry_provider_errors=False,
+                _provider_priority="background",
             )
             if not ask_quote.get("ok"):
                 errors.append({
@@ -1688,6 +1881,8 @@ class RobinhoodChainUniswapQuoteService:
                 input_token=base_token,
                 output_token=quote_token,
                 confirm_quote=True,
+                _retry_provider_errors=False,
+                _provider_priority="background",
             )
             if not bid_quote.get("ok"):
                 errors.append({
@@ -1853,7 +2048,7 @@ class RobinhoodChainUniswapQuoteService:
         quote_attempts = 0
         quote_retry_reasons: List[str] = []
         raw_response: Optional[Dict[str, Any]] = None
-        while quote_attempts < _FIRM_QUOTE_MAX_ATTEMPTS:
+        while quote_attempts < _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS:
             quote_attempts += 1
             quote_result = await self.quote(
                 symbol=symbol,
@@ -1866,6 +2061,7 @@ class RobinhoodChainUniswapQuoteService:
                 output_token=output_token,
                 confirm_quote=True,
                 _include_provider_response=True,
+                _retry_provider_errors=False,
             )
             raw_candidate = quote_result.pop("_provider_response", None)
             if quote_result.get("ok") is True and isinstance(raw_candidate, dict):
@@ -1884,7 +2080,7 @@ class RobinhoodChainUniswapQuoteService:
             retry_reason = _firm_quote_retry_reason(quote_result)
             if retry_reason:
                 quote_retry_reasons.append(retry_reason)
-            if retry_reason is None or quote_attempts >= _FIRM_QUOTE_MAX_ATTEMPTS:
+            if retry_reason is None or quote_attempts >= _firm_quote_retry_max_attempts(quote_result):
                 quote_result.update(
                     {
                         "provider_quote_retry_policy": _FIRM_QUOTE_RETRY_POLICY,

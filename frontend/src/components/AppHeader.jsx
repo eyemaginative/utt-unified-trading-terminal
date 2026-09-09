@@ -1868,6 +1868,15 @@ addDexAccount,
   const [profileStayLoggedIn, setProfileStayLoggedIn] = useState(false);
   const [profileSessionPrefBusy, setProfileSessionPrefBusy] = useState(false);
   const [profileSessionMsg, setProfileSessionMsg] = useState("");
+  const [profileRhLimitsBusy, setProfileRhLimitsBusy] = useState(false);
+  const [profileRhLimitsMsg, setProfileRhLimitsMsg] = useState("");
+  const [profileRhDiscoveryMaxUsd, setProfileRhDiscoveryMaxUsd] = useState("");
+  const [profileRhInteractiveMaxUsd, setProfileRhInteractiveMaxUsd] = useState("");
+  const [profileRhLimitSources, setProfileRhLimitSources] = useState({});
+  const [profileStartupBusy, setProfileStartupBusy] = useState(false);
+  const [profileStartupMsg, setProfileStartupMsg] = useState("");
+  const [profileTablesStartupTab, setProfileTablesStartupTab] = useState("allOrders");
+  const [profileTablesStartupSource, setProfileTablesStartupSource] = useState("—");
 
   // Auth UI (optional; local-only unless backend is wired)
   const [authOpen, setAuthOpen] = useState(false);
@@ -2063,6 +2072,10 @@ addDexAccount,
     setAuthToken("");
     setAuthUser("");
     clearAuthSensitive();
+    setProfileRhDiscoveryMaxUsd("");
+    setProfileRhInteractiveMaxUsd("");
+    setProfileRhLimitSources({});
+    setProfileRhLimitsMsg("");
     setAuthTotpEnabled(false);
     setAuthTotpProvisioned(false);
     setAuthOpen(false);
@@ -2121,6 +2134,121 @@ addDexAccount,
     }
   };
 
+
+  const loadRobinhoodChainPreferences = async () => {
+    const base = tgTrimApiBase(API_BASE);
+    const tok = String(authToken || "").trim();
+    if (!tok) return false;
+    setProfileRhLimitsBusy(true);
+    setProfileRhLimitsMsg("");
+    try {
+      const r = await fetch(`${base}/api/auth/preferences`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${tok}` },
+        cache: "no-store",
+      });
+      const ct = String(r.headers.get("content-type") || "");
+      const data = ct.includes("application/json") ? await r.json() : { detail: await r.text() };
+      if (!r.ok || data?.ok === false) {
+        const msg = typeof data?.detail === "string" ? data.detail : data?.detail?.error || data?.error;
+        setProfileRhLimitsMsg(msg || `Robinhood Chain limits load failed (${r.status}).`);
+        return false;
+      }
+      const prefs = data?.robinhood_chain || {};
+      setProfileRhDiscoveryMaxUsd(String(prefs?.discovery_max_usd ?? ""));
+      setProfileRhInteractiveMaxUsd(String(prefs?.interactive_quote_max_usd ?? ""));
+      setProfileRhLimitSources(prefs?.sources && typeof prefs.sources === "object" ? prefs.sources : {});
+      const uiPrefs = data?.ui || {};
+      const startupTab = String(uiPrefs?.tables_startup_tab || "allOrders");
+      setProfileTablesStartupTab(["allOrders", "balances", "localOrders", "discover"].includes(startupTab) ? startupTab : "allOrders");
+      setProfileTablesStartupSource(String(uiPrefs?.sources?.tables_startup_tab || "default"));
+      return true;
+    } catch (e) {
+      setProfileRhLimitsMsg(String(e?.message || e || "Robinhood Chain limits load failed."));
+      return false;
+    } finally {
+      setProfileRhLimitsBusy(false);
+    }
+  };
+
+  const saveRobinhoodChainPreferences = async () => {
+    const base = tgTrimApiBase(API_BASE);
+    const tok = String(authToken || "").trim();
+    if (!tok) return false;
+    setProfileRhLimitsBusy(true);
+    setProfileRhLimitsMsg("");
+    try {
+      const r = await fetch(`${base}/api/auth/preferences`, {
+        method: "PATCH",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${tok}`,
+        },
+        body: JSON.stringify({
+          robinhood_chain: {
+            discovery_max_usd: String(profileRhDiscoveryMaxUsd || "").trim(),
+            interactive_quote_max_usd: String(profileRhInteractiveMaxUsd || "").trim(),
+          },
+        }),
+      });
+      const ct = String(r.headers.get("content-type") || "");
+      const data = ct.includes("application/json") ? await r.json() : { detail: await r.text() };
+      if (!r.ok || data?.ok === false) {
+        const msg = typeof data?.detail === "string" ? data.detail : data?.detail?.error || data?.error;
+        setProfileRhLimitsMsg(msg || `Robinhood Chain limits save failed (${r.status}).`);
+        return false;
+      }
+      const prefs = data?.robinhood_chain || {};
+      setProfileRhDiscoveryMaxUsd(String(prefs?.discovery_max_usd ?? ""));
+      setProfileRhInteractiveMaxUsd(String(prefs?.interactive_quote_max_usd ?? ""));
+      setProfileRhLimitSources(prefs?.sources && typeof prefs.sources === "object" ? prefs.sources : {});
+      setProfileRhLimitsMsg("Robinhood Chain limits saved to the user profile database.");
+      return true;
+    } catch (e) {
+      setProfileRhLimitsMsg(String(e?.message || e || "Robinhood Chain limits save failed."));
+      return false;
+    } finally {
+      setProfileRhLimitsBusy(false);
+    }
+  };
+
+  const saveStartupPreferences = async () => {
+    const base = tgTrimApiBase(API_BASE);
+    const tok = String(authToken || "").trim();
+    if (!tok) return false;
+    setProfileStartupBusy(true);
+    setProfileStartupMsg("");
+    try {
+      const r = await fetch(`${base}/api/auth/preferences`, {
+        method: "PATCH",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${tok}`,
+        },
+        body: JSON.stringify({
+          ui: { tables_startup_tab: String(profileTablesStartupTab || "allOrders") },
+        }),
+      });
+      const ct = String(r.headers.get("content-type") || "");
+      const data = ct.includes("application/json") ? await r.json() : { detail: await r.text() };
+      if (!r.ok || data?.ok === false) {
+        const msg = typeof data?.detail === "string" ? data.detail : data?.detail?.error || data?.error;
+        setProfileStartupMsg(msg || `Startup preference save failed (${r.status}).`);
+        return false;
+      }
+      const uiPrefs = data?.ui || {};
+      const startupTab = String(uiPrefs?.tables_startup_tab || "allOrders");
+      setProfileTablesStartupTab(["allOrders", "balances", "localOrders", "discover"].includes(startupTab) ? startupTab : "allOrders");
+      setProfileTablesStartupSource(String(uiPrefs?.sources?.tables_startup_tab || "database"));
+      setProfileStartupMsg("Startup Tables Tab saved. It applies on the next full page load.");
+      return true;
+    } catch (e) {
+      setProfileStartupMsg(String(e?.message || e || "Startup preference save failed."));
+      return false;
+    } finally {
+      setProfileStartupBusy(false);
+    }
+  };
 
   const loadSessionPrefs = async () => {
     const base = tgTrimApiBase(API_BASE);
@@ -2357,6 +2485,7 @@ addDexAccount,
     refreshAuthFromServer(authToken, { silent: true, openPromptOnExpire: false });
     loadBackupPrefs();
     loadSessionPrefs();
+    loadRobinhoodChainPreferences();
     // Load API key metadata (never secrets)
     callProfileApiKeysList();
   }, [profileOpen]);
@@ -5979,7 +6108,7 @@ const autoFitBanner = async () => {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
             <div>
               <div style={{ fontSize: 14, fontWeight: 900 }}>Profile</div>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>Account • Password • 2FA • API Keys</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Account • Startup & Layout • Robinhood Chain Limits • Password • 2FA • API Keys</div>
             </div>
             <button
               type="button"
@@ -6023,6 +6152,117 @@ const autoFitBanner = async () => {
                 <div style={{ fontSize: 11, opacity: 0.7, lineHeight: 1.25, marginTop: 4 }}>
                   Default session lifetime is controlled by the backend. Enabling this requests a longer-lived session and refreshes the current login token immediately.
                 </div>
+              </div>
+              <div style={{ height: 1, background: "rgba(255,255,255,0.08)" }} />
+              <div>
+                <div style={{ fontWeight: 800, marginBottom: 6 }}>Startup & Layout</div>
+                <div style={{ fontSize: 12, opacity: 0.78, lineHeight: 1.35, marginBottom: 8 }}>
+                  Choose which Tables tab loads after a full page refresh. New or unset profiles default to All Orders so startup does not automatically request balances.
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "170px minmax(0, 1fr)", gap: 8, alignItems: "center" }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Startup Tables Tab</div>
+                  <select
+                    style={donateInputStyle}
+                    value={profileTablesStartupTab}
+                    disabled={profileStartupBusy}
+                    onChange={(e) => setProfileTablesStartupTab(String(e.target.value || "allOrders"))}
+                  >
+                    <option value="allOrders">All Orders</option>
+                    <option value="balances">Balances</option>
+                    <option value="localOrders">Local Orders</option>
+                    <option value="discover">Discover</option>
+                  </select>
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+                  <button
+                    type="button"
+                    style={donateSmallBtnStyle}
+                    disabled={profileStartupBusy}
+                    onClick={saveStartupPreferences}
+                  >
+                    {profileStartupBusy ? "Saving..." : "Save Startup & Layout"}
+                  </button>
+                  <button
+                    type="button"
+                    style={donateSmallBtnStyle}
+                    disabled={profileStartupBusy || profileRhLimitsBusy}
+                    onClick={loadRobinhoodChainPreferences}
+                  >
+                    Reload
+                  </button>
+                </div>
+                <div style={{ fontSize: 11, opacity: 0.68, lineHeight: 1.3, marginTop: 7 }}>
+                  Source: <b>{profileTablesStartupSource || "—"}</b>. The saved setting is database-backed and takes effect on the next full page load.
+                </div>
+                {!!profileStartupMsg && (
+                  <div style={{ fontSize: 12, opacity: 0.9, color: "var(--utt-hdr-link, #9ad)", lineHeight: 1.35, wordBreak: "break-word", marginTop: 6 }}>
+                    {profileStartupMsg}
+                  </div>
+                )}
+              </div>
+              <div style={{ height: 1, background: "rgba(255,255,255,0.08)" }} />
+              <div>
+                <div style={{ fontWeight: 800, marginBottom: 6 }}>Robinhood Chain Limits</div>
+                <div style={{ fontSize: 12, opacity: 0.78, lineHeight: 1.35, marginBottom: 8 }}>
+                  Per-user USD safety limits are stored in the database. They bound read-only discovery and explicit
+                  Order Ticket quote/spend requests; they do not authorize approval, signing, or broadcasting.
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "170px minmax(0, 1fr)", gap: 8, alignItems: "center" }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Discovery probe max (USD)</div>
+                  <input
+                    style={donateInputStyle}
+                    value={profileRhDiscoveryMaxUsd}
+                    disabled={profileRhLimitsBusy}
+                    inputMode="decimal"
+                    onChange={(e) => {
+                      const next = String(e.target.value || "");
+                      if (/^\d*(?:\.\d*)?$/.test(next)) setProfileRhDiscoveryMaxUsd(next);
+                    }}
+                    placeholder="e.g. 25"
+                    autoComplete="off"
+                  />
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Interactive quote/spend max (USD)</div>
+                  <input
+                    style={donateInputStyle}
+                    value={profileRhInteractiveMaxUsd}
+                    disabled={profileRhLimitsBusy}
+                    inputMode="decimal"
+                    onChange={(e) => {
+                      const next = String(e.target.value || "");
+                      if (/^\d*(?:\.\d*)?$/.test(next)) setProfileRhInteractiveMaxUsd(next);
+                    }}
+                    placeholder="e.g. 100"
+                    autoComplete="off"
+                  />
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+                  <button
+                    type="button"
+                    style={donateSmallBtnStyle}
+                    disabled={profileRhLimitsBusy}
+                    onClick={saveRobinhoodChainPreferences}
+                  >
+                    {profileRhLimitsBusy ? "Saving..." : "Save Robinhood Chain Limits"}
+                  </button>
+                  <button
+                    type="button"
+                    style={donateSmallBtnStyle}
+                    disabled={profileRhLimitsBusy}
+                    onClick={loadRobinhoodChainPreferences}
+                  >
+                    Reload
+                  </button>
+                </div>
+                <div style={{ fontSize: 11, opacity: 0.68, lineHeight: 1.3, marginTop: 7 }}>
+                  Discovery source: <b>{profileRhLimitSources?.discovery_max_usd || "—"}</b>
+                  {" • "}Interactive source: <b>{profileRhLimitSources?.interactive_quote_max_usd || "—"}</b>.
+                  Values must be positive finite decimals; there is no hidden source-code maximum.
+                </div>
+                {!!profileRhLimitsMsg && (
+                  <div style={{ fontSize: 12, opacity: 0.9, color: "var(--utt-hdr-link, #9ad)", lineHeight: 1.35, wordBreak: "break-word", marginTop: 6 }}>
+                    {profileRhLimitsMsg}
+                  </div>
+                )}
               </div>
               <div style={{ height: 1, background: "rgba(255,255,255,0.08)" }} />
               <div>

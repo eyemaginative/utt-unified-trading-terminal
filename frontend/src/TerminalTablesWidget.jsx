@@ -483,12 +483,31 @@ function normalizeMarketSymbolMaybe(sym) {
 function inferBalanceMarketSymbol(b) {
   if (!b) return "";
 
-  // Prefer backend-provided pricing symbol (should be the “right” one for USD valuation)
-  const src = normalizeMarketSymbolMaybe(b.usd_source_symbol || "");
-  if (src) return src;
-
   const asset = String(b.asset || "").trim().toUpperCase();
   if (!asset) return "";
+
+  const venueHints = [b.venue, b.wallet_id, b.network, b.chain]
+    .map((value) => String(value || "").trim().toLowerCase());
+  const isRobinhoodChain = venueHints.includes("robinhood_chain");
+  const explicitNavigationMarket = normalizeMarketSymbolMaybe(
+    b.navigation_market_symbol || b.market_symbol || ""
+  );
+  if (explicitNavigationMarket) return explicitNavigationMarket;
+
+  // Robinhood Chain uses usd_source_symbol as human-readable price provenance
+  // (for example, "RH Chain matched quote · PONS-USDG" or
+  // "Unpriced · retrying"), not as a navigation-market identifier. Keep the
+  // two semantics separate. Registered ERC-20 balance rows are quoted against
+  // USDG; native ETH and USDG navigate to the accepted USDG-ETH market.
+  if (isRobinhoodChain) {
+    if (asset === "USD") return "";
+    if (asset === "ETH" || asset === "USDG") return "USDG-ETH";
+    return `${asset}-USDG`;
+  }
+
+  // Other venues retain the existing backend-provided pricing-symbol behavior.
+  const src = normalizeMarketSymbolMaybe(b.usd_source_symbol || "");
+  if (src) return src;
 
   // Avoid silly links for pure USD rows
   if (asset === "USD") return "";
@@ -4025,6 +4044,7 @@ async function refreshSolanaOnchainBalances() {
     loading: false,
     error: "",
     markets: [],
+    identity: null,
   }));
 
   function clearHoverCloseTimer() {
@@ -4139,7 +4159,44 @@ async function refreshSolanaOnchainBalances() {
     }
   }
 
-  function openOverlibAt({ clientX, clientY, venueMaybe, assetMaybe }) {
+  function balanceHoverIdentity(b, marketMaybe, venueMaybe) {
+    if (!b || typeof b !== "object") return null;
+
+    const ven = String(venueMaybe || b?.venue || "").trim().toLowerCase();
+    const asset = String(b?.asset || "").trim().toUpperCase();
+    const market = normalizeMarketSymbolMaybe(marketMaybe || inferBalanceMarketSymbol(b));
+    const isRh = isRobinhoodChainBalanceRow(b);
+    const isSol = ven === "solana" || ven === "solana_jupiter" || ven.startsWith("solana");
+
+    const contract = String(b?.contract_address ?? b?.contractAddress ?? "").trim();
+    const mint = String(b?.mint ?? "").trim();
+    const address = contract || mint;
+    const addressLabel = contract ? "Contract" : mint ? "Mint" : "";
+    const registryId = b?.registry_id ?? b?.registryId ?? null;
+    const fetchedAt = String(b?.fetched_at ?? b?.captured_at ?? b?.created_at ?? "").trim();
+    const usdSource = String(b?.usd_source_symbol || b?.usd_source || "—").trim() || "—";
+
+    if (!isRh && !isSol && !address && (registryId === null || registryId === undefined || !String(registryId).trim())) {
+      return null;
+    }
+
+    return {
+      venue: ven,
+      asset,
+      market,
+      isRobinhoodChain: isRh,
+      isSolana: isSol,
+      registryId,
+      address,
+      addressLabel,
+      registryScope: String(b?.registry_venue || "").trim(),
+      fetchedAt,
+      usdSource,
+      sourceType: String(b?.source_type || "").trim(),
+    };
+  }
+
+  function openOverlibAt({ clientX, clientY, venueMaybe, assetMaybe, balanceRow = null, marketMaybe = "" }) {
     clearHoverCloseTimer();
 
     // Position inside widget (absolute)
@@ -4154,6 +4211,7 @@ async function refreshSolanaOnchainBalances() {
       open: true,
       venue: String(venueMaybe || "").trim().toLowerCase(),
       asset: String(assetMaybe || "").trim().toUpperCase(),
+      identity: balanceHoverIdentity(balanceRow, marketMaybe, venueMaybe),
       anchorX: clamp(Math.round(x), 10, Math.max(10, Math.round(geom.w - 260))),
       anchorY: clamp(Math.round(y + 14), 80, Math.max(80, Math.round(geom.h - 220))),
     }));
@@ -4167,6 +4225,7 @@ async function refreshSolanaOnchainBalances() {
 
     const ven = balOverlib.venue || "";
     const asset = balOverlib.asset || "";
+    const identity = balOverlib.identity && typeof balOverlib.identity === "object" ? balOverlib.identity : null;
 
     const panel = {
       position: "fixed",
@@ -4181,6 +4240,8 @@ async function refreshSolanaOnchainBalances() {
       padding: 10,
       zIndex: 60,
       color: pal.text,
+      pointerEvents: "auto",
+      userSelect: "text",
     };
 
     const header = { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 8 };
@@ -4202,7 +4263,14 @@ async function refreshSolanaOnchainBalances() {
     });
 
     return (
-      <div data-no-drag="1" style={panel} onMouseEnter={() => clearHoverCloseTimer()} onMouseLeave={() => scheduleCloseOverlib(160)}>
+      <div
+        data-no-drag="1"
+        data-balance-identity-popover="1"
+        style={panel}
+        onMouseEnter={() => clearHoverCloseTimer()}
+        onMouseLeave={() => scheduleCloseOverlib(220)}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
         <div style={header}>
           <div>
             <div style={title}>Markets for {asset || "—"}</div>
@@ -4215,6 +4283,86 @@ async function refreshSolanaOnchainBalances() {
             Close
           </button>
         </div>
+
+        {identity ? (
+          <div
+            data-balance-identity-details="1"
+            style={{
+              marginBottom: 10,
+              padding: "8px 9px",
+              border: `1px solid ${pal.border}`,
+              borderRadius: 9,
+              background: pal.widgetBg2,
+              fontSize: 11,
+              lineHeight: 1.45,
+              userSelect: "text",
+            }}
+          >
+            {identity.market ? (
+              <div>
+                Pick market: <b style={{ color: pal.text }}>{identity.market}</b>
+                {identity.venue ? ` (${identity.venue})` : ""}
+              </div>
+            ) : null}
+
+            {identity.isRobinhoodChain ? (
+              <div>Robinhood Chain mainnet 4663 · Wallet Addresses · read only</div>
+            ) : identity.isSolana ? (
+              <div>Solana token identity · selectable / copyable</div>
+            ) : null}
+
+            {identity.registryId !== null && identity.registryId !== undefined && String(identity.registryId).trim() ? (
+              <div>Registry ID: {String(identity.registryId)}</div>
+            ) : identity.isRobinhoodChain && identity.asset === "ETH" ? (
+              <div>Registry identity: native asset</div>
+            ) : null}
+
+            {identity.addressLabel ? (
+              <div style={{ marginTop: 4 }}>
+                <div style={{ ...sx.muted, fontSize: 10, marginBottom: 2 }}>{identity.addressLabel}</div>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                  <code
+                    data-balance-copy-address="1"
+                    style={{
+                      flex: "1 1 auto",
+                      minWidth: 0,
+                      color: pal.text,
+                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                      fontSize: 11,
+                      overflowWrap: "anywhere",
+                      wordBreak: "break-all",
+                      userSelect: "text",
+                      cursor: "text",
+                    }}
+                  >
+                    {identity.address || "Native / none"}
+                  </code>
+                  {identity.address ? (
+                    <button
+                      type="button"
+                      data-no-drag="1"
+                      data-copy-balance-contract="1"
+                      style={{ ...(btn?.(false) ?? smallBtn(false)), flex: "0 0 auto", padding: "3px 7px", fontSize: 10 }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        copyTextSafe(identity.address);
+                      }}
+                      title={`Copy ${identity.addressLabel.toLowerCase()}`}
+                    >
+                      Copy {identity.addressLabel.toLowerCase()}
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : identity.isRobinhoodChain ? (
+              <div>Contract: Native / none</div>
+            ) : null}
+
+            {identity.registryScope ? <div>Registry scope: {identity.registryScope}</div> : null}
+            {identity.fetchedAt ? <div>Snapshot: {identity.fetchedAt}</div> : null}
+            <div>USD source: {identity.usdSource || "—"}</div>
+          </div>
+        ) : null}
 
         {balOverlib.loading ? (
           <div style={{ ...sx.muted, fontSize: 12 }}>Loading markets…</div>
@@ -4253,27 +4401,8 @@ async function refreshSolanaOnchainBalances() {
     );
   }
 
-  function robinhoodChainBalanceIdentityTooltip(b) {
-    if (!isRobinhoodChainBalanceRow(b)) return "";
-    const registryId = b?.registry_id ?? b?.registryId ?? null;
-    const contract = String(b?.contract_address ?? b?.contractAddress ?? "").trim();
-    const fetchedAt = String(b?.fetched_at ?? b?.captured_at ?? b?.created_at ?? "").trim();
-    const usdSource = String(b?.usd_source_symbol || b?.usd_source || "—").trim() || "—";
-    const lines = ["Robinhood Chain mainnet 4663 · Wallet Addresses · read only"];
-    if (registryId !== null && registryId !== undefined && String(registryId).trim()) {
-      lines.push(`Registry ID: ${registryId}`);
-    } else if (String(b?.asset || "").trim().toUpperCase() === "ETH") {
-      lines.push("Registry identity: native asset");
-    }
-    lines.push(`Contract: ${contract || "Native / none"}`);
-    if (b?.registry_venue) lines.push(`Registry scope: ${String(b.registry_venue)}`);
-    if (fetchedAt) lines.push(`Snapshot: ${fetchedAt}`);
-    lines.push(`USD source: ${usdSource}`);
-    return lines.join("\n");
-  }
-
   // NEW (Balances-only): clickable asset cell that routes to inferred market symbol
-  function renderBalanceAssetCell(b) {
+  function renderBalanceAssetCell(b, { groupedChild = false } = {}) {
     const asset = String(b?.asset || "").trim();
     const venRow = String(b?.venue || "").trim();
     const market = normalizeMarketSymbolMaybe(inferBalanceMarketSymbol(b));
@@ -4288,6 +4417,7 @@ async function refreshSolanaOnchainBalances() {
     // Only allow clicking if we have a plausible market symbol (contains a dash) and an onPickMarket handler.
     // Unregistered RH Chain candidates are identity-review rows, not trade-navigation rows.
     const clickable =
+      !groupedChild &&
       !isUnregisteredRobinhoodToken &&
       !hideTableDataGlobal &&
       typeof onPickMarket === "function" &&
@@ -4308,14 +4438,17 @@ async function refreshSolanaOnchainBalances() {
 
     const assetUpper = String(asset || "").trim().toUpperCase();
     const isRobinhoodChain = isRobinhoodChainBalanceRow(b);
-    const identityTooltip = isRobinhoodChain ? robinhoodChainBalanceIdentityTooltip(b) : "";
+    const identity = balanceHoverIdentity(b, market, venueMaybe);
     const pickTitle = clickable ? `Pick market: ${market}${venueMaybe ? ` (${venueMaybe})` : ""}` : "";
-    const title = [pickTitle, identityTooltip].filter(Boolean).join("\n") || undefined;
+    // Native title tooltips cannot be entered/selected. For rows with token identity data,
+    // the interactive balances overlib is the authoritative hover surface.
+    const title = identity ? undefined : (pickTitle || undefined);
 
     return (
       <td
         style={{
           ...sx.td,
+          ...(groupedChild ? { paddingLeft: 22, opacity: 0.92 } : null),
           cursor: clickable ? "pointer" : sx.td?.cursor,
           textDecoration: clickable ? "underline" : "none",
           textUnderlineOffset: clickable ? 2 : undefined,
@@ -4329,6 +4462,8 @@ async function refreshSolanaOnchainBalances() {
             clientY: e.clientY,
             venueMaybe,
             assetMaybe: assetUpper,
+            balanceRow: b,
+            marketMaybe: market,
           });
         }}
         onMouseMove={(e) => {
@@ -4341,7 +4476,7 @@ async function refreshSolanaOnchainBalances() {
           const y = clamp(Math.round(e.clientY - wr.top + 14), 80, Math.max(80, Math.round(geom.h - 220)));
           setBalOverlib((p) => ({ ...p, anchorX: x, anchorY: y }));
         }}
-        onMouseLeave={() => scheduleCloseOverlib(140)}
+        onMouseLeave={() => scheduleCloseOverlib(220)}
         onClick={() => {
           if (!clickable) return;
           callPickMarket(market, venueMaybe);
@@ -4361,7 +4496,7 @@ async function refreshSolanaOnchainBalances() {
             {display}
             {isRobinhoodChain && !hideTableDataGlobal ? (
               <span
-                title={identityTooltip || "Robinhood Chain mainnet 4663 · Wallet Addresses · read only"}
+                title="Robinhood Chain mainnet 4663"
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
@@ -4400,7 +4535,20 @@ async function refreshSolanaOnchainBalances() {
               </span>
             ) : null}
           </span>
-          {showMint ? <span style={{ fontSize: 11, opacity: 0.7 }}>{mintShort2}</span> : null}
+          {showMint ? (
+            <span
+              data-no-drag="1"
+              style={{ fontSize: 11, opacity: 0.7, userSelect: "text", cursor: mintFallback ? "copy" : "text" }}
+              title={mintFallback ? `Click to copy mint: ${mintFallback}` : undefined}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!mintFallback) return;
+                copyTextSafe(mintFallback);
+              }}
+            >
+              {mintShort2}
+            </span>
+          ) : null}
           {isUnregisteredRobinhoodToken && !hideTableDataGlobal ? (
             <>
               <span
@@ -7815,12 +7963,7 @@ function renderFillToasts() {
                         </span>
                       </td>
                     ) : isGroupedChild && !b?.unregistered_token ? (
-                      <td
-                        style={{ ...sx.td, paddingLeft: 22, opacity: 0.92 }}
-                        title={hideTableDataGlobal ? "" : robinhoodChainBalanceIdentityTooltip(b)}
-                      >
-                        {hideTableDataGlobal ? "••••" : b.asset || "—"}
-                      </td>
+                      renderBalanceAssetCell(b, { groupedChild: true })
                     ) : (
                       renderBalanceAssetCell(b)
                     )}
@@ -7978,7 +8121,17 @@ function renderFillToasts() {
                       .map((it, idx) => (
                         <tr key={it.mint || it.asset || idx}>
                           <td style={sx.td}>{it.symbol || it.asset || "—"}</td>
-                          <td style={sx.td}>{hideTableDataGlobal ? "••••" : (it.mint ? `${String(it.mint).slice(0, 6)}…` : "—")}</td>
+                          <td
+                            style={{ ...sx.td, userSelect: "text", cursor: !hideTableDataGlobal && it.mint ? "copy" : sx.td?.cursor }}
+                            title={!hideTableDataGlobal && it.mint ? `Click to copy mint: ${String(it.mint)}` : undefined}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (hideTableDataGlobal || !it.mint) return;
+                              copyTextSafe(String(it.mint));
+                            }}
+                          >
+                            {hideTableDataGlobal ? "••••" : (it.mint ? `${String(it.mint).slice(0, 6)}…` : "—")}
+                          </td>
                           <td style={sx.tdRight}>{hideTableDataGlobal ? "••••" : fmtBal(it.amount)}</td>
                         </tr>
                       ))}
@@ -10194,7 +10347,7 @@ function renderFillToasts() {
     </div>
   );
 
-  const tabKey = String(tab || "balances");
+  const tabKey = String(tab || "allOrders");
   const setTabSafe = (t) => {
     if (typeof setTab === "function") setTab(t);
   };

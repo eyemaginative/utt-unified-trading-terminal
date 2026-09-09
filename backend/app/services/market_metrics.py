@@ -1651,6 +1651,110 @@ def _fetch_coingecko_markets(ids: Sequence[str], limit: int, page: int = 1) -> T
 
 
 
+def _fetch_coingecko_simple_prices(ids: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Fetch direct USD prices for explicitly mapped CoinGecko IDs.
+
+    This is a narrow resilience fallback for cases where /coins/markets returns
+    a partial list even though the requested CoinGecko ID is valid.  It is used
+    only for missing explicitly requested IDs and does not perform symbol-based
+    discovery.
+    """
+
+    global _CG_BACKOFF_UNTIL
+
+    clean_ids = [
+        str(cg_id or "").strip()
+        for cg_id in ids or []
+        if str(cg_id or "").strip()
+    ]
+    if not clean_ids:
+        return [], []
+
+    now = time.time()
+    if now < float(_CG_BACKOFF_UNTIL or 0):
+        wait_s = max(1, int(float(_CG_BACKOFF_UNTIL) - now))
+        return [], [{
+            "source": "coingecko_simple",
+            "error": "rate_limited_backoff",
+            "message": f"CoinGecko backoff active for {wait_s}s; direct simple-price fallback skipped.",
+        }]
+
+    params = {
+        "ids": ",".join(clean_ids),
+        "vs_currencies": "usd",
+        "include_last_updated_at": "true",
+        "precision": "full",
+    }
+    url = _coingecko_search_base_url() + "/simple/price?" + urllib.parse.urlencode(params)
+    errors: List[Dict[str, Any]] = []
+
+    try:
+        data = _http_json(
+            url,
+            timeout_s=float(
+                os.getenv("UTT_MARKET_METRICS_HTTP_TIMEOUT_S", "10")
+                or 10
+            ),
+        )
+    except urllib.error.HTTPError as e:
+        if int(getattr(e, "code", 0) or 0) == 429:
+            _CG_BACKOFF_UNTIL = time.time() + _cg_backoff_s()
+        errors.append({
+            "source": "coingecko_simple",
+            "error": f"HTTP {e.code}",
+            "message": str(e),
+        })
+        return [], errors
+    except Exception as e:
+        errors.append({
+            "source": "coingecko_simple",
+            "error": type(e).__name__,
+            "message": str(e),
+        })
+        return [], errors
+
+    if not isinstance(data, dict):
+        errors.append({
+            "source": "coingecko_simple",
+            "error": "unexpected_response",
+            "message": "CoinGecko simple-price endpoint did not return an object",
+        })
+        return [], errors
+
+    rows: List[Dict[str, Any]] = []
+    for cg_id in clean_ids:
+        raw = data.get(cg_id)
+        if not isinstance(raw, dict):
+            continue
+        price = _num(raw.get("usd"))
+        if price is None or price <= 0:
+            continue
+
+        last_updated = None
+        last_updated_at = _num(raw.get("last_updated_at"))
+        if last_updated_at is not None and last_updated_at > 0:
+            try:
+                last_updated = (
+                    datetime.fromtimestamp(
+                        float(last_updated_at),
+                        tz=timezone.utc,
+                    )
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+            except Exception:
+                last_updated = None
+
+        rows.append({
+            "id": cg_id,
+            "current_price": price,
+            "last_updated": last_updated,
+            "_utt_simple_price": True,
+        })
+
+    return rows, errors
+
+
 def _fetch_coingecko_market_pages(page_count: int, per_page: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Fetch top CoinGecko market pages for broad symbol-cache seeding.
 
@@ -1698,6 +1802,11 @@ def _row_from_cg(asset: str, meta: Dict[str, str], raw: Dict[str, Any], updated_
         warnings.append(f"Using stale CoinGecko cache ({int(age_s // 60)}m old).")
     if raw.get("_utt_symbol_match"):
         warnings.append("CoinGecko data matched by ticker symbol; verify if this symbol is ambiguous.")
+    if raw.get("_utt_simple_price"):
+        warnings.append(
+            "CoinGecko direct price used the simple-price fallback; "
+            "market cap and volume may be unavailable for this row."
+        )
 
     price = _num(raw.get("current_price"))
     market_cap = _num(raw.get("market_cap"))
@@ -1937,10 +2046,38 @@ def get_market_metrics_summary(
     market_page_rows: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     if live_missing_ids:
-        markets, live_errors = _fetch_coingecko_markets(live_missing_ids, min(clean_limit, len(live_missing_ids), 250))
+        markets, live_errors = _fetch_coingecko_markets(
+            live_missing_ids,
+            min(clean_limit, len(live_missing_ids), 250),
+        )
         errors.extend(live_errors)
         if markets:
             _cg_raw_cache_update(markets)
+
+        # An explicitly mapped CoinGecko ID is stronger than a ticker match.
+        # If /coins/markets returns a partial 200 response, retry only those
+        # missing explicit IDs against /simple/price.  Do not do this after a
+        # provider/transport error because that would create an avoidable
+        # second request during rate limiting or outage conditions.
+        if not live_errors:
+            returned_market_ids = {
+                str(row.get("id") or "").strip()
+                for row in markets
+                if isinstance(row, dict) and str(row.get("id") or "").strip()
+            }
+            simple_missing_ids = [
+                cg_id
+                for cg_id in live_missing_ids
+                if cg_id not in returned_market_ids
+            ]
+            if simple_missing_ids:
+                simple_rows, simple_errors = _fetch_coingecko_simple_prices(
+                    simple_missing_ids
+                )
+                errors.extend(simple_errors)
+                if simple_rows:
+                    markets.extend(simple_rows)
+                    _cg_raw_cache_update(simple_rows)
 
     # PORT-METRICS.1 v8:
     # A broad local universe can contain hundreds of symbols that do not yet

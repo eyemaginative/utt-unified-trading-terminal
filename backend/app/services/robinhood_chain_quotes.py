@@ -70,7 +70,7 @@ def _bounded_sample_amounts(seed: Any, decimals: int, levels: int) -> Tuple[str,
     out: List[str] = []
     for factor in factors:
         amount = (seed_amount * factor).quantize(quantum, rounding=ROUND_DOWN)
-        if amount <= 0 or amount > Decimal("25"):
+        if amount <= 0:
             continue
         text = _decimal_text(amount)
         if text not in out:
@@ -426,6 +426,7 @@ class RobinhoodChainQuoteService:
         registry_tokens: Sequence[Dict[str, Any]],
         route_capability: Dict[str, Any],
         indicative_input_ceiling: Optional[Decimal],
+        interactive_max_usd: Optional[Any],
         force_refresh: bool,
     ) -> Dict[str, Any]:
         normalized_side = _normalize_side(side)
@@ -448,13 +449,15 @@ class RobinhoodChainQuoteService:
             force_refresh=force_refresh,
             route_capability=route_capability,
             require_live_verified=False,
+            # Historical exact-input capability/probe ceilings are evidence and
+            # synthetic-book seeds only. They must not cap a current user-entered
+            # exact-spend amount. Exact-output review remains probe-bounded.
             max_probe_amount=(
-                _decimal_text(indicative_input_ceiling)
-                if indicative_input_ceiling is not None
-                else route_capability.get("probe_amount")
+                route_capability.get("probe_amount")
                 if normalized_amount_mode == "exact_output"
                 else None
             ),
+            max_sell_usd=interactive_max_usd,
         )
         if not result.get("ok"):
             failure = _safe_failure(result, context="indicative")
@@ -487,6 +490,7 @@ class RobinhoodChainQuoteService:
         registry_tokens: Sequence[Dict[str, Any]],
         route_capability: Dict[str, Any],
         force_refresh: bool = False,
+        interactive_max_usd: Optional[Any] = None,
     ) -> Dict[str, Any]:
         normalized_symbol = _normalize_symbol(symbol)
         base_symbol = _token_symbol(base_token)
@@ -569,25 +573,6 @@ class RobinhoodChainQuoteService:
             })
             return failure
 
-        if (
-            normalized_mode == "exact_input"
-            and indicative_input_ceiling is not None
-            and requested > indicative_input_ceiling
-        ):
-            failure = _safe_failure(
-                {"error": "robinhood_chain_quote_amount_exceeds_indicative_ceiling", "provider": ROBINHOOD_CHAIN_QUOTE_PROVIDER},
-                context="indicative",
-            )
-            failure.update({
-                "symbol": normalized_symbol,
-                "requested_amount": _decimal_text(requested),
-                "maximum_review_amount": _decimal_text(indicative_input_ceiling),
-                "amount_mode": normalized_mode,
-                "route_capability": copy.deepcopy(capability),
-                "provider_contacted": False,
-            })
-            return failure
-
         quote = await self._probe_quote(
             symbol=normalized_symbol,
             side=normalized_side,
@@ -600,6 +585,7 @@ class RobinhoodChainQuoteService:
             registry_tokens=registry_tokens,
             route_capability=capability,
             indicative_input_ceiling=indicative_input_ceiling,
+            interactive_max_usd=interactive_max_usd,
             force_refresh=force_refresh,
         )
         if not quote.get("ok"):
@@ -622,6 +608,7 @@ class RobinhoodChainQuoteService:
                 registry_tokens=registry_tokens,
                 route_capability=capability,
                 indicative_input_ceiling=indicative_input_ceiling,
+                interactive_max_usd=interactive_max_usd,
                 force_refresh=False,
             )
             if reference.get("ok"):

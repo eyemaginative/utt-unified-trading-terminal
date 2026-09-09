@@ -223,6 +223,40 @@ class _FakeUniswapV3Service:
         }
 
 
+class _TransactionObservingProbeService:
+    """Fake provider that records whether SQLite is in a write transaction at await time."""
+
+    def __init__(self, db: Session, provider: str) -> None:
+        self.db = db
+        self.provider = str(provider)
+        self.calls: List[Dict[str, Any]] = []
+        self.in_transaction_states: List[bool] = []
+
+    async def probe(self, **kwargs: Any) -> Dict[str, Any]:
+        self.calls.append(dict(kwargs))
+        connection_fairy = self.db.connection().connection
+        driver_connection = getattr(connection_fairy, "driver_connection", connection_fairy)
+        self.in_transaction_states.append(bool(getattr(driver_connection, "in_transaction", False)))
+        amount = str(kwargs.get("sell_amount") or kwargs.get("requested_amount") or "1")
+        return {
+            "ok": True,
+            "provider": self.provider,
+            "provider_contacted": True,
+            "liquidity_available": True,
+            "sell_amount": amount,
+            "buy_amount": "0.5",
+            "price_buy_per_sell": "0.5",
+            "price_impact_bps": "2.5",
+            "route": {"fills": [{"source": f"FAKE_{self.provider.upper()}"}]},
+            "provider_warnings": [],
+            "read_only": True,
+            "execution_enabled": False,
+            "signing_enabled": False,
+            "transaction_calldata": None,
+            "will_mutate": False,
+        }
+
+
 class _FakePlanningService:
     def __init__(self, *, ok: bool = True) -> None:
         self.ok = bool(ok)
@@ -2064,6 +2098,83 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["market"]["orderbook_enabled"])
         self.assertFalse(result["automatic_execution_promotion"])
 
+    async def test_selected_market_refresh_does_not_hold_sqlite_writer_across_provider_awaits(self) -> None:
+        base = self._token("LOCKA", "0x" + "a1" * 20, 18)
+        quote = self._token("LOCKB", "0x" + "a2" * 20, 6)
+        self._mark_verified(base)
+        self._mark_verified(quote)
+        self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="writer lock regression",
+            confirm_create=True,
+            require_verified_registry_identities=True,
+        )
+
+        zero_x = _TransactionObservingProbeService(self.db, "0x")
+        uniswap = _TransactionObservingProbeService(self.db, "uniswap_api")
+        uniswap_v3 = _TransactionObservingProbeService(self.db, "uniswap_v3_rpc")
+        service = RobinhoodChainRegistryDiscoveryService(
+            rpc_client=self.fake_rpc,
+            discovery_service=zero_x,
+            planning_service=self.fake_planning,
+            uniswap_service=uniswap,
+            uniswap_v3_service=uniswap_v3,
+        )
+
+        result = await service.refresh_selected_market(
+            self.db,
+            symbol="LOCKA-LOCKB",
+            taker_address="0x" + "a3" * 20,
+            force_refresh=True,
+            confirm_refresh=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["results"]), 6)
+        self.assertEqual(zero_x.in_transaction_states, [False, False])
+        self.assertEqual(uniswap.in_transaction_states, [False, False])
+        self.assertEqual(uniswap_v3.in_transaction_states, [False, False])
+
+    async def test_discover_objective_commits_each_direction_before_next_provider_await(self) -> None:
+        base = self._token("LOCKC", "0x" + "a4" * 20, 18)
+        quote = self._token("LOCKD", "0x" + "a5" * 20, 6)
+        self._mark_verified(base)
+        self._mark_verified(quote)
+        objective = self.service.create_objective(
+            self.db,
+            base_token_registry_id=base.id,
+            quote_token_registry_id=quote.id,
+            mechanism=MECHANISM_SWAP,
+            notes="legacy discovery lock regression",
+            confirm_create=True,
+            require_verified_registry_identities=True,
+        )["objective"]
+
+        zero_x = _TransactionObservingProbeService(self.db, "0x")
+        service = RobinhoodChainRegistryDiscoveryService(
+            rpc_client=self.fake_rpc,
+            discovery_service=zero_x,
+            planning_service=self.fake_planning,
+            uniswap_service=self.fake_uniswap,
+            uniswap_v3_service=self.fake_uniswap_v3,
+        )
+
+        result = await service.discover_objective(
+            self.db,
+            objective_id=objective["id"],
+            taker_address="0x" + "a6" * 20,
+            base_probe_amount="1",
+            quote_probe_amount="1",
+            force_refresh=True,
+            confirm_discovery=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(zero_x.in_transaction_states, [False, False])
+
     def test_market_by_symbol_returns_derived_provider_orderbook_state(self) -> None:
         base = self._token("ALPHA", "0x" + "c1" * 20, 18)
         quote = self._token("USDG", "0x" + "c2" * 20, 6, price_source="stable")
@@ -2160,6 +2271,20 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_contract["registry_id"], token_a.id)
         self.assertEqual(by_contract["registry_contract_address"], str(token_a.address).lower())
 
+    def test_create_objective_route_reports_sqlite_lock_as_controlled_retryable_503(self) -> None:
+        router_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "robinhood_chain.py"
+        source = router_path.read_text(encoding="utf-8")
+        start = source.index('@router.post("/registry-discovery/objectives")')
+        end = source.index('@router.delete("/registry-discovery/objectives/{objective_id}")', start)
+        endpoint_source = source[start:end]
+
+        self.assertIn("except OperationalError as exc:", endpoint_source)
+        self.assertIn('"database is locked"', endpoint_source)
+        self.assertIn("status_code=503", endpoint_source)
+        self.assertIn('"error": "pair_objective_database_busy"', endpoint_source)
+        self.assertIn('"retryable": True', endpoint_source)
+        self.assertIn('"provider_contacted": False', endpoint_source)
+
     def test_orderbook_route_uses_enriched_market_lookup(self) -> None:
         router_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "robinhood_chain.py"
         source = router_path.read_text(encoding="utf-8")
@@ -2179,6 +2304,49 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "market = registry_service.objective_by_symbol(db, symbol)",
             orderbook_source,
         )
+
+    def test_orderbook_route_uses_bounded_same_provider_fallback(self) -> None:
+        router_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "robinhood_chain.py"
+        source = router_path.read_text(encoding="utf-8")
+        start = source.index('@router.get("/orderbook")')
+        end = source.find("\n@router.", start + 1)
+        orderbook_source = source[start:] if end < 0 else source[start:end]
+
+        self.assertIn("provider_candidates = [preferred_provider]", orderbook_source)
+        self.assertIn("for fallback_provider in (", orderbook_source)
+        self.assertIn("UNISWAP_V3_RPC_PROVIDER", orderbook_source)
+        self.assertIn("ROBINHOOD_CHAIN_QUOTE_PROVIDER", orderbook_source)
+        self.assertIn("UNISWAP_PROVIDER", orderbook_source)
+        self.assertIn("for provider in provider_candidates:", orderbook_source)
+        self.assertIn("result = await build_provider_orderbook(provider)", orderbook_source)
+        self.assertIn('result["selected_orderbook_provider"] = provider', orderbook_source)
+        self.assertIn('result["provider_fallback_used"] = provider != preferred_provider', orderbook_source)
+        self.assertIn('result["provider_attempts"] = copy.deepcopy(provider_attempts)', orderbook_source)
+
+    def test_orderbook_route_preserves_structural_fail_closed_behavior(self) -> None:
+        router_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "robinhood_chain.py"
+        source = router_path.read_text(encoding="utf-8")
+        start = source.index('@router.get("/orderbook")')
+        end = source.find("\n@router.", start + 1)
+        orderbook_source = source[start:] if end < 0 else source[start:end]
+
+        self.assertIn("structural_orderbook_errors = {", orderbook_source)
+        self.assertIn('result_error in structural_orderbook_errors', orderbook_source)
+        self.assertIn("_quote_failure_status(result) < 500", orderbook_source)
+        self.assertIn("break", orderbook_source)
+        self.assertIn('"uniswap_orderbook_crossed_market"', source)
+        self.assertIn('"uniswap_orderbook_pair_identity_mismatch"', source)
+        self.assertIn('"uniswap_orderbook_direction_unavailable"', source)
+        structural_start = orderbook_source.index("structural_orderbook_errors = {")
+        structural_end = orderbook_source.index("}", structural_start)
+        structural_source = orderbook_source[structural_start:structural_end + 1]
+        self.assertIn('"verified_weth_registry_identity_required"', structural_source)
+        self.assertNotIn('"synthetic_orderbook_liquidity_incomplete"', structural_source)
+        quote_status_start = source.index("def _quote_failure_status")
+        quote_status_end = source.index("\n\n", quote_status_start)
+        quote_status_source = source[quote_status_start:quote_status_end]
+        self.assertIn('"verified_weth_registry_identity_required"', quote_status_source)
+        self.assertNotIn('"synthetic_orderbook_liquidity_incomplete"', quote_status_source)
 
     def test_market_catalog_preserves_complete_live_execution_provider_preference(self) -> None:
         base = self._token("ALPHA", "0x" + "e4" * 20, 18)
@@ -2587,11 +2755,29 @@ class RobinhoodChainRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         source = (root / "frontend" / "src" / "OrderTicketWidget.jsx").read_text(encoding="utf-8")
 
-        self.assertEqual(source.count("automatic: true"), 1)
+        approval_watch_start = source.index("function startRobinhoodChainSuccessfulApprovalReceiptWatcher")
+        approval_watch_end = source.index(
+            "async function refreshRobinhoodChainSuccessfulApprovalReceipt",
+            approval_watch_start,
+        )
+        approval_watch_source = source[approval_watch_start:approval_watch_end]
+
         receipt_watch_start = source.index("function startRobinhoodChainSuccessfulSwapReceiptWatcher")
         receipt_watch_end = source.index("async function refreshRobinhoodChainSuccessfulSwapReceipt", receipt_watch_start)
         receipt_watch_source = source[receipt_watch_start:receipt_watch_end]
+
+        self.assertIn("automatic: true", approval_watch_source)
         self.assertIn("automatic: true", receipt_watch_source)
+
+        non_receipt_source = source.replace(approval_watch_source, "").replace(receipt_watch_source, "")
+        self.assertNotIn("automatic: true", non_receipt_source)
+
+        self.assertIn("refreshRobinhoodChainWalletApprovalReceipt", approval_watch_source)
+        self.assertNotIn("eth_sendTransaction", approval_watch_source)
+        self.assertNotIn("provider.request", approval_watch_source)
+        self.assertNotIn("prepareRobinhoodChainSuccessfulSwap", approval_watch_source)
+        self.assertNotIn("sendRobinhoodChainSuccessfulSwapRequest", approval_watch_source)
+        self.assertNotIn("recordRobinhoodChainWalletSwapSubmission", approval_watch_source)
         self.assertNotIn("requestRobinhoodChainQuote(true, { automatic: true", source)
         self.assertNotIn("requestRobinhoodChainFirmPlan(true, { automatic: true", source)
         self.assertIn("MANUAL PREP", source)

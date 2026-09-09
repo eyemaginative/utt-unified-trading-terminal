@@ -76,6 +76,12 @@ ROBINHOOD_CHAIN_SWAP_TERMINAL_STATUSES = frozenset({
     "swap_submission_failed",
     "verification_failed",
 })
+ROBINHOOD_CHAIN_SWAP_RECOVERY_STATUSES = frozenset({
+    "approval_send_claimed",
+    "approval_pending",
+    "swap_send_claimed",
+    "swap_pending",
+})
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ERC20_TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 _WEI_PER_ETH = Decimal(10) ** 18
@@ -903,8 +909,14 @@ class RobinhoodChainSwapExecutionService:
         side: str,
         amount_mode: str = ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE,
         wallet_address: Optional[str] = None,
+        recovery_only: bool = False,
     ) -> Dict[str, Any]:
-        """Return the newest matching lifecycle without changing execution state."""
+        """Return the newest matching lifecycle without changing execution state.
+
+        When ``recovery_only`` is true, the newest objective row must itself be an
+        unresolved claim/submission lifecycle. Older pending rows are never
+        resurrected through a newer terminal or history-only row.
+        """
         normalized_symbol = str(symbol or "").strip().upper().replace("/", "-").replace("_", "-")
         normalized_side = str(side or "").strip().lower()
         normalized_mode = str(amount_mode or "").strip().lower().replace("exact_spend", "exact_input")
@@ -931,13 +943,16 @@ class RobinhoodChainSwapExecutionService:
         ).first()
         if row is None:
             raise KeyError("robinhood_chain_swap_execution_not_found")
+        if recovery_only and str(row.status or "").strip().lower() not in ROBINHOOD_CHAIN_SWAP_RECOVERY_STATUSES:
+            raise KeyError("robinhood_chain_swap_recovery_not_found")
         payload = self.get(db, str(row.id))
         payload["lookup"] = {
-            "kind": "latest_matching_lifecycle",
+            "kind": "latest_recoverable_lifecycle" if recovery_only else "latest_matching_lifecycle",
             "symbol": normalized_symbol,
             "side": normalized_side,
             "amount_mode": normalized_mode,
             "wallet_address": normalized_wallet or None,
+            "recovery_only": bool(recovery_only),
             "read_only": True,
             "will_mutate": False,
         }

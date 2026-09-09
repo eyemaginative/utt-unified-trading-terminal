@@ -149,7 +149,9 @@ class RobinhoodChainExecutionDiscoveryService:
         self.cache_ttl_s = max(0.0, min(float(cache_ttl_s), 300.0))
         self.error_backoff_s = max(0.0, min(float(error_backoff_s), 3600.0))
         self.max_concurrent = max(1, min(int(max_concurrent), 4))
-        self.max_sell_usd = max(0.01, min(float(max_sell_usd), 25.0))
+        # Bootstrap/default only. Per-user Profile limits are passed to probe()
+        # and re-applied even when provider evidence is served from cache.
+        self.max_sell_usd = max(0.01, float(max_sell_usd))
         self.credential_getter = credential_getter
         self.rpc_client = rpc_client or get_robinhood_chain_client()
         self.transport = transport
@@ -344,6 +346,48 @@ class RobinhoodChainExecutionDiscoveryService:
             "error": None if decimals_match else "contract_decimals_mismatch",
         }
 
+    def _effective_max_sell_usd(self, value: Optional[Any]) -> Decimal:
+        raw = self.max_sell_usd if value is None or str(value).strip() == "" else value
+        try:
+            maximum = Decimal(str(raw).strip())
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError("invalid_discovery_value_cap") from exc
+        if not maximum.is_finite() or maximum <= 0:
+            raise ValueError("invalid_discovery_value_cap")
+        return maximum
+
+    def _apply_value_cap(
+        self,
+        response: Dict[str, Any],
+        *,
+        sell_token: Dict[str, Any],
+        buy_token: Dict[str, Any],
+        max_sell_usd: Optional[Any],
+    ) -> Dict[str, Any]:
+        out = copy.deepcopy(response)
+        maximum = self._effective_max_sell_usd(max_sell_usd)
+        sell_stable = str(sell_token.get("external_price_source") or "").strip().lower() == "stable"
+        buy_stable = str(buy_token.get("external_price_source") or "").strip().lower() == "stable"
+        estimate: Optional[Decimal] = None
+        if sell_stable and out.get("sell_amount") not in (None, ""):
+            estimate = Decimal(str(out.get("sell_amount")))
+        elif buy_stable and out.get("buy_amount") not in (None, ""):
+            estimate = Decimal(str(out.get("buy_amount")))
+
+        out["discovery_value_usd_estimate"] = format(estimate, "f") if estimate is not None else None
+        out["discovery_value_cap_usd"] = format(maximum, "f")
+        out["discovery_value_cap_source"] = "user_profile_or_bootstrap"
+        out["discovery_value_cap_passed"] = estimate is None or estimate <= maximum
+        if estimate is not None and estimate > maximum:
+            out.update(
+                {
+                    "ok": False,
+                    "error": "discovery_amount_exceeds_cap",
+                    "liquidity_available": False,
+                }
+            )
+        return out
+
     def _enforce_pre_request_cap(
         self,
         *,
@@ -352,6 +396,7 @@ class RobinhoodChainExecutionDiscoveryService:
         sell_token: Dict[str, Any],
         buy_token: Dict[str, Any],
         max_probe_amount: Optional[Any] = None,
+        max_sell_usd: Optional[Any] = None,
     ) -> None:
         amount = Decimal(amount_display)
         if max_probe_amount is not None and str(max_probe_amount).strip() != "":
@@ -362,12 +407,12 @@ class RobinhoodChainExecutionDiscoveryService:
             if not explicit_cap.is_finite() or explicit_cap <= 0 or amount > explicit_cap:
                 raise ValueError("discovery_amount_exceeds_cap")
 
-        # Stable-token USD caps are driven by TokenRegistry metadata rather than
-        # symbol names. Non-stable assets remain bounded by the explicit
-        # objective probe amount supplied by the R5C.1 discovery layer.
+        # Stable-token USD classification is driven by exact Token Registry
+        # metadata, never by ticker text. The dynamic user/Profile cap is
+        # independent from historical objective probe evidence.
         stable_token = sell_token if amount_mode == "exact_input" else buy_token
         stable_source = str(stable_token.get("external_price_source") or "").strip().lower()
-        if stable_source == "stable" and amount > Decimal(str(self.max_sell_usd)):
+        if stable_source == "stable" and amount > self._effective_max_sell_usd(max_sell_usd):
             raise ValueError("discovery_amount_exceeds_cap")
 
     def _cache_key(self, params: Dict[str, str], sell_token: Dict[str, Any], buy_token: Dict[str, Any]) -> str:
@@ -463,6 +508,7 @@ class RobinhoodChainExecutionDiscoveryService:
         requested_display: str,
         credential_source: str,
         elapsed_ms: float,
+        max_sell_usd: Optional[Any] = None,
     ) -> Dict[str, Any]:
         sell_atomic = _safe_int_string(body.get("sellAmount"))
         buy_atomic = _safe_int_string(body.get("buyAmount"))
@@ -552,28 +598,15 @@ class RobinhoodChainExecutionDiscoveryService:
             "will_mutate": False,
         }
 
-        # Stable-value estimation is driven by TokenRegistry price-source
-        # metadata and never by a hardcoded ticker.
-        max_usd = Decimal(str(self.max_sell_usd))
-        sell_stable = str(sell_token.get("external_price_source") or "").strip().lower() == "stable"
-        buy_stable = str(buy_token.get("external_price_source") or "").strip().lower() == "stable"
-        usd_estimate: Optional[Decimal] = None
-        if sell_stable and sell_display is not None:
-            usd_estimate = Decimal(sell_display)
-        elif buy_stable and buy_display is not None:
-            usd_estimate = Decimal(buy_display)
-        response["discovery_value_usd_estimate"] = format(usd_estimate, "f") if usd_estimate is not None else None
-        response["discovery_value_cap_usd"] = format(max_usd, "f")
-        response["discovery_value_cap_passed"] = usd_estimate is None or usd_estimate <= max_usd
-        if usd_estimate is not None and usd_estimate > max_usd:
-            response.update(
-                {
-                    "ok": False,
-                    "error": "discovery_amount_exceeds_cap",
-                    "liquidity_available": False,
-                }
-            )
-        return response
+        # Apply the current authenticated user's economic discovery cap after
+        # provider normalization as well as before provider contact. This covers
+        # exact-input routes whose output token is the verified USD-stable side.
+        return self._apply_value_cap(
+            response,
+            sell_token=sell_token,
+            buy_token=buy_token,
+            max_sell_usd=max_sell_usd,
+        )
 
     async def probe(
         self,
@@ -587,6 +620,7 @@ class RobinhoodChainExecutionDiscoveryService:
         route_capability: Optional[Dict[str, Any]] = None,
         require_live_verified: bool = True,
         max_probe_amount: Optional[Any] = None,
+        max_sell_usd: Optional[Any] = None,
     ) -> Dict[str, Any]:
         provider = str(settings.robinhood_chain_effective_swap_provider() or "").strip().lower()
         credential = self._credential()
@@ -647,6 +681,7 @@ class RobinhoodChainExecutionDiscoveryService:
                 sell_token=sell_identity,
                 buy_token=buy_identity,
                 max_probe_amount=max_probe_amount,
+                max_sell_usd=max_sell_usd,
             )
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "read_only": True, "will_mutate": False}
@@ -701,6 +736,12 @@ class RobinhoodChainExecutionDiscoveryService:
         if not force_refresh:
             cached = await self._cached_result(cache_key)
             if cached is not None:
+                cached = self._apply_value_cap(
+                    cached,
+                    sell_token=sell_identity,
+                    buy_token=buy_identity,
+                    max_sell_usd=max_sell_usd,
+                )
                 cached["chain"] = chain
                 cached["contract_checks"] = contract_checks
                 cached["route_capability"] = capability
@@ -795,6 +836,7 @@ class RobinhoodChainExecutionDiscoveryService:
                     requested_display=requested_display,
                     credential_source=credential["source"],
                     elapsed_ms=elapsed_ms,
+                    max_sell_usd=max_sell_usd,
                 )
                 normalized["chain"] = chain
                 normalized["contract_checks"] = contract_checks

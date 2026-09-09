@@ -308,11 +308,13 @@ class Settings(BaseSettings):
         ge=1,
         le=4,
     )
+    # Bootstrap/default only. The authenticated per-user database preference
+    # becomes runtime authority after RH-CAP.PROFILE.1; do not impose a hidden
+    # source-code economic maximum here.
     robinhood_chain_discovery_max_sell_usd: float = Field(
         default=5.0,
         alias="ROBINHOOD_CHAIN_DISCOVERY_MAX_SELL_USD",
         gt=0.0,
-        le=25.0,
     )
 
     # RH-CHAIN.10D.1: dedicated browser-wallet execution gate.

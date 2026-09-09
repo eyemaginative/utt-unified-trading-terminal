@@ -1,0 +1,47 @@
+[b]UTT — Unified Trading Terminal — September 9, 2026 Cumulative Update[/b]
+
+
+[b]Profile / startup / catalog reliability[/b]
+[list]
+[*]Robinhood Chain discovery and interactive quote limits now persist through the authenticated Profile preference store instead of acting as fixed application ceilings.
+[*]The startup Tables tab is database-backed (All Orders, Balances, Local Orders, or Discover) and resolves before the Tables data surface mounts, avoiding an unintended transient balance load.
+[*]Registry-discovery writer scope was narrowed around provider work; final POOLS-USDG and VOLT-USDG refresh witnesses completed without the prior SQLite lock failure while background Ledger/FIFO refresh remains enabled.
+[/list]
+
+[b]Robinhood Chain[/b]
+[list]
+[*]Order Book routing now uses bounded provider fallback without mixing bid/ask sides across providers, while structural identity/direction/crossed-market failures remain fail-closed.
+[*]Crossed synthetic snapshots use a bounded whole-snapshot resample path; unsafe crossed data is not exposed as a normal Book.
+[*]Book → Ticket binding now preserves Robinhood Chain quote-only/synthetic context so Ask → BUY / Exact Spend works without the previous bid-row workaround.
+[*]Finite approvals remain finite and separate from swaps. Receipt status can advance through bounded read-only polling, but the watcher cannot prepare, sign, broadcast, or open an automatic second transaction.
+[*]Confirmed swaps refresh the relevant balance automatically.
+[*]Low-price Robinhood Chain books now use adaptive display/click precision, bounded at 12 decimals, so distinct raw levels are not intentionally collapsed by the old fixed 8/9-decimal frontend limits.
+[/list]
+
+[b]Counterparty / XCP[/b]
+[list]
+[*]XCP direct USD pricing now recovers through its exact CoinGecko identity when the normal market-data response omits that requested ID.
+[*]Crossed, stale, rate-limited, one-sided, or excessively wide XCP-BTC books no longer have accounting-price authority. Valid derived fallback requires coherent two-sided evidence.
+[*]Live acceptance restored a sane XCP/USD value while preserving the factual crossed Book as market evidence rather than hiding it.
+[/list]
+
+[b]Balances / UX[/b]
+[list]
+[*]Robinhood Chain contract details are now shown in an interactive balance popover with selectable text and Copy contract.
+[*]Supported balance mint identities receive the same copy-friendly treatment, including Solana balance surfaces where a mint is present.
+[/list]
+
+[b]Validation[/b]
+[list]
+[*]Canonical backend: 494 passed + 40 subtests, 0 failures.
+[*]Frontend production builds are green; existing Vite Solana-import and large-chunk warnings remain visible and non-fatal.
+[*]Multiple Robinhood Chain swaps completed successfully during the current accepted workflow.
+[/list]
+
+[b]Still intentionally gated[/b]
+[list]
+[*]No backend signing or transaction broadcast.
+[*]No unlimited approvals, automatic retries, or automatic second wallet transactions.
+[*]Successful finite-approval auto-advance remains a natural-future live witness; it will not be forced just for validation.
+[*]The adaptive low-price Book repair is installed/static-green; the final naturally occurring multi-level display/click witness remains follow-up work after this checkpoint.
+[/list]

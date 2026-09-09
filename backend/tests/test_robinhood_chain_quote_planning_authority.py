@@ -172,7 +172,11 @@ class RobinhoodChainQuotePlanningAuthorityTests(unittest.TestCase):
         )
         self.assertIn("robinhoodChainFirmPlanReviewEnabled", source)
         self.assertIn(
-            "Unsigned firm-plan review remains disabled while firm_plan_status is",
+            "!robinhoodChainFirmPlanReviewEnabled",
+            source,
+        )
+        self.assertIn(
+            "The selected database direction is not verified for unsigned firm-plan review.",
             source,
         )
 

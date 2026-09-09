@@ -36,6 +36,7 @@ TAKER = "0x70c1ddd03bc4cb74efac3f12a41465d028ae490c"
 SPENDER = "0x0000000000001ff3684f28c67538d4d072c22734"
 APPROVAL_TX_HASH = "0x" + "aa" * 32
 SWAP_TX_HASH = "0x" + "bb" * 32
+SWAP_TX_HASH_2 = "0x" + "cc" * 32
 APPROVAL_CLAIM = "cc" * 32
 SWAP_CLAIM = "dd" * 32
 SWAP_CALLDATA = "0x1234abcdef"
@@ -1077,6 +1078,78 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored["execution"]["id"], second["execution"]["id"])
         self.assertEqual(self.db.query(RobinhoodChainSwapExecution).count(), before_count)
 
+    async def test_latest_recovery_only_rejects_history_only_prepared_row(self):
+        self.planning.allowance_atomic = 2_000_000
+        prepared = await self.prepare_weth()
+        row = self.db.get(RobinhoodChainSwapExecution, prepared["execution"]["id"])
+        row.status = "swap_prepared"
+        row.swap_status = "prepared"
+        row.approval_status = "confirmed"
+        row.approval_tx_hash = APPROVAL_TX_HASH
+        row.swap_tx_hash = None
+        self.db.commit()
+
+        with self.assertRaisesRegex(KeyError, "robinhood_chain_swap_recovery_not_found"):
+            self.service.latest(
+                self.db,
+                symbol="WETH-USDG",
+                side="buy",
+                amount_mode="exact_input",
+                wallet_address=TAKER,
+                recovery_only=True,
+            )
+
+    async def test_latest_recovery_only_returns_latest_unresolved_pending_row(self):
+        self.planning.allowance_atomic = 2_000_000
+        pending = await self.prepare_weth()
+        row = self.db.get(RobinhoodChainSwapExecution, pending["execution"]["id"])
+        row.status = "swap_pending"
+        row.swap_status = "pending"
+        row.approval_status = "not_required"
+        row.swap_tx_hash = SWAP_TX_HASH
+        self.db.commit()
+
+        restored = self.service.latest(
+            self.db,
+            symbol="WETH-USDG",
+            side="buy",
+            amount_mode="exact_input",
+            wallet_address=TAKER,
+            recovery_only=True,
+        )
+
+        self.assertEqual(restored["execution"]["id"], pending["execution"]["id"])
+        self.assertEqual(restored["lookup"]["kind"], "latest_recoverable_lifecycle")
+        self.assertTrue(restored["lookup"]["recovery_only"])
+
+    async def test_latest_recovery_only_does_not_resurrect_older_pending_row(self):
+        self.planning.allowance_atomic = 2_000_000
+        older = await self.prepare_weth()
+        older_row = self.db.get(RobinhoodChainSwapExecution, older["execution"]["id"])
+        older_row.status = "swap_pending"
+        older_row.swap_status = "pending"
+        older_row.approval_status = "not_required"
+        older_row.swap_tx_hash = SWAP_TX_HASH
+        self.db.commit()
+
+        newer = await self.prepare_weth()
+        newer_row = self.db.get(RobinhoodChainSwapExecution, newer["execution"]["id"])
+        newer_row.status = "confirmed"
+        newer_row.swap_status = "confirmed"
+        newer_row.approval_status = "not_required"
+        newer_row.swap_tx_hash = SWAP_TX_HASH_2
+        self.db.commit()
+
+        with self.assertRaisesRegex(KeyError, "robinhood_chain_swap_recovery_not_found"):
+            self.service.latest(
+                self.db,
+                symbol="WETH-USDG",
+                side="buy",
+                amount_mode="exact_input",
+                wallet_address=TAKER,
+                recovery_only=True,
+            )
+
     def test_router_latest_lifecycle_route_precedes_dynamic_execution_route(self):
         source = (BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py").read_text(encoding="utf-8")
         latest_route = '@router.get("/swap-execution/latest")'
@@ -1084,6 +1157,8 @@ class RobinhoodChainSwapExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(latest_route, source)
         self.assertLess(source.index(latest_route), source.index(dynamic_route))
         self.assertIn("get_robinhood_chain_swap_execution_service().latest", source)
+        self.assertIn("recovery_only: bool = Query(default=False)", source)
+        self.assertIn("recovery_only=recovery_only", source)
         self.assertIn('"read_only": True', source)
         self.assertIn('"wallet_connection_requested": False', source)
         self.assertIn('"signing_enabled": False', source)

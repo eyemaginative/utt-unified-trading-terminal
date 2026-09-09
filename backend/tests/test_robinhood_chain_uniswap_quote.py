@@ -143,12 +143,14 @@ class RobinhoodChainUniswapQuoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["interactive_indicative_quote_no_quotes_max_attempts"], 4)
         self.assertEqual(status["interactive_indicative_quote_transient_retry_delays_s"], [0.75, 1.5])
         self.assertEqual(status["interactive_indicative_quote_no_quotes_retry_delays_s"], [5.0, 15.0, 20.0])
-        self.assertEqual(status["interactive_firm_quote_retry_policy"], "interactive_firm_plan_quote_v2")
-        self.assertEqual(status["interactive_firm_quote_max_attempts"], 4)
+        self.assertEqual(status["interactive_firm_quote_retry_policy"], "interactive_firm_plan_quote_v3")
+        self.assertEqual(status["interactive_firm_quote_max_attempts"], 6)
         self.assertEqual(status["interactive_firm_quote_transient_max_attempts"], 3)
         self.assertEqual(status["interactive_firm_quote_no_quotes_max_attempts"], 4)
+        self.assertEqual(status["interactive_firm_quote_no_route_max_attempts"], 6)
         self.assertEqual(status["interactive_firm_quote_transient_retry_delays_s"], [0.75, 1.5])
         self.assertEqual(status["interactive_firm_quote_no_quotes_retry_delays_s"], [5.0, 15.0, 20.0])
+        self.assertEqual(status["interactive_firm_quote_no_route_retry_delays_s"], [0.75, 1.5, 5.0, 8.0, 12.0])
         self.assertNotIn("test-uniswap-key", repr(status))
 
     async def test_interactive_quote_is_admitted_before_queued_background_quote(self):
@@ -690,6 +692,119 @@ class RobinhoodChainUniswapQuoteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["provider_quote_retry_reasons"], [])
                 sleep_mock.assert_not_awaited()
 
+    async def test_indicative_quote_recovers_no_route_found_error_on_short_profile(self):
+        quote_calls = 0
+        captured_bodies = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal quote_calls
+            quote_calls += 1
+            captured_bodies.append(json.loads(request.content.decode("utf-8")))
+            if quote_calls == 1:
+                return httpx.Response(
+                    404,
+                    json={
+                        "errorCode": "NoRouteFoundError",
+                        "detail": "No route with sufficient liquidity was found for this pair.",
+                    },
+                )
+            return httpx.Response(200, json=_classic_response())
+
+        service = RobinhoodChainUniswapQuoteService(
+            api_base="https://trade-api.gateway.uniswap.org/v1",
+            timeout_s=15,
+            max_concurrent=1,
+            credential_getter=_safe_credential,
+            transport=httpx.MockTransport(handler),
+        )
+        with patch(
+            "app.services.robinhood_chain_uniswap_quote.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            result = await service.quote(
+                symbol="BUCKET-USDG",
+                side="buy",
+                amount_mode="exact_input",
+                requested_amount="1",
+                slippage_bps=50,
+                swapper_address=SWAPPER,
+                input_token=USDG,
+                output_token=SPCX,
+                confirm_quote=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(quote_calls, 2)
+        self.assertEqual(captured_bodies[0], captured_bodies[1])
+        self.assertEqual(result["provider_quote_attempts"], 2)
+        self.assertEqual(result["provider_quote_retries"], 1)
+        self.assertTrue(result["provider_quote_recovery_applied"])
+        self.assertEqual(
+            result["provider_quote_retry_reasons"],
+            ["provider_404_no_route_found"],
+        )
+        sleep_mock.assert_awaited_once_with(0.75)
+
+    async def test_indicative_quote_exhausts_no_route_found_error_on_short_profile(self):
+        quote_calls = 0
+        captured_bodies = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal quote_calls
+            quote_calls += 1
+            captured_bodies.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                404,
+                json={
+                    "errorCode": "NoRouteFoundError",
+                    "detail": "No route with sufficient liquidity was found for this pair.",
+                },
+            )
+
+        service = RobinhoodChainUniswapQuoteService(
+            api_base="https://trade-api.gateway.uniswap.org/v1",
+            timeout_s=15,
+            max_concurrent=1,
+            credential_getter=_safe_credential,
+            transport=httpx.MockTransport(handler),
+        )
+        with patch(
+            "app.services.robinhood_chain_uniswap_quote.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            result = await service.quote(
+                symbol="BUCKET-USDG",
+                side="buy",
+                amount_mode="exact_input",
+                requested_amount="1",
+                slippage_bps=50,
+                swapper_address=SWAPPER,
+                input_token=USDG,
+                output_token=SPCX,
+                confirm_quote=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "uniswap_quote_provider_error")
+        self.assertEqual(result["http_status"], 404)
+        self.assertEqual(quote_calls, 3)
+        self.assertTrue(all(body == captured_bodies[0] for body in captured_bodies))
+        self.assertEqual(result["provider_quote_attempts"], 3)
+        self.assertEqual(result["provider_quote_retries"], 2)
+        self.assertFalse(result["provider_quote_recovery_applied"])
+        self.assertEqual(
+            result["provider_quote_retry_reasons"],
+            [
+                "provider_404_no_route_found",
+                "provider_404_no_route_found",
+                "provider_404_no_route_found",
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.await_args_list],
+            [0.75, 1.5],
+        )
+
     async def test_indicative_quote_recovers_transient_provider_error(self):
         quote_calls = 0
 
@@ -1083,7 +1198,7 @@ class RobinhoodChainUniswapQuoteTests(unittest.IsolatedAsyncioTestCase):
             captured_paths,
             ["/v1/quote", "/v1/quote", "/v1/check_approval", "/v1/swap"],
         )
-        self.assertEqual(result["provider_quote_retry_policy"], "interactive_firm_plan_quote_v2")
+        self.assertEqual(result["provider_quote_retry_policy"], "interactive_firm_plan_quote_v3")
         self.assertEqual(result["provider_quote_attempts"], 2)
         self.assertEqual(result["provider_quote_retries"], 1)
         self.assertTrue(result["provider_quote_recovery_applied"])
@@ -1260,6 +1375,189 @@ class RobinhoodChainUniswapQuoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["automatic_second_transaction"])
         self.assertEqual(sleep_mock.await_count, 3)
         self.assertEqual([call.args[0] for call in sleep_mock.await_args_list], [5.0, 15.0, 20.0])
+
+    async def test_firm_plan_recovers_no_route_found_error_on_measured_execution_profile(self):
+        quote_calls = 0
+        captured_paths = []
+        captured_bodies = []
+        spender = _address(9)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal quote_calls
+            captured_paths.append(request.url.path)
+            if request.url.path.endswith("/quote"):
+                quote_calls += 1
+                captured_bodies.append(json.loads(request.content.decode("utf-8")))
+                if quote_calls <= 5:
+                    return httpx.Response(
+                        404,
+                        json={
+                            "errorCode": "NoRouteFoundError",
+                            "detail": "No route with sufficient liquidity was found for this pair.",
+                        },
+                    )
+                return httpx.Response(200, json=_classic_response())
+            if request.url.path.endswith("/check_approval"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "requestId": "approval-none-no-route-r2",
+                        "approval": None,
+                        "cancel": None,
+                    },
+                )
+            if request.url.path.endswith("/swap"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "requestId": "swap-no-route-r2",
+                        "swap": {
+                            "to": spender,
+                            "from": SWAPPER,
+                            "data": "0x12345678",
+                            "value": "0",
+                            "gasLimit": "250000",
+                            "chainId": UNISWAP_CHAIN_ID,
+                        },
+                    },
+                )
+            return httpx.Response(500, json={"message": "unexpected"})
+
+        service = RobinhoodChainUniswapQuoteService(
+            api_base="https://trade-api.gateway.uniswap.org/v1",
+            timeout_s=15,
+            max_concurrent=1,
+            credential_getter=_safe_credential,
+            transport=httpx.MockTransport(handler),
+        )
+        with patch(
+            "app.services.robinhood_chain_uniswap_quote.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            result = await service.firm_quote_plan(
+                symbol="SPCX-USDG",
+                side="buy",
+                amount_mode="exact_input",
+                requested_amount="1",
+                slippage_bps=100,
+                swapper_address=SWAPPER,
+                input_token=USDG,
+                output_token=SPCX,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(quote_calls, 6)
+        self.assertEqual(
+            captured_paths,
+            [
+                "/v1/quote",
+                "/v1/quote",
+                "/v1/quote",
+                "/v1/quote",
+                "/v1/quote",
+                "/v1/quote",
+                "/v1/check_approval",
+                "/v1/swap",
+            ],
+        )
+        self.assertEqual(
+            [body["amount"] for body in captured_bodies],
+            ["1000000"] * 6,
+        )
+        self.assertEqual(
+            [body["tokenIn"] for body in captured_bodies],
+            [USDG["contract_address"]] * 6,
+        )
+        self.assertEqual(
+            [body["tokenOut"] for body in captured_bodies],
+            [SPCX["contract_address"]] * 6,
+        )
+        self.assertEqual(
+            [body["slippageTolerance"] for body in captured_bodies],
+            [1.0] * 6,
+        )
+        self.assertEqual(result["provider_quote_retry_policy"], "interactive_firm_plan_quote_v3")
+        self.assertEqual(result["provider_quote_attempts"], 6)
+        self.assertEqual(result["provider_quote_retries"], 5)
+        self.assertTrue(result["provider_quote_recovery_applied"])
+        self.assertEqual(
+            result["provider_quote_retry_reasons"],
+            ["provider_404_no_route_found"] * 5,
+        )
+        self.assertEqual(sleep_mock.await_count, 5)
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.await_args_list],
+            [0.75, 1.5, 5.0, 8.0, 12.0],
+        )
+        self.assertFalse(result["automatic_retry"])
+        self.assertFalse(result["automatic_second_transaction"])
+
+    async def test_firm_plan_exhausts_no_route_found_error_after_six_without_followup_calls(self):
+        captured_paths = []
+        captured_bodies = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_paths.append(request.url.path)
+            if request.url.path.endswith("/quote"):
+                captured_bodies.append(json.loads(request.content.decode("utf-8")))
+                return httpx.Response(
+                    404,
+                    json={
+                        "errorCode": "NoRouteFoundError",
+                        "detail": "No route with sufficient liquidity was found for this pair.",
+                    },
+                )
+            return httpx.Response(500, json={"message": "must not be called"})
+
+        service = RobinhoodChainUniswapQuoteService(
+            api_base="https://trade-api.gateway.uniswap.org/v1",
+            timeout_s=15,
+            max_concurrent=1,
+            credential_getter=_safe_credential,
+            transport=httpx.MockTransport(handler),
+        )
+        with patch(
+            "app.services.robinhood_chain_uniswap_quote.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            result = await service.firm_quote_plan(
+                symbol="SPCX-USDG",
+                side="buy",
+                amount_mode="exact_input",
+                requested_amount="1",
+                slippage_bps=100,
+                swapper_address=SWAPPER,
+                input_token=USDG,
+                output_token=SPCX,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "uniswap_quote_provider_error")
+        self.assertEqual(result["http_status"], 404)
+        self.assertEqual(
+            result["provider_error"],
+            {
+                "errorCode": "NoRouteFoundError",
+                "detail": "No route with sufficient liquidity was found for this pair.",
+            },
+        )
+        self.assertEqual(captured_paths, ["/v1/quote"] * 6)
+        self.assertEqual(len(captured_bodies), 6)
+        self.assertEqual(result["provider_quote_retry_policy"], "interactive_firm_plan_quote_v3")
+        self.assertEqual(result["provider_quote_attempts"], 6)
+        self.assertEqual(result["provider_quote_retries"], 5)
+        self.assertFalse(result["provider_quote_recovery_applied"])
+        self.assertEqual(
+            result["provider_quote_retry_reasons"],
+            ["provider_404_no_route_found"] * 6,
+        )
+        self.assertEqual(sleep_mock.await_count, 5)
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.await_args_list],
+            [0.75, 1.5, 5.0, 8.0, 12.0],
+        )
+        self.assertFalse(result["automatic_retry"])
+        self.assertFalse(result["automatic_second_transaction"])
 
     async def test_firm_plan_does_not_retry_non_retryable_provider_4xx(self):
         captured_paths = []
@@ -1900,6 +2198,334 @@ class RobinhoodChainUniswapQuoteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ask["provider"], "uniswap_api")
         self.assertFalse(result["execution_enabled"])
 
+    async def test_synthetic_orderbook_resamples_once_then_fails_closed_when_cross_persists(self):
+        quote_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal quote_calls
+            quote_calls += 1
+            body = json.loads(request.content.decode("utf-8"))
+            amount = int(body["amount"])
+            token_in = body["tokenIn"].lower()
+            if token_in == SPCX["contract_address"].lower():
+                output_amount = str(max(1, amount * 101 // 1_000_000_000_000))
+                output_token = USDG["contract_address"]
+            else:
+                output_amount = str(amount * 10_000_000_000)
+                output_token = SPCX["contract_address"]
+            return httpx.Response(200, json={
+                "requestId": f"book-crossed-{quote_calls}-{amount}",
+                "routing": "CLASSIC",
+                "quote": {
+                    "input": {"amount": str(amount), "token": body["tokenIn"]},
+                    "output": {
+                        "amount": output_amount,
+                        "minimumAmount": output_amount,
+                        "token": output_token,
+                    },
+                    "route": [[{"type": "v4-pool"}]],
+                    "gasUseEstimate": "200000",
+                },
+                "isTokenApprovalApplicable": True,
+                "permitData": None,
+                "permitTransaction": None,
+            })
+
+        service = RobinhoodChainUniswapQuoteService(
+            api_base="https://trade-api.gateway.uniswap.org/v1",
+            timeout_s=15,
+            max_concurrent=1,
+            credential_getter=_safe_credential,
+            transport=httpx.MockTransport(handler),
+        )
+        common_capability = {
+            "provider": "uniswap_api",
+            "amount_mode": "exact_input",
+            "indicative_status": "available",
+        }
+        result = await service.synthetic_orderbook_for_pair(
+            symbol="SPCX-USDG",
+            depth=2,
+            taker_address=SWAPPER,
+            base_token=SPCX,
+            quote_token=USDG,
+            base_to_quote_capability={
+                **common_capability,
+                "from_asset": "SPCX",
+                "to_asset": "USDG",
+                "probe_amount": "1",
+            },
+            quote_to_base_capability={
+                **common_capability,
+                "from_asset": "USDG",
+                "to_asset": "SPCX",
+                "probe_amount": "1",
+            },
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "uniswap_orderbook_crossed_market")
+        self.assertTrue(result["crossed"])
+        self.assertFalse(result["liquidity_available"])
+        self.assertEqual(result["bids"], [])
+        self.assertEqual(result["asks"], [])
+        self.assertEqual(result["depth_returned"], 0)
+        self.assertEqual(result["paired_level_count"], 0)
+        self.assertEqual(result["sampled_paired_level_count"], 2)
+        self.assertEqual(result["best_bid"], "101")
+        self.assertEqual(result["best_ask"], "100")
+        self.assertEqual(result["spread"], "-1")
+        self.assertIsNone(result["midpoint"])
+        self.assertTrue(result["crossed_resample_attempted"])
+        self.assertFalse(result["crossed_resample_recovery_applied"])
+        self.assertEqual(result["crossed_resample_pass_count"], 2)
+        self.assertEqual(result["provider_quote_call_count"], 8)
+        self.assertEqual(result["provider_quote_call_budget"], 8)
+        self.assertEqual(result["crossed_resample_first_best_bid"], "101")
+        self.assertEqual(result["crossed_resample_first_best_ask"], "100")
+        self.assertEqual(result["crossed_resample_first_sampled_paired_level_count"], 2)
+        self.assertEqual(quote_calls, 8)
+        self.assertFalse(result["execution_enabled"])
+
+    async def test_synthetic_orderbook_crossed_resample_recovers_with_fresh_coherent_snapshot(self):
+        quote_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal quote_calls
+            quote_calls += 1
+            body = json.loads(request.content.decode("utf-8"))
+            amount = int(body["amount"])
+            token_in = body["tokenIn"].lower()
+            first_pass = quote_calls <= 4
+            if token_in == SPCX["contract_address"].lower():
+                output_per_base = 101 if first_pass else 99
+                output_amount = str(max(1, amount * output_per_base // 1_000_000_000_000))
+                output_token = USDG["contract_address"]
+            else:
+                output_amount = str(amount * 10_000_000_000)
+                output_token = SPCX["contract_address"]
+            return httpx.Response(200, json={
+                "requestId": f"book-resample-{quote_calls}-{amount}",
+                "routing": "CLASSIC",
+                "quote": {
+                    "input": {"amount": str(amount), "token": body["tokenIn"]},
+                    "output": {
+                        "amount": output_amount,
+                        "minimumAmount": output_amount,
+                        "token": output_token,
+                    },
+                    "route": [[{"type": "v4-pool"}]],
+                    "gasUseEstimate": "200000",
+                },
+                "isTokenApprovalApplicable": True,
+                "permitData": None,
+                "permitTransaction": None,
+            })
+
+        service = RobinhoodChainUniswapQuoteService(
+            api_base="https://trade-api.gateway.uniswap.org/v1",
+            timeout_s=15,
+            max_concurrent=1,
+            credential_getter=_safe_credential,
+            transport=httpx.MockTransport(handler),
+        )
+        common_capability = {
+            "provider": "uniswap_api",
+            "amount_mode": "exact_input",
+            "indicative_status": "available",
+        }
+        result = await service.synthetic_orderbook_for_pair(
+            symbol="SPCX-USDG",
+            depth=2,
+            taker_address=SWAPPER,
+            base_token=SPCX,
+            quote_token=USDG,
+            base_to_quote_capability={
+                **common_capability,
+                "from_asset": "SPCX",
+                "to_asset": "USDG",
+                "probe_amount": "1",
+            },
+            quote_to_base_capability={
+                **common_capability,
+                "from_asset": "USDG",
+                "to_asset": "SPCX",
+                "probe_amount": "1",
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["crossed"])
+        self.assertEqual(result["best_bid"], "99")
+        self.assertEqual(result["best_ask"], "100")
+        self.assertEqual(result["depth_returned"], 2)
+        self.assertTrue(result["crossed_resample_attempted"])
+        self.assertTrue(result["crossed_resample_recovery_applied"])
+        self.assertEqual(result["crossed_resample_pass_count"], 2)
+        self.assertEqual(result["provider_quote_call_count"], 8)
+        self.assertEqual(result["provider_quote_call_budget"], 8)
+        self.assertEqual(result["crossed_resample_first_best_bid"], "101")
+        self.assertEqual(result["crossed_resample_first_best_ask"], "100")
+        self.assertNotIn("error", result)
+        self.assertEqual(quote_calls, 8)
+
+    async def test_synthetic_orderbook_crossed_resample_no_route_becomes_recoverable_incomplete(self):
+        quote_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal quote_calls
+            quote_calls += 1
+            body = json.loads(request.content.decode("utf-8"))
+            amount = int(body["amount"])
+            token_in = body["tokenIn"].lower()
+            if quote_calls > 4 and token_in == USDG["contract_address"].lower():
+                return httpx.Response(
+                    404,
+                    json={
+                        "errorCode": "NoRouteFoundError",
+                        "detail": "No route with sufficient liquidity was found for this pair.",
+                    },
+                )
+            if token_in == SPCX["contract_address"].lower():
+                output_amount = str(max(1, amount * 101 // 1_000_000_000_000))
+                output_token = USDG["contract_address"]
+            else:
+                output_amount = str(amount * 10_000_000_000)
+                output_token = SPCX["contract_address"]
+            return httpx.Response(200, json={
+                "requestId": f"book-no-route-{quote_calls}-{amount}",
+                "routing": "CLASSIC",
+                "quote": {
+                    "input": {"amount": str(amount), "token": body["tokenIn"]},
+                    "output": {
+                        "amount": output_amount,
+                        "minimumAmount": output_amount,
+                        "token": output_token,
+                    },
+                    "route": [[{"type": "v4-pool"}]],
+                    "gasUseEstimate": "200000",
+                },
+                "isTokenApprovalApplicable": True,
+                "permitData": None,
+                "permitTransaction": None,
+            })
+
+        service = RobinhoodChainUniswapQuoteService(
+            api_base="https://trade-api.gateway.uniswap.org/v1",
+            timeout_s=15,
+            max_concurrent=1,
+            credential_getter=_safe_credential,
+            transport=httpx.MockTransport(handler),
+        )
+        common_capability = {
+            "provider": "uniswap_api",
+            "amount_mode": "exact_input",
+            "indicative_status": "available",
+        }
+        result = await service.synthetic_orderbook_for_pair(
+            symbol="SPCX-USDG",
+            depth=2,
+            taker_address=SWAPPER,
+            base_token=SPCX,
+            quote_token=USDG,
+            base_to_quote_capability={
+                **common_capability,
+                "from_asset": "SPCX",
+                "to_asset": "USDG",
+                "probe_amount": "1",
+            },
+            quote_to_base_capability={
+                **common_capability,
+                "from_asset": "USDG",
+                "to_asset": "SPCX",
+                "probe_amount": "1",
+            },
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["crossed"])
+        self.assertEqual(result["error"], "synthetic_orderbook_liquidity_incomplete")
+        self.assertEqual(result["bids"], [])
+        self.assertEqual(result["asks"], [])
+        self.assertEqual(result["warning_count"], 2)
+        self.assertTrue(result["crossed_resample_attempted"])
+        self.assertFalse(result["crossed_resample_recovery_applied"])
+        self.assertEqual(result["crossed_resample_pass_count"], 2)
+        self.assertEqual(result["provider_quote_call_count"], 6)
+        self.assertEqual(result["provider_quote_call_budget"], 8)
+        self.assertEqual(result["crossed_resample_first_best_bid"], "101")
+        self.assertEqual(result["crossed_resample_first_best_ask"], "100")
+        self.assertEqual(quote_calls, 6)
+
+    async def test_synthetic_orderbook_crossed_resample_provider_call_budget_is_bounded_at_twenty(self):
+        service = RobinhoodChainUniswapQuoteService(
+            api_base="https://trade-api.gateway.uniswap.org/v1",
+            timeout_s=15,
+            max_concurrent=1,
+            credential_getter=_safe_credential,
+        )
+
+        async def quote_side_effect(**kwargs):
+            if kwargs["side"] == "buy":
+                return {
+                    "ok": True,
+                    "input_amount": kwargs["requested_amount"],
+                    "output_amount": "1",
+                    "minimum_received": "1",
+                    "price_quote_per_base": "100",
+                    "route_protocols": ["V4"],
+                    "request_id": "budget-ask",
+                    "fetched_at": "2026-09-08T00:00:00+00:00",
+                }
+            return {
+                "ok": True,
+                "input_amount": kwargs["requested_amount"],
+                "output_amount": "101",
+                "output_amount_atomic": "101000000",
+                "minimum_received": "101",
+                "price_quote_per_base": "101",
+                "route_protocols": ["V4"],
+                "request_id": "budget-bid",
+                "fetched_at": "2026-09-08T00:00:01+00:00",
+            }
+
+        service.quote = AsyncMock(side_effect=quote_side_effect)
+        common_capability = {
+            "provider": "uniswap_api",
+            "amount_mode": "exact_input",
+            "indicative_status": "available",
+        }
+        result = await service.synthetic_orderbook_for_pair(
+            symbol="SPCX-USDG",
+            depth=999,
+            taker_address=SWAPPER,
+            base_token=SPCX,
+            quote_token=USDG,
+            base_to_quote_capability={
+                **common_capability,
+                "from_asset": "SPCX",
+                "to_asset": "USDG",
+                "probe_amount": "1",
+            },
+            quote_to_base_capability={
+                **common_capability,
+                "from_asset": "USDG",
+                "to_asset": "SPCX",
+                "probe_amount": "1",
+            },
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["crossed"])
+        self.assertEqual(result["max_depth"], 5)
+        self.assertEqual(result["crossed_resample_pass_count"], 2)
+        self.assertEqual(result["provider_quote_call_count"], 20)
+        self.assertEqual(result["provider_quote_call_budget"], 20)
+        self.assertEqual(service.quote.await_count, 20)
+        for call in service.quote.await_args_list:
+            self.assertFalse(call.kwargs["_retry_provider_errors"])
+            self.assertEqual(call.kwargs["_provider_priority"], "background")
+
     async def test_synthetic_orderbook_drops_unpaired_levels_when_provider_quote_fails(self):
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content.decode("utf-8"))
@@ -2239,9 +2865,9 @@ class RobinhoodChainUniswapQuoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"automatic_second_transaction": False', router_text)
         self.assertIn('prepareRobinhoodChainWalletApproval', api_text)
         self.assertIn('refreshRobinhoodChainWalletApprovalReceipt', api_text)
-        self.assertIn('SUCCESSFUL FINITE APPROVAL ONLY', ticket_text)
+        self.assertIn('FINITE ERC-20 APPROVAL REVIEW', ticket_text)
         self.assertIn('Open MetaMask — EXACT FINITE APPROVAL', ticket_text)
-        self.assertIn('SWAP REQUEST AUTHORIZED: NO', ticket_text)
+        self.assertIn('SWAP REQUEST: SEPARATE', ticket_text)
         self.assertIn('ROBINHOOD_CHAIN_LIFECYCLE_PREFLIGHT_TIMEOUT_MS = 120000', ticket_text)
         self.assertIn('wallet_approval_prepare', ticket_text)
         self.assertIn('wallet_swap_prepare', ticket_text)
@@ -2598,12 +3224,21 @@ class RobinhoodChainUniswapQuoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("same_provider_both_exact_input_directions_not_available", registry_text)
         self.assertIn("providers = (PROVIDER_ZEROX, PROVIDER_UNISWAP, PROVIDER_UNISWAP_V3_RPC)", registry_text)
         self.assertIn("for provider in providers", registry_text)
-        self.assertIn("preferred_provider == UNISWAP_PROVIDER", router_text)
-        self.assertIn("preferred_provider == UNISWAP_V3_RPC_PROVIDER", router_text)
+        self.assertIn("provider_candidates = [preferred_provider]", router_text)
+        self.assertIn("for provider in provider_candidates:", router_text)
+        self.assertIn("if provider == UNISWAP_PROVIDER:", router_text)
+        self.assertIn("if provider == UNISWAP_V3_RPC_PROVIDER:", router_text)
+        self.assertIn('result["selected_orderbook_provider"] = provider', router_text)
+        self.assertIn('result["provider_fallback_used"] = provider != preferred_provider', router_text)
         self.assertIn("get_robinhood_chain_uniswap_v3_quote_service().quote_for_pair", router_text)
         self.assertIn("get_robinhood_chain_uniswap_quote_service().firm_quote_plan", router_text)
         self.assertIn("robinhoodChainSelectedProvider", ticket_text)
         self.assertIn("rows.find(liveExecution)", ticket_text)
+        self.assertIn("robinhoodChainQuoteStatusHasSelectedMarketCapability", ticket_text)
+        self.assertIn("...retainedQuoteStatusCapabilities", ticket_text)
+        self.assertIn("...robinhoodChainMarketCapabilities", ticket_text)
+        self.assertIn("Provider route temporarily unavailable for this exact amount", ticket_text)
+        self.assertIn("UTT kept the amount, pair, direction, and slippage unchanged.", ticket_text)
         self.assertIn('provider: String(payload?.provider || "0x")', api_text)
         for forbidden in ("SPCX", "STONKBROKER"):
             self.assertNotIn(f'== "{forbidden}"', router_text)

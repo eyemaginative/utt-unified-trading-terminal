@@ -1,0 +1,287 @@
+{
+  "publication": "PUB.UTT4.CUMULATIVE.R1D2",
+  "date": "2026-09-09",
+  "repository": "eyemaginative/utt-unified-trading-terminal",
+  "baseline_commit": "ecd735228ef57f85f4312a2908a5ca1e16f6438f",
+  "source_authority": "C:\\Users\\romes\\unified-trading-terminal",
+  "publish_workspace_current_source_authority": false,
+  "readme_policy": "README updated for the September 9 cumulative checkpoint from accepted DEV, including RH-CAP.PROFILE.1, UI-TABLES.STARTUP.1, RH-CATALOG.REGLOCK.1, Book/Ticket, XCP, balance identity, and adaptive Book precision work. The prior published README is archived during publication.",
+  "acceptance": {
+    "xcp_price_regression_2": "PASS/CLOSED",
+    "ticket_test_expectation_r1": "PASS/CLOSED",
+    "balance_hover_copy_1": "PASS/CLOSED",
+    "book_precision_root": "PASS/FROZEN",
+    "book_precision_install_static": "PASS",
+    "book_precision_multilevel_live_witness": "HOLD/NATURAL-FUTURE",
+    "ticket_successful_approval_auto_advance_canary_b": "HOLD/NATURAL-FUTURE",
+    "rh_cap_profile_1": "PASS/CLOSED",
+    "ui_tables_startup_1": "PASS/CLOSED",
+    "rh_catalog_reglock_1": "PASS/CLOSED",
+    "startup_preference_focused_tests": "PASS/5"
+  },
+  "validation": {
+    "canonical_backend": "PASS / exit=0 / 494 passed, 1 warning, 40 subtests passed in 19.19s",
+    "frontend_build": "PASS / exit=0 / existing nonfatal Vite warnings retained",
+    "staged_python_compile": "26 files, 0 syntax errors",
+    "publication_source_census": "47 accepted canonical source/test paths",
+    "r1c_unmanifested_audit": "9 changed tracked source paths identified and accepted; 257 untracked DEV source-shaped files audited, with one canonical accepted startup-preference test added and patch/suffixed/scratch artifacts excluded from publication",
+    "r1d2_publication_timestamp_utc": "2026-09-09T23:01:38.764090+00:00",
+    "source_identity_basis": "exact DEV raw SHA256 for 47 canonical source/test paths",
+    "untracked_dev_artifact_policy": "R1C scanned 257 untracked source-shaped files; the accepted canonical startup-preference test is manifested; remaining untracked suffixed/patch/scratch artifacts are excluded from publication and are not copied to UTT_PUBLISH",
+    "r1d2_execution_repair": "R1D stopped before mutation after remote-baseline verification because the unmanifested-source canonicalizer used strict UTF-8 decoding. R1D1 was not executed because its PowerShell wrapper failed to parse. R1D2 runs the byte-safe Python publication engine through a minimal parser-safe launcher."
+  },
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 21954,
+      "sha256": "848264b6db1bdebe3cc1922efbc5e269aedd3ba82d8ce10b3f7555d1ebb9afa3"
+    },
+    {
+      "path": "backend/app/adapters/counterparty.py",
+      "bytes": 251356,
+      "sha256": "7ea4a7a9ff38d181bf78ad0c789ebf1780a7a85cda0f7695d59310846fb037ef"
+    },
+    {
+      "path": "backend/app/config.py",
+      "bytes": 52235,
+      "sha256": "ef1c0282dcf40c02ba701085ba3a8918a39ad4093038289e13e1bbe38f584e49"
+    },
+    {
+      "path": "backend/app/main.py",
+      "bytes": 8438,
+      "sha256": "d8c82c5154438fea655a850e4b7ae573b0783d6fd34e9584ada9b68a98811352"
+    },
+    {
+      "path": "backend/app/routers/auth.py",
+      "bytes": 65541,
+      "sha256": "230cabece03ad54ff96c6de4acbfea9fd45ce020cbb3abebd7019a20badee70f"
+    },
+    {
+      "path": "backend/app/routers/counterparty.py",
+      "bytes": 28140,
+      "sha256": "e77dfff034cf6adc63820eda524720194ecdc949571a5c13d66044a5094063b4"
+    },
+    {
+      "path": "backend/app/routers/market_intel.py",
+      "bytes": 10057,
+      "sha256": "614d8c150ca38208979ff41aefc7bbb0e30f0009d5a659f36fd8bf4cadc7e0dd"
+    },
+    {
+      "path": "backend/app/routers/market_metrics.py",
+      "bytes": 1726,
+      "sha256": "44c95c65af679e6bb3b000aeb7c7cb320630820647c38d100c0af4a3ab52e9f3"
+    },
+    {
+      "path": "backend/app/routers/polkadot_dex.py",
+      "bytes": 463584,
+      "sha256": "d2a673baaa1495e54343ab38c9da853a3b7bf9b36308a181638ff811eab3d3cb"
+    },
+    {
+      "path": "backend/app/routers/robinhood_chain.py",
+      "bytes": 296561,
+      "sha256": "c391c0d6597ce1997909d2f87211e47d8ab697834154a0b76737876958fd7a2b"
+    },
+    {
+      "path": "backend/app/routers/scanners.py",
+      "bytes": 28204,
+      "sha256": "7cf8b7548c89b69cdeba76bae3dbee816d5f2d3a1cb2706a6b83a8bf6ff03e43"
+    },
+    {
+      "path": "backend/app/routers/solana_dex.py",
+      "bytes": 105084,
+      "sha256": "f81df9e6c03f4006245d53b7bc6d133d02c5c2fc6e095fd146a0c7ec8aa953f3"
+    },
+    {
+      "path": "backend/app/routers/token_registry.py",
+      "bytes": 17757,
+      "sha256": "1a51b11f5411a28460fa2be6f6ddc186e531d0b85aceee9803fef12c5cca285c"
+    },
+    {
+      "path": "backend/app/routers/wallet_addresses.py",
+      "bytes": 213633,
+      "sha256": "1f70a624d13fe3c51636a746adbee7dc02ea7c1f4dec123fd94c724345ca1df3"
+    },
+    {
+      "path": "backend/app/schemas.py",
+      "bytes": 13145,
+      "sha256": "c83419420a8c46fe12c43808a11947ae5192e202b2a5b107d25756c6fad3dda3"
+    },
+    {
+      "path": "backend/app/services/counterparty_historical_btc_usd.py",
+      "bytes": 12077,
+      "sha256": "48e54bbfdb4ba259066ab839ab1a1f8e1d6853ed64101ece5551085d3834a284"
+    },
+    {
+      "path": "backend/app/services/counterparty_ledger_preview.py",
+      "bytes": 31461,
+      "sha256": "7aba97cba28e0612bc08696dd4d6ba5c7cf2915bc9d5effc44566a7dc8f63d7b"
+    },
+    {
+      "path": "backend/app/services/market_metrics.py",
+      "bytes": 83603,
+      "sha256": "b7058a3922efc95d489eedfe5f1bbd7791970df46ef43bf621b258e63bcd8ca3"
+    },
+    {
+      "path": "backend/app/services/robinhood_chain_execution_discovery.py",
+      "bytes": 38950,
+      "sha256": "783c872141973df36d95b08c47ca27642ef3e1ad37eb4c206be7ee0e038f9494"
+    },
+    {
+      "path": "backend/app/services/robinhood_chain_quotes.py",
+      "bytes": 44198,
+      "sha256": "32e9346c76e71489c45430d8975a631688aab0af8099caf69c574c903fa12127"
+    },
+    {
+      "path": "backend/app/services/robinhood_chain_registry_discovery.py",
+      "bytes": 157024,
+      "sha256": "96bb15e8a1fa0ffa796111bd61fe4038b404809acd04ca955b39e54d22f8829a"
+    },
+    {
+      "path": "backend/app/services/robinhood_chain_swap_execution.py",
+      "bytes": 110243,
+      "sha256": "87b9068021a7cc1bbd222b093937c9088cf960de96d57514c4708f0210d546b9"
+    },
+    {
+      "path": "backend/app/services/robinhood_chain_uniswap_quote.py",
+      "bytes": 111175,
+      "sha256": "04e5e3cbdae2002c75b69e2bc8ea173b98c473981a1bf4ed1e298b521e6ad1b0"
+    },
+    {
+      "path": "backend/tests/test_cexius_adapter.py",
+      "bytes": 45361,
+      "sha256": "36d4b7350a0b040485d42c3b1e4291fd622bc4047cc4719d0233ffc0dfdf6bc0"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_balance_pricing.py",
+      "bytes": 55736,
+      "sha256": "ede42ee414ae54ba8df16b6d8d6dda0d8aa539decaaeef443d6291fb9eb900fa"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_profile_limits.py",
+      "bytes": 13636,
+      "sha256": "80ee4892887f981d60ff670a6e43c16ffc8833ff96be9799ee313ed0226bc82c"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_quote_planning_authority.py",
+      "bytes": 15515,
+      "sha256": "acd72896f0de71f59e48bb7fc71b46c405a341da1d3b286e71ce5484aef7f29b"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_quotes.py",
+      "bytes": 38101,
+      "sha256": "e71d961bd068bdfe271eecf45fe1f524bd3b64485cce2520cb2d1e2c74dc8fe2"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_registry_authority.py",
+      "bytes": 23287,
+      "sha256": "bd74e72a949f52c172e64dca7e90b2b3b95513260c75e601130ab3bc05803cb1"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_registry_discovery.py",
+      "bytes": 136912,
+      "sha256": "128a7d60538eefc081151883b64ff5e64a8902daddf0af90d5028902ac9243f9"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_swap_execution.py",
+      "bytes": 113426,
+      "sha256": "227dc168a28b1a80cdf8be151af6d8e3abbc3d8ccd354417b32ab9322c8659a8"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_sync_load.py",
+      "bytes": 7887,
+      "sha256": "a71ef43461b373b0f0d78a5bf0e4e3722ae28b79c304c3cb3b4be7efe8d2ef4c"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_uniswap_quote.py",
+      "bytes": 139234,
+      "sha256": "7e9c8d9e7bcc4ca27fd64c481145d4eed21d4e07d387eebf405d485fbdbc6886"
+    },
+    {
+      "path": "backend/tests/test_robinhood_chain_wallet_materialization.py",
+      "bytes": 21145,
+      "sha256": "638352845360a311a69d04ab5abf1b19602d314d7690a1738f5b8c86788473be"
+    },
+    {
+      "path": "backend/tests/test_ui_tables_startup_preference.py",
+      "bytes": 5811,
+      "sha256": "76f626f450f8f0bf231baf2cc11fef61bcbaf280dde00e0aa4e345a49186c38e"
+    },
+    {
+      "path": "backend/tests/test_xcp_price_regression_2_R1.py",
+      "bytes": 8472,
+      "sha256": "dd6347539ef81143e405fac9cafc2312e385a4cbb506ebfcc68b22c62c4d232e"
+    },
+    {
+      "path": "docs/updates/2026-09-09-announcement.bbcode.txt",
+      "bytes": 3309,
+      "sha256": "4a96323bd5cb04ccea2aed466b0a3ca663ac12f258aa0f711903a5d3b247443a"
+    },
+    {
+      "path": "docs/updates/2026-09-09-cumulative-update.md",
+      "bytes": 7021,
+      "sha256": "d4e5858a1b4ad41544f37afa525b36a6ba287daf7a63314ab9fde8e1d5a40e5d"
+    },
+    {
+      "path": "frontend/src/App.jsx",
+      "bytes": 257208,
+      "sha256": "98690a7512d83cc0e662b9220349212cacbfc7bdef391b1f9d481bc581c99677"
+    },
+    {
+      "path": "frontend/src/ArbChip.jsx",
+      "bytes": 29669,
+      "sha256": "a7a14644eb8c4d198b3c3e4bc4e595bbbe0ffa249abb94878f101c14f3b84e4a"
+    },
+    {
+      "path": "frontend/src/OrderBookWidget.jsx",
+      "bytes": 183579,
+      "sha256": "74a80e91dbe85b99c63afb6a5375d39d556910e11b56c31ca16b8d74370df3ab",
+      "accepted_package_sha256": "e0a1b8dadeb48295228dc8134b382455cbc325ef4a7775905f5d5362af47a280",
+      "identity_mode": "canonical_text_equivalent"
+    },
+    {
+      "path": "frontend/src/OrderTicketWidget.jsx",
+      "bytes": 884311,
+      "sha256": "fb6addfbbbbfb2bab8e253a2e27000a39cc200127e9244a12a2a1ba3e932a9f8"
+    },
+    {
+      "path": "frontend/src/TerminalTablesWidget.jsx",
+      "bytes": 387077,
+      "sha256": "7bbb66486729036349b3d9f3845b4f037f358f80f1e90f4c413b4aa9b1c13c28"
+    },
+    {
+      "path": "frontend/src/components/AppHeader.jsx",
+      "bytes": 304653,
+      "sha256": "9b5df320902f2fa549a51bd4865b839581caf37bae0f992c95799b29e372a196"
+    },
+    {
+      "path": "frontend/src/features/basis/LedgerWindow.jsx",
+      "bytes": 218438,
+      "sha256": "8554b27feb8927561fb2f62632e7b157d9b9ecc51972b54acaa387540fa8f7ba"
+    },
+    {
+      "path": "frontend/src/features/nfts/NftCollectiblesWindow.jsx",
+      "bytes": 80641,
+      "sha256": "ec9c539d19027980beba4381c86b2b36333e522510bce96d590fbb6a8b37ea7e"
+    },
+    {
+      "path": "frontend/src/features/registry/TokenRegistryWindow.jsx",
+      "bytes": 137077,
+      "sha256": "73d34c4c4478514ffcdf469f897ab49de80f7e4df77967df5b2e5bfe757aa55e"
+    },
+    {
+      "path": "frontend/src/features/scanners/MarketCapWindow.jsx",
+      "bytes": 36189,
+      "sha256": "5cd882a62fb522767eaee3dc23c0e8c1adbba90965c1634cfdcb2584ece61022"
+    },
+    {
+      "path": "frontend/src/features/scanners/VolumeWindow.jsx",
+      "bytes": 35473,
+      "sha256": "4a78d756db42234f82de395b6accfabbeae42390179a01f0d4ed6daf2827f84d"
+    },
+    {
+      "path": "frontend/src/lib/api.js",
+      "bytes": 78227,
+      "sha256": "fdc335e9609bb6c3bd15f4bb1c4568567ca8ff3e8e5a2ed60eeff57c93cb65e5"
+    }
+  ]
+}

@@ -18,9 +18,14 @@ from . import discovery_models  # noqa: F401
 
 # Migrate the raw-SQL credential vault before importing routers/adapters that
 # may resolve Profile-managed credentials during module initialization.
-from .routers.auth import router as auth_router, ensure_api_key_vault_schema
+from .routers.auth import (
+    router as auth_router,
+    ensure_api_key_vault_schema,
+    ensure_user_preferences_schema,
+)
 
 ensure_api_key_vault_schema()
+ensure_user_preferences_schema()
 settings.refresh_vault_backed_fields()
 
 from .routers.health import router as health_router

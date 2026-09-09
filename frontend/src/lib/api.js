@@ -14,6 +14,17 @@ export const http = axios.create({
   timeout: 30000,
 });
 
+const UTT_AUTH_TOKEN_KEY = "utt_auth_token_v1";
+
+function robinhoodChainAuthHeaders(extra = {}) {
+  try {
+    const token = String(window?.localStorage?.getItem(UTT_AUTH_TOKEN_KEY) || "").trim();
+    return token ? { ...extra, Authorization: `Bearer ${token}` } : { ...extra };
+  } catch {
+    return { ...extra };
+  }
+}
+
 function cleanParams(params) {
   const out = {};
   Object.entries(params || {}).forEach(([k, v]) => {
@@ -575,11 +586,12 @@ export async function getRobinhoodChainSyntheticOrderbook({
 export async function getRobinhoodChainIndicativeQuote(payload = {}, { apiBase, timeout_ms = 30000 } = {}) {
   const body = { provider: String(payload?.provider || "0x").trim().toLowerCase(), ...requireRobinhoodChainReviewRequest(payload) };
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  const headers = robinhoodChainAuthHeaders();
   if (base === API_BASE) {
-    const res = await http.post(`/api/robinhood_chain/quotes/indicative`, body, { timeout: timeout_ms });
+    const res = await http.post(`/api/robinhood_chain/quotes/indicative`, body, { timeout: timeout_ms, headers });
     return res.data;
   }
-  const res = await axios.post(`${base}/api/robinhood_chain/quotes/indicative`, body, { timeout: timeout_ms });
+  const res = await axios.post(`${base}/api/robinhood_chain/quotes/indicative`, body, { timeout: timeout_ms, headers });
   return res.data;
 }
 
@@ -590,11 +602,12 @@ export async function getRobinhoodChainFirmQuotePlan(payload = {}, { apiBase, ti
     ...requireRobinhoodChainReviewRequest(payload),
   };
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
+  const headers = robinhoodChainAuthHeaders();
   if (base === API_BASE) {
-    const res = await http.post(`/api/robinhood_chain/quotes/firm-plan`, body, { timeout: timeout_ms });
+    const res = await http.post(`/api/robinhood_chain/quotes/firm-plan`, body, { timeout: timeout_ms, headers });
     return res.data;
   }
-  const res = await axios.post(`${base}/api/robinhood_chain/quotes/firm-plan`, body, { timeout: timeout_ms });
+  const res = await axios.post(`${base}/api/robinhood_chain/quotes/firm-plan`, body, { timeout: timeout_ms, headers });
   return res.data;
 }
 
@@ -896,7 +909,7 @@ export async function prepareRobinhoodChainSwapExecution(payload = {}, { apiBase
 }
 
 export async function getRobinhoodChainLatestSwapExecution(
-  { symbol, side, amount_mode = "exact_input", wallet_address } = {},
+  { symbol, side, amount_mode = "exact_input", wallet_address, recovery_only = false } = {},
   { apiBase, timeout_ms = 30000 } = {}
 ) {
   const requestedSymbol = String(symbol || "").trim().toUpperCase().replace(/[\/_]/g, "-");
@@ -910,6 +923,7 @@ export async function getRobinhoodChainLatestSwapExecution(
     side: requestedSide,
     amount_mode: requestedMode,
     wallet_address,
+    recovery_only: recovery_only === true ? true : undefined,
   });
   const base = String(apiBase || API_BASE).replace(/\/$/, "");
   if (base === API_BASE) {

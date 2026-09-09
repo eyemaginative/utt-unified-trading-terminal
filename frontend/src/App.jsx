@@ -932,6 +932,13 @@ function withBalanceBasisFields(row) {
 const APP_SOL_MINT = "So11111111111111111111111111111111111111112";
 const APP_COUNTERPARTY_UNISAT_ADDR_LS_KEY = "utt_nft_unisat_address_v1";
 const APP_COUNTERPARTY_UNISAT_BTC_BALANCE_LS_KEY = "utt_counterparty_unisat_btc_balance_v1";
+const APP_TABLES_STARTUP_TAB_DEFAULT = "allOrders";
+const APP_TABLES_STARTUP_TABS = new Set(["allOrders", "balances", "localOrders", "discover"]);
+
+function appNormalizeTablesStartupTab(value) {
+  const normalized = String(value || "").trim();
+  return APP_TABLES_STARTUP_TABS.has(normalized) ? normalized : APP_TABLES_STARTUP_TAB_DEFAULT;
+}
 
 function appFiniteNumberOrNull(v) {
   if (v === null || v === undefined || v === "") return null;
@@ -942,7 +949,7 @@ function appFiniteNumberOrNull(v) {
 function appAuthHeaders(extra = {}) {
   const headers = { Accept: "application/json", ...extra };
   try {
-    const tok = localStorage.getItem("utt_auth_token") || sessionStorage.getItem("utt_auth_token") || "";
+    const tok = localStorage.getItem("utt_auth_token_v1") || localStorage.getItem("utt_auth_token") || sessionStorage.getItem("utt_auth_token_v1") || sessionStorage.getItem("utt_auth_token") || "";
     if (tok) headers.Authorization = `Bearer ${tok}`;
   } catch {
     // ignore
@@ -1900,6 +1907,14 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
       const usdSource = isRobinhoodChain
         ? appRobinhoodChainUsdSourceLabel(registryMeta, px, row?.usd_source)
         : (px !== null ? `${asset}-USD` : (totalUsd !== null ? "snapshot" : "—"));
+      const navigationMarketSymbol = isRobinhoodChain
+        ? ((asset === "ETH" || asset === "USDG") ? "USDG-ETH" : `${asset}-USDG`)
+        : null;
+      const robinhoodTransientCached = (
+        isRobinhoodChain &&
+        px !== null &&
+        String(usdSource || "").toLowerCase().includes("cached · retrying")
+      );
 
       return {
         ...row,
@@ -1921,7 +1936,8 @@ async function appFetchWalletAddressSnapshotPortfolioBalanceRows(opts = {}) {
         available_usd: totalUsd,
         hold_usd: 0,
         usd_source_symbol: usdSource,
-        price_status: px !== null ? "priced" : "unpriced",
+        navigation_market_symbol: navigationMarketSymbol,
+        price_status: robinhoodTransientCached ? "transient_cached" : (px !== null ? "priced" : "unpriced"),
         price_basis: isRobinhoodChain && registryMeta ? "token_registry" : (px !== null ? "market_symbol" : null),
         registry_id: exactRegistryId ?? registryMeta?.registry_id ?? null,
         registry_venue: exactRegistryVenue ?? registryMeta?.registry_venue ?? null,
@@ -2840,7 +2856,8 @@ export default function App() {
   }, [styles]);
 
   const [venue, setVenue] = useState("gemini");
-  const [tab, setTab] = useState("balances");
+  const [tab, setTab] = useState(APP_TABLES_STARTUP_TAB_DEFAULT);
+  const [startupTablesTabResolved, setStartupTablesTabResolved] = useState(false);
   const [error, setError] = useState(null);
 
   // ─────────────────────────────────────────────────────────────
@@ -6276,6 +6293,28 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
   }
 
   useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      let nextTab = APP_TABLES_STARTUP_TAB_DEFAULT;
+      try {
+        const data = await appFetchJson("/api/auth/preferences");
+        nextTab = appNormalizeTablesStartupTab(data?.ui?.tables_startup_tab);
+      } catch {
+        nextTab = APP_TABLES_STARTUP_TAB_DEFAULT;
+      }
+      if (cancelled) return;
+      setTab(nextTab);
+      setStartupTablesTabResolved(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!startupTablesTabResolved) return;
     if (tab === "balances") doRefreshBalancesSafe({ liveRefresh: false });
     if (tab === "localOrders") doLoadOrders();
     if (tab === "allOrders") {
@@ -6286,7 +6325,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [venue]);
+  }, [venue, startupTablesTabResolved]);
 
   useEffect(() => {
     if (!pollEnabled) return;
@@ -6597,6 +6636,18 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
                   if (isTablesLockInteractionTarget(e.target)) armTablesLockScrollGuard();
                 }}
               >
+                {!startupTablesTabResolved ? (
+                  <div
+                    data-utt-tables-startup-loading="1"
+                    style={{
+                      padding: "14px 16px",
+                      fontSize: 12,
+                      opacity: 0.75,
+                    }}
+                  >
+                    Loading saved startup tab…
+                  </div>
+                ) : (
                 <TerminalTablesWidget
                   key="terminal-tables-main-pane-v24-local-pane-lock-fix"
                   styles={styles}
@@ -6707,6 +6758,7 @@ async function doLedgerSyncFromLocalStorage({ silent = true, reloadAllOrders = t
                   orderbookVenues={orderbookVenuesList}
                   balancesVenues={balancesVenuesList}
                 />
+                )}
               </div>
             )}
           </div>

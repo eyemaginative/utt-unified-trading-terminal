@@ -41,11 +41,13 @@ _WALLET_SWAP_RECEIPT_TTL_SECONDS = 30 * 60
 _WALLET_SWAP_CAPABILITY_DOMAIN = b"UTT:R5C.5D.2F.3:wallet-swap-capability:v1"
 _INDICATIVE_QUOTE_RETRY_POLICY = "interactive_indicative_quote_v1"
 _INDICATIVE_QUOTE_PROVIDER_ATTEMPT_TIMEOUT_S = 5.0
-_FIRM_QUOTE_RETRY_POLICY = "interactive_firm_plan_quote_v2"
+_FIRM_QUOTE_RETRY_POLICY = "interactive_firm_plan_quote_v3"
 _FIRM_QUOTE_MAX_ATTEMPTS = 3
 _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS = 4
+_FIRM_QUOTE_NO_ROUTE_EXECUTION_MAX_ATTEMPTS = 6
 _FIRM_QUOTE_RETRY_DELAYS_S = (0.75, 1.5)
 _FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S = (5.0, 15.0, 20.0)
+_FIRM_QUOTE_NO_ROUTE_EXECUTION_RETRY_DELAYS_S = (0.75, 1.5, 5.0, 8.0, 12.0)
 
 
 def _utc_iso() -> str:
@@ -967,19 +969,40 @@ def _firm_quote_retry_reason(result: Dict[str, Any]) -> Optional[str]:
     detail = str(provider_error.get("detail") or provider_error.get("message") or "").strip().lower()
     if code == "resourcenotfound" and detail == "no quotes available":
         return "provider_404_no_quotes_available"
+    # RH-LIFECYCLE.REQUOTE.1C.R1 / 1F.R2: live evidence proved this exact
+    # Uniswap 404 can be a transient false negative for an otherwise routable
+    # exact request. Indicative quote() keeps the short 3-attempt profile;
+    # firm/execution preparation may select the measured 6-attempt profile.
+    # Persistent failure always remains fail-closed.
+    if (
+        code == "noroutefounderror"
+        and detail == "no route with sufficient liquidity was found for this pair."
+    ):
+        return "provider_404_no_route_found"
     return None
 
 
-def _firm_quote_retry_max_attempts(result: Dict[str, Any]) -> int:
+def _firm_quote_retry_max_attempts(
+    result: Dict[str, Any],
+    *,
+    execution_preparation: bool = False,
+) -> int:
     retry_reason = _firm_quote_retry_reason(result)
     if retry_reason == "provider_404_no_quotes_available":
         return _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS
+    if retry_reason == "provider_404_no_route_found" and execution_preparation:
+        return _FIRM_QUOTE_NO_ROUTE_EXECUTION_MAX_ATTEMPTS
     if retry_reason is not None:
         return _FIRM_QUOTE_MAX_ATTEMPTS
     return 1
 
 
-def _firm_quote_retry_delay_s(result: Dict[str, Any], retry_index: int) -> float:
+def _firm_quote_retry_delay_s(
+    result: Dict[str, Any],
+    retry_index: int,
+    *,
+    execution_preparation: bool = False,
+) -> float:
     retry_after = str((result or {}).get("retry_after") or "").strip()
     if retry_after:
         try:
@@ -989,11 +1012,12 @@ def _firm_quote_retry_delay_s(result: Dict[str, Any], retry_index: int) -> float
         if parsed > 0:
             return max(0.25, min(parsed, 3.0))
     retry_reason = _firm_quote_retry_reason(result)
-    delays = (
-        _FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S
-        if retry_reason == "provider_404_no_quotes_available"
-        else _FIRM_QUOTE_RETRY_DELAYS_S
-    )
+    if retry_reason == "provider_404_no_quotes_available":
+        delays = _FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S
+    elif retry_reason == "provider_404_no_route_found" and execution_preparation:
+        delays = _FIRM_QUOTE_NO_ROUTE_EXECUTION_RETRY_DELAYS_S
+    else:
+        delays = _FIRM_QUOTE_RETRY_DELAYS_S
     index = max(0, min(int(retry_index), len(delays) - 1))
     return float(delays[index])
 
@@ -1243,11 +1267,13 @@ class RobinhoodChainUniswapQuoteService:
             "interactive_indicative_quote_transient_retry_delays_s": list(_FIRM_QUOTE_RETRY_DELAYS_S),
             "interactive_indicative_quote_no_quotes_retry_delays_s": list(_FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S),
             "interactive_firm_quote_retry_policy": _FIRM_QUOTE_RETRY_POLICY,
-            "interactive_firm_quote_max_attempts": _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS,
+            "interactive_firm_quote_max_attempts": _FIRM_QUOTE_NO_ROUTE_EXECUTION_MAX_ATTEMPTS,
             "interactive_firm_quote_transient_max_attempts": _FIRM_QUOTE_MAX_ATTEMPTS,
             "interactive_firm_quote_no_quotes_max_attempts": _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS,
+            "interactive_firm_quote_no_route_max_attempts": _FIRM_QUOTE_NO_ROUTE_EXECUTION_MAX_ATTEMPTS,
             "interactive_firm_quote_transient_retry_delays_s": list(_FIRM_QUOTE_RETRY_DELAYS_S),
             "interactive_firm_quote_no_quotes_retry_delays_s": list(_FIRM_QUOTE_NO_QUOTES_RETRY_DELAYS_S),
+            "interactive_firm_quote_no_route_retry_delays_s": list(_FIRM_QUOTE_NO_ROUTE_EXECUTION_RETRY_DELAYS_S),
             "last_good_at": self._last_good_at,
             "last_error": self._last_error,
             "read_only": True,
@@ -1816,163 +1842,249 @@ class RobinhoodChainUniswapQuoteService:
         except ValueError as exc:
             return _failure(str(exc), symbol=normalized_symbol)
 
-        bids: List[Dict[str, Any]] = []
-        asks: List[Dict[str, Any]] = []
-        errors: List[Dict[str, Any]] = []
+        async def sample_once() -> Dict[str, Any]:
+            sample_bids: List[Dict[str, Any]] = []
+            sample_asks: List[Dict[str, Any]] = []
+            sample_errors: List[Dict[str, Any]] = []
+            provider_quote_calls = 0
 
-        for pair_index, quote_amount in enumerate(quote_amounts, start=1):
-            quote_input_atomic, _ = _display_to_atomic(
-                quote_amount,
-                int(quote_identity["decimals"]),
-            )
-            if int(quote_input_atomic) < _BOOK_MIN_QUOTE_INPUT_ATOMIC:
-                errors.append({
-                    "side": "pair",
+            for pair_index, quote_amount in enumerate(quote_amounts, start=1):
+                quote_input_atomic, _ = _display_to_atomic(
+                    quote_amount,
+                    int(quote_identity["decimals"]),
+                )
+                if int(quote_input_atomic) < _BOOK_MIN_QUOTE_INPUT_ATOMIC:
+                    sample_errors.append({
+                        "side": "pair",
+                        "pair_index": pair_index,
+                        "sample_quote_notional": quote_amount,
+                        "error": "synthetic_orderbook_quote_notional_below_precision_floor",
+                        "quote_input_atomic": quote_input_atomic,
+                        "minimum_quote_input_atomic": _BOOK_MIN_QUOTE_INPUT_ATOMIC,
+                    })
+                    continue
+
+                provider_quote_calls += 1
+                ask_quote = await self.quote(
+                    symbol=normalized_symbol,
+                    side="buy",
+                    amount_mode="exact_input",
+                    requested_amount=quote_amount,
+                    slippage_bps=50,
+                    swapper_address=taker_address,
+                    input_token=quote_token,
+                    output_token=base_token,
+                    confirm_quote=True,
+                    _retry_provider_errors=False,
+                    _provider_priority="background",
+                )
+                if not ask_quote.get("ok"):
+                    sample_errors.append({
+                        "side": "ask",
+                        "pair_index": pair_index,
+                        "sample_quote_notional": quote_amount,
+                        "sample_input_amount": quote_amount,
+                        "error": ask_quote.get("error"),
+                    })
+                    continue
+
+                paired_base_amount = str(ask_quote.get("output_amount") or "").strip()
+                try:
+                    _display_to_atomic(paired_base_amount, int(base_identity["decimals"]))
+                except ValueError:
+                    sample_errors.append({
+                        "side": "pair",
+                        "pair_index": pair_index,
+                        "sample_quote_notional": quote_amount,
+                        "error": "synthetic_orderbook_invalid_paired_base_amount",
+                    })
+                    continue
+
+                provider_quote_calls += 1
+                bid_quote = await self.quote(
+                    symbol=normalized_symbol,
+                    side="sell",
+                    amount_mode="exact_input",
+                    requested_amount=paired_base_amount,
+                    slippage_bps=50,
+                    swapper_address=taker_address,
+                    input_token=base_token,
+                    output_token=quote_token,
+                    confirm_quote=True,
+                    _retry_provider_errors=False,
+                    _provider_priority="background",
+                )
+                if not bid_quote.get("ok"):
+                    sample_errors.append({
+                        "side": "bid",
+                        "pair_index": pair_index,
+                        "sample_quote_notional": quote_amount,
+                        "sample_input_amount": paired_base_amount,
+                        "error": bid_quote.get("error"),
+                    })
+                    continue
+
+                bid_output_atomic = str(bid_quote.get("output_amount_atomic") or "").strip()
+                if not bid_output_atomic.isdigit() or int(bid_output_atomic) < _BOOK_MIN_QUOTE_OUTPUT_ATOMIC:
+                    sample_errors.append({
+                        "side": "pair",
+                        "pair_index": pair_index,
+                        "sample_quote_notional": quote_amount,
+                        "sample_input_amount": paired_base_amount,
+                        "error": "synthetic_orderbook_quote_output_below_precision_floor",
+                        "quote_output_atomic": bid_output_atomic or None,
+                        "minimum_quote_output_atomic": _BOOK_MIN_QUOTE_OUTPUT_ATOMIC,
+                    })
+                    continue
+
+                route_sources: List[str] = []
+                for item in [*(ask_quote.get("route_protocols") or []), *(bid_quote.get("route_protocols") or [])]:
+                    source = f"UNISWAP_{item}"
+                    if source not in route_sources:
+                        route_sources.append(source)
+
+                common = {
                     "pair_index": pair_index,
                     "sample_quote_notional": quote_amount,
-                    "error": "synthetic_orderbook_quote_notional_below_precision_floor",
-                    "quote_input_atomic": quote_input_atomic,
-                    "minimum_quote_input_atomic": _BOOK_MIN_QUOTE_INPUT_ATOMIC,
-                })
-                continue
-
-            ask_quote = await self.quote(
-                symbol=normalized_symbol,
-                side="buy",
-                amount_mode="exact_input",
-                requested_amount=quote_amount,
-                slippage_bps=50,
-                swapper_address=taker_address,
-                input_token=quote_token,
-                output_token=base_token,
-                confirm_quote=True,
-                _retry_provider_errors=False,
-                _provider_priority="background",
-            )
-            if not ask_quote.get("ok"):
-                errors.append({
+                    "paired_base_amount": paired_base_amount,
+                    "sampling_policy": "quote_notional_matched_v1",
+                    "route_sources": route_sources,
+                    "provider": UNISWAP_PROVIDER,
+                    "synthetic": True,
+                    "resting_order": False,
+                }
+                sample_asks.append({
+                    **common,
                     "side": "ask",
-                    "pair_index": pair_index,
-                    "sample_quote_notional": quote_amount,
+                    "price": ask_quote.get("price_quote_per_base"),
+                    "size": ask_quote.get("output_amount"),
+                    "base_quantity": ask_quote.get("output_amount"),
+                    "quote_quantity": ask_quote.get("input_amount"),
+                    "input_asset": quote_identity["symbol"],
+                    "input_amount": ask_quote.get("input_amount"),
+                    "output_asset": base_identity["symbol"],
+                    "output_amount": ask_quote.get("output_amount"),
+                    "minimum_received": ask_quote.get("minimum_received"),
                     "sample_input_amount": quote_amount,
-                    "error": ask_quote.get("error"),
+                    "provider_request_id": ask_quote.get("request_id"),
+                    "paired_provider_request_id": bid_quote.get("request_id"),
+                    "fetched_at": ask_quote.get("fetched_at"),
                 })
-                continue
-
-            paired_base_amount = str(ask_quote.get("output_amount") or "").strip()
-            try:
-                _display_to_atomic(paired_base_amount, int(base_identity["decimals"]))
-            except ValueError:
-                errors.append({
-                    "side": "pair",
-                    "pair_index": pair_index,
-                    "sample_quote_notional": quote_amount,
-                    "error": "synthetic_orderbook_invalid_paired_base_amount",
-                })
-                continue
-
-            bid_quote = await self.quote(
-                symbol=normalized_symbol,
-                side="sell",
-                amount_mode="exact_input",
-                requested_amount=paired_base_amount,
-                slippage_bps=50,
-                swapper_address=taker_address,
-                input_token=base_token,
-                output_token=quote_token,
-                confirm_quote=True,
-                _retry_provider_errors=False,
-                _provider_priority="background",
-            )
-            if not bid_quote.get("ok"):
-                errors.append({
+                sample_bids.append({
+                    **common,
                     "side": "bid",
-                    "pair_index": pair_index,
-                    "sample_quote_notional": quote_amount,
+                    "price": bid_quote.get("price_quote_per_base"),
+                    "size": bid_quote.get("input_amount"),
+                    "base_quantity": bid_quote.get("input_amount"),
+                    "quote_quantity": bid_quote.get("output_amount"),
+                    "input_asset": base_identity["symbol"],
+                    "input_amount": bid_quote.get("input_amount"),
+                    "output_asset": quote_identity["symbol"],
+                    "output_amount": bid_quote.get("output_amount"),
+                    "minimum_received": bid_quote.get("minimum_received"),
                     "sample_input_amount": paired_base_amount,
-                    "error": bid_quote.get("error"),
+                    "provider_request_id": bid_quote.get("request_id"),
+                    "paired_provider_request_id": ask_quote.get("request_id"),
+                    "fetched_at": bid_quote.get("fetched_at"),
                 })
-                continue
 
-            bid_output_atomic = str(bid_quote.get("output_amount_atomic") or "").strip()
-            if not bid_output_atomic.isdigit() or int(bid_output_atomic) < _BOOK_MIN_QUOTE_OUTPUT_ATOMIC:
-                errors.append({
-                    "side": "pair",
-                    "pair_index": pair_index,
-                    "sample_quote_notional": quote_amount,
-                    "sample_input_amount": paired_base_amount,
-                    "error": "synthetic_orderbook_quote_output_below_precision_floor",
-                    "quote_output_atomic": bid_output_atomic or None,
-                    "minimum_quote_output_atomic": _BOOK_MIN_QUOTE_OUTPUT_ATOMIC,
-                })
-                continue
+            sample_bids.sort(key=lambda item: Decimal(str(item.get("price") or "0")), reverse=True)
+            sample_asks.sort(key=lambda item: Decimal(str(item.get("price") or "0")))
+            sample_best_bid = Decimal(str(sample_bids[0]["price"])) if sample_bids else None
+            sample_best_ask = Decimal(str(sample_asks[0]["price"])) if sample_asks else None
+            sample_crossed = bool(
+                sample_best_bid is not None
+                and sample_best_ask is not None
+                and sample_best_bid >= sample_best_ask
+            )
+            sample_spread = (
+                sample_best_ask - sample_best_bid
+                if sample_best_bid is not None and sample_best_ask is not None
+                else None
+            )
+            sample_midpoint = (
+                (sample_best_ask + sample_best_bid) / Decimal(2)
+                if sample_spread is not None
+                else None
+            )
+            sample_spread_bps = (
+                sample_spread / sample_midpoint * Decimal(10000)
+                if sample_midpoint and sample_midpoint > 0
+                else None
+            )
+            sample_sources: List[str] = []
+            for row in [*sample_bids, *sample_asks]:
+                for source in row.get("route_sources") or []:
+                    if source not in sample_sources:
+                        sample_sources.append(source)
 
-            route_sources: List[str] = []
-            for item in [*(ask_quote.get("route_protocols") or []), *(bid_quote.get("route_protocols") or [])]:
-                source = f"UNISWAP_{item}"
-                if source not in route_sources:
-                    route_sources.append(source)
-
-            common = {
-                "pair_index": pair_index,
-                "sample_quote_notional": quote_amount,
-                "paired_base_amount": paired_base_amount,
-                "sampling_policy": "quote_notional_matched_v1",
-                "route_sources": route_sources,
-                "provider": UNISWAP_PROVIDER,
-                "synthetic": True,
-                "resting_order": False,
+            return {
+                "bids": sample_bids,
+                "asks": sample_asks,
+                "errors": sample_errors,
+                "best_bid": sample_best_bid,
+                "best_ask": sample_best_ask,
+                "crossed": sample_crossed,
+                "spread": sample_spread,
+                "midpoint": sample_midpoint,
+                "spread_bps": sample_spread_bps,
+                "sources": sample_sources,
+                "provider_quote_calls": provider_quote_calls,
             }
-            asks.append({
-                **common,
-                "side": "ask",
-                "price": ask_quote.get("price_quote_per_base"),
-                "size": ask_quote.get("output_amount"),
-                "base_quantity": ask_quote.get("output_amount"),
-                "quote_quantity": ask_quote.get("input_amount"),
-                "input_asset": quote_identity["symbol"],
-                "input_amount": ask_quote.get("input_amount"),
-                "output_asset": base_identity["symbol"],
-                "output_amount": ask_quote.get("output_amount"),
-                "minimum_received": ask_quote.get("minimum_received"),
-                "sample_input_amount": quote_amount,
-                "provider_request_id": ask_quote.get("request_id"),
-                "paired_provider_request_id": bid_quote.get("request_id"),
-                "fetched_at": ask_quote.get("fetched_at"),
-            })
-            bids.append({
-                **common,
-                "side": "bid",
-                "price": bid_quote.get("price_quote_per_base"),
-                "size": bid_quote.get("input_amount"),
-                "base_quantity": bid_quote.get("input_amount"),
-                "quote_quantity": bid_quote.get("output_amount"),
-                "input_asset": base_identity["symbol"],
-                "input_amount": bid_quote.get("input_amount"),
-                "output_asset": quote_identity["symbol"],
-                "output_amount": bid_quote.get("output_amount"),
-                "minimum_received": bid_quote.get("minimum_received"),
-                "sample_input_amount": paired_base_amount,
-                "provider_request_id": bid_quote.get("request_id"),
-                "paired_provider_request_id": ask_quote.get("request_id"),
-                "fetched_at": bid_quote.get("fetched_at"),
-            })
 
-        bids.sort(key=lambda item: Decimal(str(item.get("price") or "0")), reverse=True)
-        asks.sort(key=lambda item: Decimal(str(item.get("price") or "0")))
-        best_bid = Decimal(str(bids[0]["price"])) if bids else None
-        best_ask = Decimal(str(asks[0]["price"])) if asks else None
-        crossed = bool(best_bid is not None and best_ask is not None and best_bid >= best_ask)
-        spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
-        midpoint = (best_ask + best_bid) / Decimal(2) if spread is not None else None
-        spread_bps = spread / midpoint * Decimal(10000) if midpoint and midpoint > 0 else None
-        sources: List[str] = []
-        for row in [*bids, *asks]:
-            for source in row.get("route_sources") or []:
-                if source not in sources:
-                    sources.append(source)
+        # RH-BOOK.CROSS.STABILITY.1G.RESAMPLE-R1: one crossed complete
+        # paired snapshot is non-authoritative under observed route-state churn.
+        # Discard it wholesale and permit exactly one fresh complete pass; the
+        # second pass remains authoritative and persistent crossing still fails closed.
+        first_sample = await sample_once()
+        final_sample = first_sample
+        crossed_resample_attempted = bool(first_sample["crossed"])
+        crossed_resample_recovery_applied = False
+        sample_pass_count = 1
+        provider_quote_call_count = int(first_sample["provider_quote_calls"])
+
+        first_crossed_diagnostics: Dict[str, Any] = {}
+        if crossed_resample_attempted:
+            first_crossed_diagnostics = {
+                "crossed_resample_first_best_bid": (
+                    _decimal_text(first_sample["best_bid"])
+                    if first_sample["best_bid"] is not None
+                    else None
+                ),
+                "crossed_resample_first_best_ask": (
+                    _decimal_text(first_sample["best_ask"])
+                    if first_sample["best_ask"] is not None
+                    else None
+                ),
+                "crossed_resample_first_spread_bps": (
+                    _decimal_text(first_sample["spread_bps"])
+                    if first_sample["spread_bps"] is not None
+                    else None
+                ),
+                "crossed_resample_first_route_sources": list(first_sample["sources"]),
+                "crossed_resample_first_sampled_paired_level_count": len(first_sample["bids"]),
+                "crossed_resample_first_warning_count": len(first_sample["errors"]),
+            }
+            final_sample = await sample_once()
+            sample_pass_count = 2
+            provider_quote_call_count += int(final_sample["provider_quote_calls"])
+            crossed_resample_recovery_applied = not bool(final_sample["crossed"]) and bool(
+                final_sample["bids"] and final_sample["asks"]
+            )
+
+        bids = final_sample["bids"]
+        asks = final_sample["asks"]
+        errors = final_sample["errors"]
+        best_bid = final_sample["best_bid"]
+        best_ask = final_sample["best_ask"]
+        crossed = bool(final_sample["crossed"])
+        spread = final_sample["spread"]
+        midpoint = final_sample["midpoint"]
+        spread_bps = final_sample["spread_bps"]
+        sources = final_sample["sources"]
+
         return {
-            "ok": bool(bids and asks),
+            "ok": bool(bids and asks) and not crossed,
             "tranche": "R5C.5D.2E",
             "venue": "robinhood_chain",
             "network": "robinhood_chain",
@@ -1990,21 +2102,21 @@ class RobinhoodChainUniswapQuoteService:
             "identity_source": "token_registry",
             "capability_source": "database",
             "depth_requested": int(depth),
-            "depth_returned": len(bids),
+            "depth_returned": 0 if crossed else len(bids),
             "max_depth": len(_BOOK_MULTIPLIERS),
-            "bids": bids,
-            "asks": asks,
+            "bids": [] if crossed else bids,
+            "asks": [] if crossed else asks,
             "best_bid": _decimal_text(best_bid) if best_bid is not None else None,
             "best_ask": _decimal_text(best_ask) if best_ask is not None else None,
             "crossed": crossed,
             "spread": _decimal_text(spread) if spread is not None else None,
             "spread_bps": _decimal_text(spread_bps) if spread_bps is not None else None,
-            "midpoint": _decimal_text(midpoint) if midpoint is not None else None,
+            "midpoint": _decimal_text(midpoint) if midpoint is not None and not crossed else None,
             "sources": sources,
             "route_sources": sources,
             "errors": errors[:20],
             "warning_count": len(errors),
-            "liquidity_available": bool(bids and asks),
+            "liquidity_available": bool(bids and asks) and not crossed,
             "priceDecimals": max(6, min(12, int(quote_identity["decimals"]))),
             "sizeDecimals": max(0, min(18, int(base_identity["decimals"]))),
             "cached": False,
@@ -2015,7 +2127,14 @@ class RobinhoodChainUniswapQuoteService:
             "quote_probe_seed_source": quote_seed_source,
             "minimum_quote_input_atomic": _BOOK_MIN_QUOTE_INPUT_ATOMIC,
             "minimum_quote_output_atomic": _BOOK_MIN_QUOTE_OUTPUT_ATOMIC,
-            "paired_level_count": len(bids),
+            "paired_level_count": 0 if crossed else len(bids),
+            "crossed_resample_policy": "single_complete_fresh_pair_resample_v1",
+            "crossed_resample_attempted": crossed_resample_attempted,
+            "crossed_resample_recovery_applied": crossed_resample_recovery_applied,
+            "crossed_resample_pass_count": sample_pass_count,
+            "provider_quote_call_count": provider_quote_call_count,
+            "provider_quote_call_budget": (4 if crossed_resample_attempted else 2) * levels,
+            **first_crossed_diagnostics,
             "stale": False,
             "synthetic": True,
             "resting_order": False,
@@ -2027,7 +2146,14 @@ class RobinhoodChainUniswapQuoteService:
             "firm_quote": False,
             "transaction_calldata": None,
             "will_mutate": False,
-            **({"error": "synthetic_orderbook_liquidity_incomplete"} if not (bids and asks) else {}),
+            **(
+                {
+                    "error": "uniswap_orderbook_crossed_market",
+                    "sampled_paired_level_count": len(bids),
+                }
+                if crossed
+                else ({"error": "synthetic_orderbook_liquidity_incomplete"} if not (bids and asks) else {})
+            ),
         }
 
     async def firm_quote_plan(
@@ -2048,7 +2174,10 @@ class RobinhoodChainUniswapQuoteService:
         quote_attempts = 0
         quote_retry_reasons: List[str] = []
         raw_response: Optional[Dict[str, Any]] = None
-        while quote_attempts < _FIRM_QUOTE_NO_QUOTES_MAX_ATTEMPTS:
+        # RH-LIFECYCLE.REQUOTE.1F.R2: execution preparation gets the measured
+        # six-attempt NoRoute envelope, while ordinary indicative quote() keeps
+        # the short three-attempt profile.
+        while quote_attempts < _FIRM_QUOTE_NO_ROUTE_EXECUTION_MAX_ATTEMPTS:
             quote_attempts += 1
             quote_result = await self.quote(
                 symbol=symbol,
@@ -2080,7 +2209,10 @@ class RobinhoodChainUniswapQuoteService:
             retry_reason = _firm_quote_retry_reason(quote_result)
             if retry_reason:
                 quote_retry_reasons.append(retry_reason)
-            if retry_reason is None or quote_attempts >= _firm_quote_retry_max_attempts(quote_result):
+            if retry_reason is None or quote_attempts >= _firm_quote_retry_max_attempts(
+                quote_result,
+                execution_preparation=True,
+            ):
                 quote_result.update(
                     {
                         "provider_quote_retry_policy": _FIRM_QUOTE_RETRY_POLICY,
@@ -2098,6 +2230,7 @@ class RobinhoodChainUniswapQuoteService:
                 _firm_quote_retry_delay_s(
                     quote_result,
                     quote_attempts - 1,
+                    execution_preparation=True,
                 )
             )
 

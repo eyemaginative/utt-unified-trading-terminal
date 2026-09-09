@@ -12,10 +12,12 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
+from .auth import get_robinhood_chain_preferences, require_auth
 from ..models import (
     RobinhoodChainExternalSwap,
     RobinhoodChainSwapExecution,
@@ -2931,6 +2933,110 @@ async def _refresh_robinhood_chain_execution_balance_snapshots(
     }
 
 
+def _robinhood_chain_profile_limit(preferences: Dict[str, Any], key: str) -> Decimal:
+    raw = preferences.get(key)
+    try:
+        value = Decimal(str(raw or "").strip())
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "invalid_robinhood_chain_profile_limit", "field": key},
+        ) from exc
+    if not value.is_finite() or value <= 0:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "invalid_robinhood_chain_profile_limit", "field": key},
+        )
+    return value
+
+
+def _robinhood_chain_token_is_usd_stable(token: Dict[str, Any]) -> bool:
+    return str(token.get("external_price_source") or "").strip().lower() == "stable"
+
+
+def _robinhood_chain_quote_direction_tokens(
+    *,
+    side: str,
+    base: Dict[str, Any],
+    quote: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    normalized_side = str(side or "").strip().lower()
+    return (base, quote) if normalized_side == "sell" else (quote, base)
+
+
+def _enforce_robinhood_chain_interactive_profile_cap_before_provider(
+    *,
+    requested_amount: Any,
+    amount_mode: str,
+    input_token: Dict[str, Any],
+    output_token: Dict[str, Any],
+    maximum_usd: Decimal,
+) -> None:
+    normalized_mode = str(amount_mode or "").strip().lower()
+    stable_token = input_token if normalized_mode == "exact_input" else output_token
+    if not _robinhood_chain_token_is_usd_stable(stable_token):
+        return
+    try:
+        estimate = Decimal(str(requested_amount or "").strip())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_requested_amount"}) from exc
+    if estimate > maximum_usd:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "robinhood_chain_interactive_quote_exceeds_profile_cap",
+                "interactive_quote_value_usd_estimate": format(estimate, "f"),
+                "interactive_quote_cap_usd": format(maximum_usd, "f"),
+                "interactive_quote_cap_source": "user_profile",
+                "provider_contacted": False,
+            },
+        )
+
+
+def _apply_robinhood_chain_interactive_profile_cap_after_provider(
+    result: Dict[str, Any],
+    *,
+    input_token: Dict[str, Any],
+    output_token: Dict[str, Any],
+    maximum_usd: Decimal,
+) -> Dict[str, Any]:
+    out = copy.deepcopy(result)
+    estimate: Optional[Decimal] = None
+    try:
+        if _robinhood_chain_token_is_usd_stable(input_token):
+            raw = (
+                out.get("input_amount")
+                if out.get("input_amount") not in (None, "")
+                else out.get("sell_amount")
+            )
+            if raw not in (None, ""):
+                estimate = Decimal(str(raw))
+        elif _robinhood_chain_token_is_usd_stable(output_token):
+            raw = (
+                out.get("output_amount")
+                if out.get("output_amount") not in (None, "")
+                else out.get("buy_amount")
+            )
+            if raw not in (None, ""):
+                estimate = Decimal(str(raw))
+    except Exception:
+        estimate = None
+
+    out["interactive_quote_value_usd_estimate"] = format(estimate, "f") if estimate is not None else None
+    out["interactive_quote_cap_usd"] = format(maximum_usd, "f")
+    out["interactive_quote_cap_source"] = "user_profile"
+    out["interactive_quote_cap_passed"] = estimate is None or estimate <= maximum_usd
+    if out.get("ok") is True and estimate is not None and estimate > maximum_usd:
+        out.update(
+            {
+                "ok": False,
+                "error": "robinhood_chain_interactive_quote_exceeds_profile_cap",
+                "liquidity_available": False,
+            }
+        )
+    return out
+
+
 def _quote_failure_status(result: Dict[str, Any]) -> int:
     error = str(result.get("error") or "robinhood_chain_quote_failed")
     if error in {
@@ -2947,6 +3053,7 @@ def _quote_failure_status(result: Dict[str, Any]) -> int:
         "firm_quote_amount_exceeds_capability_probe",
         "firm_quote_maximum_input_exceeds_capability_ceiling",
         "robinhood_chain_quote_amount_exceeds_indicative_ceiling",
+        "robinhood_chain_interactive_quote_exceeds_profile_cap",
         "robinhood_chain_quote_exact_output_exceeds_probe_evidence",
         "maximum_input_amount_requires_exact_output",
         "invalid_slippage_bps",
@@ -2970,7 +3077,9 @@ def _quote_failure_status(result: Dict[str, Any]) -> int:
         "uniswap_approval_reset_required",
         "uniswap_orderbook_direction_unavailable",
         "uniswap_orderbook_pair_identity_mismatch",
+        "uniswap_orderbook_crossed_market",
         "robinhood_chain_same_provider_orderbook_unavailable",
+        "verified_weth_registry_identity_required",
     }:
         return 409
     if error in {
@@ -3906,9 +4015,12 @@ async def robinhood_chain_registry_discovery_refresh_market(
     symbol: str,
     request: RobinhoodChainSelectedMarketRefreshRequest,
     db: Session = Depends(get_db),
+    ident: dict = Depends(require_auth),
 ) -> Dict[str, Any]:
     """Explicitly refresh one selected market's bounded review-only directions."""
     taker = _resolve_robinhood_chain_quote_taker(db, request.taker_address)
+    preferences = await run_in_threadpool(get_robinhood_chain_preferences, ident)
+    discovery_max_usd = _robinhood_chain_profile_limit(preferences, "discovery_max_usd")
     try:
         return await get_robinhood_chain_registry_discovery_service().refresh_selected_market(
             db,
@@ -3917,6 +4029,7 @@ async def robinhood_chain_registry_discovery_refresh_market(
             force_refresh=bool(request.force_refresh),
             confirm_refresh=bool(request.confirm_refresh),
             objective_id=request.objective_id,
+            max_discovery_usd=discovery_max_usd,
         )
     except ValueError as exc:
         db.rollback()
@@ -3963,6 +4076,24 @@ async def robinhood_chain_registry_discovery_create_objective(
             confirm_create=bool(request.confirm_create),
             require_verified_registry_identities=True,
         )
+    except OperationalError as exc:
+        db.rollback()
+        message = str(exc or "")
+        if "database is locked" in message.lower():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "pair_objective_database_busy",
+                    "retryable": True,
+                    "provider_contacted": False,
+                    "rpc_contacted": False,
+                    "wallet_connection_requested": False,
+                    "signing_enabled": False,
+                    "broadcast_enabled": False,
+                    "automatic_execution_promotion": False,
+                },
+            ) from exc
+        raise
     except ValueError as exc:
         db.rollback()
         error = str(exc)
@@ -4044,6 +4175,7 @@ async def robinhood_chain_execution_discovery_status(
 async def robinhood_chain_execution_discovery_probe(
     request: RobinhoodChainExecutionDiscoveryRequest,
     db: Session = Depends(get_db),
+    ident: dict = Depends(require_auth),
 ) -> Dict[str, Any]:
     """Run one bounded indicative-price probe without constructing a trade."""
     if not bool(settings.robinhood_chain_enabled):
@@ -4075,6 +4207,8 @@ async def robinhood_chain_execution_discovery_probe(
         amount_mode=amount_mode,
     )
 
+    preferences = await run_in_threadpool(get_robinhood_chain_preferences, ident)
+    discovery_max_usd = _robinhood_chain_profile_limit(preferences, "discovery_max_usd")
     result = await get_robinhood_chain_execution_discovery_service().probe(
         sell_token=sell_token,
         buy_token=buy_token,
@@ -4085,6 +4219,7 @@ async def robinhood_chain_execution_discovery_probe(
         route_capability=capability,
         require_live_verified=True,
         max_probe_amount=(request.sell_amount if amount_mode == "exact_input" else request.buy_amount),
+        max_sell_usd=discovery_max_usd,
     )
     if result.get("ok"):
         return result
@@ -4358,12 +4493,14 @@ async def robinhood_chain_quotes_status(
 async def robinhood_chain_indicative_quote(
     request: RobinhoodChainIndicativeQuoteRequest,
     db: Session = Depends(get_db),
+    ident: dict = Depends(require_auth),
 ) -> Dict[str, Any]:
     """Return a bounded indicative quote without constructing or submitting a trade.
 
     The requested market, identities, direction, and amount mode must be present
-    in database-backed capability evidence. Exact-input review uses an explicit
-    direction ceiling when present, otherwise the configured read-only value cap.
+    in database-backed capability evidence. Historical probe/input ceilings remain
+    route evidence only; the authenticated Profile USD preference is the current
+    interactive economic limit whenever exact Registry metadata yields USD notional.
     """
     if not bool(settings.robinhood_chain_enabled):
         raise HTTPException(status_code=503, detail="Robinhood Chain is disabled")
@@ -4398,6 +4535,20 @@ async def robinhood_chain_indicative_quote(
         capability_status_field="indicative_status",
         provider=provider,
         objective_id=request.objective_id,
+    )
+    preferences = await run_in_threadpool(get_robinhood_chain_preferences, ident)
+    interactive_max_usd = _robinhood_chain_profile_limit(preferences, "interactive_quote_max_usd")
+    input_token, output_token = _robinhood_chain_quote_direction_tokens(
+        side=request.side,
+        base=base,
+        quote=quote,
+    )
+    _enforce_robinhood_chain_interactive_profile_cap_before_provider(
+        requested_amount=request.requested_amount,
+        amount_mode=request.amount_mode,
+        input_token=input_token,
+        output_token=output_token,
+        maximum_usd=interactive_max_usd,
     )
     if provider == UNISWAP_PROVIDER:
         normalized_side = str(request.side or "").strip().lower()
@@ -4453,7 +4604,14 @@ async def robinhood_chain_indicative_quote(
             registry_tokens=registry_tokens,
             route_capability=capability,
             force_refresh=bool(request.force_refresh),
+            interactive_max_usd=interactive_max_usd,
         )
+    result = _apply_robinhood_chain_interactive_profile_cap_after_provider(
+        result,
+        input_token=input_token,
+        output_token=output_token,
+        maximum_usd=interactive_max_usd,
+    )
     db.rollback()
     if result.get("ok"):
         return result
@@ -4464,6 +4622,7 @@ async def robinhood_chain_indicative_quote(
 async def robinhood_chain_firm_quote_plan(
     request: RobinhoodChainFirmQuotePlanRequest,
     db: Session = Depends(get_db),
+    ident: dict = Depends(require_auth),
 ) -> Dict[str, Any]:
     """Return a bounded provider quote and validated unsigned transaction plan.
 
@@ -4498,6 +4657,20 @@ async def robinhood_chain_firm_quote_plan(
         provider=provider,
         objective_id=request.objective_id,
     )
+    preferences = await run_in_threadpool(get_robinhood_chain_preferences, ident)
+    interactive_max_usd = _robinhood_chain_profile_limit(preferences, "interactive_quote_max_usd")
+    input_token, output_token = _robinhood_chain_quote_direction_tokens(
+        side=request.side,
+        base=base,
+        quote=quote,
+    )
+    _enforce_robinhood_chain_interactive_profile_cap_before_provider(
+        requested_amount=request.requested_amount,
+        amount_mode=request.amount_mode,
+        input_token=input_token,
+        output_token=output_token,
+        maximum_usd=interactive_max_usd,
+    )
     if provider == UNISWAP_PROVIDER:
         if str(request.amount_mode or "").strip().lower() != "exact_input":
             raise HTTPException(status_code=400, detail={"error": "uniswap_quote_exact_input_only"})
@@ -4530,6 +4703,12 @@ async def robinhood_chain_firm_quote_plan(
             route_capability=capability,
             slippage_bps=int(request.slippage_bps),
         )
+    result = _apply_robinhood_chain_interactive_profile_cap_after_provider(
+        result,
+        input_token=input_token,
+        output_token=output_token,
+        maximum_usd=interactive_max_usd,
+    )
     db.rollback()
     if result.get("ok"):
         return result
@@ -6009,6 +6188,7 @@ async def robinhood_chain_swap_execution_latest(
     side: str = Query(..., min_length=3, max_length=4),
     amount_mode: str = Query(default=ROBINHOOD_CHAIN_SWAP_AMOUNT_MODE, min_length=1, max_length=32),
     wallet_address: Optional[str] = Query(default=None, min_length=42, max_length=42),
+    recovery_only: bool = Query(default=False),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Restore the newest matching lifecycle by read-only database lookup."""
@@ -6019,6 +6199,7 @@ async def robinhood_chain_swap_execution_latest(
             side=side,
             amount_mode=amount_mode,
             wallet_address=wallet_address,
+            recovery_only=recovery_only,
         )
         db.rollback()
         return payload
@@ -6523,12 +6704,21 @@ async def robinhood_chain_synthetic_orderbook(
     ]
     base_symbol = str(base.get("symbol") or "").strip().upper()
     quote_symbol = str(quote.get("symbol") or "").strip().upper()
-    preferred_provider = str(market.get("preferred_orderbook_provider") or "").strip().lower()
-    if preferred_provider not in {
+    supported_orderbook_providers = {
         ROBINHOOD_CHAIN_QUOTE_PROVIDER,
         UNISWAP_PROVIDER,
         UNISWAP_V3_RPC_PROVIDER,
-    }:
+    }
+    preferred_provider = str(market.get("preferred_orderbook_provider") or "").strip().lower()
+    complete_orderbook_providers = []
+    for provider in market.get("orderbook_providers") or []:
+        normalized_provider = str(provider or "").strip().lower()
+        if (
+            normalized_provider in supported_orderbook_providers
+            and normalized_provider not in complete_orderbook_providers
+        ):
+            complete_orderbook_providers.append(normalized_provider)
+    if preferred_provider not in supported_orderbook_providers:
         db.rollback()
         raise HTTPException(
             status_code=409,
@@ -6540,61 +6730,74 @@ async def robinhood_chain_synthetic_orderbook(
             },
         )
 
-    def direction_capability(from_asset: str, to_asset: str) -> Optional[Dict[str, Any]]:
+    provider_candidates = [preferred_provider]
+    for fallback_provider in (
+        UNISWAP_V3_RPC_PROVIDER,
+        ROBINHOOD_CHAIN_QUOTE_PROVIDER,
+        UNISWAP_PROVIDER,
+    ):
+        if (
+            fallback_provider in complete_orderbook_providers
+            and fallback_provider not in provider_candidates
+        ):
+            provider_candidates.append(fallback_provider)
+
+    def direction_capability(
+        provider: str,
+        from_asset: str,
+        to_asset: str,
+    ) -> Optional[Dict[str, Any]]:
         return next(
             (
                 item for item in capabilities
-                if str(item.get("provider") or "").strip().lower() == preferred_provider
+                if str(item.get("provider") or "").strip().lower() == provider
                 and str(item.get("from_asset") or "").strip().upper() == from_asset
                 and str(item.get("to_asset") or "").strip().upper() == to_asset
             ),
             None,
         )
 
-    base_to_quote = direction_capability(base_symbol, quote_symbol)
-    quote_to_base = direction_capability(quote_symbol, base_symbol)
-    if preferred_provider == UNISWAP_PROVIDER:
-        result = await get_robinhood_chain_uniswap_quote_service().synthetic_orderbook_for_pair(
-            symbol=market.get("symbol") or symbol,
-            depth=depth,
-            taker_address=taker,
-            base_token=base,
-            quote_token=quote,
-            base_to_quote_capability=base_to_quote or {},
-            quote_to_base_capability=quote_to_base or {},
-        )
-    elif preferred_provider == UNISWAP_V3_RPC_PROVIDER:
-        try:
-            weth = registry_service.resolve_verified_token(db, "WETH")
-        except ValueError as exc:
-            db.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail={
+    async def build_provider_orderbook(provider: str) -> Dict[str, Any]:
+        base_to_quote = direction_capability(provider, base_symbol, quote_symbol)
+        quote_to_base = direction_capability(provider, quote_symbol, base_symbol)
+        if provider == UNISWAP_PROVIDER:
+            return await get_robinhood_chain_uniswap_quote_service().synthetic_orderbook_for_pair(
+                symbol=market.get("symbol") or symbol,
+                depth=depth,
+                taker_address=taker,
+                base_token=base,
+                quote_token=quote,
+                base_to_quote_capability=base_to_quote or {},
+                quote_to_base_capability=quote_to_base or {},
+            )
+        if provider == UNISWAP_V3_RPC_PROVIDER:
+            try:
+                weth = registry_service.resolve_verified_token(db, "WETH")
+            except ValueError as exc:
+                return {
+                    "ok": False,
                     "error": "verified_weth_registry_identity_required",
                     "message": str(exc),
                     "symbol": market.get("symbol"),
                     "provider": UNISWAP_V3_RPC_PROVIDER,
                     "provider_contacted": False,
-                },
-            ) from exc
-        base_provider = weth if bool(base.get("native")) else base
-        quote_provider = weth if bool(quote.get("native")) else quote
-        result = await get_robinhood_chain_uniswap_v3_quote_service().synthetic_orderbook_for_pair(
-            symbol=market.get("symbol") or symbol,
-            depth=depth,
-            base_token=base,
-            quote_token=quote,
-            base_provider_token=base_provider,
-            quote_provider_token=quote_provider,
-            bridge_token=weth,
-            base_to_quote_capability=base_to_quote or {},
-            quote_to_base_capability=quote_to_base or {},
-            force_refresh=bool(force_refresh),
-        )
-    else:
+                }
+            base_provider = weth if bool(base.get("native")) else base
+            quote_provider = weth if bool(quote.get("native")) else quote
+            return await get_robinhood_chain_uniswap_v3_quote_service().synthetic_orderbook_for_pair(
+                symbol=market.get("symbol") or symbol,
+                depth=depth,
+                base_token=base,
+                quote_token=quote,
+                base_provider_token=base_provider,
+                quote_provider_token=quote_provider,
+                bridge_token=weth,
+                base_to_quote_capability=base_to_quote or {},
+                quote_to_base_capability=quote_to_base or {},
+                force_refresh=bool(force_refresh),
+            )
         registry_tokens, native_token = _resolve_robinhood_chain_review_identities(db)
-        result = await get_robinhood_chain_quote_service().synthetic_orderbook_for_pair(
+        return await get_robinhood_chain_quote_service().synthetic_orderbook_for_pair(
             symbol=market.get("symbol") or symbol,
             depth=depth,
             taker_address=taker,
@@ -6606,13 +6809,53 @@ async def robinhood_chain_synthetic_orderbook(
             registry_tokens=registry_tokens,
             force_refresh=bool(force_refresh),
         )
+
+    structural_orderbook_errors = {
+        "robinhood_chain_pair_identity_mismatch",
+        "robinhood_chain_bid_direction_unavailable",
+        "robinhood_chain_ask_direction_unavailable",
+        "uniswap_orderbook_pair_identity_mismatch",
+        "uniswap_orderbook_direction_unavailable",
+        "uniswap_orderbook_crossed_market",
+        "uniswap_v3_orderbook_pair_identity_mismatch",
+        "uniswap_v3_orderbook_direction_unavailable",
+        "verified_weth_registry_identity_required",
+    }
+
+    provider_attempts: List[Dict[str, Any]] = []
+    result: Dict[str, Any] = {
+        "ok": False,
+        "error": "robinhood_chain_same_provider_orderbook_unavailable",
+        "symbol": market.get("symbol"),
+        "provider_contacted": False,
+    }
+    for provider in provider_candidates:
+        result = await build_provider_orderbook(provider)
+        provider_attempts.append({
+            "provider": provider,
+            "ok": bool(result.get("ok")),
+            "error": result.get("error"),
+        })
+        if result.get("ok"):
+            result["preferred_orderbook_provider"] = preferred_provider
+            result["selected_orderbook_provider"] = provider
+            result["provider_fallback_used"] = provider != preferred_provider
+            result["provider_attempts"] = copy.deepcopy(provider_attempts)
+            result["market"] = {
+                "id": market.get("id"),
+                "symbol": market.get("symbol"),
+                "mechanism": market.get("mechanism"),
+                "review_only": market.get("review_only"),
+            }
+            db.rollback()
+            return result
+        result_error = str(result.get("error") or "").strip()
+        if result_error in structural_orderbook_errors or _quote_failure_status(result) < 500:
+            break
+
+    result["preferred_orderbook_provider"] = preferred_provider
+    result["selected_orderbook_provider"] = None
+    result["provider_fallback_used"] = len(provider_attempts) > 1
+    result["provider_attempts"] = copy.deepcopy(provider_attempts)
     db.rollback()
-    if result.get("ok"):
-        result["market"] = {
-            "id": market.get("id"),
-            "symbol": market.get("symbol"),
-            "mechanism": market.get("mechanism"),
-            "review_only": market.get("review_only"),
-        }
-        return result
     raise HTTPException(status_code=_quote_failure_status(result), detail=result)

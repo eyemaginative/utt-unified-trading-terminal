@@ -121,6 +121,7 @@ class FakeDiscoveryService:
         route_capability: dict | None = None,
         require_live_verified: bool = True,
         max_probe_amount: str | None = None,
+        max_sell_usd: str | None = None,
     ) -> dict:
         amount_mode = "exact_output" if buy_amount is not None else "exact_input"
         amount_text = str(buy_amount if buy_amount is not None else sell_amount or "")
@@ -133,6 +134,7 @@ class FakeDiscoveryService:
                 "taker": taker_address,
                 "force_refresh": force_refresh,
                 "max_probe_amount": max_probe_amount,
+                "max_sell_usd": max_sell_usd,
             }
         )
         if amount_text in self.fail_inputs:
@@ -225,6 +227,7 @@ async def _quote_request(
     route_capability: dict | None = None,
     force_refresh: bool = False,
     amount_mode: str | None = None,
+    interactive_max_usd: str | None = None,
 ) -> dict:
     base = dict(base_token or GASX)
     quote = dict(quote_token or CRED)
@@ -266,6 +269,7 @@ async def _quote_request(
         registry_tokens=registry_tokens,
         route_capability=route_capability,
         force_refresh=force_refresh,
+        interactive_max_usd=interactive_max_usd,
     )
 
 
@@ -433,7 +437,7 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(discovery.calls[-1]["amount"], "0.004")
         self.assertIsNone(discovery.calls[0]["max_probe_amount"])
 
-    async def test_explicit_indicative_input_ceiling_fails_before_provider(self) -> None:
+    async def test_explicit_indicative_input_ceiling_is_evidence_not_current_amount_cap(self) -> None:
         service, discovery = self.make_service()
         quote = await _quote_request(
             service,
@@ -446,13 +450,15 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
             quote_token=CRED,
             route_capability={**GASX_TO_CRED, "indicative_max_input_amount": "0.004"},
             force_refresh=True,
+            interactive_max_usd="100",
         )
 
-        self.assertFalse(quote["ok"])
-        self.assertEqual(quote["error"], "robinhood_chain_quote_amount_exceeds_indicative_ceiling")
-        self.assertEqual(quote["maximum_review_amount"], "0.004")
-        self.assertFalse(quote["provider_contacted"])
-        self.assertEqual(discovery.calls, [])
+        self.assertTrue(quote["ok"])
+        self.assertEqual(quote["indicative_input_ceiling"], "0.004")
+        self.assertEqual(quote["probe_amount_role"], "evidence_and_orderbook_seed")
+        self.assertEqual(discovery.calls[0]["amount"], "0.0041")
+        self.assertIsNone(discovery.calls[0]["max_probe_amount"])
+        self.assertEqual(discovery.calls[0]["max_sell_usd"], "100")
 
     async def test_exact_output_buy_is_blocked_before_provider_contact(self) -> None:
         service, discovery = self.make_service()
@@ -573,6 +579,23 @@ class RobinhoodChainQuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(book["error"], "robinhood_chain_bid_direction_unavailable")
         self.assertFalse(book["provider_contacted"])
         self.assertEqual(discovery.calls, [])
+
+    def test_router_maps_crossed_uniswap_orderbook_to_http_409(self) -> None:
+        router_path = BACKEND_ROOT / "app" / "routers" / "robinhood_chain.py"
+        router_tree = ast.parse(router_path.read_text(encoding="utf-8"))
+        status_node = next(
+            node
+            for node in router_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_quote_failure_status"
+        )
+        isolated_module = ast.Module(body=[status_node], type_ignores=[])
+        namespace = {"Dict": dict, "Any": object}
+        exec(compile(ast.fix_missing_locations(isolated_module), str(router_path), "exec"), namespace)
+
+        status = namespace["_quote_failure_status"](
+            {"error": "uniswap_orderbook_crossed_market"}
+        )
+        self.assertEqual(status, 409)
 
     def test_route_capabilities_are_not_embedded_in_provider_service(self) -> None:
         source = inspect.getsource(discovery_module)

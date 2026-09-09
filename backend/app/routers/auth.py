@@ -16,6 +16,7 @@ import json
 import re
 import shutil
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional, Any
 
@@ -401,6 +402,257 @@ def _ensure_api_keys_table() -> None:
 def ensure_api_key_vault_schema() -> None:
     """Public startup hook used by app.main before adapters resolve credentials."""
     _ensure_api_keys_table()
+
+
+_RH_DISCOVERY_MAX_USD_PREF = "robinhood_chain.discovery_max_usd"
+_RH_INTERACTIVE_QUOTE_MAX_USD_PREF = "robinhood_chain.interactive_quote_max_usd"
+_UI_TABLES_STARTUP_TAB_PREF = "ui.tables_startup_tab"
+_UI_TABLES_STARTUP_TAB_DEFAULT = "allOrders"
+_UI_TABLES_STARTUP_TAB_ALLOWED = {"allOrders", "balances", "localOrders", "discover"}
+_PREFERENCE_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+
+
+def ensure_user_preferences_schema() -> None:
+    """Create the user-scoped application-preference table.
+
+    Preferences deliberately do not foreign-key to ``utt_users``. Shared-password
+    mode and no-auth/local mode can therefore use the same persisted Profile
+    settings as DB-auth users without coupling application settings to account
+    security state.
+    """
+    ddl = """
+    CREATE TABLE IF NOT EXISTS utt_user_preferences (
+      username TEXT NOT NULL,
+      preference_key TEXT NOT NULL,
+      preference_value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (username, preference_key)
+    );
+    """
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_utt_user_preferences_username
+                ON utt_user_preferences(username, updated_at DESC)
+                """
+            )
+        )
+
+
+def _preference_subject(identity: Any) -> str:
+    if isinstance(identity, dict):
+        user = str(identity.get("user") or "").strip()
+        authenticated = identity.get("auth") is True
+        if not authenticated and user.lower() in {"", "anonymous"}:
+            return "local"
+        return user or "local"
+    user = str(identity or "").strip()
+    return "local" if user.lower() in {"", "anonymous"} else user
+
+
+def _normalize_positive_decimal_preference(value: Any, *, field: str) -> str:
+    raw = str(value if value is not None else "").strip()
+    if not raw or len(raw) > 80 or not _PREFERENCE_DECIMAL_RE.fullmatch(raw):
+        raise ValueError(f"invalid_{field}")
+    try:
+        amount = Decimal(raw)
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(f"invalid_{field}") from exc
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError(f"invalid_{field}")
+    normalized = format(amount, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
+def _normalize_tables_startup_tab_preference(value: Any) -> str:
+    raw = str(value if value is not None else "").strip()
+    if raw not in _UI_TABLES_STARTUP_TAB_ALLOWED:
+        raise ValueError("invalid_ui_tables_startup_tab")
+    return raw
+
+
+def get_ui_preferences(identity: Any) -> dict:
+    """Resolve global per-user UI preferences without using localStorage authority."""
+    ensure_user_preferences_schema()
+    user = _preference_subject(identity)
+    value = _UI_TABLES_STARTUP_TAB_DEFAULT
+    source = "default"
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT preference_value
+                FROM utt_user_preferences
+                WHERE username = :username
+                  AND preference_key = :preference_key
+                LIMIT 1
+                """
+            ),
+            {
+                "username": user,
+                "preference_key": _UI_TABLES_STARTUP_TAB_PREF,
+            },
+        ).mappings().first()
+    if row is not None:
+        try:
+            value = _normalize_tables_startup_tab_preference(row.get("preference_value"))
+            source = "database"
+        except ValueError:
+            value = _UI_TABLES_STARTUP_TAB_DEFAULT
+            source = "default_invalid_persisted"
+    return {
+        "user": user,
+        "tables_startup_tab": value,
+        "sources": {"tables_startup_tab": source},
+        "storage": "utt_user_preferences",
+        "default": _UI_TABLES_STARTUP_TAB_DEFAULT,
+    }
+
+
+def _set_ui_preferences(identity: Any, *, tables_startup_tab: Any) -> dict:
+    ensure_user_preferences_schema()
+    user = _preference_subject(identity)
+    value = _normalize_tables_startup_tab_preference(tables_startup_tab)
+    now = int(time.time())
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO utt_user_preferences (
+                  username, preference_key, preference_value, updated_at
+                )
+                VALUES (:username, :preference_key, :preference_value, :updated_at)
+                ON CONFLICT(username, preference_key) DO UPDATE SET
+                  preference_value = excluded.preference_value,
+                  updated_at = excluded.updated_at
+                """
+            ),
+            {
+                "username": user,
+                "preference_key": _UI_TABLES_STARTUP_TAB_PREF,
+                "preference_value": value,
+                "updated_at": now,
+            },
+        )
+    return get_ui_preferences({"user": user, "auth": True})
+
+
+def _robinhood_chain_preference_defaults() -> dict:
+    bootstrap = _normalize_positive_decimal_preference(
+        getattr(settings, "robinhood_chain_discovery_max_sell_usd", 5.0),
+        field="robinhood_chain_bootstrap_max_usd",
+    )
+    return {
+        _RH_DISCOVERY_MAX_USD_PREF: bootstrap,
+        _RH_INTERACTIVE_QUOTE_MAX_USD_PREF: bootstrap,
+    }
+
+
+def get_robinhood_chain_preferences(identity: Any) -> dict:
+    """Resolve effective per-user Robinhood Chain economic limits.
+
+    Database values are authoritative after the user saves Profile settings.
+    The legacy config value is retained only as a bootstrap/default for users
+    without persisted preferences.
+    """
+    ensure_user_preferences_schema()
+    user = _preference_subject(identity)
+    defaults = _robinhood_chain_preference_defaults()
+    values = dict(defaults)
+    sources = {
+        _RH_DISCOVERY_MAX_USD_PREF: "bootstrap_default",
+        _RH_INTERACTIVE_QUOTE_MAX_USD_PREF: "bootstrap_default",
+    }
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT preference_key, preference_value
+                FROM utt_user_preferences
+                WHERE username = :username
+                  AND preference_key IN (:discovery_key, :interactive_key)
+                """
+            ),
+            {
+                "username": user,
+                "discovery_key": _RH_DISCOVERY_MAX_USD_PREF,
+                "interactive_key": _RH_INTERACTIVE_QUOTE_MAX_USD_PREF,
+            },
+        ).mappings().all()
+    for row in rows:
+        key = str(row.get("preference_key") or "")
+        if key not in values:
+            continue
+        try:
+            values[key] = _normalize_positive_decimal_preference(
+                row.get("preference_value"),
+                field=key.replace(".", "_"),
+            )
+        except ValueError:
+            # A corrupt persisted value fails closed to the validated bootstrap
+            # default rather than propagating a non-finite/unbounded cap.
+            continue
+        sources[key] = "database"
+
+    return {
+        "user": user,
+        "discovery_max_usd": values[_RH_DISCOVERY_MAX_USD_PREF],
+        "interactive_quote_max_usd": values[_RH_INTERACTIVE_QUOTE_MAX_USD_PREF],
+        "sources": {
+            "discovery_max_usd": sources[_RH_DISCOVERY_MAX_USD_PREF],
+            "interactive_quote_max_usd": sources[_RH_INTERACTIVE_QUOTE_MAX_USD_PREF],
+        },
+        "storage": "utt_user_preferences",
+        "database_authoritative_after_save": True,
+    }
+
+
+def _set_robinhood_chain_preferences(
+    identity: Any,
+    *,
+    discovery_max_usd: Any,
+    interactive_quote_max_usd: Any,
+) -> dict:
+    ensure_user_preferences_schema()
+    user = _preference_subject(identity)
+    discovery = _normalize_positive_decimal_preference(
+        discovery_max_usd,
+        field="robinhood_chain_discovery_max_usd",
+    )
+    interactive = _normalize_positive_decimal_preference(
+        interactive_quote_max_usd,
+        field="robinhood_chain_interactive_quote_max_usd",
+    )
+    now = int(time.time())
+    with engine.begin() as conn:
+        for key, value in (
+            (_RH_DISCOVERY_MAX_USD_PREF, discovery),
+            (_RH_INTERACTIVE_QUOTE_MAX_USD_PREF, interactive),
+        ):
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO utt_user_preferences (
+                      username, preference_key, preference_value, updated_at
+                    )
+                    VALUES (:username, :preference_key, :preference_value, :updated_at)
+                    ON CONFLICT(username, preference_key) DO UPDATE SET
+                      preference_value = excluded.preference_value,
+                      updated_at = excluded.updated_at
+                    """
+                ),
+                {
+                    "username": user,
+                    "preference_key": key,
+                    "preference_value": value,
+                    "updated_at": now,
+                },
+            )
+    return get_robinhood_chain_preferences({"user": user, "auth": True})
 
 
 def _api_keys_encrypt(payload: dict) -> str:
@@ -1024,6 +1276,20 @@ class SessionPrefsRequest(BaseModel):
     remember_login: bool = False
 
 
+class RobinhoodChainPreferencesPatch(BaseModel):
+    discovery_max_usd: str = Field(..., min_length=1, max_length=80)
+    interactive_quote_max_usd: str = Field(..., min_length=1, max_length=80)
+
+
+class UiPreferencesPatch(BaseModel):
+    tables_startup_tab: str = Field(..., min_length=1, max_length=32)
+
+
+class UserPreferencesPatchRequest(BaseModel):
+    robinhood_chain: Optional[RobinhoodChainPreferencesPatch] = None
+    ui: Optional[UiPreferencesPatch] = None
+
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -1224,6 +1490,49 @@ def auth_session_prefs_set(req: SessionPrefsRequest, ident: dict = Depends(requi
         "token": token,
         "user": user,
         "token_ttl_s": int(_token_ttl_for_login(user, remember)),
+    }
+
+
+@router.get("/preferences")
+def auth_preferences_get(ident: dict = Depends(require_auth)):
+    return {
+        "ok": True,
+        "robinhood_chain": get_robinhood_chain_preferences(ident),
+        "ui": get_ui_preferences(ident),
+    }
+
+
+@router.patch("/preferences")
+def auth_preferences_patch(
+    req: UserPreferencesPatchRequest,
+    ident: dict = Depends(require_auth),
+):
+    if req.robinhood_chain is None and req.ui is None:
+        raise HTTPException(status_code=400, detail={"error": "preference_patch_empty"})
+    try:
+        robinhood_chain_preferences = (
+            _set_robinhood_chain_preferences(
+                ident,
+                discovery_max_usd=req.robinhood_chain.discovery_max_usd,
+                interactive_quote_max_usd=req.robinhood_chain.interactive_quote_max_usd,
+            )
+            if req.robinhood_chain is not None
+            else get_robinhood_chain_preferences(ident)
+        )
+        ui_preferences = (
+            _set_ui_preferences(
+                ident,
+                tables_startup_tab=req.ui.tables_startup_tab,
+            )
+            if req.ui is not None
+            else get_ui_preferences(ident)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    return {
+        "ok": True,
+        "robinhood_chain": robinhood_chain_preferences,
+        "ui": ui_preferences,
     }
 
 

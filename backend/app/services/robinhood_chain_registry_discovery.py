@@ -293,13 +293,69 @@ def _parse_probe_amount(value: Any, decimals: int) -> str:
         raise ValueError("invalid_probe_amount")
     if max(0, -amount.as_tuple().exponent) > int(decimals):
         raise ValueError("probe_amount_exceeds_token_precision")
-    # Review-only discovery is intentionally bounded to 25 display units per request.
-    if amount > Decimal("25"):
-        raise ValueError("probe_amount_exceeds_review_cap")
+    # Economic ceilings are user/Profile policy. Keep only structural validity
+    # and exact token-precision validation at this parser boundary.
     normalized = format(amount, "f")
     if "." in normalized:
         normalized = normalized.rstrip("0").rstrip(".")
     return normalized
+
+
+def _parse_optional_positive_usd_cap(value: Any) -> Optional[Decimal]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        maximum = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_discovery_value_cap") from exc
+    if not maximum.is_finite() or maximum <= 0:
+        raise ValueError("invalid_discovery_value_cap")
+    return maximum
+
+
+def _registry_token_is_usd_stable(identity: Dict[str, Any]) -> bool:
+    return str(identity.get("external_price_source") or "").strip().lower() == "stable"
+
+
+def _apply_selected_probe_value_cap(
+    result: Dict[str, Any],
+    *,
+    input_token: Dict[str, Any],
+    output_token: Dict[str, Any],
+    input_amount: str,
+    maximum_usd: Optional[Decimal],
+) -> Dict[str, Any]:
+    if maximum_usd is None or not isinstance(result, dict):
+        return result
+    out = copy.deepcopy(result)
+    estimate: Optional[Decimal] = None
+    try:
+        if _registry_token_is_usd_stable(input_token):
+            estimate = Decimal(str(input_amount))
+        elif _registry_token_is_usd_stable(output_token) and out.get("ok") is True:
+            raw_output = (
+                out.get("buy_amount")
+                if out.get("buy_amount") not in (None, "")
+                else out.get("output_amount")
+            )
+            if raw_output not in (None, ""):
+                estimate = Decimal(str(raw_output))
+    except (InvalidOperation, ValueError, TypeError):
+        estimate = None
+
+    out["discovery_value_usd_estimate"] = format(estimate, "f") if estimate is not None else None
+    out["discovery_value_cap_usd"] = format(maximum_usd, "f")
+    out["discovery_value_cap_source"] = "user_profile"
+    out["discovery_value_cap_passed"] = estimate is None or estimate <= maximum_usd
+    if out.get("ok") is True and estimate is not None and estimate > maximum_usd:
+        out.update(
+            {
+                "ok": False,
+                "error": "discovery_amount_exceeds_cap",
+                "liquidity_available": False,
+            }
+        )
+    return out
 
 
 def _registry_external_price_meta(db: Session, token_id: int) -> Dict[str, Optional[str]]:
@@ -2327,8 +2383,9 @@ class RobinhoodChainRegistryDiscoveryService:
                     result=result,
                 )
                 db.flush()
+                db.commit()
+                db.refresh(row)
                 results.append(self._capability_dict(db, row))
-            db.commit()
 
         return {
             "ok": True,
@@ -2362,6 +2419,7 @@ class RobinhoodChainRegistryDiscoveryService:
         force_refresh: bool,
         confirm_refresh: bool,
         objective_id: Optional[str] = None,
+        max_discovery_usd: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Refresh provider-scoped exact-input evidence for one selected market.
 
@@ -2372,6 +2430,7 @@ class RobinhoodChainRegistryDiscoveryService:
         """
         if confirm_refresh is not True:
             raise ValueError("confirm_selected_market_refresh_required")
+        discovery_max_usd = _parse_optional_positive_usd_cap(max_discovery_usd)
 
         schema_compatibility = _ensure_provider_scoped_capability_schema(db)
         normalized_symbol = _normalize_market_symbol(symbol)
@@ -2432,15 +2491,24 @@ class RobinhoodChainRegistryDiscoveryService:
             )
             direction_probe_amount = str(getattr(direction_probe_row, "probe_amount", "") or "").strip()
             for provider in providers:
-                capability = self._capability_row(
-                    db,
-                    objective_id=objective.id,
-                    from_token_registry_id=int(from_row.id),
-                    to_token_registry_id=int(to_row.id),
-                    amount_mode=AMOUNT_MODE_EXACT_INPUT,
-                    provider=provider,
+                # Read any persisted provider-specific probe amount without
+                # creating/updating capability evidence before the network
+                # probe. SQLite permits concurrent readers under WAL, but a
+                # DML statement here would hold the single writer lock across
+                # the awaited provider request and can starve unrelated local
+                # writes such as Add Selected Pair.
+                existing_capability = (
+                    db.query(RobinhoodChainPairCapability)
+                    .filter(
+                        RobinhoodChainPairCapability.objective_id == objective.id,
+                        RobinhoodChainPairCapability.from_token_registry_id == int(from_row.id),
+                        RobinhoodChainPairCapability.to_token_registry_id == int(to_row.id),
+                        RobinhoodChainPairCapability.amount_mode == AMOUNT_MODE_EXACT_INPUT,
+                        RobinhoodChainPairCapability.provider == provider,
+                    )
+                    .first()
                 )
-                probe_amount = str(capability.probe_amount or "").strip()
+                probe_amount = str(getattr(existing_capability, "probe_amount", "") or "").strip()
                 if not probe_amount:
                     probe_amount = direction_probe_amount or self._default_selected_probe_amount(from_identity)
                 classification_result: Optional[Dict[str, Any]] = None
@@ -2469,6 +2537,26 @@ class RobinhoodChainRegistryDiscoveryService:
                             "will_mutate": False,
                         }
 
+                if (
+                    classification_result is None
+                    and discovery_max_usd is not None
+                    and _registry_token_is_usd_stable(from_identity)
+                    and Decimal(probe_amount) > discovery_max_usd
+                ):
+                    classification_result = {
+                        "ok": False,
+                        "error": "discovery_amount_exceeds_cap",
+                        "provider": provider,
+                        "provider_contacted": False,
+                        "liquidity_available": False,
+                        "discovery_value_usd_estimate": probe_amount,
+                        "discovery_value_cap_usd": format(discovery_max_usd, "f"),
+                        "discovery_value_cap_source": "user_profile",
+                        "discovery_value_cap_passed": False,
+                        "read_only": True,
+                        "will_mutate": False,
+                    }
+
                 if classification_result is None:
                     try:
                         if provider == PROVIDER_ZEROX:
@@ -2482,6 +2570,7 @@ class RobinhoodChainRegistryDiscoveryService:
                                 route_capability=None,
                                 require_live_verified=False,
                                 max_probe_amount=probe_amount,
+                                max_sell_usd=discovery_max_usd,
                             )
                         elif provider == PROVIDER_UNISWAP:
                             classification_result = await self.uniswap_service.probe(
@@ -2528,6 +2617,13 @@ class RobinhoodChainRegistryDiscoveryService:
                     except Exception as exc:
                         classification_result = _provider_exception_result(provider, exc)
 
+                classification_result = _apply_selected_probe_value_cap(
+                    classification_result or {},
+                    input_token=from_identity,
+                    output_token=to_identity,
+                    input_amount=probe_amount,
+                    maximum_usd=discovery_max_usd,
+                )
                 provider_contacted = provider_contacted or _probe_provider_contacted(classification_result)
                 try:
                     row = self._persist_probe_result(

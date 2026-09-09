@@ -86,6 +86,32 @@ def _counterparty_balance_derived_asset_cap(value: Any) -> int:
     return max(0, min(requested, configured, 50))
 
 
+def _counterparty_balance_derived_max_spread_pct() -> float:
+    """Maximum two-sided XCP/BTC-style spread accepted for balance valuation.
+
+    The derived fallback is intentionally conservative: direct USD pricing is
+    preferred, while a book-derived accounting price must come from a fresh,
+    coherent, two-sided market.  The default 100% midpoint-relative spread
+    allows wide illiquid markets while rejecting pathological dislocations.
+    """
+
+    try:
+        configured = float(
+            os.getenv("COUNTERPARTY_BALANCE_DERIVED_MAX_SPREAD_PCT")
+            or "100"
+        )
+    except Exception:
+        configured = 100.0
+
+    if configured != configured or configured in (
+        float("inf"),
+        float("-inf"),
+    ):
+        configured = 100.0
+
+    return max(1.0, min(configured, 200.0))
+
+
 def _market_metric_price_rows(assets: List[str], *, force_refresh: bool) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     requested = []
     seen = set()
@@ -140,7 +166,17 @@ def _metric_price_candidate(row: Optional[Dict[str, Any]]) -> Optional[Dict[str,
 
 
 def _counterparty_book_price_btc(book: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a validated two-sided midpoint for balance valuation.
+
+    Counterparty books remain useful for display even when stale, crossed, or
+    one-sided.  Those states are not acceptable accounting evidence.  A
+    derived balance price therefore requires a fresh, non-rate-limited,
+    two-sided book with bid < ask and a bounded midpoint-relative spread.
+    """
+
     if not isinstance(book, dict) or book.get("ok") is False:
+        return None
+    if book.get("stale") is True or book.get("rate_limited") is True:
         return None
 
     best_bid = _positive_number(book.get("best_bid"))
@@ -148,25 +184,43 @@ def _counterparty_book_price_btc(book: Dict[str, Any]) -> Optional[Dict[str, Any
     if best_bid is None:
         bids = book.get("bids") if isinstance(book.get("bids"), list) else []
         if bids:
-            best_bid = _positive_number((bids[0] or {}).get("price") if isinstance(bids[0], dict) else None)
+            best_bid = _positive_number(
+                (bids[0] or {}).get("price")
+                if isinstance(bids[0], dict)
+                else None
+            )
     if best_ask is None:
         asks = book.get("asks") if isinstance(book.get("asks"), list) else []
         if asks:
-            best_ask = _positive_number((asks[0] or {}).get("price") if isinstance(asks[0], dict) else None)
+            best_ask = _positive_number(
+                (asks[0] or {}).get("price")
+                if isinstance(asks[0], dict)
+                else None
+            )
 
-    if best_bid is not None:
-        return {
-            "price_btc": best_bid,
-            "price_basis": "best_bid",
-            "price_warning": None,
-        }
-    if best_ask is not None:
-        return {
-            "price_btc": best_ask,
-            "price_basis": "best_ask_reference",
-            "price_warning": "No executable bid was available; valuation uses the lowest visible ask as a reference.",
-        }
-    return None
+    if best_bid is None or best_ask is None:
+        return None
+    if best_bid >= best_ask:
+        return None
+
+    midpoint = (best_bid + best_ask) / 2.0
+    if midpoint <= 0:
+        return None
+
+    spread_pct = ((best_ask - best_bid) / midpoint) * 100.0
+    max_spread_pct = _counterparty_balance_derived_max_spread_pct()
+    if spread_pct > max_spread_pct:
+        return None
+
+    return {
+        "price_btc": midpoint,
+        "price_basis": "validated_midpoint",
+        "price_warning": None,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread_pct_midpoint": spread_pct,
+        "max_spread_pct_midpoint": max_spread_pct,
+    }
 
 
 _COUNTERPARTY_BALANCE_PORTFOLIO_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -463,10 +517,18 @@ def counterparty_configured_balance_portfolio(
         "btc_usd_source": (btc_metric or {}).get("price_source"),
         "pricing_hierarchy": [
             "token_registry_or_market_metrics_direct_usd",
-            "counterparty_asset_btc_best_bid_or_ask_reference",
+            "counterparty_asset_btc_validated_midpoint",
             "btc_usd_market_metrics",
             "unavailable",
         ],
+        "derived_price_guard": {
+            "requires_fresh_book": True,
+            "requires_two_sided_book": True,
+            "rejects_crossed_book": True,
+            "rejects_one_sided_book": True,
+            "basis": "validated_midpoint",
+            "max_spread_pct_midpoint": _counterparty_balance_derived_max_spread_pct(),
+        },
         "market_metrics_cache": metric_summary.get("cache"),
         "market_metrics_updated_at": metric_summary.get("updated_at"),
         "derived_asset_count": int(derived_count),

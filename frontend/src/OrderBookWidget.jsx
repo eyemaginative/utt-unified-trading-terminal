@@ -24,6 +24,7 @@ const ROBINHOOD_CHAIN_MARKET_CAPABILITY_REFRESHED_EVENT = "utt:robinhood-chain-m
 const ROBINHOOD_CHAIN_INTERACTIVE_QUOTE_PRIORITY_EVENT = "utt:robinhood-chain-interactive-quote-priority";
 const ROBINHOOD_CHAIN_AUTO_PRIORITY_RELEASE_MS = 250;
 const ROBINHOOD_CHAIN_AUTO_INITIAL_DELAY_MS = 1000;
+const UTT_AUTH_TOKEN_KEY = "utt_auth_token_v1";
 const MARKET_METRICS_BROWSER_CACHE_KEY = "utt.market_metrics.summary.v10";
 const MARKET_METRICS_BROWSER_CACHE_EVENT = "utt:market-metrics-summary-v10";
 const ORDERBOOK_QUOTE_USD_STALE_MS = 15 * 60 * 1000;
@@ -39,6 +40,15 @@ const USD_VALUE_QUOTES = new Set([
 function safeNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function robinhoodChainAuthHeaders(extra = {}) {
+  try {
+    const token = String(window?.localStorage?.getItem(UTT_AUTH_TOKEN_KEY) || "").trim();
+    return token ? { ...extra, Authorization: `Bearer ${token}` } : { ...extra };
+  } catch {
+    return { ...extra };
+  }
 }
 
 function robinhoodChainExactIdentityLabel(asset) {
@@ -854,11 +864,14 @@ export default function OrderBookWidget({
   const [sizeDecimals, setSizeDecimals] = useState(null);
   const [priceIncrement, setPriceIncrement] = useState(null);
 
-  // Separate display precision from click/ticket precision:
-  // - display: keep compact/readable (cap 8)
-  // - click/ticket: preserve up to 9 decimals for low-priced USDC pairs
+  // Separate normal display precision from adaptive low-price precision.
+  // Most books stay compact at 8 decimals. Robinhood Chain synthetic books may
+  // temporarily require more precision so distinct visible raw levels do not
+  // collapse to the same displayed/clicked price. Keep the adaptive boundary
+  // bounded to the exact-current Robinhood Chain market precision ceiling.
   const ORDERBOOK_PRICE_DISPLAY_CAP = 8;
   const ORDERBOOK_PRICE_CLICK_CAP = 9;
+  const ORDERBOOK_PRICE_ADAPTIVE_CAP = 12;
 
   // Defaults:
   // - Auto refresh: ON
@@ -1968,7 +1981,10 @@ function clampBox(next) {
     if (np === null) return "—";
 
     if (Number.isFinite(Number(priceDecimals))) {
-      const d = clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_DISPLAY_CAP);
+      const normal = clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_DISPLAY_CAP);
+      const d = isRobinhoodChainVenue
+        ? clamp(Number(orderBookAdaptiveDisplayDecimals ?? normal), normal, ORDERBOOK_PRICE_ADAPTIVE_CAP)
+        : normal;
       return Number(np).toFixed(d);
     }
 
@@ -2213,7 +2229,7 @@ function clampBox(next) {
           `${apiBase}/api/robinhood_chain/registry-discovery/markets/${encodeURIComponent(sym)}/refresh`,
           {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: robinhoodChainAuthHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({
               confirm_refresh: true,
               force_refresh: true,
@@ -3000,17 +3016,26 @@ function clampBox(next) {
     }
   }
 
-  function dispatchRobinhoodChainBookPick(row, pick) {
+  function dispatchRobinhoodChainBookPick(row, pick, displaySide = "") {
     if (!isRobinhoodChainVenue || typeof window === "undefined" || !row || typeof row !== "object") return;
+    const rowSide = String(row?.side || "").trim().toLowerCase();
+    const laneSide = String(displaySide || "").trim().toLowerCase();
+    const sideConsistent = !rowSide || !laneSide || rowSide === laneSide;
+    const effectiveBookSide = laneSide || rowSide;
+    const synthetic = row?.synthetic === true || orderBookMeta?.synthetic === true;
+    const quoteOnly = row?.quote_only === true || orderBookMeta?.quoteOnly === true;
     try {
       window.dispatchEvent(new CustomEvent(ROBINHOOD_CHAIN_ORDERBOOK_PICK_EVENT, {
         detail: {
           symbol: orderBookMeta?.symbol || obSymbol,
           row,
           pick: String(pick || "price"),
-          book_side: String(row?.side || "").trim().toLowerCase(),
-          synthetic: row?.synthetic === true,
-          quote_only: row?.quote_only === true,
+          book_side: effectiveBookSide,
+          row_side: rowSide || null,
+          display_side: laneSide || null,
+          side_consistent: sideConsistent,
+          synthetic,
+          quote_only: quoteOnly,
         },
       }));
     } catch {
@@ -3018,7 +3043,7 @@ function clampBox(next) {
     }
   }
 
-  function handlePickPrice(px, row = null) {
+  function handlePickPrice(px, row = null, displaySide = "") {
     if (isCounterpartyVenue) {
       const exact = counterpartyRowExactPriceText(row || { price: px });
       if (!exact || !Number.isFinite(Number(exact)) || Number(exact) <= 0) return;
@@ -3040,25 +3065,33 @@ function clampBox(next) {
     const n = Number(outPx);
     if (!Number.isFinite(n)) return;
 
-    // Preserve decimals for venues where order rules may be unknown.
-    // Some ticket implementations format clicked prices using "known" decimals
-    // (which may default to 0), causing whole-number rounding.
-    const d = Number.isFinite(Number(priceDecimals))
+    // Preserve enough precision for the exact visible Robinhood Chain level.
+    // A fixed 9-decimal click cap can collapse distinct low-price rows even when
+    // the adaptive display has correctly separated them. Other venues retain
+    // their existing rule-derived click precision.
+    const normalClickDecimals = Number.isFinite(Number(priceDecimals))
       ? clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_CLICK_CAP)
       : null;
+    const d = isRobinhoodChainVenue && normalClickDecimals !== null
+      ? clamp(
+          Math.max(normalClickDecimals, Number(orderBookAdaptiveClickDecimals ?? normalClickDecimals)),
+          0,
+          ORDERBOOK_PRICE_ADAPTIVE_CAP
+        )
+      : normalClickDecimals;
     const pxStr = d !== null ? n.toFixed(clamp(d, 0, 18)) : String(outPx);
 
     if (typeof onPickPrice === "function") {
       onPickPrice(n, pxStr, { priceDecimals: d, priceIncrement });
     }
     dispatchCounterpartyBookPick(row, "price");
-    dispatchRobinhoodChainBookPick(row, "price");
+    dispatchRobinhoodChainBookPick(row, "price", displaySide);
   }
 
-  function handlePickQty(q, row = null, pick = "size") {
+  function handlePickQty(q, row = null, pick = "size", displaySide = "") {
     if (typeof onPickQty === "function" && Number.isFinite(Number(q))) onPickQty(Number(q));
     dispatchCounterpartyBookPick(row, pick);
-    dispatchRobinhoodChainBookPick(row, pick);
+    dispatchRobinhoodChainBookPick(row, pick, displaySide);
   }
 
   const depthN = Math.max(1, Math.min(200, Number(obDepth) || 25));
@@ -3070,6 +3103,37 @@ function clampBox(next) {
     : bidsSorted;
   const asksView = asksFiltered.slice(0, depthN);
   const bidsView = bidsFiltered.slice(0, depthN);
+
+  function minimumVisibleRobinhoodChainPriceDecimals(rows, startDecimals) {
+    const start = clamp(Number(startDecimals), 0, ORDERBOOK_PRICE_ADAPTIVE_CAP);
+    const values = rows
+      .map((row) => Number(row?.price))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    const distinct = [...new Set(values)];
+    if (distinct.length <= 1) return start;
+
+    for (let d = start; d <= ORDERBOOK_PRICE_ADAPTIVE_CAP; d += 1) {
+      const rendered = distinct.map((value) => value.toFixed(d));
+      if (new Set(rendered).size === rendered.length) return d;
+    }
+
+    return ORDERBOOK_PRICE_ADAPTIVE_CAP;
+  }
+
+  const orderBookNormalDisplayDecimals = Number.isFinite(Number(priceDecimals))
+    ? clamp(Number(priceDecimals), 0, ORDERBOOK_PRICE_DISPLAY_CAP)
+    : null;
+  const orderBookAdaptiveDisplayDecimals = isRobinhoodChainVenue && orderBookNormalDisplayDecimals !== null
+    ? minimumVisibleRobinhoodChainPriceDecimals(asksView.concat(bidsView), orderBookNormalDisplayDecimals)
+    : orderBookNormalDisplayDecimals;
+  const orderBookAdaptiveClickDecimals = isRobinhoodChainVenue && orderBookAdaptiveDisplayDecimals !== null
+    ? clamp(
+        Math.max(ORDERBOOK_PRICE_CLICK_CAP, orderBookAdaptiveDisplayDecimals),
+        0,
+        ORDERBOOK_PRICE_ADAPTIVE_CAP
+      )
+    : null;
+
   const hasLiveBookRows = asksView.length > 0 || bidsView.length > 0;
   const liveBookWrapMinHeight = hasLiveBookRows ? 96 : 44;
 
@@ -3899,7 +3963,7 @@ function clampBox(next) {
                           <td
                             style={{ ...asksTd(), cursor: "pointer", userSelect: "none" }}
                             title={orderBookPriceTitle(x.price, x)}
-                            onClick={() => handlePickPrice(x.price, x)}
+                            onClick={() => handlePickPrice(x.price, x, "ask")}
                           >
                             {renderOrderBookPrice(x)}
                           </td>
@@ -3911,7 +3975,7 @@ function clampBox(next) {
                             }}
                             title={remainingClickable ? "Click to set ticket Qty" : "Remaining dispenser inventory; use Lot for purchase quantity"}
                             onClick={() => {
-                              if (remainingClickable) handlePickQty(x.size, x, "size");
+                              if (remainingClickable) handlePickQty(x.size, x, "size", "ask");
                             }}
                           >
                             {fmtSizeCell(x.size)}
@@ -3925,7 +3989,7 @@ function clampBox(next) {
                               }}
                               title={liquidityType === "dispenser" && lotSize !== null ? "Click to set one complete dispenser lot as Qty" : "Not applicable to protocol limit orders"}
                               onClick={() => {
-                                if (liquidityType === "dispenser" && lotSize !== null) handlePickQty(lotSize, x, "lot");
+                                if (liquidityType === "dispenser" && lotSize !== null) handlePickQty(lotSize, x, "lot", "ask");
                               }}
                             >
                               {lotSize !== null ? fmtSizeCell(lotSize) : "—"}
@@ -3981,14 +4045,14 @@ function clampBox(next) {
                           <td
                             style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
                             title={orderBookPriceTitle(x.price, x)}
-                            onClick={() => handlePickPrice(x.price, x)}
+                            onClick={() => handlePickPrice(x.price, x, "bid")}
                           >
                             {renderOrderBookPrice(x)}
                           </td>
                           <td
                             style={{ ...bidsTd(), cursor: "pointer", userSelect: "none" }}
                             title="Click to set ticket Qty"
-                            onClick={() => handlePickQty(x.size, x, "size")}
+                            onClick={() => handlePickQty(x.size, x, "size", "bid")}
                           >
                             {fmtSizeCell(x.size)}
                           </td>

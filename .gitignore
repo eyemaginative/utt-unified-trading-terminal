@@ -25,6 +25,9 @@ venv/
 *.log
 logs/
 
+# Developer-only tests are retained outside the public publication workspace.
+backend/tests/
+
 # Node / React
 node_modules/
 dist/

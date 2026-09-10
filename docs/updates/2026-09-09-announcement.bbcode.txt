@@ -1,5 +1,26 @@
-[b]UTT — Unified Trading Terminal — September 9, 2026 Cumulative Update[/b]
+[b]UTT — Unified Trading Terminal — Rolling Cumulative Update through September 10, 2026[/b]
 
+This is a cumulative update, not a replacement of prior functionality. The canonical README retains the detailed operator guide, venue coverage, setup instructions, security boundaries, accounting workflows, and historical release notes, with the September 9/10 work added on top.
+
+[b]What UTT currently provides[/b]
+[list]
+[*]connect and manage venue credentials through an owner-scoped encrypted local API-key vault with metadata-only inventory and read-only migration defaults
+[*]inspect balances, available amounts, holds, priced totals, cost basis, average cost, and gain/loss columns
+[*]view CEX orderbooks, DEX pseudo-orderbooks, Counterparty dispenser / protocol-order books, synthetic price-context books, and manual route books
+[*]submit and track CEX orders, cancel supported venue orders, and monitor venue-native order snapshots
+[*]trade through supported live-gated CEX adapters such as Coinbase, Crypto.com, Cexius, Dex-Trade, Gemini, Kraken, Robinhood, and OKX where configured
+[*]use Counterparty / UniSat workflows for Bitcoin-metaprotocol assets, collectibles, orderbook context, unsigned compose review, explicit PSBT signing, and separately gated broadcast
+[*]use Robinhood Chain for registry-backed EVM balances, exact Token Registry / pair-objective identity, 0x, Uniswap API, and Uniswap v3 RPC read-only indicative quote context, synthetic books, bounded exact-input planning, controlled browser-wallet execution, receipt reconciliation, historical/incremental wallet ingestion, external-swap materialization, All Orders Sync+Load, and deterministic ERC-20 USD balance pricing
+[*]submit and track Solana swaps / limit-style flows and confirmed Hydration manual-route swaps
+[*]monitor scanners, discovery tools, Ordinals / Counterparty collectibles, wallet activity, market-cap data, volume data, and self-custody balances
+[*]filter Market Cap and Volume windows by All / Owned / Unowned and by venue/source such as Coinbase, Crypto.com, Dex-Trade, Gemini, Hydration, Kraken, OKX, Robinhood, self-custody, Solana, and Solana-Jupiter
+[*]work with local ledger, deposits, withdrawals, missing-basis lots, transfer links, FIFO lot-impact previews, and tax-related state
+[*]preview per-fill basis impact for supported venue fills without mutating FIFO lots
+[*]plan cross-chain UTTT movements with bridge-transfer records, canonical supply context, per-chain supply context, and read-only basis previews
+[*]manage Token Registry rows, Hydration Route Registry rows, wallet addresses, venue API keys, and local operator preferences
+[*]inspect a managed read-only Arbitrage window with best bid/ask, spread, per-venue top-of-book rows, manual refresh, and bounded auto-refresh
+[*]integrate Solana and Polkadot / Hydration DEX routing and wallet-based execution alongside traditional exchange adapters
+[/list]
 
 [b]Profile / startup / catalog reliability[/b]
 [list]
@@ -45,3 +66,21 @@
 [*]Successful finite-approval auto-advance remains a natural-future live witness; it will not be forced just for validation.
 [*]The adaptive low-price Book repair is installed/static-green; the final naturally occurring multi-level display/click witness remains follow-up work after this checkpoint.
 [/list]
+
+[b]Detailed operator documentation retained[/b]
+[list]
+[*]Centralized exchange workflows for Coinbase, Crypto.com Exchange, Cexius, Dex-Trade, Gemini, Kraken, OKX, and Robinhood Crypto where locally configured and live-gated.
+[*]Dedicated Robinhood Chain Registry, synthetic Book, browser-wallet execution, receipt reconciliation, wallet-history ingestion, external-swap materialization, pricing, and accounting workflows.
+[*]Counterparty / UniSat discovery, dispenser/protocol-order review, unsigned compose, explicit PSBT signing, separately gated broadcast, and accounting previews.
+[*]Solana-Jupiter/Raydium routing, Polkadot/Hydration routes, UTTT Spread/Bridge planning, Market Cap/Volume, scanners, Arbitrage, Wallet Addresses, All Venues, ledger, FIFO, and basis workflows.
+[*]Complete Quick Start, local environment/secrets model, credential-vault lifecycle, venue-specific setup, live-trading gates, and operational guidance remain in the README.
+[/list]
+
+[b]Public repository hygiene[/b]
+[list]
+[*]Absolute local workstation paths and local user/machine identifiers are omitted from public publication metadata.
+[*]Runtime secrets, databases, backups, wallet keys, and private operational material remain outside source control.
+[*]Developer regression tests remain local DEV acceptance assets and are not part of the public runtime distribution.
+[/list]
+
+The announcement summarizes the cumulative release; the repository README remains the detailed rolling operator reference.
